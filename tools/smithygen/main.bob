@@ -605,16 +605,12 @@ function root(out: string): string {
 /// The imports of the file out, of Unit if unit and of Fault if faults.
 function imports(out: string, unit: bool, faults: bool): Decl[] {
 	const up = root(out)
-	let names = "Caller"
-	if (faults) {
-		names += ", Fault"
-	}
-	names += ", Handler"
-	if (unit) {
-		names += ", Unit"
-	}
 	const decls: Decl[] = []
 	decls.push(new Decl("import", [`import * as query from "${up}core/protocol/query"`]))
+	if (faults) {
+		decls.push(new Decl("import", [`import { Fault } from "${up}core/fault"`]))
+	}
+	const names = if (unit) "Caller, Handler, Unit" else "Caller, Handler"
 	decls.push(new Decl("import", [`import { ${names} } from "${up}core/service"`]))
 	decls.push(new Decl("import", [`import { Request, Response } from "std/http"`]))
 	return decls
