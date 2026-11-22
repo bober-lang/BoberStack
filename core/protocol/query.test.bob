@@ -1,5 +1,5 @@
 import { Fault } from "../fault"
-import { Caller, Handler, Unit } from "../service"
+import { Caller, notImplemented, Unit } from "../service"
 import { Blob, Call, decode, Flat, Key, Member, Name, result, Timestamp, Value } from "./query"
 import { Query } from "std/url"
 
@@ -201,11 +201,12 @@ function call(q: string): Call {
 }
 
 test "serve" {
-	let h: Handler[QueryStructuresInput, XmlTestResult] = null
-	const unimplemented = call("foo=Hello!").serve(h)
+	const unimplemented = call("foo=Hello!").serve((c: Caller, input: QueryStructuresInput): XmlTestResult => {
+		throw notImplemented("XmlTest")
+	})
 	assert unimplemented.status == 501
 	assert unimplemented.body.whole == error("NotImplemented", "The operation XmlTest is not implemented", true)
-	h = (c, input) => {
+	const h = (c: Caller, input: QueryStructuresInput): XmlTestResult => {
 		if (input.bar != null) {
 			throw new Fault(403, "Denied", input.bar!)
 		}

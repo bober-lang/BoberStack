@@ -1,17 +1,17 @@
 //! An ordered map of byte keys to byte values on tidwall's copy-on-write B-tree, for store.bob, which alone imports
 //! this file. An entry is one malloc'd, reference-counted record, which clones share. Keys order bytewise, a shorter
 //! key first on a tie. A function that cannot allocate leaves the store as it was and returns 0 for a handle or -1 for
-//! a result. The counts, the library's and the records', are not atomic: bobcc has no atomics, and one isolate uses
-//! the stores.
+//! a result. The counts, the library's and the records', are atomic, so that clones may be read in other threads.
 
+#include <stdatomic.h>
 #include <stdint.h>  // which btree.c takes from its header, left out as the library is static here
-#define BTREE_NOATOMICS
 #define BTREE_STATIC
 #include "../../vendor/btree/btree.c"
 
 // An entry: its key's bytes then its value's, held by each node that has it.
 typedef struct {
-  size_t refs, klen, vlen;
+  atomic_size_t refs;
+  size_t klen, vlen;
   const unsigned char *key;  // data, or for a probe the caller's bytes
   unsigned char data[];
 } rec;
@@ -21,7 +21,8 @@ typedef struct {
   size_t bytes;
 } store;
 
-static long records, trees, failing;
+static atomic_long records, trees;
+static long failing;
 
 /// Fails the nth allocation from now, for a test; none for 0.
 void store_fail(long n) { failing = n; }
@@ -40,20 +41,20 @@ static int compare(const void *a, const void *b, void *udata) {
 
 static bool hold(const void *item, void *into, void *udata) {
   rec *r = *(rec *const *)item;
-  r->refs++;
+  atomic_fetch_add(&r->refs, 1);
   *(rec **)into = r;
   return true;
 }
 
 static void release(rec *r) {
-  if (!--r->refs) free(r), records--;
+  if (atomic_fetch_sub(&r->refs, 1) == 1) free(r), atomic_fetch_sub(&records, 1);
 }
 
 static void drop(const void *item, void *udata) { release(*(rec *const *)item); }
 
 static void *wrap(struct btree *t, size_t bytes) {
   store *s = t ? alloc(sizeof *s) : 0;
-  if (s) *s = (store){t, bytes}, trees++;
+  if (s) *s = (store){t, bytes}, atomic_fetch_add(&trees, 1);
   else if (t) btree_free(t);
   return s;
 }
@@ -70,7 +71,7 @@ void *store_clone(void *s) { return wrap(btree_clone(((store *)s)->tree), ((stor
 
 void store_free(void *s) {
   btree_free(((store *)s)->tree);
-  free(s), trees--;
+  free(s), atomic_fetch_sub(&trees, 1);
 }
 
 static rec *find(store *s, const void *key, size_t kn) {
@@ -84,7 +85,7 @@ int store_put(void *p, const void *key, size_t kn, const void *value, size_t vn)
   store *s = p;
   rec *old = find(s, key, kn), *r = alloc(sizeof *r + kn + vn);
   if (!r) return -1;
-  *r = (rec){1, kn, vn, r->data}, records++;
+  r->refs = 1, r->klen = kn, r->vlen = vn, r->key = r->data, atomic_fetch_add(&records, 1);
   memcpy(r->data, key, kn), memcpy(r->data + kn, value, vn);
   size_t was = old ? kn + old->vlen : 0;  // read now, as the set frees old
   btree_set(s->tree, &r);  // which holds r, or on failure not
@@ -144,5 +145,5 @@ size_t store_count(void *s) { return btree_count(((store *)s)->tree); }
 /// The bytes of the keys and values s holds.
 size_t store_bytes(void *s) { return ((store *)s)->bytes; }
 /// The records, and the stores, not yet freed in the process.
-long store_records(void) { return records; }
-long store_trees(void) { return trees; }
+long store_records(void) { return atomic_load(&records); }
+long store_trees(void) { return atomic_load(&trees); }

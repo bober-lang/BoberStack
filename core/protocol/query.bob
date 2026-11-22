@@ -14,7 +14,7 @@ import { httpDate, millisecond, parseHttpDate, parseRfc3339, rfc3339, second } f
 import { Decodable, has, tag } from "std/types"
 import { Query } from "std/url"
 import { Fault } from "../fault"
-import { Caller, Handler, Unit } from "../service"
+import { Caller, Unit } from "../service"
 
 /// Tags a member to be named K on the wire, as Smithy's xmlName on it.
 export class Name[K extends string] {}
@@ -47,14 +47,10 @@ export class Call {
 		this.action = if (params.get("Version") == version) params.get("Action") ?? "" else ""
 	}
 
-	/// The answer by h, the handler of its action: NotImplemented if h is null, else h's output or the Fault that h or
-	/// decoding its input throws.
-	serve[I extends Decodable, O](h: Handler[I, O]): Response {
+	/// The answer by h, the handler of its action: h's output or the Fault that h or decoding its input throws.
+	serve[I extends Decodable, O](h: (caller: Caller, input: I) => O throws Fault): Response {
 		const id = this.caller.requestId
 		try {
-			if (h == null) {
-				throw new Fault(501, "NotImplemented", `The operation ${this.action} is not implemented`)
-			}
 			return reply(result(this.action, this.ns, id, h(this.caller, decode[I](this.params))), id)
 		} catch (f: Fault) {
 			return error(f, id, this.ns)
@@ -243,7 +239,7 @@ export function invalid(s: string | null, k: string, why: string): Fault {
 }
 
 /// The instant that the timestamp s in format names.
-function instant(s: string, format: string): i64 throws ParseError {
+export function instant(s: string, format: string): i64 throws ParseError {
 	switch (format) {
 		case "epoch-seconds": return (round(parseFloat[f64](s) * 1000.0) as i64) * millisecond
 		case "http-date": return parseHttpDate(s)
@@ -252,7 +248,7 @@ function instant(s: string, format: string): i64 throws ParseError {
 }
 
 /// The instant t, to the millisecond, as a timestamp in format.
-function stamp(t: i64, format: string): string {
+export function stamp(t: i64, format: string): string {
 	const ms = t - t % millisecond
 	switch (format) {
 		case "epoch-seconds":
