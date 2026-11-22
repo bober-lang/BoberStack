@@ -1,0 +1,125 @@
+//! IAM's state in an account's tree: a table of records of each kind, keyed by the name lower-cased, as IAM's names
+//! are unique whatever their case; and those of a user or role, by its key, a NUL and their own.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+import { lower } from "std/string"
+import { Decodable } from "std/types"
+
+export class User {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Role {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	/// The trust policy, as given.
+	trust = ""
+	description: string | null = null
+	/// In seconds.
+	maxSession: i32 = 3600
+	tags: [string, string][] = []
+}
+
+/// A managed policy.
+export class Policy {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	updated: i64 = 0
+	description: string | null = null
+	/// The version that is the default, and the number of the next.
+	defaultVersion = "v1"
+	next = 2
+	/// The users and roles it is attached to.
+	attachments = 0
+	tags: [string, string][] = []
+}
+
+/// A managed policy's version.
+export class Version {
+	/// v1, v2 and on, never one again once deleted.
+	id = ""
+	document = ""
+	created: i64 = 0
+}
+
+/// A user's access key, or the root's, of user "", whose secret is in the credentials of the global state.
+export class AccessKey {
+	user = ""
+	id = ""
+	status = "Active"
+	created: i64 = 0
+}
+
+/// A managed policy attached to a user or role.
+export class Attachment {
+	name = ""
+	path = ""
+	arn = ""
+}
+
+/// A policy embedded in a user or role.
+export class Inline {
+	name = ""
+	document = ""
+}
+
+/// The tables of an account's tree.
+export class Tables {
+	users: Table[User]
+	/// The account's root, by "", as a user of no name or path, from the first request that needs it.
+	root: Table[User]
+	roles: Table[Role]
+	policies: Table[Policy]
+	/// By the policy's key and the version's number, of 10 digits so that they sort.
+	versions: Table[Version]
+	/// By the user's key, "" for the root's, which no name has, and the access key's id.
+	keys: Table[AccessKey]
+	/// By the user's or role's key, the policy's and its account, the account's own or aws, as AWS's managed policies,
+	/// which are not in the tree, may share a name with the account's.
+	userAttached: Table[Attachment]
+	roleAttached: Table[Attachment]
+	userInline: Table[Inline]
+	roleInline: Table[Inline]
+
+	constructor(s: Store) {
+		this.users = new Table[User](s, "iam/users")
+		this.root = new Table[User](s, "iam/root")
+		this.roles = new Table[Role](s, "iam/roles")
+		this.policies = new Table[Policy](s, "iam/policies")
+		this.versions = new Table[Version](s, "iam/versions")
+		this.keys = new Table[AccessKey](s, "iam/keys")
+		this.userAttached = new Table[Attachment](s, "iam/user-attached")
+		this.roleAttached = new Table[Attachment](s, "iam/role-attached")
+		this.userInline = new Table[Inline](s, "iam/user-inline")
+		this.roleInline = new Table[Inline](s, "iam/role-inline")
+	}
+}
+
+/// The key of a name.
+export function key(name: string): string { return lower(name) }
+/// The key of the record of name, the key of what it belongs to, within it.
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+/// The ARN of an IAM resource of a kind, as user, in account; IAM's have no region.
+export function arn(account: string, kind: string, path: string, name: string): string {
+	return `arn:aws:iam::${account}:${kind}${path}${name}`
+}
+
+/// Puts v at k in t; a record holds no float, the one thing JSON cannot encode.
+export function save[V extends Decodable](t: Table[V], k: string, v: V) throws Fault {
+	try {
+		t.put(k, v)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

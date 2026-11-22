@@ -1,0 +1,34 @@
+//! What tests of a gateway share: requests signed as boto3 signs them, and what is in the answers.
+
+import * as sigv4 from "./auth/sigv4"
+import { CryptoError } from "std/crypto/error"
+import { parse } from "std/encoding/xml"
+import { Request, Response } from "std/http"
+import { ParseError } from "std/string"
+
+/// A query of body to service from accessKey, dated now as tests see it, signed by secret, of the session token if
+/// not "".
+export function request(service: string, accessKey: string, secret: string, body: string,
+	token = ""): Request throws CryptoError | ParseError {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("host", "localhost:4566")
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.headers.set("x-amz-date", "20150626T140000Z")
+	let signed = "content-type;host;x-amz-date"
+	if (token != "") {
+		req.headers.set("x-amz-security-token", token)
+		signed += ";x-amz-security-token"
+	}
+	const header = `AWS4-HMAC-SHA256 Credential=${accessKey}/20150626/us-east-1/${service}/aws4_request, `
+		+ `SignedHeaders=${signed}, Signature=`
+	req.headers.set("authorization", header + sigv4.signature(req, body, sigv4.parse(header + "0")!, secret))
+	return req
+}
+
+/// The texts of the elements named name in the document of res, in order.
+export function texts(res: Response, name: string): string[] throws ParseError {
+	return parse(res.body.whole ?? "").elements(name).map(e => e.text())
+}
+
+/// The text of the first element named name in the document of res, null if none.
+export function text(res: Response, name: string): string | null throws ParseError { return texts(res, name).at(0) }

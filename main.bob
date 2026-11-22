@@ -1,0 +1,46 @@
+import { Gateway } from "./core/gateway"
+import * as iamApi from "./services/iam/api"
+import { Catalog } from "./services/iam/catalog"
+import * as iam from "./services/iam/iam"
+import * as stsApi from "./services/sts/api"
+import * as sts from "./services/sts/sts"
+import { decode, help } from "std/encoding/optarg"
+import { serve } from "std/http"
+import { ParseError } from "std/string"
+import { catalog_text } from "./services/iam/catalog.c"
+
+class Options {
+	/// The port to listen on, LocalStack's by default.
+	port: u16 = 4566
+}
+
+function main(): i32 {
+	let o = new Options()
+	try {
+		o = decode[Options](args())
+	} catch (e: ParseError) {
+		print(help[Options]())
+		return 2
+	}
+	const text = new u64[](2)
+	catalog_text(text)
+	let catalog: Catalog | null = null
+	try {
+		catalog = new Catalog(text[0], text[1])
+	} catch (e: ParseError) {
+		print(`boberstack: the AWS managed policies do not parse at byte ${e.at}`)
+		return 1
+	}
+	const g = new Gateway()
+	const i = new iam.Handler(catalog!)
+	const s = new sts.Handler()
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
+	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	try {
+		serve(g.handle, `:${o.port}`)
+	} catch (e: IoError | ParseError) {
+		print(`boberstack: ${e}`)
+		return 1
+	}
+	return 0
+}

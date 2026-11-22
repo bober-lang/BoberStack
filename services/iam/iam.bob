@@ -1,0 +1,1005 @@
+//! AWS Identity and Access Management: users and their access keys, roles, managed policies and their versions, and
+//! the policies attached to or embedded in users and roles, and AWS's managed policies, which any account may attach
+//! but none change. Policies are stored, never evaluated.
+
+import { Credential, credentials, id, secret } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { invalid } from "../../core/protocol/query"
+import { Caller, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+import { AccessKey, arn, Attachment, Inline, key, Policy, Role, save, Tables, User, Version, within } from "./records"
+import { endsWith, indexOf, lastIndexOf, merge, startsWith } from "std/algo"
+import { isAlphanumeric, isGraphic } from "std/ascii"
+import { HashMap } from "std/collections/hashmap"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { lower, ParseError, parseInt } from "std/string"
+import { Decodable } from "std/types"
+import { escape } from "std/url"
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	/// AWS's managed policies.
+	catalog: Catalog
+
+	constructor(catalog: Catalog) { this.catalog = catalog }
+
+	createUser(caller: Caller, input: api.CreateUserRequest): api.CreateUserResponse throws Fault {
+		const db = new Tables(caller.store())
+		const k = key(named(input.UserName, "userName", 64))
+		if (db.users.get(k) != null) {
+			throw api.entityAlreadyExistsException(`User with name ${input.UserName} already exists.`)
+		}
+		const u = new User()
+		u.name = input.UserName
+		u.path = path(input.Path, "path")
+		u.id = id("AIDA", 17)
+		u.created = now()
+		u.tags = tagged([], input.Tags ?? [], "User")
+		save(db.users, k, u)
+		const r = new api.CreateUserResponse()
+		r.User = userOf(caller.account, u, true)
+		return r
+	}
+
+	getUser(caller: Caller, input: api.GetUserRequest): api.GetUserResponse throws Fault {
+		const r = new api.GetUserResponse()
+		r.User = userOf(caller.account, owner(caller, new Tables(caller.store()), input.UserName), true)
+		return r
+	}
+
+	listUsers(caller: Caller, input: api.ListUsersRequest): api.ListUsersResponse throws Fault {
+		const prefix = input.PathPrefix ?? "/"
+		const [users, next] = page(new Tables(caller.store()).users, "", input.Marker, input.MaxItems,
+			u => startsWith(u.path, prefix))
+		const r = new api.ListUsersResponse()
+		r.Users = users.map(u => userOf(caller.account, u, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateUser(caller: Caller, input: api.UpdateUserRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const was = key(u.name)
+		const name = named(input.NewUserName ?? u.name, "newUserName", 64)
+		const k = key(name)
+		if (k != was && db.users.get(k) != null) {
+			throw api.entityAlreadyExistsException(`User with name ${name} already exists.`)
+		}
+		u.name = name
+		if (input.NewPath != null) {
+			u.path = path(input.NewPath, "newPath")
+		}
+		db.users.delete(was)
+		save(db.users, k, u)
+		move(db.keys, was, k, a => {
+			a.user = name
+		})
+		move(db.userAttached, was, k, a => {})
+		move(db.userInline, was, k, p => {})
+		const issued = credentials(caller.global())
+		for (const [_, a] of db.keys.scan(null, 2, within(k, ""))) {
+			const c = issued.get(a.id)!
+			c.arn = arn(caller.account, "user", u.path, u.name)
+			save(issued, a.id, c)
+		}
+		return new Unit()
+	}
+
+	deleteUser(caller: Caller, input: api.DeleteUserRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const k = key(user(db, input.UserName).name)
+		if (db.keys.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete access keys first.")
+		}
+		if (db.userAttached.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
+		}
+		if (db.userInline.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		db.users.delete(k)
+		return new Unit()
+	}
+
+	tagUser(caller: Caller, input: api.TagUserRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.tags = tagged(u.tags, input.Tags, "User")
+		save(db.users, key(u.name), u)
+		return new Unit()
+	}
+
+	untagUser(caller: Caller, input: api.UntagUserRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.tags = u.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		save(db.users, key(u.name), u)
+		return new Unit()
+	}
+
+	listUserTags(caller: Caller, input: api.ListUserTagsRequest): api.ListUserTagsResponse throws Fault {
+		const [tags,
+			next] = tagPage(user(new Tables(caller.store()), input.UserName).tags, input.Marker, input.MaxItems)
+		const r = new api.ListUserTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	createAccessKey(caller: Caller, input: api.CreateAccessKeyRequest): api.CreateAccessKeyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const u = owner(caller, db, input.UserName)
+		const k = key(u.name)
+		if (db.keys.scan(null, 2, within(k, "")).length == 2) {
+			throw api.limitExceededException("Cannot exceed quota for AccessKeysPerUser: 2")
+		}
+		const a = new AccessKey()
+		a.user = u.name
+		a.id = id("AKIA", 16)
+		a.created = now()
+		save(db.keys, within(k, a.id), a)
+		const c = new Credential()
+		c.secret = secret()
+		c.account = caller.account
+		c.arn = identity(caller.account, u)
+		c.userId = u.id
+		save(credentials(caller.global()), a.id, c)
+		const r = new api.CreateAccessKeyResponse()
+		r.AccessKey.UserName = u.name
+		r.AccessKey.AccessKeyId = a.id
+		r.AccessKey.Status = "Active"
+		r.AccessKey.SecretAccessKey = c.secret
+		r.AccessKey.CreateDate = a.created
+		return r
+	}
+
+	listAccessKeys(caller: Caller, input: api.ListAccessKeysRequest): api.ListAccessKeysResponse throws Fault {
+		const db = new Tables(caller.store())
+		const u = owner(caller, db, input.UserName)
+		const [keys, next] = page(db.keys, within(key(u.name), ""), input.Marker, input.MaxItems, a => true)
+		const r = new api.ListAccessKeysResponse()
+		r.AccessKeyMetadata = keys.map(a => {
+			const m = new api.AccessKeyMetadata()
+			m.UserName = if (a.user == "") null else a.user // the root's
+			m.AccessKeyId = a.id
+			m.Status = if (a.status == "Active") "Active" else "Inactive"
+			m.CreateDate = a.created
+			return m
+		})
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateAccessKey(caller: Caller, input: api.UpdateAccessKeyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
+		const a = accessKey(db, k, input.AccessKeyId)
+		a.status = input.Status
+		save(db.keys, k, a)
+		const issued = credentials(caller.global())
+		const c = issued.get(a.id)!
+		c.status = input.Status
+		save(issued, a.id, c)
+		return new Unit()
+	}
+
+	deleteAccessKey(caller: Caller, input: api.DeleteAccessKeyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
+		accessKey(db, k, input.AccessKeyId)
+		db.keys.delete(k)
+		// Kept, so that the key is refused rather than taken for a root's, as one never issued is.
+		const issued = credentials(caller.global())
+		const c = issued.get(input.AccessKeyId)!
+		c.status = "Deleted"
+		save(issued, input.AccessKeyId, c)
+		return new Unit()
+	}
+
+	createRole(caller: Caller, input: api.CreateRoleRequest): api.CreateRoleResponse throws Fault {
+		const db = new Tables(caller.store())
+		const k = key(named(input.RoleName, "roleName", 64))
+		if (db.roles.get(k) != null) {
+			throw api.entityAlreadyExistsException(`Role with name ${input.RoleName} already exists.`)
+		}
+		const r = new Role()
+		r.name = input.RoleName
+		r.path = path(input.Path, "path")
+		r.id = id("AROA", 17)
+		r.created = now()
+		r.trust = document(input.AssumeRolePolicyDocument)
+		r.description = input.Description
+		r.maxSession = input.MaxSessionDuration ?? 3600
+		if (r.maxSession < 3600 || r.maxSession > 43200) {
+			const why = `Member must have value ${if (r.maxSession < 3600) "greater than or equal to 3600" else "less than or equal to 43200"}`
+			throw invalid(`${r.maxSession}`, "maxSessionDuration", why)
+		}
+		r.tags = tagged([], input.Tags ?? [], "Role")
+		save(db.roles, k, r)
+		const out = new api.CreateRoleResponse()
+		out.Role = roleOf(caller.account, r, true)
+		return out
+	}
+
+	getRole(caller: Caller, input: api.GetRoleRequest): api.GetRoleResponse throws Fault {
+		const r = new api.GetRoleResponse()
+		r.Role = roleOf(caller.account, role(new Tables(caller.store()), input.RoleName), true)
+		r.Role.RoleLastUsed = new api.RoleLastUsed()
+		return r
+	}
+
+	listRoles(caller: Caller, input: api.ListRolesRequest): api.ListRolesResponse throws Fault {
+		const prefix = input.PathPrefix ?? "/"
+		const [roles, next] = page(new Tables(caller.store()).roles, "", input.Marker, input.MaxItems,
+			r => startsWith(r.path, prefix))
+		const r = new api.ListRolesResponse()
+		r.Roles = roles.map(x => roleOf(caller.account, x, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateAssumeRolePolicy(caller: Caller, input: api.UpdateAssumeRolePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.trust = document(input.PolicyDocument)
+		save(db.roles, key(r.name), r)
+		return new Unit()
+	}
+
+	deleteRole(caller: Caller, input: api.DeleteRoleRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const k = key(role(db, input.RoleName).name)
+		if (db.roleAttached.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
+		}
+		if (db.roleInline.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		db.roles.delete(k)
+		return new Unit()
+	}
+
+	tagRole(caller: Caller, input: api.TagRoleRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.tags = tagged(r.tags, input.Tags, "Role")
+		save(db.roles, key(r.name), r)
+		return new Unit()
+	}
+
+	untagRole(caller: Caller, input: api.UntagRoleRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.tags = r.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		save(db.roles, key(r.name), r)
+		return new Unit()
+	}
+
+	listRoleTags(caller: Caller, input: api.ListRoleTagsRequest): api.ListRoleTagsResponse throws Fault {
+		const [tags,
+			next] = tagPage(role(new Tables(caller.store()), input.RoleName).tags, input.Marker, input.MaxItems)
+		const r = new api.ListRoleTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	createPolicy(caller: Caller, input: api.CreatePolicyRequest): api.CreatePolicyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const k = key(named(input.PolicyName, "policyName", 128))
+		if (db.policies.get(k) != null) {
+			const why = `A policy called ${input.PolicyName} already exists. Duplicate names are not allowed.`
+			throw api.entityAlreadyExistsException(why)
+		}
+		const p = new Policy()
+		p.name = input.PolicyName
+		p.path = path(input.Path, "path")
+		p.id = id("ANPA", 17)
+		p.created = now()
+		p.updated = p.created
+		p.description = input.Description
+		p.tags = tagged([], input.Tags ?? [], "Policy")
+		const v = new Version()
+		v.id = "v1"
+		v.document = document(input.PolicyDocument)
+		v.created = p.created
+		save(db.policies, k, p)
+		save(db.versions, within(k, number(1)), v)
+		const r = new api.CreatePolicyResponse()
+		r.Policy = policyOf(caller.account, p, true)
+		return r
+	}
+
+	getPolicy(caller: Caller, input: api.GetPolicyRequest): api.GetPolicyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		if (aws(a)) {
+			p.attachments = uses(db).get(a) ?? 0
+		}
+		const r = new api.GetPolicyResponse()
+		r.Policy = policyOf(if (aws(a)) "aws" else caller.account, p, true)
+		return r
+	}
+
+	/// The account's policies and AWS's, of each name the account's first.
+	listPolicies(caller: Caller, input: api.ListPoliciesRequest): api.ListPoliciesResponse throws Fault {
+		const db = new Tables(caller.store())
+		const prefix = input.PathPrefix ?? "/"
+		const scope = input.Scope ?? "All"
+		// There are no permissions boundaries.
+		const none = input.PolicyUsageFilter == "PermissionsBoundary"
+		const attached = input.OnlyAttached ?? false
+		const n = limit(input.MaxItems)
+		const after = cursor(input.Marker)
+		const listed: [string, api.Policy][] = []
+		if (!none && scope != "AWS") {
+			for (const [k, p] of take(db.policies, "", after, n + 1,
+				p => startsWith(p.path, prefix) && (!attached || p.attachments > 0))) {
+				listed.push([within(k, caller.account), policyOf(caller.account, p, false)])
+			}
+		}
+		const local = listed.length
+		const counts = uses(db)
+		for (let i = this.catalog.after(after
+			?? ""); !none && scope != "Local" && i < this.catalog.size() && listed.length - local <= n; i++) {
+			const p = this.catalog.policy(i)
+			p.attachments = counts.get(arn("aws", "policy", p.path, p.name)) ?? 0
+			if (startsWith(p.path, prefix) && (!attached || p.attachments > 0)) {
+				listed.push([within(key(p.name), "aws"), policyOf("aws", p, false)])
+			}
+		}
+		merge(listed, local, (x, y) => x[0] < y[0])
+		const r = new api.ListPoliciesResponse()
+		r.Policies = listed.slice(0, if (listed.length < n) listed.length else n).map(e => e[1])
+		r.IsTruncated = listed.length > n
+		r.Marker = if (listed.length > n) base64.encode(listed[n - 1][0]) else null
+		return r
+	}
+
+	deletePolicy(caller: Caller, input: api.DeletePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "DeletePolicy")
+		const k = key(p.name)
+		if (p.attachments > 0) {
+			throw api.deleteConflictException("Cannot delete a policy attached to entities.")
+		}
+		const versions = db.versions.scan(null, 2, within(k, ""))
+		if (versions.length > 1) {
+			throw api.deleteConflictException("This policy has more than one version. Before you delete a policy, you "
+				+ "must delete the policy's versions. The default version is deleted with the policy.")
+		}
+		db.versions.delete(versions[0][0])
+		db.policies.delete(k)
+		return new Unit()
+	}
+
+	createPolicyVersion(caller: Caller,
+		input: api.CreatePolicyVersionRequest): api.CreatePolicyVersionResponse throws Fault {
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "CreatePolicyVersion")
+		const k = key(p.name)
+		if (db.versions.scan(null, 5, within(k, "")).length == 5) {
+			throw api.limitExceededException("A managed policy can have up to 5 versions. Before you create a new "
+				+ "version, you must delete an existing version.")
+		}
+		const v = new Version()
+		v.id = `v${p.next}`
+		v.document = document(input.PolicyDocument)
+		v.created = now()
+		save(db.versions, within(k, number(p.next)), v)
+		p.next++
+		p.updated = v.created
+		if (input.SetAsDefault ?? false) {
+			p.defaultVersion = v.id
+		}
+		save(db.policies, k, p)
+		const r = new api.CreatePolicyVersionResponse()
+		r.PolicyVersion = versionOf(p, v, false)
+		return r
+	}
+
+	getPolicyVersion(caller: Caller, input: api.GetPolicyVersionRequest): api.GetPolicyVersionResponse throws Fault {
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		let v: Version | null = null
+		if (aws(a)) {
+			v = this.catalog.version(this.catalog.find(a), input.VersionId)
+		} else {
+			v = version(db, p, a, input.VersionId)[1]
+		}
+		if (v == null) {
+			throw unknownVersion(a, input.VersionId)
+		}
+		const r = new api.GetPolicyVersionResponse()
+		r.PolicyVersion = versionOf(p, v, true)
+		return r
+	}
+
+	/// The account's policy's versions in their order, AWS's as AWS lists them, the latest first.
+	listPolicyVersions(caller: Caller,
+		input: api.ListPolicyVersionsRequest): api.ListPolicyVersionsResponse throws Fault {
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		const [versions, next] = if (aws(a)) part(this.catalog.versions(this.catalog.find(a)), input.Marker,
+			input.MaxItems)
+			else page(db.versions, within(key(p.name), ""), input.Marker, input.MaxItems, v => true)
+		const r = new api.ListPolicyVersionsResponse()
+		r.Versions = versions.map(v => versionOf(p, v, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deletePolicyVersion(caller: Caller, input: api.DeletePolicyVersionRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "DeletePolicyVersion")
+		const [k, v] = version(db, p, input.PolicyArn, input.VersionId)
+		if (v.id == p.defaultVersion) {
+			throw api.deleteConflictException("Cannot delete the default version of a policy.")
+		}
+		db.versions.delete(k)
+		return new Unit()
+	}
+
+	setDefaultPolicyVersion(caller: Caller, input: api.SetDefaultPolicyVersionRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "SetDefaultPolicyVersion")
+		p.defaultVersion = version(db, p, input.PolicyArn, input.VersionId)[1].id
+		p.updated = now()
+		save(db.policies, key(p.name), p)
+		return new Unit()
+	}
+
+	attachUserPolicy(caller: Caller, input: api.AttachUserPolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		attach(caller, db, this.catalog, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn, "User")
+		return new Unit()
+	}
+
+	detachUserPolicy(caller: Caller, input: api.DetachUserPolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		detach(caller, db, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn)
+		return new Unit()
+	}
+
+	listAttachedUserPolicies(caller: Caller,
+		input: api.ListAttachedUserPoliciesRequest): api.ListAttachedUserPoliciesResponse throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		const [policies, next] = attached(db.userAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
+		const r = new api.ListAttachedUserPoliciesResponse()
+		r.AttachedPolicies = policies
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	attachRolePolicy(caller: Caller, input: api.AttachRolePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "Role")
+		return new Unit()
+	}
+
+	detachRolePolicy(caller: Caller, input: api.DetachRolePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		detach(caller, db, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn)
+		return new Unit()
+	}
+
+	listAttachedRolePolicies(caller: Caller,
+		input: api.ListAttachedRolePoliciesRequest): api.ListAttachedRolePoliciesResponse throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		const [policies, next] = attached(db.roleAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
+		const r = new api.ListAttachedRolePoliciesResponse()
+		r.AttachedPolicies = policies
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	/// The users, then the roles, a managed policy is attached to, each in the order of their names.
+	listEntitiesForPolicy(caller: Caller,
+		input: api.ListEntitiesForPolicyRequest): api.ListEntitiesForPolicyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		managed(caller, db, this.catalog, a)
+		const prefix = input.PathPrefix ?? "/"
+		const f = input.EntityFilter
+		// There are no groups, nor permissions boundaries.
+		const none = input.PolicyUsageFilter == "PermissionsBoundary"
+		const entities: [bool, string, string][] = [] // whether a user's, the name and the id
+		for (const [k, at] of if (none || f != null && f != "User") [] else db.userAttached.scan(null, 2147483647)) {
+			const u = if (at.arn == a) db.users.get(k.slice(0, indexOf(k, "\x00"))) else null
+			if (u != null && startsWith(u.path, prefix)) {
+				entities.push([true, u.name, u.id])
+			}
+		}
+		for (const [k, at] of if (none || f != null && f != "Role") [] else db.roleAttached.scan(null, 2147483647)) {
+			const x = if (at.arn == a) db.roles.get(k.slice(0, indexOf(k, "\x00"))) else null
+			if (x != null && startsWith(x.path, prefix)) {
+				entities.push([false, x.name, x.id])
+			}
+		}
+		const [found, next] = part(entities, input.Marker, input.MaxItems)
+		const r = new api.ListEntitiesForPolicyResponse()
+		r.PolicyGroups = []
+		r.PolicyUsers = found.filter(e => e[0]).map(e => ({ ...new api.PolicyUser(), UserName: e[1], UserId: e[2] }))
+		r.PolicyRoles = found.filter(e => !e[0]).map(e => ({ ...new api.PolicyRole(), RoleName: e[1], RoleId: e[2] }))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	putUserPolicy(caller: Caller, input: api.PutUserPolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		embed(db.userInline, owner, input.PolicyName, input.PolicyDocument)
+		return new Unit()
+	}
+
+	getUserPolicy(caller: Caller, input: api.GetUserPolicyRequest): api.GetUserPolicyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const p = inline(db.userInline, key(u.name), input.PolicyName, "user")
+		const r = new api.GetUserPolicyResponse()
+		r.UserName = u.name
+		r.PolicyName = p.name
+		r.PolicyDocument = escape(p.document, "component")
+		return r
+	}
+
+	listUserPolicies(caller: Caller, input: api.ListUserPoliciesRequest): api.ListUserPoliciesResponse throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		const [policies, next] = page(db.userInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
+		const r = new api.ListUserPoliciesResponse()
+		r.PolicyNames = policies.map(p => p.name)
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteUserPolicy(caller: Caller, input: api.DeleteUserPolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		inline(db.userInline, owner, input.PolicyName, "user")
+		db.userInline.delete(within(owner, key(input.PolicyName)))
+		return new Unit()
+	}
+
+	putRolePolicy(caller: Caller, input: api.PutRolePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		embed(db.roleInline, owner, input.PolicyName, input.PolicyDocument)
+		return new Unit()
+	}
+
+	getRolePolicy(caller: Caller, input: api.GetRolePolicyRequest): api.GetRolePolicyResponse throws Fault {
+		const db = new Tables(caller.store())
+		const x = role(db, input.RoleName)
+		const p = inline(db.roleInline, key(x.name), input.PolicyName, "role")
+		const r = new api.GetRolePolicyResponse()
+		r.RoleName = x.name
+		r.PolicyName = p.name
+		r.PolicyDocument = escape(p.document, "component")
+		return r
+	}
+
+	listRolePolicies(caller: Caller, input: api.ListRolePoliciesRequest): api.ListRolePoliciesResponse throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		const [policies, next] = page(db.roleInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
+		const r = new api.ListRolePoliciesResponse()
+		r.PolicyNames = policies.map(p => p.name)
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteRolePolicy(caller: Caller, input: api.DeleteRolePolicyRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		inline(db.roleInline, owner, input.PolicyName, "role")
+		db.roleInline.delete(within(owner, key(input.PolicyName)))
+		return new Unit()
+	}
+}
+
+/// The user named name.
+function user(db: Tables, name: string): User throws Fault {
+	const u = db.users.get(key(name))
+	if (u == null) {
+		throw api.noSuchEntityException(`The user with name ${name} cannot be found.`)
+	}
+	return u
+}
+
+/// The user named name, or if none the caller, which must then be a user or the account's root.
+function owner(caller: Caller, db: Tables, name: string | null): User throws Fault {
+	if (name != null) {
+		return user(db, name)
+	}
+	if (caller.arn == arn(caller.account, "root", "", "")) {
+		const found = db.root.get("")
+		if (found != null) {
+			return found
+		}
+		const r = { ...new User(), path: "", id: caller.account, created: now() }
+		save(db.root, "", r)
+		return r
+	}
+	if (indexOf(caller.arn, ":user/") < 0) {
+		throw new Fault(400, "ValidationError", "Must specify userName when calling with non-User credentials")
+	}
+	return user(db, caller.arn.slice(lastIndexOf(caller.arn, "/") + 1, caller.arn.length))
+}
+
+/// The role named name.
+function role(db: Tables, name: string): Role throws Fault {
+	const r = db.roles.get(key(name))
+	if (r == null) {
+		throw api.noSuchEntityException(`The role with name ${name} cannot be found.`)
+	}
+	return r
+}
+
+/// The managed policy of the caller's account that a names.
+function policy(caller: Caller, db: Tables, a: string, missing = "was not found."): Policy throws Fault {
+	if (!startsWith(a, "arn:aws:iam::") || indexOf(a, ":policy/") < 0) {
+		throw api.invalidInputException(`ARN ${a} is not valid.`)
+	}
+	const p = db.policies.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
+	if (p == null || arn(caller.account, "policy", p.path, p.name) != a) {
+		throw api.noSuchEntityException(`Policy ${a} ${missing}`)
+	}
+	return p
+}
+
+/// The managed policy that a names, the caller's account's or AWS's; one of AWS's counts no attachments.
+function managed(caller: Caller, db: Tables, catalog: Catalog, a: string,
+	missing = "was not found."): Policy throws Fault {
+	if (!aws(a)) {
+		return policy(caller, db, a, missing)
+	}
+	const i = catalog.find(a)
+	if (i < 0) {
+		throw api.noSuchEntityException(`Policy ${a} ${missing}`)
+	}
+	return catalog.policy(i)
+}
+
+/// The managed policy of the caller's account that a names, for the action, which is denied on AWS's.
+function owned(caller: Caller, db: Tables, a: string, action: string): Policy throws Fault {
+	if (aws(a)) {
+		throw new Fault(403, "AccessDenied",
+			`User: ${caller.arn} is not authorized to perform: iam:${action} on resource: policy ${a}`)
+	}
+	return policy(caller, db, a)
+}
+
+/// Whether a is the ARN of one of AWS's managed policies, of the account aws.
+function aws(a: string): bool { return startsWith(a, "arn:aws:iam::aws:") }
+
+/// The number of users and roles each managed policy is attached to, by its ARN.
+function uses(db: Tables): HashMap[string, i32] {
+	const n = new HashMap[string, i32]()
+	for (const t of [db.userAttached, db.roleAttached]) {
+		for (const [_, at] of t.scan(null, 2147483647)) {
+			n.set(at.arn, (n.get(at.arn) ?? 0) + 1)
+		}
+	}
+	return n
+}
+
+/// The key and version of p, of the ARN a, whose id is v.
+function version(db: Tables, p: Policy, a: string, v: string): [string, Version] throws Fault {
+	let n = 0
+	try {
+		n = if (startsWith(v, "v")) parseInt(v.slice(1, v.length)) else 0
+	} catch (e: ParseError) {}
+	const k = within(key(p.name), number(n))
+	const found = db.versions.get(k)
+	if (found == null || found.id != v) {
+		throw unknownVersion(a, v)
+	}
+	return [k, found]
+}
+
+/// The fault of the version v, of the policy of ARN a, that does not exist.
+function unknownVersion(a: string, v: string): Fault {
+	return api.noSuchEntityException(`Policy ${a} version ${v} does not exist or is not attachable.`)
+}
+
+/// A version's number, of 10 digits so that keys sort by it.
+function number(n: i32): string { return `${10000000000 + (n as i64)}`.slice(1, 11) }
+
+/// The access key k of the user that k names, whose id is id.
+function accessKey(db: Tables, k: string, id: string): AccessKey throws Fault {
+	const a = db.keys.get(k)
+	if (a == null) {
+		throw api.noSuchEntityException(`The Access Key with id ${id} cannot be found.`)
+	}
+	return a
+}
+
+/// Attaches the policy of ARN a to the user or role, as kind names it, of key owner, whose attachments are in t, unless
+/// it is already; a service role's policy of AWS's only AWS attaches, to the role it makes.
+function attach(caller: Caller, db: Tables, catalog: Catalog, t: Table[Attachment], owner: string, a: string,
+	kind: string) throws Fault {
+	const p = managed(caller, db, catalog, a, "does not exist or is not attachable.")
+	if (aws(a) && startsWith(p.path, "/aws-service-role/")) {
+		throw api.policyNotAttachableException(`Cannot attach a Service Role Policy to a Customer ${kind}.`)
+	}
+	const k = within(owner, placed(caller, a))
+	if (t.get(k) == null) {
+		const at = new Attachment()
+		at.name = p.name
+		at.path = p.path
+		at.arn = a
+		save(t, k, at)
+		if (!aws(a)) {
+			p.attachments++
+			save(db.policies, key(p.name), p)
+		}
+	}
+}
+
+/// Detaches the policy of ARN a from the user or role of key owner, whose attachments are in t.
+function detach(caller: Caller, db: Tables, t: Table[Attachment], owner: string, a: string) throws Fault {
+	const k = within(owner, placed(caller, a))
+	const at = t.get(k)
+	if (at == null || at.arn != a) {
+		throw api.noSuchEntityException(`Policy ${a} was not found.`)
+	}
+	t.delete(k)
+	if (!aws(a)) {
+		const p = policy(caller, db, a)
+		p.attachments--
+		save(db.policies, key(p.name), p)
+	}
+}
+
+/// The place of the managed policy of ARN a among those of a listing or attached to a user or role: its key, then its
+/// account's, the caller's or aws, as AWS's may share a name with the account's own.
+function placed(caller: Caller, a: string): string {
+	return within(key(a.slice(lastIndexOf(a, "/") + 1, a.length)), if (aws(a)) "aws" else caller.account)
+}
+
+/// A page of the policies attached to the user or role of key owner, of t, whose paths start with prefix.
+function attached(t: Table[Attachment], owner: string, prefix: string | null, marker: string | null,
+	max: i32 | null): [api.AttachedPolicy[], string | null] throws Fault {
+	const [policies, next] = page(t, within(owner, ""), marker, max, a => startsWith(a.path, prefix ?? "/"))
+	return [policies.map(a => ({ ...new api.AttachedPolicy(), PolicyName: a.name, PolicyArn: a.arn })), next]
+}
+
+/// Puts the policy named name of the document doc into the user or role of key owner, whose inline policies are in t.
+function embed(t: Table[Inline], owner: string, name: string, doc: string) throws Fault {
+	const p = new Inline()
+	p.name = named(name, "policyName", 128)
+	p.document = document(doc)
+	save(t, within(owner, key(name)), p)
+}
+
+/// The inline policy named name of the user or role, as kind names it, of key owner, of t.
+function inline(t: Table[Inline], owner: string, name: string, kind: string): Inline throws Fault {
+	const p = t.get(within(owner, key(name)))
+	if (p == null) {
+		throw api.noSuchEntityException(`The ${kind} policy with name ${name} cannot be found.`)
+	}
+	return p
+}
+
+/// Moves the records of t that belong to the key from to the key to, each as edit changes it.
+function move[V extends Decodable](t: Table[V], from: string, to: string, edit: (v: V) => void) throws Fault {
+	for (const [k, v] of t.scan(null, 2147483647, within(from, ""))) {
+		t.delete(k)
+		edit(v)
+		save(t, within(to, k.slice(from.length + 1, k.length)), v)
+	}
+}
+
+/// A page of the records of t whose keys start with prefix, those that keep takes, after the one that marker names, of
+/// at most max (100 if null, 1 to 1000); and the marker of the next page, null after the last.
+function page[V extends Decodable](t: Table[V], prefix: string, marker: string | null, max: i32 | null,
+	keep: (v: V) => bool): [V[], string | null] throws Fault {
+	const n = limit(max)
+	const got = take(t, prefix, cursor(marker), n + 1, keep)
+	return [got.slice(0, if (got.length < n) got.length else n).map(e => e[1]),
+		if (got.length > n) base64.encode(got[n - 1][0]) else null]
+}
+
+/// The key after which the page that marker names starts, null for the first.
+function cursor(marker: string | null): string | null throws Fault {
+	try {
+		return if (marker == null) null else base64.decode(marker)
+	} catch (e: ParseError) {
+		throw api.invalidInputException("Invalid Marker.")
+	}
+}
+
+/// Up to n records of t, with their keys, whose keys start with prefix and come after after, those that keep takes.
+function take[V extends Decodable](t: Table[V], prefix: string, after: string | null, n: i32,
+	keep: (v: V) => bool): [string, V][] {
+	const out: [string, V][] = []
+	let from = after
+	while (true) {
+		const chunk = t.scan(from, 100, prefix)
+		for (const [k, v] of chunk) {
+			if (keep(v)) {
+				out.push([k, v])
+				if (out.length == n) {
+					return out
+				}
+			}
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+/// A page of items as page has one, its marker the index of the first of the next.
+function part[T](items: T[], marker: string | null, max: i32 | null): [T[], string | null] throws Fault {
+	const n = limit(max)
+	let from = 0
+	try {
+		from = if (marker == null) 0 else parseInt(marker)
+	} catch (e: ParseError) {
+		throw api.invalidInputException("Invalid Marker.")
+	}
+	if (from < 0 || from > items.length) {
+		throw api.invalidInputException("Invalid Marker.")
+	}
+	const to = if (from + n < items.length) from + n else items.length
+	return [items.slice(from, to), if (to < items.length) `${to}` else null]
+}
+
+/// A page of tags as part has one.
+function tagPage(tags: [string, string][], marker: string | null,
+	max: i32 | null): [api.Tag[], string | null] throws Fault {
+	const [page, next] = part(tags, marker, max)
+	return [page.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] })), next]
+}
+
+/// The number of items of a page, max, 100 if null.
+function limit(max: i32 | null): i32 throws Fault {
+	const n = max ?? 100
+	if (n < 1 || n > 1000) {
+		const why = if (n < 1) "greater than or equal to 1" else "less than or equal to 1000"
+		throw invalid(`${n}`, "maxItems", `Member must have value ${why}`)
+	}
+	return n
+}
+
+/// tags with given set over them by key, whatever its case, of a resource of a kind, as User; at most 50.
+function tagged(tags: [string, string][], given: api.Tag[], kind: string): [string, string][] throws Fault {
+	for (let i = 0; i < given.length; i++) {
+		for (let j = 0; j < i; j++) {
+			if (lower(given[i].Key) == lower(given[j].Key)) {
+				throw api.invalidInputException("Duplicate tag keys found. Please note that Tag keys are case insensitive.")
+			}
+		}
+	}
+	const out = tags.filter(t => !given.some(g => lower(g.Key) == lower(t[0])))
+	out.append(given.map(g => [g.Key, g.Value]))
+	if (out.length > 50) {
+		throw api.limitExceededException(`Cannot exceed quota for TagsPer${kind}: 50`)
+	}
+	return out
+}
+
+/// name, of the member m, if it is a name of at most max characters of IAM's.
+function named(name: string, m: string, max: i32): string throws Fault {
+	if (name.length < 1 || name.length > max) {
+		const why = if (name.length < 1) "greater than or equal to 1" else `less than or equal to ${max}`
+		throw invalid(name, m, `Member must have length ${why}`)
+	}
+	if (!name.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
+		throw invalid(name, m, "Member must satisfy regular expression pattern: [\\w+=,.@-]+")
+	}
+	return name
+}
+
+/// The path p of the member m, / if null; one starts and ends with a /.
+function path(p: string | null, m: string): string throws Fault {
+	const s = p ?? "/"
+	if (s.length > 512) {
+		throw invalid(s, m, "Member must have length less than or equal to 512")
+	}
+	if (!startsWith(s, "/") || !endsWith(s, "/") || !s.every(isGraphic)) {
+		throw invalid(s, m,
+			"Member must satisfy regular expression pattern: (\\u002F)|(\\u002F[\\u0021-\\u007E]+\\u002F)")
+	}
+	return s
+}
+
+/// d, if it is a policy document: a JSON object.
+function document(d: string): string throws Fault {
+	try {
+		json.decode[json.Keys](d)
+	} catch (e: ParseError) {
+		throw api.malformedPolicyDocumentException("Syntax errors in policy.")
+	}
+	return d
+}
+
+/// tags as IAM gives them, none if there are none.
+function tagsOf(tags: [string, string][]): api.Tag[] | null {
+	return if (tags.length == 0) null else tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+}
+
+/// u of account as IAM gives it, with its tags if full.
+function userOf(account: string, u: User, full: bool): api.User {
+	const w = new api.User()
+	w.Path = u.path
+	w.UserName = u.name
+	w.UserId = u.id
+	w.Arn = identity(account, u)
+	w.CreateDate = u.created
+	w.Tags = if (full) tagsOf(u.tags) else null
+	return w
+}
+
+/// The ARN of u of account: the root's if u is.
+function identity(account: string, u: User): string {
+	return if (u.name == "") arn(account, "root", "", "") else arn(account, "user", u.path, u.name)
+}
+
+/// r of account as IAM gives it, its trust policy URL-encoded, with its tags if full.
+function roleOf(account: string, r: Role, full: bool): api.Role {
+	const w = new api.Role()
+	w.Path = r.path
+	w.RoleName = r.name
+	w.RoleId = r.id
+	w.Arn = arn(account, "role", r.path, r.name)
+	w.CreateDate = r.created
+	w.AssumeRolePolicyDocument = escape(r.trust, "component")
+	w.Description = r.description
+	w.MaxSessionDuration = r.maxSession
+	w.Tags = if (full) tagsOf(r.tags) else null
+	return w
+}
+
+/// p of account as IAM gives it, with its description and tags if full: none for AWS's, an empty list.
+function policyOf(account: string, p: Policy, full: bool): api.Policy {
+	const w = new api.Policy()
+	w.PolicyName = p.name
+	w.PolicyId = p.id
+	w.Arn = arn(account, "policy", p.path, p.name)
+	w.Path = p.path
+	w.DefaultVersionId = p.defaultVersion
+	w.AttachmentCount = p.attachments
+	w.PermissionsBoundaryUsageCount = 0
+	w.IsAttachable = true
+	w.Description = if (full) p.description else null
+	w.CreateDate = p.created
+	w.UpdateDate = p.updated
+	w.Tags = if (!full) null else if (account == "aws") [] else tagsOf(p.tags)
+	return w
+}
+
+/// v of p as IAM gives it, with its document URL-encoded if full.
+function versionOf(p: Policy, v: Version, full: bool): api.PolicyVersion {
+	const w = new api.PolicyVersion()
+	w.Document = if (full) escape(v.document, "component") else null
+	w.VersionId = v.id
+	w.IsDefaultVersion = v.id == p.defaultVersion
+	w.CreateDate = v.created
+	return w
+}

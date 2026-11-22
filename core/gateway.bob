@@ -1,0 +1,108 @@
+//! The HTTP handler in front of every service: it authenticates a request by SigV4 and hands it to the service its
+//! credential scope names, in a transaction over the state.
+
+import { accountOf, authenticate, credentials } from "./auth/credentials"
+import * as sigv4 from "./auth/sigv4"
+import { Fault } from "./fault"
+import * as query from "./protocol/query"
+import { Caller } from "./service"
+import { Store } from "./state/store"
+import { Signal } from "builtin/fiber"
+import { HashMap } from "std/collections/hashmap"
+import { CryptoError } from "std/crypto/error"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import { Body, Request, Response } from "std/http"
+import { ParseError } from "std/string"
+
+/// A service's answer to a request, its body whole, from caller.
+export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
+
+/// One request at a time reads and writes the state: each in a transaction of the trees it opens, which commit together
+/// if it answers 2xx and are dropped if not, so that a request that fails leaves no trace.
+export class Gateway {
+	/// By signing name.
+	services = new HashMap[string, Service]()
+	/// The committed state: each account's tree, from the first request that opens it, and the global one by "", which
+	/// holds the credentials issued. Access keys of none are taken, unchecked, for the root of accountOf's account.
+	trees = new HashMap[string, Store]()
+	/// Whether a request holds the lock on the trees, and what those waiting for it wait on.
+	private busy = false
+	private freed = new Signal()
+
+	handle(req: Request): Response throws IoError | ParseError {
+		const id = requestId()
+		const auth = sigv4.parse(req.headers.get("authorization") ?? "")
+		if (auth == null) {
+			const why = "Request is missing Authentication Token"
+			return query.error(new Fault(403, "MissingAuthenticationToken", why), id)
+		}
+		const service = this.services.get(auth.service)
+		if (service == null) {
+			return query.error(new Fault(501, "NotImplemented", `The service ${auth.service} is not implemented`), id)
+		}
+		const body = req.body.text()
+		req.body = new Body(body)
+		while (this.busy) {
+			this.freed.wait()
+		}
+		this.busy = true
+		try {
+			return this.serve(service, req, body, auth, id)
+		} finally {
+			this.busy = false
+			this.freed.wake()
+		}
+	}
+
+	/// Closes the trees.
+	close() {
+		for (const t of this.trees.values()) {
+			t.close()
+		}
+		this.trees = new HashMap[string, Store]()
+	}
+
+	/// The answer to req, with body, by service, holding the lock: the credential of its access key is checked, and the
+	/// trees it opens committed if it succeeds, else closed.
+	private serve(service: Service, req: Request, body: string, auth: sigv4.Authorization,
+		id: string): Response throws IoError | ParseError {
+		const global = this.trees.get("")
+		const known = if (global == null) null else credentials(global).get(auth.accessKey)
+		if (known != null) {
+			let why: Fault | null = null
+			try {
+				why = authenticate(known, req, body, auth, now())
+			} catch (e: CryptoError) {
+				why = new Fault(500, "InternalFailure", e.what)
+			}
+			if (why != null) {
+				return query.error(why, id)
+			}
+		}
+		const account = if (known == null) accountOf(auth.accessKey) else known.account
+		const arn = if (known == null) `arn:aws:iam::${account}:root` else known.arn
+		const caller = new Caller(account, auth.region, arn, id, known?.userId ?? account, this.trees)
+		let res: Response | null = null
+		try {
+			res = service(caller, req)
+		} finally {
+			const commit = res != null && res!.status < 300
+			for (const [account, tree] of caller.opened) {
+				if (commit) {
+					this.trees.get(account)?.close()
+					this.trees.set(account, tree)
+				} else {
+					tree.close()
+				}
+			}
+		}
+		return res!
+	}
+}
+
+/// A random UUID, as AWS's request ids are.
+function requestId(): string throws IoError {
+	const h = hex.encode(bytes(16))
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}

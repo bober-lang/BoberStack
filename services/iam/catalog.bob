@@ -1,0 +1,122 @@
+//! The AWS managed policies, of the account aws, every version of each: read-only, shared by all accounts and kept
+//! out of their trees. Their text is as models/iam-managed-policies.sh writes it: a policy's line, then the document of
+//! each of its versions, a line each; policies sort by their keys. Only the policies' lines are decoded, once; a
+//! document is copied out of the text when it is read.
+
+import { arn, key, Policy, Version, within } from "./records"
+import { lastIndexOf, partitionPoint } from "std/algo"
+import { decode } from "std/encoding/json"
+import { ParseError } from "std/string"
+import { parseRfc3339 } from "std/time"
+import { memchr } from "string.h"
+
+/// A policy's line.
+class Line {
+	PolicyName = ""
+	PolicyId = ""
+	Arn = ""
+	Path = ""
+	DefaultVersionId = ""
+	IsAttachable = true
+	Description: string | null = null
+	CreateDate = ""
+	UpdateDate = ""
+	Versions: Listed[] = []
+}
+
+/// A version, of a policy's line.
+class Listed {
+	VersionId = ""
+	IsDefaultVersion = false
+	CreateDate = ""
+}
+
+/// A policy, its versions in the order IAM lists them, their documents left out, and where those are in the text.
+class Entry {
+	policy = new Policy()
+	versions: Version[] = []
+	documents: [u64, u64][] = []
+}
+
+export class Catalog {
+	private entries: Entry[] = []
+
+	/// Of the text of n bytes at the address at, which shall never change nor be freed.
+	constructor(at: u64, n: u64) throws ParseError {
+		const end = at + n
+		let p = at
+		while (p < end) {
+			const from = p
+			const length = line(at, p, end)
+			const l = decode[Line](fromBytes(p, length))
+			p += length + 1
+			const e = new Entry()
+			e.policy.name = l.PolicyName
+			e.policy.path = l.Path
+			e.policy.id = l.PolicyId
+			e.policy.created = parseRfc3339(l.CreateDate)
+			e.policy.updated = parseRfc3339(l.UpdateDate)
+			e.policy.description = l.Description
+			e.policy.defaultVersion = l.DefaultVersionId
+			const last = this.entries.length - 1
+			if (l.Arn != arn("aws", "policy", l.Path, l.PolicyName) || !l.IsAttachable
+				|| last >= 0 && key(l.PolicyName) <= key(this.entries[last].policy.name)) {
+				throw new ParseError("syntax", (from - at) as i32)
+			}
+			for (const x of l.Versions) {
+				if (x.IsDefaultVersion != (x.VersionId == l.DefaultVersionId)) {
+					throw new ParseError("syntax", (from - at) as i32)
+				}
+				const v = new Version()
+				v.id = x.VersionId
+				v.created = parseRfc3339(x.CreateDate)
+				e.versions.push(v)
+				const d = line(at, p, end)
+				e.documents.push([p, d])
+				p += d + 1
+			}
+			this.entries.push(e)
+		}
+	}
+
+	/// The number of policies.
+	size(): i32 { return this.entries.length }
+
+	/// The index of the policy of the ARN a, -1 if there is none.
+	find(a: string): i32 {
+		const i = this.after(within(key(a.slice(lastIndexOf(a, "/") + 1, a.length)), ""))
+		if (i == this.entries.length) {
+			return -1
+		}
+		const p = this.entries[i].policy
+		return if (arn("aws", "policy", p.path, p.name) == a) i else -1
+	}
+
+	/// The index of the first policy whose key, within it aws, as a policy's place in a listing, comes after k.
+	after(k: string): i32 { return partitionPoint(this.entries, e => within(key(e.policy.name), "aws") > k) as i32 }
+	/// The policy at index i, a copy.
+	policy(i: i32): Policy { return { ...this.entries[i].policy } }
+	/// The versions of the policy at index i, as IAM lists them, without their documents.
+	versions(i: i32): Version[] { return this.entries[i].versions.map(v => ({ ...v })) }
+
+	/// The version of the policy at index i whose id is id, with its document; null if there is none.
+	version(i: i32, id: string): Version | null {
+		const e = this.entries[i]
+		for (const j of 0 ... e.versions.length - 1) {
+			if (e.versions[j].id == id) {
+				const [at, n] = e.documents[j]
+				return { ...e.versions[j], document: fromBytes(at, n) }
+			}
+		}
+		return null
+	}
+}
+
+/// The length of the line at p, of the text from start to end, which ends at a newline.
+function line(start: u64, p: u64, end: u64): u64 throws ParseError {
+	const nl = if (p < end) memchr(p, 10, end - p) else 0
+	if (nl == 0) {
+		throw new ParseError("syntax", (p - start) as i32)
+	}
+	return nl - p
+}

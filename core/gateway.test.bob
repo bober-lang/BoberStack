@@ -1,0 +1,75 @@
+import { request } from "./client"
+import { Fault } from "./fault"
+import { Gateway } from "./gateway"
+import { Caller } from "./service"
+import { live } from "./state/store"
+import { Request, Response } from "std/http"
+import { ParseError, parseInt } from "std/string"
+import { millisecond, sleep } from "std/time"
+
+/// A service that puts the request's body under its own key in the caller's tree and the global one, after waiting
+/// 10 ms of tests' logical time between reading the count of requests and writing it one more; and fails as the body
+/// asks: by status 400, or by throwing. It notes in log where each starts and ends.
+function service(caller: Caller, req: Request, log: string[]): Response throws IoError | ParseError {
+	const body = req.body.text()
+	log.push(`start ${body}`)
+	try {
+		const count = parseInt(caller.store().get("count") ?? "0")
+		sleep(10 * millisecond)
+		caller.store().put("count", `${count + 1}`)
+		caller.store().put(body, "account")
+		caller.global().put(body, "global")
+	} catch (f: Fault) {
+		return new Response(f.status, f.message)
+	}
+	log.push(`end ${body}`)
+	if (body == "throw") {
+		throw new ParseError("syntax", 0)
+	}
+	return new Response(if (body == "fail") 400 else 200, "")
+}
+
+function gateway(log: string[] = []): Gateway {
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => service(caller, req, log))
+	return g
+}
+
+/// What the trees of the account 000000000000 and the global one hold under k.
+function held(g: Gateway, k: string): [string | null, string | null] {
+	return [g.trees.get("000000000000")?.get(k), g.trees.get("")?.get(k)]
+}
+
+test "a request that succeeds commits both trees, one that fails neither" {
+	const before = live()
+	const g = gateway()
+	assert g.handle(request("test", "test", "test", "ok")).status == 200
+	assert held(g, "ok") == ["account", "global"] && held(g, "count")[0] == "1"
+	assert g.handle(request("test", "test", "test", "fail")).status == 400
+	assert held(g, "fail") == [null, null] && held(g, "count")[0] == "1"
+	assert g.handle(request("test", "test", "test", "throw")) throws new ParseError("syntax", 0)
+	assert held(g, "throw") == [null, null] && held(g, "count")[0] == "1"
+	assert live()[1] == before[1] + 2
+	g.close()
+	assert live() == before
+}
+
+test "a request parked in its handler holds off the next, whose write is not lost" {
+	const before = live()
+	const log: string[] = []
+	const g = gateway(log)
+	const a = async g.handle(request("test", "test", "test", "a"))
+	const b = async g.handle(request("test", "test", "test", "b"))
+	assert (await a).status == 200 && (await b).status == 200
+	assert log == ["start a", "end a", "start b", "end b"]
+	assert held(g, "count")[0] == "2" && held(g, "a") == ["account", "global"] && held(g, "b") == ["account", "global"]
+	g.close()
+	assert live() == before
+}
+
+test "a request that opens no tree commits none" {
+	const before = live()
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => new Response(200, ""))
+	assert g.handle(request("test", "test", "test", "")).status == 200 && g.trees.size == 0 && live() == before
+}
