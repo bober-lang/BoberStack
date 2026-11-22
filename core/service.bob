@@ -1,0 +1,37 @@
+//! What a service's handlers are given and throw, whatever its protocol.
+
+/// Who sent a request, where, and the id it is answered under.
+export class Caller {
+	account: string
+	region: string
+	arn: string
+	requestId: string
+
+	constructor(account: string, region: string, arn: string, requestId: string) {
+		this.account = account
+		this.region = region
+		this.arn = arn
+		this.requestId = requestId
+	}
+}
+
+/// An error a request is answered with: its code, message and HTTP status, and whether the sender is at fault.
+export class Fault {
+	status: i32
+	code: string
+	message: string
+	sender: bool
+
+	constructor(status: i32, code: string, message: string, sender: bool = status < 500) {
+		this.status = status
+		this.code = code
+		this.message = message
+		this.sender = sender
+	}
+}
+
+/// An operation's handler, taking its input to its output, or null where the service does not implement it.
+export type Handler[I, O] = ((caller: Caller, input: I) => O throws Fault) | null
+
+/// The input or output of an operation that has none.
+export class Unit {}
