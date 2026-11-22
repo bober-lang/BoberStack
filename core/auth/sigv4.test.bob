@@ -1,0 +1,78 @@
+import { Request } from "std/http"
+import { minute, parseRfc3339, second } from "std/time"
+import { Authorization, canonicalRequest, parse, signature, verify } from "./sigv4"
+
+// The cases' signatures are botocore's SigV4Auth's; get-vanilla's is the aws-sig-v4-test-suite's too.
+const secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+const date = "20150830T123600Z"
+
+function request(method: string, url: string, body = ""): Request {
+	const req = new Request(method, url, body)
+	req.headers.set("host", "example.amazonaws.com")
+	req.headers.set("x-amz-date", date)
+	return req
+}
+
+function auth(service: string, signed: string, sig: string): Authorization {
+	const scope = `20150830/us-east-1/${service}/aws4_request`
+	return parse(`AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/${scope}, SignedHeaders=${signed}, Signature=${sig}`)!
+}
+
+test "parse" {
+	const a = auth("service", "host;x-amz-date", "abc")
+	assert a.accessKey == "AKIDEXAMPLE" && a.date == "20150830" && a.region == "us-east-1" && a.service == "service"
+	assert a.signedHeaders == ["host", "x-amz-date"] && a.signature == "abc"
+	assert parse("AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/sts, SignedHeaders=host, Signature=a") == null
+	assert parse("AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/sts/aws4_request, Signature=a") == null
+	assert parse("Bearer x") == null && parse("") == null
+}
+
+test "get-vanilla" {
+	const req = request("GET", "https://example.amazonaws.com/")
+	const a = auth("service", "host;x-amz-date", "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+	const canonical = ["GET", "/", "", "host:example.amazonaws.com", "x-amz-date:20150830T123600Z", "",
+		"host;x-amz-date", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
+	assert canonicalRequest(req, "", a.signedHeaders) == canonical.join("\n")
+	assert signature(req, "", a, secret) == a.signature
+}
+
+test "get-vanilla-query-order-key-case" {
+	const req = request("GET", "https://example.amazonaws.com/?Param2=value2&Param1=value1")
+	const a = auth("service", "host;x-amz-date", "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500")
+	assert canonicalRequest(req, "", a.signedHeaders).slice(0, 34) == "GET\n/\nParam1=value1&Param2=value2\n"
+	assert signature(req, "", a, secret) == a.signature
+}
+
+test "an STS query" {
+	const body = "Action=GetCallerIdentity&Version=2011-06-15"
+	const req = request("POST", "https://example.amazonaws.com/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	const a = auth("sts", "content-type;host;x-amz-date",
+		"650e2b8d7f08a2f752a985c427e0a3d3f4fd65137366a31875242ab0875057b5")
+	assert signature(req, body, a, secret) == a.signature
+	const at = parseRfc3339("2015-08-30T12:36:00Z")
+	assert verify(req, body, a, secret, at) == null
+	assert verify(req, body + " ", a, secret, at) != null
+	assert verify(req, body, a, "wrong", at) != null
+	const expired = "Signature expired: 20150830T123600Z is now earlier than 20150830T123601Z (20150830T125101Z - 15 min.)"
+	assert verify(req, body, a, secret, at + 15 * minute + second) == expired
+	const early = "Signature not yet current: 20150830T123600Z is still later than 20150830T123559Z (20150830T122059Z + "
+		+ "15 min.)"
+	assert verify(req, body, a, secret, at - 15 * minute - second) == early
+	req.headers.set("x-amz-date", "yesterday")
+	assert verify(req, body, a, secret, at) != null
+}
+
+test "a signed X-Amz-Content-Sha256 does not stand for another body" {
+	const body = "Action=GetCallerIdentity&Version=2011-06-15"
+	const req = request("POST", "https://example.amazonaws.com/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.headers.set("x-amz-content-sha256", "ab821ae955788b0e33ebd34c208442ccfc2d406e2edc5e7a39bd6458fbb4f843")
+	const a = auth("sts", "content-type;host;x-amz-content-sha256;x-amz-date",
+		"c4a2990f141dd251be7cca1e334e097e973f892b34dc3927dc4327e32055f329")
+	const at = parseRfc3339("2015-08-30T12:36:00Z")
+	assert verify(req, body, a, secret, at) == null
+	const mismatch = "The request signature we calculated does not match the signature you provided. Check your AWS "
+		+ "Secret Access Key and signing method. Consult the service documentation for details."
+	assert verify(req, "Action=GetSessionToken&Version=2011-06-15", a, secret, at) == mismatch
+}

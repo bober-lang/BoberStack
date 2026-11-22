@@ -1,0 +1,313 @@
+//! The awsQuery protocol: parameters form-encoded in the body, results and errors as XML. An operation's input and
+//! output are classes whose fields are its members, read and written by reflection under the tags below: a list is a
+//! T[], a map a [K, V][], a union a union of classes of one field each, its member the field set, and a member whose
+//! type does not take null is required.
+
+import { startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Attr, Attribute, encode, Node, OmitEmpty, serialize } from "std/encoding/xml"
+import { parseFloat } from "std/float"
+import { Request, Response } from "std/http"
+import { round } from "std/math"
+import { lower, ParseError, parseInt } from "std/string"
+import { httpDate, millisecond, parseHttpDate, parseRfc3339, rfc3339, second } from "std/time"
+import { Decodable, has, tag } from "std/types"
+import { Query } from "std/url"
+import { Fault } from "../fault"
+import { Caller, Handler, Unit } from "../service"
+
+/// Tags a member to be named K on the wire, as Smithy's xmlName on it.
+export class Name[K extends string] {}
+/// Tags a list or map member to repeat its items in place of a wrapper, as Smithy's xmlFlattened.
+export class Flat {}
+/// Tags a list member whose items are named K, not member.
+export class Member[K extends string] {}
+/// Tags a map member whose keys are named K, not key.
+export class Key[K extends string] {}
+/// Tags a map member whose values are named K, not value.
+export class Value[K extends string] {}
+/// Tags an i64 member, or its items, as a timestamp in ns since 1970, on the wire in the format F: date-time,
+/// epoch-seconds or http-date.
+export class Timestamp[F extends string = "date-time"] {}
+/// Tags a string member, or its items, as bytes, base64 on the wire.
+export class Blob {}
+
+/// A request from caller to the service of API version and XML namespace ns.
+export class Call {
+	caller: Caller
+	params: Query
+	ns: string
+	/// The operation it asks for, "" if its Version is not the service's.
+	action: string
+
+	constructor(caller: Caller, params: Query, version: string, ns: string) {
+		this.caller = caller
+		this.params = params
+		this.ns = ns
+		this.action = if (params.get("Version") == version) params.get("Action") ?? "" else ""
+	}
+
+	/// The answer by h, the handler of its action: NotImplemented if h is null, else h's output or the Fault that h or
+	/// decoding its input throws.
+	serve[I extends Decodable, O](h: Handler[I, O]): Response {
+		const id = this.caller.requestId
+		try {
+			if (h == null) {
+				throw new Fault(501, "NotImplemented", `The operation ${this.action} is not implemented`)
+			}
+			return reply(result(this.action, this.ns, id, h(this.caller, decode[I](this.params))), id)
+		} catch (f: Fault) {
+			return error(f, id, this.ns)
+		}
+	}
+
+	/// The answer where its action is none of the service's.
+	invalidAction(): Response {
+		const p = this.params
+		const why = `Could not find operation ${p.get("Action") ?? ""} for version ${p.get("Version") ?? ""}`
+		return error(new Fault(400, "InvalidAction", why), this.caller.requestId, this.ns)
+	}
+}
+
+/// The call of req from caller to the service of API version and XML namespace ns.
+export function call(caller: Caller, req: Request, version: string, ns: string): Call throws IoError {
+	return new Call(caller, Query.parse(req.body.text()), version, ns)
+}
+
+/// The T whose members p holds; a required one missing, or a value not of its type, is a ValidationError.
+export function decode[T extends Decodable](p: Query): T throws Fault { return value[T](p, "", []) }
+
+/// The document answering the operation op of the service of namespace ns with out.
+export function result[O](op: string, ns: string, requestId: string, out: O): string {
+	const root = new Node("element", `${op}Response`)
+	root.attrs.push(new Attribute("xmlns", ns))
+	if (O != Unit) {
+		put(root, `${op}Result`, out, [])
+	}
+	put(child(root, "ResponseMetadata"), "RequestId", requestId, [])
+	return serialize(root)
+}
+
+/// xml, the document answering the request requestId.
+export function reply(xml: string, requestId: string, status: i32 = 200): Response {
+	const res = new Response(status, xml)
+	res.headers.set("content-type", "text/xml")
+	res.headers.set("x-amzn-requestid", requestId)
+	return res
+}
+
+class Error {
+	Type = "Sender"
+	Code = ""
+	Message = ""
+}
+
+class ErrorResponse {
+	xmlns: string @Attr @OmitEmpty = ""
+	Error = new Error()
+	RequestId = ""
+}
+
+/// The document of the fault f, in the namespace ns if given.
+export function error(f: Fault, requestId: string, ns: string = ""): Response {
+	const e = new ErrorResponse()
+	e.xmlns = ns
+	e.Error.Type = if (f.sender) "Sender" else "Receiver"
+	e.Error.Code = f.code
+	e.Error.Message = f.message
+	e.RequestId = requestId
+	return reply(encode(e), requestId, f.status)
+}
+
+/// The T that the parameter k of p holds, or those within it, of a member tagged tags.
+function value[T extends Decodable](p: Query, k: string, tags: Type[]): T throws Fault {
+	const s = p.get(k) ?? ""
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return variant[T](p, k)
+			}
+			let last = invalid(s, k, "Member must satisfy enum value set")
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					try {
+						return value[M](p, k, tags)
+					} catch (f: Fault) {
+						last = f
+					}
+				}
+			}
+			throw last
+		case "literal":
+			if (s == T.value) {
+				return T.value
+			}
+			throw invalid(s, k, "Member must satisfy enum value set")
+		case "array":
+			// k.member.1 or, flattened, k.1; a map's items k.entry.1.key and k.entry.1.value, or k.1.key.
+			const xs: T = []
+			const item = if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
+			const at = if (has(tags, Flat)) k else `${k}.${item}`
+			for (let i = 1; present(p, `${at}.${i}`); i++) {
+				xs.push(value[T.elem](p, `${at}.${i}`, tags))
+			}
+			return xs
+		case "tuple":
+			const e = new T() // a map's entry
+			for (const f of T.fields) {
+				const n = if (f.name == "0") tag(tags, Key, "key") else tag(tags, Value, "value")
+				e[f.name] = value[f.type](p, `${k}.${n}`, tags)
+			}
+			return e
+		case "class":
+			const r = new T()
+			for (const f of T.fields) {
+				const m = (if (k == "") "" else `${k}.`) + tag(f.tags, Name, f.name)
+				if (present(p, m)) {
+					r[f.name] = value[f.type](p, m, f.tags)
+				} else if (!nullable(f.type)) {
+					throw invalid(null, m, "Member must not be null")
+				}
+			}
+			return r
+		case "string":
+			if (!has(tags, Blob)) {
+				return s
+			}
+			try {
+				return base64.decode(s)
+			} catch (e: ParseError) {
+				throw invalid(s, k, "Member must be base64")
+			}
+		case "bool":
+			if (s == "true" || s == "false") {
+				return s == "true"
+			}
+			throw invalid(s, k, "Member must be true or false")
+		case "int": try {
+			if (T == i64 && has(tags, Timestamp)) {
+				return instant(s, tag(tags, Timestamp, ""))
+			}
+			return parseInt[T](s)
+		} catch (e: ParseError) {
+			throw invalid(s, k, `Member must be ${if (has(tags, Timestamp)) "a timestamp" else "an integer"}`)
+		}
+		case "float":
+			const zero: T = 0.0
+			switch (s) {
+				case "NaN": return zero / zero
+				case "Infinity": return 1.0 / zero
+				case "-Infinity": return -1.0 / zero
+			}
+			try {
+				return parseFloat[T](s)
+			} catch (e: ParseError) {
+				throw invalid(s, k, "Member must be a number")
+			}
+		default: throw invalid(s, k, `Member must be a ${T.name}`)
+	}
+}
+
+/// The T, a union, of the one member that p holds within k.
+function variant[T extends Decodable](p: Query, k: string): T throws Fault {
+	let r: T | null = null
+	let n = 0
+	for (const M of T.members) {
+		if (M.kind == "class") {
+			if (present(p, `${k}.${tag(M.fields[0].tags, Name, M.fields[0].name)}`)) {
+				r = value[M](p, k, [])
+				n++
+			}
+		}
+	}
+	if (n != 1) {
+		throw invalid(null, k, "Member must have exactly one member set")
+	}
+	return r!
+}
+
+/// Whether p holds the parameter k or one within it.
+function present(p: Query, k: string): bool { return p.entries.some(e => e[0] == k || startsWith(e[0], `${k}.`)) }
+
+/// Whether t takes null.
+function nullable(t: Type): bool {
+	return t.kind == "null" || t.kind == "union" && t.members.some(M => M.kind == "null")
+}
+
+/// A ValidationError of the value s, or null, at the parameter k, as AWS words one.
+export function invalid(s: string | null, k: string, why: string): Fault {
+	const v = if (s == null) "null" else `'${s}'`
+	const at = lower(k.slice(0, 1)) + k.slice(1, k.length)
+	return new Fault(400, "ValidationError",
+		`1 validation error detected: Value ${v} at '${at}' failed to satisfy constraint: ${why}`)
+}
+
+/// The instant that the timestamp s in format names.
+function instant(s: string, format: string): i64 throws ParseError {
+	switch (format) {
+		case "epoch-seconds": return (round(parseFloat[f64](s) * 1000.0) as i64) * millisecond
+		case "http-date": return parseHttpDate(s)
+		default: return parseRfc3339(s)
+	}
+}
+
+/// The instant t, to the millisecond, as a timestamp in format.
+function stamp(t: i64, format: string): string {
+	const ms = t - t % millisecond
+	switch (format) {
+		case "epoch-seconds":
+			const frac = ms % second / millisecond
+			const digits = `${1000 + frac}`.slice(1, 4)
+			return if (frac == 0) `${ms / second}` else `${ms / second}.${digits}`
+		case "http-date": return httpDate(t)
+		default: return rfc3339(ms)
+	}
+}
+
+/// Into el, the element named n of v, of a member tagged tags: none for null, one per item for a flattened list.
+function put[T](el: Node, n: string, v: T, tags: Type[]): void {
+	switch (T.kind) {
+		case "null": return
+		case "union": for (const M of T.members) {
+			if (v instanceof M) {
+				put(el, n, v, tags)
+			}
+		}
+		case "array":
+			const flat = has(tags, Flat)
+			const box = if (flat) el else child(el, n)
+			const item = if (flat) n else if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
+			for (const x of v) {
+				put(box, item, x, tags)
+			}
+		case "tuple":
+			const e = child(el, n) // a map's entry
+			for (const f of T.fields) {
+				put(e, if (f.name == "0") tag(tags, Key, "key") else tag(tags, Value, "value"), v[f.name], tags)
+			}
+		case "class", "object":
+			const c = child(el, n)
+			for (const f of T.fields) {
+				put(c, tag(f.tags, Name, f.name), v[f.name], f.tags)
+			}
+		default: child(el, n).insert(new Node("text", "", format(v, tags)))
+	}
+}
+
+/// The text of the scalar v of a member tagged tags.
+function format[T](v: T, tags: Type[]): string {
+	if (T == i64 && has(tags, Timestamp)) {
+		return stamp(v, tag(tags, Timestamp, ""))
+	}
+	if (T == string && has(tags, Blob)) {
+		return base64.encode(v)
+	}
+	return `${v}` // a float's NaN and infinities as awsQuery has them too
+}
+
+/// A new element named n, el's last child.
+function child(el: Node, n: string): Node {
+	const c = new Node("element", n)
+	el.insert(c)
+	return c
+}

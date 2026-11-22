@@ -1,0 +1,264 @@
+import { Fault } from "../fault"
+import { Caller, Handler, Unit } from "../service"
+import { Blob, Call, decode, Flat, Key, Member, Name, result, Timestamp, Value } from "./query"
+import { Query } from "std/url"
+
+// The inputs and outputs are the Smithy awsQuery and XML binding specs' examples, their expected text the specs'.
+class MyStructure {
+	temp: string | null
+}
+
+class QueryStructuresInput {
+	foo: string | null
+	bar: string | null @Name["Custom"]
+	baz: MyStructure | null
+}
+
+class GreetingStruct {
+	hi: string | null
+}
+
+class QueryListsInput {
+	ListArg: string[] | null
+	ComplexListArg: GreetingStruct[] | null
+	FlattenedListArg: string[] | null @Flat
+	ListArgWithXmlNameMember: string[] | null @Member["item"]
+	FlattenedListArgWithXmlName: string[] | null @Flat @Name["Hi"] @Member["item"]
+}
+
+class QueryMapsInput {
+	MapArg: [string, string][] | null
+	RenamedMapArg: [string, string][] | null @Name["reNamed"]
+	ComplexMapArg: [string, GreetingStruct][] | null
+	MapWithXmlMemberName: [string, string][] | null @Key["K"] @Value["V"]
+}
+
+class Scalars {
+	Name: string
+	Count: i32 | null
+	Ratio: f64 | null
+	On: bool | null
+	Data: string | null @Blob
+	At: i64 | null @Timestamp
+	Epoch: i64 | null @Timestamp["epoch-seconds"]
+	Http: i64 | null @Timestamp["http-date"]
+	Mode: "fast" | "safe" | null
+}
+
+function query(s: string): Query { return Query.parse(s) }
+function message(why: string): string { return `1 validation error detected: ${why}` }
+
+test "structures" {
+	const v = decode[QueryStructuresInput](query("Action=QueryStructures&Version=2020-07-02&foo=example1"
+		+ "&Custom=example2&baz.temp=example3"))
+	assert v.foo == "example1" && v.bar == "example2" && v.baz?.temp == "example3"
+	const none = decode[QueryStructuresInput](query("Action=QueryStructures&Version=2020-07-02"))
+	assert none.foo == null && none.bar == null && none.baz == null
+}
+
+test "lists" {
+	const v = decode[QueryListsInput](query("ListArg.member.1=foo&ListArg.member.2=bar&ListArg.member.3=baz"
+		+ "&ComplexListArg.member.1.hi=hello&ComplexListArg.member.2.hi=hola&FlattenedListArg.1=A&FlattenedListArg.2=B"
+		+ "&ListArgWithXmlNameMember.item.1=A&ListArgWithXmlNameMember.item.2=B&Hi.1=A&Hi.2=B"))
+	assert v.ListArg == ["foo", "bar", "baz"]
+	assert v.ComplexListArg!.map(g => g.hi) == ["hello", "hola"]
+	assert v.FlattenedListArg == ["A", "B"] && v.ListArgWithXmlNameMember == ["A", "B"]
+	assert v.FlattenedListArgWithXmlName == ["A", "B"]
+	assert decode[QueryListsInput](query("ListArg=")).ListArg == [] // an empty list, as botocore sends one
+}
+
+test "maps" {
+	const v = decode[QueryMapsInput](query("MapArg.entry.1.key=bar&MapArg.entry.1.value=Bar&MapArg.entry.2.key=foo"
+		+ "&MapArg.entry.2.value=Foo&reNamed.entry.1.key=foo&reNamed.entry.1.value=Foo&ComplexMapArg.entry.1.key=bar"
+		+ "&ComplexMapArg.entry.1.value.hi=Bar&ComplexMapArg.entry.2.key=foo&ComplexMapArg.entry.2.value.hi=Foo"
+		+ "&MapWithXmlMemberName.entry.1.K=bar&MapWithXmlMemberName.entry.1.V=Bar&MapWithXmlMemberName.entry.2.K=foo"
+		+ "&MapWithXmlMemberName.entry.2.V=Foo"))
+	assert v.MapArg == [["bar", "Bar"], ["foo", "Foo"]] && v.RenamedMapArg == [["foo", "Foo"]]
+	assert v.ComplexMapArg!.map(e => `${e[0]}=${e[1].hi}`) == ["bar=Bar", "foo=Foo"]
+	assert v.MapWithXmlMemberName == [["bar", "Bar"], ["foo", "Foo"]]
+}
+
+test "scalars" {
+	const v = decode[Scalars](query("Name=n&Count=-3&Ratio=2.5&On=true&Data=dmFsdWU%3D&At=2020-01-05T20:13:26.5Z"
+		+ "&Epoch=1515531081.123&Http=Tue%2C+29+Apr+2014+18%3A30%3A38+GMT&Mode=safe"))
+	assert v.Name == "n" && v.Count == -3 && v.Ratio == 2.5 && v.On == true && v.Data == "value" && v.Mode == "safe"
+	assert v.At == 1578255206_500_000_000 && v.Epoch == 1515531081_123_000_000 && v.Http == 1398796238_000_000_000
+	const none = decode[Scalars](query("Name="))
+	assert none.Name == "" && none.Count == null && none.At == null && none.Mode == null
+	const nan = decode[Scalars](query("Name=&Ratio=NaN")).Ratio!
+	assert nan != nan
+}
+
+test "a missing required member" {
+	const why = message("Value null at 'name' failed to satisfy constraint: Member must not be null")
+	assert decode[Scalars](query("Count=1")) throws new Fault(400, "ValidationError", why)
+	const nested = message("Value null at 'items.member.2.Name' failed to satisfy constraint: Member must not be null")
+	const items = query("Items.member.1.Name=a&Items.member.2.Count=1")
+	assert decode[Nested](items) throws new Fault(400, "ValidationError", nested)
+}
+
+class Nested {
+	Items: Scalars[] = []
+}
+
+test "a value not of its type" {
+	const int = message("Value 'x' at 'count' failed to satisfy constraint: Member must be an integer")
+	assert decode[Scalars](query("Name=&Count=x")) throws new Fault(400, "ValidationError", int)
+	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set")
+	assert decode[Scalars](query("Name=&Mode=slow")) throws new Fault(400, "ValidationError", mode)
+	const on = message("Value 'yes' at 'on' failed to satisfy constraint: Member must be true or false")
+	assert decode[Scalars](query("Name=&On=yes")) throws new Fault(400, "ValidationError", on)
+}
+
+class XmlTestResult {
+	testValue: string | null
+}
+
+const ns = "https://example.com/"
+const id = "c6104cbe-af31-11e0-8154-cbc7ccf896c7"
+
+/// The response to op whose result holds xml.
+function response(op: string, xml: string): string {
+	return `<${op}Response xmlns="${ns}"><${op}Result>${xml}</${op}Result><ResponseMetadata><RequestId>${id}</RequestId>`
+		+ `</ResponseMetadata></${op}Response>`
+}
+
+test "a response" {
+	const r = new XmlTestResult()
+	r.testValue = "Hello!"
+	assert result("XmlTest", ns, id, r) == response("XmlTest", "<testValue>Hello!</testValue>")
+	r.testValue = null
+	const empty = `<XmlTestResponse xmlns="${ns}"><XmlTestResult/><ResponseMetadata><RequestId>${id}</RequestId>`
+		+ "</ResponseMetadata></XmlTestResponse>"
+	assert result("XmlTest", ns, id, r) == empty
+	const none = `<VoidResponse xmlns="${ns}"><ResponseMetadata><RequestId>${id}</RequestId></ResponseMetadata>`
+		+ "</VoidResponse>"
+	assert result("Void", ns, id, new Unit()) == none
+}
+
+class Lists {
+	values: string[] = ["example1", "example2"]
+	items: string[] @Member["Item"] = ["example1", "example2"]
+	flat: string[] @Flat = ["example1", "example2"]
+	renamed: string[] @Flat @Name["Hi"] @Member["Ignored"] = ["example1", "example2"]
+	none: string[] | null
+}
+
+test "lists in a response" {
+	const xml = "<values><member>example1</member><member>example2</member></values><items><Item>example1</Item>"
+		+ "<Item>example2</Item></items><flat>example1</flat><flat>example2</flat><Hi>example1</Hi><Hi>example2</Hi>"
+	assert result("Lists", ns, id, new Lists()) == response("Lists", xml)
+}
+
+class Maps {
+	values: [string, string][] = [["example-key1", "example1"]]
+	named: [string, string][] @Key["Name"] @Value["Setting"] = [["example-key1", "example1"]]
+	flatMap: [string, string][] @Flat = [["example-key1", "example1"], ["example-key2", "example2"]]
+	flat: [string, string][] @Flat @Name["Hi"] @Key["Name"] @Value["Setting"] = [["example-key1", "example1"]]
+}
+
+test "maps in a response" {
+	const xml = "<values><entry><key>example-key1</key>"
+		+ "<value>example1</value></entry></values><named><entry><Name>example-key1</Name><Setting>example1</Setting>"
+		+ "</entry></named><flatMap><key>example-key1</key><value>example1</value></flatMap><flatMap>"
+		+ "<key>example-key2</key><value>example2</value></flatMap><Hi><Name>example-key1</Name>"
+		+ "<Setting>example1</Setting></Hi>"
+	assert result("Maps", ns, id, new Maps()) == response("Maps", xml)
+}
+
+class Struct {
+	binary: string @Blob = "value"
+	date: i64 @Timestamp = 1578255206_000_000_000
+	fine: i64 @Timestamp = 1578255206_520_999_999
+	epoch: i64 @Timestamp["epoch-seconds"] = 1515531081_123_456_789
+	http: i64 @Timestamp["http-date"] = 1398796238_000_000_000
+	n: i32 = 7
+	on = true
+	inf: f64 = 1.0 / 0.0
+	mode: "fast" | "safe" = "fast"
+	nested = new GreetingStruct()
+}
+
+test "scalars in a response" {
+	const xml = "<binary>dmFsdWU=</binary>"
+		+ "<date>2020-01-05T20:13:26Z</date><fine>2020-01-05T20:13:26.52Z</fine><epoch>1515531081.123</epoch>"
+		+ "<http>Tue, 29 Apr 2014 18:30:38 GMT</http><n>7</n><on>true</on><inf>Infinity</inf><mode>fast</mode>"
+		+ "<nested/>"
+	assert result("Struct", ns, id, new Struct()) == response("Struct", xml)
+}
+
+const caller = new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", id)
+
+/// The error document of code, as a Sender's unless receiver.
+function error(code: string, message: string, receiver = false): string {
+	return `<ErrorResponse xmlns="${ns}"><Error><Type>${if (receiver) "Receiver" else "Sender"}</Type><Code>${code}`
+		+ `</Code><Message>${message}</Message></Error><RequestId>${id}</RequestId></ErrorResponse>`
+}
+
+/// A call of XmlTest, of version 2020-07-02, with the parameters q.
+function call(q: string): Call {
+	return new Call(caller, query(`Action=XmlTest&Version=2020-07-02&${q}`), "2020-07-02", ns)
+}
+
+test "serve" {
+	let h: Handler[QueryStructuresInput, XmlTestResult] = null
+	const unimplemented = call("foo=Hello!").serve(h)
+	assert unimplemented.status == 501
+	assert unimplemented.body.whole == error("NotImplemented", "The operation XmlTest is not implemented", true)
+	h = (c, input) => {
+		if (input.bar != null) {
+			throw new Fault(403, "Denied", input.bar!)
+		}
+		const r = new XmlTestResult()
+		r.testValue = input.foo
+		return r
+	}
+	const ok = call("foo=Hello!").serve(h)
+	assert ok.status == 200 && ok.headers.get("x-amzn-requestid") == id
+	assert ok.body.whole == response("XmlTest", "<testValue>Hello!</testValue>")
+	const denied = call("Custom=no").serve(h)
+	assert denied.status == 403 && denied.body.whole == error("Denied", "no")
+}
+
+test "an action of another version" {
+	const c = new Call(caller, query("Action=XmlTest&Version=2019-01-01"), "2020-07-02", ns)
+	assert c.action == "" && c.invalidAction().status == 400
+	const why = "Could not find operation XmlTest for version 2019-01-01"
+	assert c.invalidAction().body.whole == error("InvalidAction", why)
+}
+
+class Chosen$Name {
+	Name = ""
+}
+
+class Chosen$Alias {
+	Alias: string @Name["Nick"] = ""
+}
+
+class Chosen$Ids {
+	Ids: string[] = []
+}
+
+type Chosen = Chosen$Name | Chosen$Alias | Chosen$Ids
+
+class Choosing {
+	One: Chosen | null
+}
+
+test "a union" {
+	const name = decode[Choosing](query("One.Name=a")).One
+	assert name instanceof Chosen$Name && name.Name == "a"
+	const alias = decode[Choosing](query("One.Nick=b")).One
+	assert alias instanceof Chosen$Alias && alias.Alias == "b"
+	const ids = decode[Choosing](query("One.Ids.member.1=x&One.Ids.member.2=y")).One
+	assert ids instanceof Chosen$Ids && ids.Ids == ["x", "y"]
+	assert decode[Choosing](query("")).One == null
+	const why = message("Value null at 'one' failed to satisfy constraint: Member must have exactly one member set")
+	assert decode[Choosing](query("One.Name=a&One.Nick=b")) throws new Fault(400, "ValidationError", why)
+	assert decode[Choosing](query("One.Other=c")) throws new Fault(400, "ValidationError", why)
+	const r = new Choosing()
+	const a = new Chosen$Alias()
+	a.Alias = "b"
+	r.One = a
+	assert result("Choosing", ns, id, r) == response("Choosing", "<One><Nick>b</Nick></One>")
+}

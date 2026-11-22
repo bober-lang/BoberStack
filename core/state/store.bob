@@ -1,14 +1,14 @@
 //! Service state: an ordered map of byte strings off the collector's heap, on a copy-on-write B-tree (store.c), so that
 //! a snapshot, a branch or a transaction is a clone in O(1). Typed tables sit on top, their values as JSON.
 
-import { Fault } from "../service"
+import { Fault } from "../fault"
 import { indexOf } from "std/algo"
 import { EncodeError, decode, encode } from "std/encoding/json"
 import { ParseError } from "std/string"
 import { Decodable } from "std/types"
 
-import { store_bytes, store_clone, store_count, store_delete, store_free, store_get, store_new, store_fail,
-	store_put, store_records, store_scan, store_trees } from "./store.c"
+import { store_bytes, store_clone, store_count, store_delete, store_fail, store_free, store_get, store_new, store_put,
+	store_records, store_scan, store_trees } from "./store.c"
 
 /// Keys and values are any bytes. Its memory is C's, freed by close, after which every call traps. A call that cannot
 /// allocate throws an InternalFailure and leaves the store as it was.
@@ -107,9 +107,9 @@ export class Table[V extends Decodable] {
 	/// Whether key was there.
 	delete(key: string): bool throws Fault { return this.store.delete(this.prefix + key) }
 
-	/// A page as Store.scan's of the table's entries.
-	scan(after: string | null = null, limit = 1000): [string, V][] {
-		const page = this.store.scan(this.prefix, if (after == null) null else this.prefix + after, limit)
+	/// A page as Store.scan's of the table's entries whose keys start with prefix.
+	scan(after: string | null = null, limit = 1000, prefix = ""): [string, V][] {
+		const page = this.store.scan(this.prefix + prefix, if (after == null) null else this.prefix + after, limit)
 		return page.map(e => [e[0].slice(this.prefix.length, e[0].length), value[V](e[1])])
 	}
 }

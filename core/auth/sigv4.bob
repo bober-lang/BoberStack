@@ -1,0 +1,104 @@
+//! AWS Signature Version 4 in the Authorization header: parsing it and checking a request's signature.
+
+import { indexOf, sortBy, startsWith } from "std/algo"
+import { CryptoError } from "std/crypto/error"
+import { equal, hmacSha256, sha256 } from "std/crypto/hash"
+import * as hex from "std/encoding/hex"
+import { Request } from "std/http"
+import { ParseError, split, trim } from "std/string"
+import { iso8601Basic, minute, parseIso8601Basic, second } from "std/time"
+import { escape } from "std/url"
+
+/// What an Authorization header of the form `AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request,
+/// SignedHeaders=a;b, Signature=hex` says.
+export class Authorization {
+	accessKey = ""
+	/// The credential scope's date, as 20150830.
+	date = ""
+	region = ""
+	service = ""
+	signedHeaders: string[] = []
+	signature = ""
+}
+
+/// header as a SigV4 Authorization, or null if it is not one.
+export function parse(header: string): Authorization | null {
+	const scheme = "AWS4-HMAC-SHA256 "
+	if (!startsWith(header, scheme)) {
+		return null
+	}
+	const a = new Authorization()
+	for (const part of split(header.slice(scheme.length, header.length), ",")) {
+		const p = trim(part)
+		const eq = indexOf(p, "=")
+		const v = p.slice(eq + 1, p.length)
+		switch (p.slice(0, if (eq < 0) 0 else eq)) {
+			case "Credential":
+				const scope = split(v, "/")
+				if (scope.length != 5 || scope[4] != "aws4_request") {
+					return null
+				}
+				a.accessKey = scope[0]
+				a.date = scope[1]
+				a.region = scope[2]
+				a.service = scope[3]
+			case "SignedHeaders": a.signedHeaders = split(v, ";")
+			case "Signature": a.signature = v
+		}
+	}
+	return if (a.accessKey == "" || a.signedHeaders.length == 0 || a.signature == "") null else a
+}
+
+/// Why req, whose body is body, does not bear auth's signature by secret at the instant now, as AWS words it; null if
+/// it does. A request dated more than 15 minutes from now has expired.
+export function verify(req: Request, body: string, auth: Authorization, secret: string,
+	now: i64): string | null throws CryptoError {
+	const stamp = req.headers.get("x-amz-date") ?? ""
+	let t: i64 = 0
+	try {
+		t = parseIso8601Basic(stamp)
+	} catch (e: ParseError) {
+		return `X-Amz-Date ${stamp} is not a timestamp such as 20150830T123600Z`
+	}
+	const [early, late] = [now - 15 * minute, now + 15 * minute]
+	if (t < early) {
+		return `Signature expired: ${stamp} is now earlier than ${basic(early)} (${basic(now)} - 15 min.)`
+	}
+	if (t > late) {
+		return `Signature not yet current: ${stamp} is still later than ${basic(late)} (${basic(now)} + 15 min.)`
+	}
+	if (!equal(signature(req, body, auth, secret), auth.signature)) {
+		return "The request signature we calculated does not match the signature you provided. Check your AWS Secret "
+			+ "Access Key and signing method. Consult the service documentation for details."
+	}
+	return null
+}
+
+/// The signature, in hex, of req with body by secret in auth's scope over auth's signed headers.
+export function signature(req: Request, body: string, auth: Authorization, secret: string): string throws CryptoError {
+	const scope = `${auth.date}/${auth.region}/${auth.service}/aws4_request`
+	const canonical = hex.encode(sha256(canonicalRequest(req, body, auth.signedHeaders)))
+	const toSign = `AWS4-HMAC-SHA256\n${req.headers.get("x-amz-date") ?? ""}\n${scope}\n${canonical}`
+	let key = `AWS4${secret}`
+	for (const part of [auth.date, auth.region, auth.service, "aws4_request"]) {
+		key = hmacSha256(key, part)
+	}
+	return hex.encode(hmacSha256(key, toSign))
+}
+
+/// The canonical request of req with body over the headers signed: its method, its path and query encoded once more,
+/// the signed headers with their values trimmed, and the body's hash, never X-Amz-Content-Sha256's, which outside S3
+/// is a signed header like any other.
+export function canonicalRequest(req: Request, body: string, signed: string[]): string throws CryptoError {
+	const path = if (req.url.path == "") "/" else req.url.path
+	const query = req.url.query.entries.map(e => [escape(e[0], "component"), escape(e[1], "component")])
+	sortBy(query, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+	const headers = signed.map(h => `${h}:${req.headers.all(h).map(value).join(",")}\n`)
+	return [req.method, escape(path, "path"), query.map(e => `${e[0]}=${e[1]}`).join("&"), headers.join(""),
+		signed.join(";"), hex.encode(sha256(body))].join("\n")
+}
+
+/// A header's value trimmed, its runs of spaces one.
+function value(v: string): string { return split(trim(v), " ").filter(w => w != "").join(" ") }
+/// t to the second as SigV4 dates a request: 20150830T123600Z.
+function basic(t: i64): string { return iso8601Basic(t - t % second) }

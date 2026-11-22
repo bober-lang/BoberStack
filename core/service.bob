@@ -1,33 +1,51 @@
 //! What a service's handlers are given and throw, whatever its protocol.
 
-/// Who sent a request, where, and the id it is answered under.
+import { Fault } from "./fault"
+import { Store } from "./state/store"
+import { HashMap } from "std/collections/hashmap"
+
+/// Who sent a request, where, and the id it is answered under; and the state it reads and writes.
 export class Caller {
 	account: string
 	region: string
+	/// The identity it acts as, and that identity's unique id: the account's for its root.
 	arn: string
+	userId: string
 	requestId: string
+	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
+	/// it succeeds, and closes if not.
+	opened: [string, Store][] = []
+	/// The trees committed, by account, which the gateway does not change while the request runs.
+	private committed: HashMap[string, Store]
 
-	constructor(account: string, region: string, arn: string, requestId: string) {
+	constructor(account: string, region: string, arn: string, requestId: string, userId: string = account,
+		committed: HashMap[string, Store] = new HashMap[string, Store]()) {
 		this.account = account
 		this.region = region
 		this.arn = arn
+		this.userId = userId
 		this.requestId = requestId
+		this.committed = committed
 	}
-}
 
-/// An error a request is answered with: its code, message and HTTP status, and whether the sender is at fault.
-export class Fault {
-	status: i32
-	code: string
-	message: string
-	sender: bool
-
-	constructor(status: i32, code: string, message: string, sender: bool = status < 500) {
-		this.status = status
-		this.code = code
-		this.message = message
-		this.sender = sender
+	/// account's state as the request sees it, a clone of its committed tree, or a tree of its own if there is none,
+	/// made at the first call; "" names the global state, what all accounts share.
+	tree(account: string): Store throws Fault {
+		for (const [a, s] of this.opened) {
+			if (a == account) {
+				return s
+			}
+		}
+		const c = this.committed.get(account)
+		const s = if (c == null) new Store() else c.clone()
+		this.opened.push([account, s])
+		return s
 	}
+
+	/// The state of the caller's account.
+	store(): Store throws Fault { return this.tree(this.account) }
+	/// The global state.
+	global(): Store throws Fault { return this.tree("") }
 }
 
 /// An operation's handler, taking its input to its output, or null where the service does not implement it.

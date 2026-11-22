@@ -1,0 +1,223 @@
+import { Fault } from "../fault"
+import { Store, Table, failAllocation, live } from "./store"
+import { indexOf } from "std/algo"
+
+/// The key of i, padded so that byte order is numeric order.
+function k(i: i32): string { return `k${`${1000000 + i}`.slice(1, 7)}` }
+
+test "get, put and delete" {
+	const s = new Store()
+	assert s.get("a") == null && !s.delete("a")
+	s.put("a", "1")
+	s.put("a", "2")
+	assert s.get("a") == "2" && s.count() == 1 && s.bytes() == 2
+	s.put("e", "")
+	assert s.get("e") == "" && s.get("f") == null && s.count() == 2
+	const bin = "\x00k\x00\xff"
+	s.put(bin, "v\x00\x00")
+	s.put("\x00k", "other")
+	assert s.get(bin) == "v\x00\x00" && s.get("\x00k") == "other" && s.get("\x00k\x00") == null
+	assert s.delete("a") && s.get("a") == null && !s.delete("a")
+	assert s.count() == 3 && s.bytes() == 1 + 4 + 3 + 2 + 5
+	s.close()
+}
+
+test "scan pages through a prefix in byte order" {
+	const s = new Store()
+	for (const key of ["b", "a\xff", "a", "a\x00", "ab", "a/2", "a/10", "", "c"]) {
+		s.put(key, `v${key}`)
+	}
+	assert s.scan("a").map(e => e[0]) == ["a", "a\x00", "a/10", "a/2", "ab", "a\xff"]
+	assert s.scan("").length == 9 && s.scan("")[0][0] == "" && s.scan("a", null, 0) == []
+	assert s.scan("a", "a/2", 2) == [["ab", "vab"], ["a\xff", "va\xff"]]
+	assert s.scan("a", "\x00") == s.scan("a") && s.scan("a", "zz") == [] && s.scan("ba") == []
+	let seen: string[] = []
+	let after: string | null = null
+	while (true) {
+		const page = s.scan("a", after, 4)
+		seen = [...seen, ...page.map(e => e[0])]
+		if (page.length < 4) {
+			break
+		}
+		after = page[page.length - 1][0]
+	}
+	assert seen == s.scan("a").map(e => e[0])
+	s.close()
+}
+
+test "a scan is a copy" {
+	const s = new Store()
+	s.put("a", "1")
+	s.put("b", "2")
+	const page = s.scan("")
+	s.put("a", "changed")
+	s.delete("b")
+	assert page == [["a", "1"], ["b", "2"]]
+	s.close()
+}
+
+test "clones are isolated both ways" {
+	const n: i32 = 100000
+	const a = new Store()
+	for (const i of 0 ... n - 1) {
+		a.put(k(i), `a${i}`)
+	}
+	const b = a.clone()
+	for (const i of 0 ... n - 1) {
+		if (i % 3 == 0) {
+			b.put(k(i), `b${i}`)
+		} else if (i % 5 == 0) {
+			b.delete(k(i))
+		}
+		if (i % 7 == 0) {
+			a.delete(k(i))
+		}
+	}
+	a.put("new", "a")
+	let ok = true
+	let inA = 0
+	let inB = 0
+	for (const i of 0 ... n - 1) {
+		const va = a.get(k(i))
+		const vb = b.get(k(i))
+		ok = ok && va == (if (i % 7 == 0) null else `a${i}`)
+		ok = ok && vb == (if (i % 3 == 0) `b${i}` else if (i % 5 == 0) null else `a${i}`)
+		inA += (va != null) as i32
+		inB += (vb != null) as i32
+	}
+	assert ok && a.get("new") == "a" && b.get("new") == null
+	assert a.count() == inA + 1 && b.count() == inB
+	const sum = (s: Store) => {
+		let total: i64 = 0
+		for (const [key, value] of s.scan("", null, n + 1)) {
+			total += (key.length + value.length) as i64
+		}
+		return total
+	}
+	assert a.bytes() == sum(a) && b.bytes() == sum(b)
+	a.close()
+	b.close()
+}
+
+test "clones of clones free everything once closed" {
+	const [records, trees] = live()
+	const stores = [new Store()]
+	let seed: i64 = 1
+	const next = (n: i32) => {
+		seed = (seed * 1103515245 + 12345) % 2147483648
+		return (seed % (n as i64)) as i32
+	}
+	for (const i of 0 ... 5000) {
+		const s = stores[next(stores.length)]
+		if (i % 4 == 0) {
+			stores.push(s.clone())
+		} else if (i % 4 == 1) {
+			s.delete(k(next(3000)))
+		} else {
+			s.put(k(next(3000)), `${i}`)
+		}
+	}
+	assert live()[1] == trees + (stores.length as i64) && live()[0] > records
+	while (stores.length > 0) {
+		const i = next(stores.length)
+		stores[i].close()
+		stores[i] = stores[stores.length - 1]
+		stores.pop()
+	}
+	assert live() == [records, trees]
+}
+
+class Tag {
+	key = ""
+	value: string | null = null
+}
+
+class Queue {
+	name = ""
+	tags: Tag[] = []
+	limits = new Limits()
+	dlq: string | null = null
+}
+
+class Limits {
+	size = 0
+	delay = 0.0
+}
+
+test "tables" {
+	const s = new Store()
+	const queues = new Table[Queue](s, "queues")
+	const other = new Table[Queue](s, "queue")
+	const q = new Queue()
+	q.name = "a"
+	q.tags = [new Tag(), new Tag()]
+	q.tags[1].key = "k"
+	q.tags[1].value = "v"
+	q.limits.size = 262144
+	q.limits.delay = 0.5
+	queues.put("a", q)
+	const got = queues.get("a")!
+	assert got.name == "a" && got.tags.length == 2 && got.tags[0].value == null && got.tags[1].value == "v"
+	assert got.limits.size == 262144 && got.limits.delay == 0.5 && got.dlq == null
+	assert queues.get("b") == null && other.get("a") == null
+	other.put("s\x00a", new Queue())
+	for (const name of ["c", "b", "", "d"]) {
+		q.name = name
+		queues.put(name, q)
+	}
+	assert queues.scan().map(e => e[0]) == ["", "a", "b", "c", "d"]
+	assert queues.scan(null, 2).map(e => e[1].name) == ["", "a"] && queues.scan("a", 2).map(e => e[0]) == ["b", "c"]
+	assert other.scan().map(e => e[0]) == ["s\x00a"] && queues.delete("a") && !queues.delete("a")
+	assert queues.scan(null, 1000, "c").map(e => e[0]) == ["c"] && queues.scan("b", 1, "").map(e => e[0]) == ["c"]
+	assert queues.scan().length == 4
+	s.close()
+}
+
+function closed(): i32 {
+	const s = new Store()
+	s.close()
+	return s.count()
+}
+
+test "a closed store traps" {
+	let trap = ""
+	try {
+		await spawn closed()
+	} catch (e: Trap) {
+		trap = e.message
+	}
+	assert indexOf(trap, "assert failed: !closed") > 0
+}
+
+/// Whether f throws the store's fault with the stores' nth allocation from now failing.
+function fails[T](n: i32, f: () => T throws Fault): bool {
+	failAllocation(n)
+	try {
+		f()
+	} catch (e: Fault) {
+		return e.status == 500 && e.code == "InternalFailure"
+	} finally {
+		failAllocation(0)
+	}
+	return false
+}
+
+test "out of memory throws and changes nothing" {
+	const [records, trees] = live()
+	const a = new Store()
+	for (const i of 0 ... 999) {
+		a.put(k(i), "a")
+	}
+	const b = a.clone()
+	assert fails(1, () => new Store()) && fails(2, () => new Store())
+	assert fails(1, () => a.clone()) && fails(2, () => a.clone())
+	assert fails(1, () => b.put("new", "b")) && fails(2, () => b.put("new", "b")) // the record, a node's copy
+	assert fails(1, () => b.delete(k(5))) && fails(1, () => a.delete(k(6)))
+	assert b.get("new") == null && b.get(k(5)) == "a" && a.get(k(6)) == "a"
+	assert a.count() == 1000 && b.count() == 1000 && b.bytes() == a.bytes()
+	b.put("new", "b")
+	assert b.get("new") == "b" && a.get("new") == null
+	a.close()
+	b.close()
+	assert live() == [records, trees]
+}
