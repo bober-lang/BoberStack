@@ -1,0 +1,125 @@
+//! Service state: an ordered map of byte strings off the collector's heap, on a copy-on-write B-tree (store.c), so that
+//! a snapshot, a branch or a transaction is a clone in O(1). Typed tables sit on top, their values as JSON.
+
+import { Fault } from "../service"
+import { indexOf } from "std/algo"
+import { EncodeError, decode, encode } from "std/encoding/json"
+import { ParseError } from "std/string"
+import { Decodable } from "std/types"
+
+import { store_bytes, store_clone, store_count, store_delete, store_free, store_get, store_new, store_fail,
+	store_put, store_records, store_scan, store_trees } from "./store.c"
+
+/// Keys and values are any bytes. Its memory is C's, freed by close, after which every call traps. A call that cannot
+/// allocate throws an InternalFailure and leaves the store as it was.
+export class Store {
+	private h: u64
+	private out = new u64[](2)
+
+	/// An empty store, or a copy of of.
+	constructor(of: Store | null = null) throws Fault {
+		this.h = if (of == null) store_new() else store_clone(of.handle())
+		memory(this.h != 0)
+	}
+
+	/// A copy in O(1): the two share memory until either writes.
+	clone(): Store throws Fault { return new Store(this) }
+
+	close() {
+		store_free(this.handle())
+		this.h = 0
+	}
+
+	get(key: string): string | null {
+		const found = store_get(this.handle(), key, key.length as u64, this.out) == 1
+		return if (found) fromBytes(this.out[0], this.out[1]) else null
+	}
+
+	put(key: string, value: string) throws Fault {
+		memory(store_put(this.handle(), key, key.length as u64, value, value.length as u64) == 0)
+	}
+
+	/// Whether key was there.
+	delete(key: string): bool throws Fault {
+		const r = store_delete(this.handle(), key, key.length as u64)
+		memory(r >= 0)
+		return r == 1
+	}
+
+	/// A page, copied: up to limit entries whose keys start with prefix and, unless after is null, come after it, in
+	/// byte order. The next page is after the last key.
+	scan(prefix: string, after: string | null = null, limit = 1000): [string, string][] {
+		const n = if (limit < this.count()) limit else this.count()
+		const out = new u64[](4 * n)
+		const got = store_scan(this.handle(), prefix, prefix.length as u64, after ?? (0 as u64),
+			(after ?? "").length as u64, n as u64, out) as i32
+		const page: [string, string][] = []
+		for (const i of 0 ... got - 1) {
+			page.push([fromBytes(out[4 * i], out[4 * i + 1]), fromBytes(out[4 * i + 2], out[4 * i + 3])])
+		}
+		return page
+	}
+
+	/// The number of entries.
+	count(): i32 { return store_count(this.handle()) as i32 }
+	/// The bytes of the keys and values held.
+	bytes(): i64 { return store_bytes(this.handle()) as i64 }
+
+	private handle(): u64 {
+		const closed = this.h == 0
+		assert !closed
+		return this.h
+	}
+}
+
+/// For tests, which cannot import store.c, as each import compiles a copy: the records and the stores not yet freed in
+/// the process.
+export function live(): [i64, i64] { return [store_records(), store_trees()] }
+/// For tests: fails the stores' nth allocation from now.
+export function failAllocation(n: i32) { store_fail(n as i64) }
+
+/// Throws unless ok, as C is out of memory.
+function memory(ok: bool) throws Fault {
+	if (!ok) {
+		throw new Fault(500, "InternalFailure", "The store is out of memory")
+	}
+}
+
+/// The entries of a store under a name, their values V as JSON. An entry's key is the name, a NUL and its own key, so
+/// that tables neither overlap nor scan into each other: a name holds no NUL, a key any bytes.
+export class Table[V extends Decodable] {
+	private store: Store
+	private prefix: string
+
+	constructor(store: Store, name: string) {
+		assert indexOf(name, "\x00") < 0
+		this.store = store
+		this.prefix = name + "\x00"
+	}
+
+	get(key: string): V | null {
+		const s = this.store.get(this.prefix + key)
+		return if (s == null) null else value[V](s)
+	}
+
+	/// Throws for a NaN or infinite float, which JSON cannot hold.
+	put(key: string, v: V) throws EncodeError | Fault { this.store.put(this.prefix + key, encode(v)) }
+	/// Whether key was there.
+	delete(key: string): bool throws Fault { return this.store.delete(this.prefix + key) }
+
+	/// A page as Store.scan's of the table's entries.
+	scan(after: string | null = null, limit = 1000): [string, V][] {
+		const page = this.store.scan(this.prefix, if (after == null) null else this.prefix + after, limit)
+		return page.map(e => [e[0].slice(this.prefix.length, e[0].length), value[V](e[1])])
+	}
+}
+
+/// s, which put encoded, as a V; traps if it does not decode, as when the store was written under the table's prefix
+/// by other means.
+function value[V extends Decodable](s: string): V {
+	let v: V | null = null
+	try {
+		v = decode[V](s)
+	} catch (e: ParseError) {}
+	return v!
+}
