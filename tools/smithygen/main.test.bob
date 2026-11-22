@@ -19,6 +19,33 @@ test "protocoltests/query is what models/awsquery-tests.json generates" {
 	assert suite[1] == "77 vectors: 56 tests, 21 skipped"
 }
 
+test "services/sqs/api.bob is what models/sqs.json generates" {
+	assert generate(readFile("models/sqs.json")!, "models/sqs.json", "services/sqs/api.bob")
+		== readFile("services/sqs/api.bob")
+}
+
+/// Whether the API and tests in the directory dir are what the model, of protocol test vectors, generates; and their
+/// tally.
+function fresh(model: string, dir: string, tally: string): bool throws ModelError {
+	const m = readFile(model)!
+	const api = `${dir}/api.bob`
+	const suite = vectors(m, model, api, readFile(`${dir}/skips.txt`)!)
+	return generate(m, model, api) == readFile(api) && suite[0] == readFile(`${dir}/api.test.bob`) && suite[1] == tally
+}
+
+test "protocoltests/json10 is what models/awsjson10-tests.json generates" {
+	assert fresh("models/awsjson10-tests.json", "protocoltests/json10", "73 vectors: 39 tests, 34 skipped")
+}
+
+test "protocoltests/json10querycompatible is what models/awsjson10-querycompatible-tests.json generates" {
+	const model = "models/awsjson10-querycompatible-tests.json"
+	assert fresh(model, "protocoltests/json10querycompatible", "3 vectors: 3 tests, 0 skipped")
+}
+
+test "protocoltests/json11 is what models/awsjson11-tests.json generates" {
+	assert fresh("models/awsjson11-tests.json", "protocoltests/json11", "122 vectors: 95 tests, 27 skipped")
+}
+
 test "a model it cannot express" {
 	const document = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "operations": [{"target": "a#Op"}],
 		"traits": {"aws.protocols#awsQuery": {}, "aws.auth#sigv4": {"name": "s"}, "smithy.api#xmlNamespace": {"uri": "u"}}},
@@ -26,6 +53,6 @@ test "a model it cannot express" {
 		{"U": {"target": "a#U"}}}, "a#U": {"type": "document"}}}`
 	assert generate(document, "m.json", "api.bob") throws new ModelError("a#U: a document")
 	const rest = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "traits": {"aws.protocols#restXml": {}}}}}`
-	const why = "a#S: not an awsQuery service of sigv4 and an XML namespace, or has resources"
+	const why = "a#S: not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
 	assert generate(rest, "m.json", "api.bob") throws new ModelError(why)
 }

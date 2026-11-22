@@ -1,6 +1,7 @@
 //! What the tests that smithygen generates from a model's protocol test vectors share.
 
-import { sort } from "std/algo"
+import { sort, startsWith } from "std/algo"
+import * as json from "std/encoding/json"
 import { Node, parse } from "std/encoding/xml"
 import { Response } from "std/http"
 import { ParseError, trim } from "std/string"
@@ -45,4 +46,40 @@ function attributes(el: Node): string {
 	const all = el.attrs.map(a => `${a.name}="${a.value}"`)
 	sort(all)
 	return all.join(" ")
+}
+
+/// Whether the JSON of res and want say the same, whitespace and the order of members aside; none if want is "".
+export function sameJson(res: Response, want: string): bool throws ParseError {
+	const got = res.body.whole ?? ""
+	return if (want == "") got == "" else canonical(got) == canonical(want)
+}
+
+/// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
+type Item = f64 | string | bool | json.Keys | null | (f64 | string | bool | json.Keys | null)[]
+
+/// The JSON s, without whitespace and with the members of its objects in order of their names.
+function canonical(s: string): string throws ParseError {
+	const t = trim(s)
+	if (startsWith(t, "{")) {
+		const members = json.decode[json.Keys](t).all.map(m => `${json.quoted(m[0])}:${canonical(m[1])}`)
+		sort(members)
+		return `{${members.join(",")}}`
+	}
+	if (startsWith(t, "[")) {
+		const items: string[] = []
+		for (const x of json.decode[Item[]](t)) {
+			items.push(canonical(encode(x)))
+		}
+		return `[${items.join(",")}]`
+	}
+	return encode(json.decode[Item](t))
+}
+
+/// The JSON of x, which it can hold.
+function encode(x: Item): string {
+	try {
+		return json.encode(x)
+	} catch (e: json.EncodeError) {
+		return "" // a float of JSON is finite
+	}
 }
