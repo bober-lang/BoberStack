@@ -1,0 +1,48 @@
+//! What the tests that smithygen generates from a model's protocol test vectors share.
+
+import { sort } from "std/algo"
+import { Node, parse } from "std/encoding/xml"
+import { Response } from "std/http"
+import { ParseError, trim } from "std/string"
+import { Caller } from "../../core/service"
+
+/// The caller of a request answered under requestId.
+export function caller(requestId: string): Caller {
+	return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", requestId)
+}
+
+/// Whether the XML document of res and want say the same, whitespace between elements aside. Where the root of want
+/// has no ResponseMetadata, that of res is left out: a vector shows it only where it tests it.
+export function same(res: Response, want: string): bool throws ParseError {
+	const g = parse(res.body.whole ?? "").elements()[0]
+	const w = parse(want).elements()[0]
+	if (!w.children.some(c => c.name == "ResponseMetadata")) {
+		g.children = g.children.filter(c => c.name != "ResponseMetadata")
+	}
+	return alike(g, w)
+}
+
+/// Whether the elements a and b have the same name, attributes and content.
+function alike(a: Node, b: Node): bool {
+	const as = a.children.filter(c => c.kind == "element")
+	const bs = b.children.filter(c => c.kind == "element")
+	if (a.name != b.name || a.ns != b.ns || attributes(a) != attributes(b) || as.length != bs.length) {
+		return false
+	}
+	if (as.length == 0) {
+		return trim(a.text()) == trim(b.text())
+	}
+	for (let i = 0; i < as.length; i++) {
+		if (!alike(as[i], bs[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The attributes of el, in order of their names.
+function attributes(el: Node): string {
+	const all = el.attrs.map(a => `${a.name}="${a.value}"`)
+	sort(all)
+	return all.join(" ")
+}

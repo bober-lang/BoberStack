@@ -1,0 +1,26 @@
+import { generate, ModelError, vectors } from "./main"
+
+test "services/sts/api.bob is what models/sts.json generates" {
+	assert generate(readFile("models/sts.json")!, "models/sts.json", "services/sts/api.bob")
+		== readFile("services/sts/api.bob")
+}
+
+test "protocoltests/query is what models/awsquery-tests.json generates" {
+	const model = readFile("models/awsquery-tests.json")!
+	const api = "protocoltests/query/api.bob"
+	assert generate(model, "models/awsquery-tests.json", api) == readFile(api)
+	const suite = vectors(model, "models/awsquery-tests.json", api, readFile("protocoltests/query/skips.txt")!)
+	assert suite[0] == readFile("protocoltests/query/api.test.bob")
+	assert suite[1] == "77 vectors: 56 tests, 21 skipped"
+}
+
+test "a model it cannot express" {
+	const document = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "operations": [{"target": "a#Op"}],
+		"traits": {"aws.protocols#awsQuery": {}, "aws.auth#sigv4": {"name": "s"}, "smithy.api#xmlNamespace": {"uri": "u"}}},
+		"a#Op": {"type": "operation", "input": {"target": "a#In"}}, "a#In": {"type": "structure", "members":
+		{"U": {"target": "a#U"}}}, "a#U": {"type": "document"}}}`
+	assert generate(document, "m.json", "api.bob") throws new ModelError("a#U: a document")
+	const rest = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "traits": {"aws.protocols#restXml": {}}}}}`
+	const why = "a#S: not an awsQuery service of sigv4 and an XML namespace, or has resources"
+	assert generate(rest, "m.json", "api.bob") throws new ModelError(why)
+}

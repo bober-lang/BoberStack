@@ -1,0 +1,786 @@
+//! Generates the API of an awsQuery service from its Smithy model, in the JSON AST: a class for each structure its
+//! operations take or give, a type for each enum, for each union a class U$M of one field M for each member M and their
+//! union U, a function making each error's Fault, and a table of the operations' handlers that serves the service's
+//! requests with the codec of ../../core/protocol/query. It fails on what that cannot express. Given a list of the
+//! model's protocol test vectors to skip, it generates a test of each of the others beside the API, as OUT.test.bob.
+//!
+//! Usage: smithygen MODEL OUT [SKIPS], as `bober run tools/smithygen/main.bob -- models/sts.json services/sts/api.bob`,
+//! or `-- models/awsquery-tests.json protocoltests/query/api.bob protocoltests/query/skips.txt`.
+
+import { indexOf, sortBy, startsWith, unique } from "std/algo"
+import * as json from "std/encoding/json"
+import { min, round } from "std/math"
+import { lower, ParseError, replace, split } from "std/string"
+
+class Model {
+	shapes: [string, Shape][] @json.Mapping = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Shape {
+	type = ""
+	version = ""
+	members: [string, Ref][] @json.Mapping = []
+	member: Ref | null
+	key: Ref | null
+	value: Ref | null
+	input: Ref | null
+	output: Ref | null
+	operations: Ref[] = []
+	resources: Ref[] = []
+	errors: Ref[] = []
+	traits = new Traits()
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Ref {
+	target = ""
+	traits = new Traits()
+}
+
+/// The traits this reads; the others it ignores.
+class Traits {
+	required: Mark | null @json.Name["smithy.api#required"]
+	xmlName: string | null @json.Name["smithy.api#xmlName"]
+	xmlFlattened: Mark | null @json.Name["smithy.api#xmlFlattened"]
+	xmlAttribute: Mark | null @json.Name["smithy.api#xmlAttribute"]
+	xmlNamespace: Namespace | null @json.Name["smithy.api#xmlNamespace"]
+	timestampFormat: string | null @json.Name["smithy.api#timestampFormat"]
+	enumValue: string | i32 | null @json.Name["smithy.api#enumValue"]
+	enum: EnumValue[] | null @json.Name["smithy.api#enum"]
+	streaming: Mark | null @json.Name["smithy.api#streaming"]
+	sparse: Mark | null @json.Name["smithy.api#sparse"]
+	error: string | null @json.Name["smithy.api#error"]
+	queryError: QueryError | null @json.Name["aws.protocols#awsQueryError"]
+	awsQuery: Mark | null @json.Name["aws.protocols#awsQuery"]
+	sigv4: Sigv4 | null @json.Name["aws.auth#sigv4"]
+	service: Service | null @json.Name["aws.api#service"]
+	requestTests: Vector[] @json.Name["smithy.test#httpRequestTests"] = []
+	responseTests: Vector[] @json.Name["smithy.test#httpResponseTests"] = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+/// A protocol test vector: a request and what it holds, or a response and what makes it.
+class Vector {
+	id = ""
+	protocol = ""
+	appliesTo = ""
+	method = ""
+	uri = ""
+	headers: [string, string][] @json.Mapping = []
+	body: string | null
+	params = new json.Keys()
+	code: i32 = 0
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Mark {}
+
+class Namespace {
+	uri = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class EnumValue {
+	value = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class QueryError {
+	code = ""
+	httpResponseCode: i32 = 0
+}
+
+class Sigv4 {
+	name = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Service {
+	sdkId = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+/// What makes a model one this cannot generate from.
+export class ModelError {
+	what: string
+
+	constructor(what: string) { this.what = what }
+}
+
+/// A declaration's lines, of a kind: import, const, type, class, function, field or method.
+class Decl {
+	kind: string
+	lines: string[]
+
+	constructor(kind: string, lines: string[]) {
+		this.kind = kind
+		this.lines = lines
+	}
+}
+
+const width = 120
+
+class Generator {
+	model: Model
+	/// The structures, unions and enums the operations reach.
+	structures: string[] = []
+	enums: string[] = []
+	/// The names declared, the imported ones too, to fail on a second of one.
+	taken = ["query", "Caller", "Fault", "Handler", "Unit", "Request", "Response", "signingName", "version", "ns"]
+	/// The service's operations, its version and the class of its table, once api has run.
+	ops: string[] = []
+	version = ""
+	table = ""
+
+	constructor(model: Model) { this.model = model }
+
+	api(from: string, out: string): string throws ModelError {
+		const services = this.model.shapes.filter(s => s[1].type == "service")
+		if (services.length != 1) {
+			throw new ModelError(`${services.length} services, not one`)
+		}
+		const s = services[0][1]
+		const t = s.traits
+		if (t.awsQuery == null || t.xmlNamespace == null || t.sigv4 == null || s.resources.length > 0) {
+			throw new ModelError(`${services[0][0]}: not an awsQuery service of sigv4 and an XML namespace, or has resources`)
+		}
+		const ops = s.operations.map(r => r.target)
+		sortNames(ops)
+		const errors = s.errors.map(r => r.target)
+		const fields: Decl[] = []
+		const cases: string[] = []
+		let unit = false
+		for (const id of ops) {
+			const op = this.shape(id)
+			errors.push(...op.errors.map(r => r.target))
+			const input = this.structure(op.input)
+			const output = this.structure(op.output)
+			if (input == "Unit" || output == "Unit") {
+				unit = true
+			}
+			fields.push(handler(lowerCamel(name(id)), input, output))
+			cases.push(`\t\t\tcase ${json.quoted(name(id))}: return c.serve(this.${lowerCamel(name(id))})`)
+		}
+		fields.push(handle(cases))
+		sortNames(errors)
+		sortNames(this.structures)
+		sortNames(this.enums)
+		const decls = imports(out, unit, errors.length > 0)
+		decls.push(new Decl("const", [`export const signingName = ${json.quoted(t.sigv4!.name)}`]))
+		decls.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
+		decls.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
+		for (const id of this.enums) {
+			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, this.values(id))))
+		}
+		for (const id of this.structures) {
+			decls.push(...this.classOf(id))
+		}
+		for (const id of unique(errors)) {
+			decls.push(new Decl("function", this.maker(id)))
+		}
+		this.table = this.declare(replace(t.service?.sdkId ?? name(services[0][0]), " ", ""))
+		this.version = s.version
+		this.ops = ops
+		decls.push(new Decl("class", [`export class ${this.table} {`, ...layout(fields), "}"]))
+		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
+	}
+
+	/// n, declared at the top level.
+	declare(n: string): string throws ModelError {
+		if (this.taken.includes(n)) {
+			throw new ModelError(`${n} names two declarations`)
+		}
+		this.taken.push(n)
+		return n
+	}
+
+	/// The shape id, of the model or Smithy's prelude.
+	shape(id: string): Shape throws ModelError {
+		for (const s of this.model.shapes) {
+			if (s[0] == id) {
+				return s[1]
+			}
+		}
+		if (!startsWith(id, "smithy.api#")) {
+			throw new ModelError(`${id}: no such shape`)
+		}
+		const s = new Shape()
+		s.type = lower(replace(name(id), "Primitive", ""))
+		return s
+	}
+
+	/// The class of an operation's input or output r, Unit if none, each structure it reaches to be generated.
+	structure(r: Ref | null): string throws ModelError {
+		if (r == null || r.target == "smithy.api#Unit") {
+			return "Unit"
+		}
+		const s = this.shape(r.target)
+		if (s.type != "structure") {
+			throw new ModelError(`${r.target}: an operation's input or output that is a ${s.type}`)
+		}
+		this.reach(r.target)
+		return name(r.target)
+	}
+
+	/// Notes the structures, unions and enums that the shape id is or holds, to be generated.
+	reach(id: string): void throws ModelError {
+		const s = this.shape(id)
+		if (enumerates(s)) {
+			if (!this.enums.includes(id)) {
+				this.enums.push(id)
+			}
+		} else if ((s.type == "structure" || s.type == "union") && !this.structures.includes(id)) {
+			this.structures.push(id)
+			for (const m of s.members) {
+				this.reach(m[1].target)
+			}
+		}
+		for (const r of [s.member, s.key, s.value]) {
+			if (r != null) {
+				this.reach(r.target)
+			}
+		}
+	}
+
+	/// The literals of the enum id.
+	values(id: string): string[] throws ModelError {
+		const s = this.shape(id)
+		const values: string[] = []
+		for (const m of s.members) {
+			const v = m[1].traits.enumValue
+			values.push(json.quoted(if (v == null) m[0] else `${v}`))
+		}
+		for (const v of s.traits.enum ?? []) {
+			values.push(json.quoted(v.value))
+		}
+		return values
+	}
+
+	/// The class of the structure id, a field for each member, null where it is not required; or the classes of the
+	/// union id's members and their union.
+	classOf(id: string): Decl[] throws ModelError {
+		const s = this.shape(id)
+		const decls: Decl[] = []
+		if (s.type == "union") {
+			const variants: string[] = []
+			for (const m of s.members) {
+				const v = this.declare(`${name(id)}$${m[0]}`)
+				variants.push(v)
+				decls.push(new Decl("class", [`export class ${v} {`, this.field(id, m, true), "}"]))
+			}
+			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, variants)))
+			return decls
+		}
+		const n = this.declare(name(id))
+		if (s.members.length == 0) {
+			return [new Decl("class", [`export class ${n} {}`])]
+		}
+		const lines = [`export class ${n} {`]
+		for (const m of s.members) {
+			lines.push(this.field(id, m, m[1].traits.required != null))
+		}
+		lines.push("}")
+		return [new Decl("class", lines)]
+	}
+
+	/// The field of the member m of the shape id, null unless required.
+	field(id: string, m: [string, Ref], required: bool): string throws ModelError {
+		const t = m[1].traits
+		if (t.xmlAttribute != null) {
+			throw new ModelError(`${id}$${m[0]}: an XML attribute`)
+		}
+		const tags: string[] = []
+		if (t.xmlName != null) {
+			tags.push(`@query.Name[${json.quoted(t.xmlName!)}]`)
+		}
+		if (t.xmlFlattened != null) {
+			tags.push("@query.Flat")
+		}
+		const ty = this.typeOf(m[1], tags, false)
+		const tagged = tags.map(x => ` ${x}`).join("")
+		const field = if (required) `\t${m[0]}: ${ty}${tagged}${this.initial(m[1].target, ty)}`
+			else `\t${m[0]}: ${ty} | null${tagged}`
+		if (wide(field)) {
+			throw new ModelError(`${id}$${m[0]}: a field wider than a line`) // bober format would wrap it
+		}
+		return field
+	}
+
+	/// The initializer of a required field of the shape id, of type ty: none where ty has a zero value.
+	initial(id: string, ty: string): string throws ModelError {
+		const s = this.shape(id)
+		if (enumerates(s)) {
+			return ` = ${this.values(id)[0]}`
+		}
+		switch (s.type) {
+			case "list", "map": return " = []"
+			case "structure": return ` = new ${ty}()`
+			case "union": return ` = new ${ty}$${s.members[0][0]}()`
+			default: return ""
+		}
+	}
+
+	/// The type of a member, or item, r, with the tags into tags that its target takes; within a list or map if inner.
+	typeOf(r: Ref, tags: string[], inner: bool): string throws ModelError {
+		const s = this.shape(r.target)
+		if (enumerates(s)) {
+			return name(r.target)
+		}
+		switch (s.type) {
+			case "string": return "string"
+			case "boolean": return "bool"
+			case "byte": return "i8"
+			case "short": return "i16"
+			case "integer", "intEnum": return "i32"
+			case "long": return "i64"
+			case "float": return "f32"
+			case "double": return "f64"
+			case "timestamp":
+				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? "date-time"
+				tags.push(if (format == "date-time") "@query.Timestamp" else `@query.Timestamp[${json.quoted(format)}]`)
+				return "i64"
+			case "blob":
+				if (s.traits.streaming != null) {
+					throw new ModelError(`${r.target}: a stream`)
+				}
+				tags.push("@query.Blob")
+				return "string"
+			case "list":
+				const m = s.member!
+				if (s.traits.sparse != null || inner && m.traits.xmlName != null) {
+					throw new ModelError(`${r.target}: a sparse list, or one within a list or map whose items are named`)
+				}
+				if (m.traits.xmlName != null) {
+					tags.push(`@query.Member[${json.quoted(m.traits.xmlName!)}]`)
+				}
+				return `${this.typeOf(m, tags, true)}[]`
+			case "map":
+				const k = s.key!
+				const v = s.value!
+				if (s.traits.sparse != null || inner && (k.traits.xmlName != null || v.traits.xmlName != null)) {
+					throw new ModelError(`${r.target}: a sparse map, or one within a list or map whose keys or values are named`)
+				}
+				if (k.traits.xmlName != null) {
+					tags.push(`@query.Key[${json.quoted(k.traits.xmlName!)}]`)
+				}
+				if (v.traits.xmlName != null) {
+					tags.push(`@query.Value[${json.quoted(v.traits.xmlName!)}]`)
+				}
+				return `[${this.typeOf(k, tags, true)}, ${this.typeOf(v, tags, true)}][]`
+			case "structure", "union": return name(r.target)
+			default: throw new ModelError(`${r.target}: a ${s.type}`)
+		}
+	}
+
+	/// The function making the Fault of the error id, as awsQuery answers it.
+	maker(id: string): string[] throws ModelError {
+		const t = this.shape(id).traits
+		if (t.error == null) {
+			throw new ModelError(`${id}: an error without the error trait`)
+		}
+		const client = t.error == "client"
+		const status = t.queryError?.httpResponseCode ?? (if (client) 400 else 500)
+		const code = t.queryError?.code ?? name(id)
+		const sender = if (client == (status < 500)) "" else `, ${client}`
+		const head = `export function ${this.declare(lowerCamel(name(id)))}(message: string): Fault {`
+		const body = `return new Fault(${status}, ${json.quoted(code)}, message${sender})`
+		const line = `${head} ${body} }` // as bober format puts a body of one statement where it fits
+		return if (wide(line)) [head, `\t${body}`, "}"] else [line]
+	}
+
+	/// The tests of the vectors of the operations and their errors, of the API in the file out, after api has run;
+	/// those that skips, of a line "id: reason" each, gives a reason for, and those for clients only, listed instead.
+	/// And how many there are.
+	suite(from: string, out: string, skips: string): [string, string] throws ModelError | ParseError {
+		const reasons = split(skips, "\n").filter(l => l != "").map(l => split(l, ": "))
+		const tests: Decl[] = []
+		const skipped: string[] = []
+		const ids: string[] = []
+		const errors: string[] = []
+		for (const op of this.ops) {
+			const vectors: [Vector, string | null][] = [] // a response's error, "" if none; null for a request
+			for (const v of this.shape(op).traits.requestTests) {
+				vectors.push([v, null])
+			}
+			for (const v of this.shape(op).traits.responseTests) {
+				vectors.push([v, ""])
+			}
+			for (const e of this.shape(op).errors.filter(e => !errors.includes(e.target))) {
+				errors.push(e.target)
+				for (const v of this.shape(e.target).traits.responseTests) {
+					vectors.push([v, e.target])
+				}
+			}
+			for (const [v, error] of vectors) {
+				ids.push(v.id)
+				const test = `${v.id} ${if (error == null) "request" else "response"}` // an id can name one of each
+				const reason = reasons.find(r => r[0] == v.id)
+				if (v.protocol != "aws.protocols#awsQuery") {
+					throw new ModelError(`${v.id}: a vector of ${v.protocol}`)
+				} else if (v.appliesTo == "client" || reason != null) {
+					const why = if (reason == null) "for clients only" else reason.slice(1, reason.length).join(": ")
+					skipped.push(`// ${test}: ${why}`)
+				} else {
+					const lines = if (error == null) this.request(op, v) else this.response(op, v, error)
+					tests.push(new Decl("test", [`test ${json.quoted(test)} {`, ...lines, "}"]))
+				}
+			}
+		}
+		for (const r of reasons.filter(r => !ids.includes(r[0]))) {
+			throw new ModelError(`${r[0]}: skipped, but no such vector`)
+		}
+		const tally = `${ids.length} vectors: ${tests.length} tests, ${skipped.length} skipped`
+		const up = root(out)
+		const decls = [new Decl("import", [`import { Unit } from "${up}core/service"`])]
+		decls.push(new Decl("import", [`import { caller, same } from "${up}tools/smithygen/vectors"`]))
+		decls.push(new Decl("import", [`import * as api from "./${replace(split(out, "/").pop()!, ".bob", "")}"`]))
+		decls.push(new Decl("import", [`import { Request } from "std/http"`]))
+		const head = [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, `// ${tally}:`, ...skipped]
+		return [[...head, ...layout([...decls, ...tests])].join("\n") + "\n", tally]
+	}
+
+	/// The test that the request of vector v, of operation op, decodes to its params.
+	request(op: string, v: Vector): string[] throws ModelError | ParseError {
+		const o = this.shape(op)
+		const input = this.className(o.input)
+		if (v.body == null) {
+			throw new ModelError(`${v.id}: a request without a body`)
+		}
+		const lines = [`\tconst t = new api.${this.table}()`, `\tlet got: ${input} | null = null`]
+		lines.append([`\tt.${lowerCamel(name(op))} = (c, input) => {`, "\t\tgot = input"])
+		lines.append([`\t\treturn new ${this.className(o.output)}()`, "\t}"])
+		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(v.uri)}, ${json.quoted(v.body!)})`
+		lines.append(wrap(`\tconst req = ${req}`))
+		for (const h of v.headers) {
+			lines.push(`\treq.headers.set(${json.quoted(h[0])}, ${json.quoted(h[1])})`)
+		}
+		lines.append([`\tt.handle(caller(""), req)`, `\tconst want = new ${input}()`])
+		lines.append(this.assignments("\twant", o.input, v.params))
+		lines.push("\tassert `${got}` == `${want}`")
+		return lines
+	}
+
+	/// The test that operation op, its handler making the params of vector v, or throwing the error of them if error is
+	/// not "", answers as v does.
+	response(op: string, v: Vector, error: string): string[] throws ModelError | ParseError {
+		const o = this.shape(op)
+		const lines = [`\tconst t = new api.${this.table}()`]
+		lines.push(`\tt.${lowerCamel(name(op))} = (c, input) => {`)
+		if (error != "") {
+			const message = v.params.all.find(p => p[0] == "Message")
+			if (message == null || v.params.all.length != 1) {
+				throw new ModelError(`${v.id}: an error of members besides a Message`)
+			}
+			const text = this.literal(this.member(error, "Message"), message[1])
+			lines.append(wrap(`\t\tthrow api.${lowerCamel(name(error))}(${text})`))
+		} else {
+			lines.push(`\t\tconst out = new ${this.className(o.output)}()`)
+			lines.append(this.assignments("\t\tout", o.output, v.params))
+			lines.push("\t\treturn out")
+		}
+		const body = v.body ?? ""
+		const id = if (has(body, "<RequestId>")) split(split(body, "<RequestId>")[1], "</RequestId>")[0] else ""
+		const req = `new Request("POST", "/", ${json.quoted(`Action=${name(op)}&Version=${this.version}`)})`
+		lines.append(["\t}", ...wrap(`\tconst res = t.handle(caller(${json.quoted(id)}), ${req})`)])
+		lines.push(`\tassert res.status == ${v.code}`)
+		for (const h of v.headers) {
+			lines.push(`\tassert res.headers.get(${json.quoted(h[0])}) == ${json.quoted(h[1])}`)
+		}
+		if (v.body != null) {
+			if (has(body, "`") || has(body, "${") || has(body, "\\")) {
+				throw new ModelError(`${v.id}: a body that a template literal cannot hold as it is`)
+			}
+			const xml = `\`${body}\`)`
+			lines.append(if (has(body, "\n")) ["\tassert same(res,", `\t\t${xml}`] else [`\tassert same(res, ${xml}`])
+		}
+		return lines
+	}
+
+	/// The class of an operation's input or output r, as a test names it.
+	className(r: Ref | null): string throws ModelError {
+		const c = this.structure(r)
+		return if (c == "Unit") c else `api.${c}`
+	}
+
+	/// The statements setting the members of x, of the structure r, to the values that params gives them.
+	assignments(x: string, r: Ref | null, params: json.Keys): string[] throws ModelError | ParseError {
+		const lines: string[] = []
+		for (const p of params.all) {
+			lines.append(wrap(`${x}.${p[0]} = ${this.literal(this.member(r!.target, p[0]), p[1])}`))
+		}
+		return lines
+	}
+
+	/// The member m of the structure id.
+	member(id: string, m: string): Ref throws ModelError {
+		const found = this.shape(id).members.find(x => x[0] == m)
+		if (found == null) {
+			throw new ModelError(`${id}: no member ${m}`)
+		}
+		return found[1]
+	}
+
+	/// The value, of the member or item r, that a vector's params give as the JSON v.
+	literal(r: Ref, v: string): string throws ModelError | ParseError {
+		const s = this.shape(r.target)
+		switch (if (enumerates(s)) "string" else s.type) {
+			case "string", "blob": return json.quoted(json.decode[string](v))
+			case "boolean", "byte", "short", "integer", "long", "intEnum": return v
+			case "float", "double":
+				switch (v) {
+					case "\"NaN\"": return "0.0 / 0.0"
+					case "\"Infinity\"": return "1.0 / 0.0"
+					case "\"-Infinity\"": return "-1.0 / 0.0"
+				}
+				return if (has(v, ".")) v else `${v}.0`
+			case "timestamp":
+				// ns from epoch seconds
+				return `${(round(json.decode[f64](v) * 1000.0) as i64) * 1000000}`
+			case "list":
+				const items: string[] = []
+				for (const x of json.decode[Item[]](v)) {
+					items.push(this.literal(s.member!, encode(x)))
+				}
+				return `[${items.join(", ")}]`
+			case "map":
+				const entries: string[] = []
+				for (const e of json.decode[json.Keys](v).all) {
+					entries.push(`[${json.quoted(e[0])}, ${this.literal(s.value!, e[1])}]`)
+				}
+				return `[${entries.join(", ")}]`
+			case "structure":
+				const members: string[] = []
+				for (const p of json.decode[json.Keys](v).all) {
+					members.push(`, ${p[0]}: ${this.literal(this.member(r.target, p[0]), p[1])}`)
+				}
+				return `{ ...new api.${name(r.target)}()${members.join("")} }`
+			default: throw new ModelError(`${r.target}: a ${s.type} in a vector`)
+		}
+	}
+}
+
+/// An item of a list in a vector's params, a list of items of no lists if one.
+type Item = string | f64 | bool | json.Keys | (string | f64 | bool | json.Keys)[]
+
+/// The JSON of x, which it can hold.
+function encode(x: Item): string {
+	try {
+		return json.encode(x)
+	} catch (e: json.EncodeError) {
+		return "" // a float of JSON is finite
+	}
+}
+
+/// The API of the service that the Smithy JSON AST model, read from the file from, describes, as the file out.
+export function generate(model: string, from: string, out: string): string throws ModelError {
+	try {
+		return new Generator(json.decode[Model](model)).api(from, out)
+	} catch (e: ParseError) {
+		throw new ModelError(`${from}: ${e}`)
+	}
+}
+
+/// The tests of the vectors of the model, read from the file from, of the API that generate makes as the file out,
+/// but for those that skips, of a line "id: reason" each, gives a reason for; and how many there are.
+export function vectors(model: string, from: string, out: string, skips: string): [string, string] throws ModelError {
+	try {
+		const g = new Generator(json.decode[Model](model))
+		g.api(from, out)
+		return g.suite(from, out, skips)
+	} catch (e: ParseError) {
+		throw new ModelError(`${from}: ${e}`)
+	}
+}
+
+/// The path from the file out up to the root.
+function root(out: string): string {
+	let up = ""
+	for (let i = 1; i < split(out, "/").length; i++) {
+		up += "../"
+	}
+	return up
+}
+
+/// The imports of the file out, of Unit if unit and of Fault if faults.
+function imports(out: string, unit: bool, faults: bool): Decl[] {
+	const up = root(out)
+	let names = "Caller"
+	if (faults) {
+		names += ", Fault"
+	}
+	names += ", Handler"
+	if (unit) {
+		names += ", Unit"
+	}
+	const decls: Decl[] = []
+	decls.push(new Decl("import", [`import * as query from "${up}core/protocol/query"`]))
+	decls.push(new Decl("import", [`import { ${names} } from "${up}core/service"`]))
+	decls.push(new Decl("import", [`import { Request, Response } from "std/http"`]))
+	return decls
+}
+
+/// The handler field of the table, wrapped as bober format wraps it.
+function handler(field: string, input: string, output: string): Decl {
+	const line = `\t${field}: Handler[${input}, ${output}]`
+	return new Decl("field", if (wide(line)) [`\t${field}: Handler[${input},`, `\t\t${output}]`] else [line])
+}
+
+/// The table's method serving a request, by the cases of its actions.
+function handle(cases: string[]): Decl {
+	const lines: string[] = []
+	lines.push("\thandle(caller: Caller, req: Request): Response throws IoError {")
+	lines.push("\t\tconst c = query.call(caller, req, version, ns)")
+	lines.push("\t\tswitch (c.action) {")
+	lines.push(...cases)
+	lines.push("\t\t\tdefault: return c.invalidAction()")
+	lines.push("\t\t}")
+	lines.push("\t}")
+	return new Decl("method", lines)
+}
+
+/// The decls' lines, a blank line between two of different kinds or of more than a line, as bober format puts them.
+function layout(decls: Decl[]): string[] {
+	const lines: string[] = []
+	for (let i = 0; i < decls.length; i++) {
+		const d = decls[i]
+		if (i > 0) {
+			const prev = decls[i - 1]
+			if (prev.kind != d.kind || prev.lines.length > 1 || d.lines.length > 1) {
+				lines.push("")
+			}
+		}
+		lines.push(...d.lines)
+	}
+	return lines
+}
+
+/// head followed by the union of values, wrapped as bober format wraps it.
+function fill(head: string, values: string[]): string[] {
+	const lines = [head + values[0]]
+	for (const v of values.slice(1, values.length)) {
+		const last = lines[lines.length - 1]
+		if (wide(`${last} | ${v}`)) {
+			lines.push(`\t| ${v}`)
+		} else {
+			lines[lines.length - 1] = `${last} | ${v}`
+		}
+	}
+	return lines
+}
+
+/// line, wrapped as bober format wraps one too wide, the lines after the first indented a tab more.
+function wrap(line: string): string[] {
+	const lines = [""]
+	put(lines, line, line.slice(0, tabs(line)) + "\t")
+	return lines
+}
+
+/// Puts s on lines: on the last where it fits, else on a line of its own at indent, else each of its pieces so.
+function put(lines: string[], s: string, indent: string): void {
+	const last = lines[lines.length - 1]
+	const cut = pieces(s)
+	if (!wide(last + s) || last == "" && cut.length == 1) {
+		lines[lines.length - 1] = last + s
+	} else if (last != "" && (!wide(indent + s.slice(1, s.length)) || cut.length == 1)) {
+		lines.push(indent + s.slice(1, s.length))
+	} else {
+		for (const p of cut) {
+			put(lines, p, indent)
+		}
+	}
+}
+
+/// s cut after each of its commas, not in a string, that the fewest brackets enclose.
+function pieces(s: string): string[] {
+	const commas: [i32, i32][] = [] // where, and in how many brackets
+	let depth = 0
+	let quoted = false
+	for (let i = 0; i < s.length; i++) {
+		const c = s.slice(i, i + 1)
+		if (c == "\\") {
+			i++
+		} else if (c == "\"") {
+			quoted = !quoted
+		} else if (!quoted) {
+			depth += if (c == "(" || c == "[" || c == "{") 1 else if (c == ")" || c == "]" || c == "}") -1 else 0
+			if (c == ",") {
+				commas.push([i, depth])
+			}
+		}
+	}
+	let least = s.length
+	for (const c of commas) {
+		least = min(least, c[1])
+	}
+	const out: string[] = []
+	let at = 0
+	for (const c of commas.filter(c => c[1] == least)) {
+		out.push(s.slice(at, c[0] + 1))
+		at = c[0] + 1
+	}
+	out.push(s.slice(at, s.length))
+	return out
+}
+
+/// Whether line is wider than bober format allows, a tab as 4 columns.
+function wide(line: string): bool { return line.length + 3 * tabs(line) > width }
+
+/// How many tabs line starts with.
+function tabs(line: string): i32 {
+	let n = 0
+	while (n < line.length && line.slice(n, n + 1) == "\t") {
+		n++
+	}
+	return n
+}
+
+/// Whether s has sub in it.
+function has(s: string, sub: string): bool { return indexOf(s, sub) >= 0 }
+/// Whether s is an enum, or a string of Smithy 1's enum trait.
+function enumerates(s: Shape): bool { return s.type == "enum" || s.traits.enum != null }
+/// Sorts the shape ids by their names.
+function sortNames(ids: string[]) { sortBy(ids, (a, b) => name(a) < name(b)) }
+/// The name of the shape id, without its namespace.
+function name(id: string): string { return split(id, "#")[1] }
+
+/// s with its leading capitals lowered, but for the last of several that starts a word: IDPError as idpError.
+function lowerCamel(s: string): string {
+	let n = 0
+	while (n < s.length && s.slice(n, n + 1) != lower(s.slice(n, n + 1))) {
+		n++
+	}
+	if (n > 1 && n < s.length) {
+		n--
+	}
+	return lower(s.slice(0, n)) + s.slice(n, s.length)
+}
+
+function main(): i32 {
+	const a = args()
+	if (a.length != 2 && a.length != 3) {
+		print("usage: smithygen MODEL OUT [SKIPS]")
+		return 2
+	}
+	const model = readFile(a[0])
+	const skips = if (a.length == 3) readFile(a[2]) else ""
+	if (model == null || skips == null) {
+		print(`smithygen: cannot read ${a.filter(f => f != a[1]).join(" or ")}`)
+		return 1
+	}
+	try {
+		const tests = replace(a[1], ".bob", ".test.bob")
+		const suite = if (a.length == 3) vectors(model, a[0], a[1], skips) else null
+		if (!writeFile(a[1], generate(model, a[0], a[1])) || suite != null && !writeFile(tests, suite[0])) {
+			print(`smithygen: cannot write ${a[1]} or ${tests}`)
+			return 1
+		}
+		if (suite != null) {
+			print(suite[1])
+		}
+	} catch (e: ModelError) {
+		print(`smithygen: ${e.what}`)
+		return 1
+	}
+	return 0
+}
