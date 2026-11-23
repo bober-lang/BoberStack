@@ -14,7 +14,9 @@
 //! there is no long poll.
 //!
 //! A version is a machine's revision as it was published; an alias routes to one or two, by weight. An execution
-//! started by either runs the version's definition and role. TestState runs one state alone, its tasks performed.
+//! started by either runs the version's definition and role, and is listed by its ARN. DescribeStateMachine of a
+//! version's ARN describes the version; DeleteStateMachine deletes the machine's versions and aliases with it.
+//! TestState runs one state alone, its tasks performed.
 //! Where AWS differs:
 //!
 //! - Tasks are the optimized integrations sqs:sendMessage, sns:publish, dynamodb:getItem, putItem, updateItem and
@@ -29,11 +31,14 @@
 //!   the epoch.
 //! - Heartbeats are accepted and change nothing; no task times out, so neither TaskTimedOut nor an ActivityTimedOut
 //!   event ever comes.
-//! - DescribeStateMachine does not take a version's or alias's ARN, and DeleteStateMachine leaves its versions and
-//!   aliases. TestState's mocks, variables, context and state configuration are ignored, as is revealSecrets; its
+//! - An alias of two versions does not pick at random: of each 100 executions it starts in a row, exactly as many as
+//!   the first's weight run the first version, spread evenly. DescribeStateMachine refuses an alias's ARN.
+//! - TestState's mocks, variables, context and state configuration are ignored, as is revealSecrets; its
 //!   inspection data is the input and the value after each of InputPath, Parameters, the result, ResultSelector and
 //!   ResultPath, of a Pass or Task state, and the matching retrier or catcher; nothing more at TRACE than at DEBUG.
-//! - The other aws-sdk integrations, redrives and map runs are not implemented; nor is JSONata, which
+//! - A redrive takes the execution again from the task whose failure ended it, its history kept, the task's earlier
+//!   events not made again; any other failed or aborted execution is taken again from its start, its steps replayed.
+//! - The other aws-sdk integrations and map runs are not implemented; nor is JSONata, which
 //!   CreateStateMachine refuses.
 //! - Branches of a Parallel and iterations of a Map run one after the other, and a pause in one stops the others.
 //!   Timeouts never pass, and an EXPRESS machine's executions are kept and described as a STANDARD one's.
@@ -123,7 +128,11 @@ export class Handler {
 
 	describeStateMachine(caller: Caller,
 		input: api.DescribeStateMachineInput): api.DescribeStateMachineOutput throws Fault {
-		const m = machine(caller, input.stateMachineArn)
+		const [name, qualifier] = qualified(input.stateMachineArn)
+		if (qualifier != "" && !isDigit(qualifier)) {
+			throw api.validationException(`Invalid Arn: 'Resource type not valid in this context: stateMachine alias'`)
+		}
+		const m = machine(caller, if (qualifier == "") input.stateMachineArn else machineArn(caller, name))
 		const out = new api.DescribeStateMachineOutput()
 		out.stateMachineArn = input.stateMachineArn
 		out.name = m.name
@@ -135,6 +144,14 @@ export class Handler {
 		out.loggingConfiguration = logging()
 		out.tracingConfiguration = tracing()
 		out.revisionId = m.revision
+		if (qualifier != "") {
+			const v = version(new Tables(caller.regional()), name, qualifier, input.stateMachineArn)
+			out.definition = v.definition
+			out.roleArn = v.role
+			out.revisionId = v.revision
+			out.description = v.description
+			out.creationDate = v.created
+		}
 		return out
 	}
 
@@ -342,7 +359,14 @@ export class Handler {
 	deleteStateMachine(caller: Caller, input: api.DeleteStateMachineInput): api.DeleteStateMachineOutput throws Fault {
 		const name = machineName(input.stateMachineArn)
 		caller.allow(input.stateMachineArn)
-		new Tables(caller.regional()).machines.delete(name)
+		const db = new Tables(caller.regional())
+		for (const [k, _] of db.versions.scan(null, 2147483647, `${name}\x00`)) {
+			db.versions.delete(k)
+		}
+		for (const [k, _] of db.aliases.scan(null, 2147483647, `${name}\x00`)) {
+			db.aliases.delete(k)
+		}
+		db.machines.delete(name)
 		return new api.DeleteStateMachineOutput()
 	}
 
@@ -512,12 +536,11 @@ export class Handler {
 		out.cause = e.cause
 		out.stateMachineVersionArn = e.version
 		out.stateMachineAliasArn = e.alias
-		out.redriveCount = 0
-		out.redriveStatus = "NOT_REDRIVABLE"
-		out.redriveStatusReason = "Execution is SUCCEEDED and cannot be redriven"
-		if (e.status != "SUCCEEDED") {
-			out.redriveStatusReason = `Execution is ${e.status} and cannot be redriven`
-		}
+		out.redriveCount = e.redrives
+		out.redriveDate = e.redriven
+		const reason = this.refusal(e)
+		out.redriveStatus = if (reason == "") "REDRIVABLE" else "NOT_REDRIVABLE"
+		out.redriveStatusReason = if (reason == "") null else reason
 		return out
 	}
 
@@ -539,14 +562,21 @@ export class Handler {
 		if (input.stateMachineArn == null) {
 			throw api.validationException("Must provide a StateMachine ARN or MapRun ARN")
 		}
-		const name = machineName(input.stateMachineArn!)
-		caller.allow(input.stateMachineArn!)
+		const arn = input.stateMachineArn!
+		const [name, qualifier] = qualified(arn)
+		caller.allow(arn)
 		const db = new Tables(caller.regional())
 		if (db.machines.get(name) == null) {
-			throw doesNotExist(input.stateMachineArn!)
+			throw doesNotExist(arn)
 		}
-		const all = db.executions.scan(null, 2147483647,
-			`${name}\x00`).map(e => e[1]).filter(e => input.statusFilter == null || e.status == input.statusFilter)
+		if (qualifier != ""
+			&& (if (isDigit(qualifier)) db.versions.get(`${name}\x00${qualifier}`) == null
+			else db.aliases.get(`${name}\x00${qualifier}`) == null)) {
+			throw doesNotExist(arn)
+		}
+		// A version's or alias's ARN lists the executions started by it.
+		const all = db.executions.scan(null, 2147483647, `${name}\x00`).map(e => e[1]).filter(e => (input.statusFilter
+			== null || e.status == input.statusFilter) && (qualifier == "" || e.version == arn || e.alias == arn))
 		const [page, next] = part(all, input.nextToken, input.maxResults)
 		const out = new api.ListExecutionsOutput()
 		out.executions = page.map(e => {
@@ -588,6 +618,47 @@ export class Handler {
 		}
 		const out = new api.StopExecutionOutput()
 		out.stopDate = e.stopped ?? now()
+		return out
+	}
+
+	redriveExecution(caller: Caller, input: api.RedriveExecutionInput): api.RedriveExecutionOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const reason = this.refusal(e)
+		if (reason != "") {
+			throw api.executionNotRedrivable(reason)
+		}
+		// Taken again from the task whose failure ended it, if one did; else from its end, its steps replayed.
+		let kept = e.events.length - 1 - e.shift
+		if (e.status == "FAILED" && e.steps.length > 0 && e.steps.length == e.marks.length) {
+			let last = new Json()
+			try {
+				last = parse(e.steps[e.steps.length - 1])
+			} catch (j: JsonError) {} // written by write
+			if (last.kind == "object" && last.str("Error") == e.error && last.str("Cause") == e.cause) {
+				e.steps.pop()
+				kept = e.marks.pop()!
+			}
+		}
+		e.status = "RUNNING"
+		e.output = null
+		e.error = null
+		e.cause = null
+		e.stopped = null
+		e.redrives++
+		e.redriven = now()
+		const host = new Host(this, caller, e, machineArn(caller, e.machine))
+		host.made = host.kept
+		host.event("ExecutionRedriven", "executionRedrivenEventDetails",
+			obj([["redriveCount", num(e.redrives as f64)]]))
+		e.shift = e.events.length - kept
+		let given = new Json()
+		try {
+			given = parse(e.input)
+		} catch (j: JsonError) {} // validated when started
+		this.run(caller, e, e.version ?? machineArn(caller, e.machine), given)
+		save(new Tables(caller.regional()).executions, nameOf(input.executionArn, "execution"), e)
+		const out = new api.RedriveExecutionOutput()
+		out.redriveDate = e.redriven!
 		return out
 	}
 
@@ -746,7 +817,7 @@ export class Handler {
 		e.role = m.role
 		e.secret = split(uuid(), "-").join("")
 		if (qualifier != "") {
-			const v = version(db, m.name, qualifier, arn)
+			const v = version(db, m.name, qualifier, arn, true)
 			e.definition = v.definition
 			e.role = v.role
 			e.version = `${machineArn(caller, m.name)}:${v.number}`
@@ -761,13 +832,24 @@ export class Handler {
 		return e
 	}
 
+	/// Why the execution e cannot be redriven, "" if it can.
+	private refusal(e: Execution): string {
+		if (e.express) {
+			return "Execution of an EXPRESS state machine cannot be redriven"
+		}
+		if (e.status == "RUNNING" || e.status == "SUCCEEDED") {
+			return `Execution is ${e.status} and cannot be redriven`
+		}
+		return ""
+	}
+
 	/// Runs e, of the machine of the ARN arn, given input, to its end, its history and outcome kept in it.
 	private run(caller: Caller, e: Execution, arn: string, input: Json) throws Fault {
 		const host = new Host(this, caller, e, arn)
 		const time = stamp(e.started)
 		const context = obj([["Execution",
 			obj([["Id", str(executionArn(caller, e))], ["Input", input], ["StartTime", str(time)],
-			["Name", str(e.name)], ["RoleArn", str(e.role)], ["RedriveCount", num(0.0)]])],
+			["Name", str(e.name)], ["RoleArn", str(e.role)], ["RedriveCount", num(e.redrives as f64)]])],
 			["StateMachine", obj([["Id", str(arn)], ["Name", str(e.machine)]])]])
 		host.event("ExecutionStarted", "executionStartedEventDetails",
 			obj([["input", str(e.input)], ["inputDetails", truncated()], ["roleArn", str(e.role)]]))
@@ -827,6 +909,8 @@ export class Handler {
 			return
 		}
 		e.steps.push(write(outcome))
+		// The run paused at the task, its events after it not made.
+		e.marks.push(e.events.length - e.shift)
 		e.waiting = -1
 		e.activity = ""
 		e.work = ""
@@ -1010,7 +1094,8 @@ class Host {
 	step = 0
 	tasks = 0
 	made = 0
-	/// The number of events the execution had before this run.
+	/// The number of events of the execution before this run that a run makes again, all but those its redrives left
+	/// behind.
 	kept: i32
 	/// Whether the run stopped at a task that waits for its token.
 	paused = false
@@ -1020,7 +1105,13 @@ class Host {
 		this.caller = caller
 		this.e = e
 		this.arn = arn
-		this.kept = e.events.length
+		this.kept = e.events.length - e.shift
+	}
+
+	/// Records the step s, with the events made before it.
+	private record(s: Json) {
+		this.e.steps.push(write(s))
+		this.e.marks.push(this.made)
 	}
 
 	task(resource: string, parameters: Json): Json throws asl.Failure {
@@ -1062,7 +1153,7 @@ class Host {
 				this.paused = true
 				throw new asl.Failure("States.Runtime", "The execution waits for its task token")
 			}
-			this.e.steps.push(write(obj([["Output", out]])))
+			this.record(obj([["Output", out]]))
 			return out
 		} catch (f: asl.Failure) {
 			if (f.error == childRunning) {
@@ -1072,7 +1163,7 @@ class Host {
 				throw new asl.Failure("States.Runtime", "The execution waits for its nested execution")
 			}
 			if (!this.paused) {
-				this.e.steps.push(write(obj([["Error", str(f.error)], ["Cause", str(f.cause)]])))
+				this.record(obj([["Error", str(f.error)], ["Cause", str(f.cause)]]))
 			}
 			throw f
 		}
@@ -1110,7 +1201,7 @@ class Host {
 		if (this.paused || this.made <= this.kept) {
 			return
 		}
-		const id = this.made
+		const id = this.made + this.e.shift
 		const t = now()
 		const ms = (t % second) / 1000000
 		const keys: [string, Json][] = [["timestamp", num(((t / second) as f64) + (ms as f64) / 1000.0)],
@@ -1135,7 +1226,7 @@ class Host {
 		} catch (f: Fault) {
 			this.fault = f
 		}
-		this.e.steps.push(write(str(u)))
+		this.record(str(u))
 		return u
 	}
 
@@ -1150,7 +1241,7 @@ class Host {
 			const b = bytes(4)
 			x = (((b[0] as i64) << 16 | (b[1] as i64) << 8 | (b[2] as i64)) as f64) / 16777216.0
 		} catch (e: IoError) {}
-		this.e.steps.push(write(num(x)))
+		this.record(num(x))
 		return x
 	}
 }
@@ -1240,26 +1331,28 @@ function qualified(arn: string): [string, string] throws Fault {
 function isDigit(s: string): bool { return s.length > 0 && s.every(c => c >= 0x30 && c <= 0x39) }
 
 /// The version of the machine named name that qualifier, a version's number or an alias's name, of the ARN arn,
-/// names: of an alias, one of its versions picked by their weights.
-function version(db: Tables, name: string, qualifier: string, arn: string): Version throws Fault {
+/// names; of an alias, as started counts, its first version for the k-th start (from 0) if (k + 1) * w / 100 passes a
+/// whole number k * w / 100 does not, w the first's weight: of each 100 starts in a row, w exactly, spread evenly.
+function version(db: Tables, name: string, qualifier: string, arn: string, started = false): Version throws Fault {
 	let n = 0
 	if (isDigit(qualifier)) {
 		try {
 			n = parseInt(qualifier)
 		} catch (e: ParseError) {}
 	} else {
-		const a = db.aliases.get(`${name}\x00${qualifier}`)
+		const k = `${name}\x00${qualifier}`
+		const a = db.aliases.get(k)
 		if (a == null) {
 			throw api.resourceNotFound(`Resource not found: '${arn}'`)
 		}
 		n = a.routes[0][0]
-		let roll = 0
-		try {
-			const b = bytes(3)
-			roll = (((b[0] as i32) << 16 | (b[1] as i32) << 8 | (b[2] as i32)) % 100) as i32
-		} catch (e: IoError) {}
-		if (a.routes.length == 2 && roll >= a.routes[0][1]) {
+		const w = a.routes[0][1]
+		if (a.routes.length == 2 && (a.starts + 1) * w / 100 == a.starts * w / 100) {
 			n = a.routes[1][0]
+		}
+		if (started) {
+			a.starts++
+			save(db.aliases, k, a!)
 		}
 	}
 	const v = db.versions.get(`${name}\x00${n}`)

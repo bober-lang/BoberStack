@@ -1036,10 +1036,12 @@ function json11Of(g: Gateway, service: string, op: string, body: string): Respon
 	const target = switch (service) {
 		case "kinesis": "Kinesis_20131202"
 		case "firehose": "Firehose_20150804"
+		case "states": "AWSStepFunctions"
 		default: "Logs_20140328"
 	}
 	const req = new Request("POST", "http://localhost:4566/", body)
-	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("content-type",
+		if (service == "states") "application/x-amz-json-1.0" else "application/x-amz-json-1.1")
 	req.headers.set("x-amz-target", `${target}.${op}`)
 	sign(req, body, service, "us-east-1", "test", "test", "", "20150626T140000Z")
 	return g.handle(req)
@@ -1193,6 +1195,58 @@ test "EventBridge targets: a Kinesis stream and a bus as the target's role, a lo
 	const events = json11Of(g, "logs", "GetLogEvents", `{"logGroupName":"/events/g","logStreamName":"${name}"}`)
 	assert indexOf(events.body.whole ?? "", `"message":"{\\"k\\":\\"v\\"}"`) > 0
 	assert bodies(g, "b2").length == 1 && bodies(g, "b3").length == 0
+	g.close()
+}
+
+test "EventBridge targets: a bus of another account as its policy allows, a state machine as a role that trusts EventBridge" {
+	const g = gateway()
+	const far = `arn:aws:events:us-east-1:${other}:event-bus/far`
+	assert call(g, "events", "CreateEventBus", `{"Name":"far"}`, otherRoot()).status == 200
+	queue(g, "far",
+		policy([statement("Allow", `"sqs:SendMessage"`, queueArn("far", other), `{"Service":"events.amazonaws.com"}`,
+		`{"ArnEquals":{"aws:SourceArn":"arn:aws:events:us-east-1:${other}:rule/far/r"}}`)]), "", otherRoot())
+	assert call(g, "events", "PutRule", `{"Name":"r","EventBusName":"far","EventPattern":"{\\"source\\":[\\"app\\"]}"}`,
+		otherRoot()).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","EventBusName":"far","Targets":[{"Id":"q","Arn":"${queueArn("far", other)}"}]}`,
+		otherRoot()).status == 200
+	role(g, "put", "events.amazonaws.com", policy([statement("Allow", `"events:PutEvents"`, "*")]))
+	role(g, "machine", "states.amazonaws.com")
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	const sm = json11Of(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"arn:aws:iam::000000000000:role/machine",`
+		+ `"definition":"{\\"StartAt\\":\\"P\\",\\"States\\":{\\"P\\":{\\"Type\\":\\"Pass\\",\\"End\\":true}}}"}`)
+	assert sm.status == 200
+	const machine = member(sm, "stateMachineArn")
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[`
+		+ `{"Id":"b","Arn":"${far}","RoleArn":"arn:aws:iam::000000000000:role/put","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}},`
+		+ `{"Id":"s","Arn":"${machine}","RoleArn":"arn:aws:iam::000000000000:role/machine",`
+		+ `"DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}]}`).status == 200
+	const put = `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`
+	assert call(g, "events", "PutEvents", put).status == 200
+	// Not yet allowed by the far bus's policy.
+	assert bodies(g, "far", other).length == 0
+	// Each refused delivery reaches the dead-letter queue with what refused it, the role's session's or the bus's.
+	const dead = received(g, "dlq").map(m => m.MessageAttributes ?? [])
+	assert dead.length == 2
+	for (const attributes of dead) {
+		assert attributes.map(a => a[0]).join(",") == "ERROR_CODE,ERROR_MESSAGE,RULE_ARN,TARGET_ARN"
+		assert attributes[0][1].StringValue == "AccessDenied" && attributes[2][1].StringValue == rule
+	}
+	const targets = dead.map(attributes => attributes[3][1].StringValue ?? "")
+	assert targets.some(t => t == machine) && targets.some(t => t == far)
+	assert json11Of(g, "states", "ListExecutions", `{"stateMachineArn":"${machine}"}`).body.whole == `{"executions":[]}`
+	assert call(g, "events", "PutPermission",
+		`{"EventBusName":"far","Action":"events:PutEvents","Principal":"${account}","StatementId":"s"}`,
+		otherRoot()).status == 200
+	assert call(g, "events", "PutEvents", put).status == 200
+	const again = received(g, "dlq").map(m => m.MessageAttributes ?? [])
+	assert again.length == 1 && again[0][3][1].StringValue == machine
+	const [got] = bodies(g, "far", other)
+	assert indexOf(got, `"account":"${account}"`) > 0
 	g.close()
 }
 
