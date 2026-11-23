@@ -1,0 +1,470 @@
+//! AWS Certificate Manager: public certificates requested by DNS or email validation, imported certificates, their
+//! tags and options, and the account's configuration. Where AWS differs:
+//!
+//! - A requested certificate is ISSUED at once: nothing runs between requests and nobody proves control of a domain.
+//!   AWS answers PENDING_VALIDATION until the DNS record exists or the email is answered. Its validation record is
+//!   shaped as AWS's, each domain's status SUCCESS.
+//! - A requested certificate's PEM, which GetCertificate answers, is self-signed by an Ed25519 key of its own, with no
+//!   chain, whatever its key algorithm and the issuer described; its serial is random, and it is valid for 198 days.
+//! - An imported certificate's PEM framing is checked, not its contents: it has no names, dates or key read from it,
+//!   and is described as RSA_2048 with no domain. It is answered by GetCertificate as given. The messages of a
+//!   malformed import and of a validation option of no name requested are not AWS's verbatim.
+//! - KeyAlgorithm is answered as the model names it, RSA_2048; AWS answers RSA-2048.
+//! - Private certificates, ExportCertificate, RevokeCertificate, SearchCertificates, the ACME operations and those of
+//!   tags by resource are not implemented; RenewCertificate, of private certificates, does nothing.
+
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import { Account, accounts, Certificate, certificates, Domain, save } from "./records"
+import { selfSigned } from "./x509"
+import { indexOf, stableSort, startsWith } from "std/algo"
+import { isAlphanumeric } from "std/ascii"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { lower, ParseError, parseInt, split, trim } from "std/string"
+import { EncodeError } from "std/encoding/json"
+import { day } from "std/time"
+
+/// AWS's pattern of a domain name, as its validation errors quote it.
+const domainPattern = "(\\*\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])"
+/// The days a public certificate is valid.
+const validity = 198
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	requestCertificate(caller: Caller,
+		input: api.RequestCertificateRequest): api.RequestCertificateResponse throws Fault {
+		named(input.DomainName, "domainName")
+		for (const n of input.SubjectAlternativeNames ?? []) {
+			named(n, "subjectAlternativeNames")
+		}
+		caller.actions = caller.actions.filter(a => a == "acm:RequestCertificate"
+			|| a == "acm:AddTagsToCertificate" && (input.Tags ?? []).length > 0)
+		const db = certificates(caller.regional())
+		if (input.IdempotencyToken != null) {
+			for (const c of all(db)) {
+				if (c.token == input.IdempotencyToken && c.domain == input.DomainName) {
+					caller.allow(c.arn)
+					return { ...new api.RequestCertificateResponse(), CertificateArn: c.arn }
+				}
+			}
+		}
+		const id = uuid()
+		const arn = `arn:aws:acm:${caller.region}:${caller.account}:certificate/${id}`
+		caller.allow(arn)
+		if (input.CertificateAuthorityArn != null) {
+			throw api.invalidParameterException("Private certificates are not implemented.")
+		}
+		const names = [input.DomainName]
+		for (const n of input.SubjectAlternativeNames ?? []) {
+			if (!names.some(m => m == n)) {
+				names.push(n)
+			}
+		}
+		const options = input.DomainValidationOptions ?? []
+		for (const o of options) {
+			if (!names.some(n => n == o.DomainName)) {
+				throw api.invalidDomainValidationOptionsException(`DomainValidationOption DomainName ${o.DomainName} `
+					+ "is not one of the domain names requested.")
+			}
+		}
+		const t = now()
+		const number = randomBytes(16)
+		const c = { ...new Certificate(), id: id, arn: arn, type: "AMAZON_ISSUED", domain: input.DomainName,
+			method: input.ValidationMethod ?? "EMAIL", keyAlgorithm: input.KeyAlgorithm ?? "RSA_2048",
+			serial: colons(number), token: input.IdempotencyToken, created: t, notAfter: t + validity * day }
+		c.body = selfSigned(names, number, t, c.notAfter, randomBytes(32))
+		for (const n of names) {
+			const o = options.find(o => o.DomainName == n)
+			const base = if (startsWith(n, "*.")) n.slice(2, n.length) else n
+			c.domains.push({ ...new Domain(), name: n, validation: o?.ValidationDomain ?? n,
+				record: `_${hex.encode(randomBytes(16))}.${lower(base)}.`,
+				value: `_${hex.encode(randomBytes(16))}.${letters(10)}.acm-validations.aws.` })
+		}
+		const opts = input.Options
+		if (opts != null) {
+			c.transparency = opts.CertificateTransparencyLoggingPreference ?? "ENABLED"
+			c.exportable = opts.Export ?? "DISABLED"
+		}
+		c.tags = tagged([], input.Tags ?? [])
+		save(db, c)
+		return { ...new api.RequestCertificateResponse(), CertificateArn: arn }
+	}
+
+	importCertificate(caller: Caller, input: api.ImportCertificateRequest): api.ImportCertificateResponse throws Fault {
+		caller.actions = caller.actions.filter(a => a == "acm:ImportCertificate"
+			|| a == "acm:AddTagsToCertificate" && (input.Tags ?? []).length > 0)
+		const db = certificates(caller.regional())
+		let c = new Certificate()
+		if (input.CertificateArn != null) {
+			const [_, old] = found(caller, input.CertificateArn!)
+			if (old.type != "IMPORTED") {
+				throw api.validationException("Only imported certificates can be re-imported.")
+			}
+			if ((input.Tags ?? []).length > 0) {
+				throw api.invalidParameterException("Tags cannot be specified when reimporting a certificate.")
+			}
+			c = old
+		} else {
+			c.id = uuid()
+			c.arn = `arn:aws:acm:${caller.region}:${caller.account}:certificate/${c.id}`
+			caller.allow(c.arn)
+			c.type = "IMPORTED"
+			c.keyAlgorithm = "RSA_2048"
+			c.created = now()
+			c.serial = colons(randomBytes(16))
+			c.tags = tagged([], input.Tags ?? [])
+		}
+		if (pems(input.Certificate, "CERTIFICATE") != 1) {
+			throw api.validationException("The certificate field must contain exactly 1 certificate in PEM format.")
+		}
+		if (pems(input.PrivateKey, "PRIVATE KEY") != 1 && pems(input.PrivateKey, "RSA PRIVATE KEY") != 1
+			&& pems(input.PrivateKey, "EC PRIVATE KEY") != 1) {
+			throw api.validationException("The private key is not supported.")
+		}
+		if (input.CertificateChain != null && pems(input.CertificateChain!, "CERTIFICATE") < 1) {
+			throw api.validationException("The certificate chain must contain certificates in PEM format.")
+		}
+		c.body = input.Certificate
+		c.key = input.PrivateKey
+		c.chain = input.CertificateChain
+		c.imported = now()
+		save(db, c)
+		return { ...new api.ImportCertificateResponse(), CertificateArn: c.arn }
+	}
+
+	describeCertificate(caller: Caller,
+		input: api.DescribeCertificateRequest): api.DescribeCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		return { ...new api.DescribeCertificateResponse(), Certificate: detail(c) }
+	}
+
+	getCertificate(caller: Caller, input: api.GetCertificateRequest): api.GetCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		return { ...new api.GetCertificateResponse(), Certificate: c.body, CertificateChain: c.chain }
+	}
+
+	listCertificates(caller: Caller, input: api.ListCertificatesRequest): api.ListCertificatesResponse throws Fault {
+		caller.allow("*")
+		const db = certificates(caller.regional())
+		const statuses = input.CertificateStatuses ?? []
+		const includes = input.Includes ?? new api.Filters()
+		const keys: string[] = (includes.keyTypes ?? ["RSA_2048"]).map(k => k as string)
+		const origins: string[] = (input.CertificateKeyPairOrigins ?? []).map(o => o as string)
+		const cs = all(db).filter(c => (statuses.length == 0 || statuses.some(s => s == "ISSUED"))
+			&& keys.some(k => k == c.keyAlgorithm) && (origins.length == 0 || origins.some(o => o == origin(c)))
+			&& (includes.exportOption == null || includes.exportOption == c.exportable) && (includes.managedBy == null))
+		const descending = input.SortOrder == "DESCENDING"
+		stableSort(cs, (a, b) => if (descending) a.created > b.created else a.created < b.created)
+		const [from, to, next] = paged(cs.length, input.NextToken, input.MaxItems)
+		const r = new api.ListCertificatesResponse()
+		r.CertificateSummaryList = cs.slice(from, to).map(c => summary(c))
+		r.NextToken = next
+		return r
+	}
+
+	deleteCertificate(caller: Caller, input: api.DeleteCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		db.delete(c.id)
+		return new Unit()
+	}
+
+	addTagsToCertificate(caller: Caller, input: api.AddTagsToCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		const tags = tagged(c.tags, input.Tags)
+		if (tags.length > 50) {
+			throw api.tooManyTagsException("the TagSet: {} contains too many Tags")
+		}
+		c.tags = tags
+		save(db, c)
+		return new Unit()
+	}
+
+	removeTagsFromCertificate(caller: Caller, input: api.RemoveTagsFromCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		c.tags = c.tags.filter(t => !input.Tags.some(g => g.Key == t[0] && (g.Value == null || g.Value == t[1])))
+		save(db, c)
+		return new Unit()
+	}
+
+	listTagsForCertificate(caller: Caller,
+		input: api.ListTagsForCertificateRequest): api.ListTagsForCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		const r = new api.ListTagsForCertificateResponse()
+		r.Tags = c.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return r
+	}
+
+	updateCertificateOptions(caller: Caller, input: api.UpdateCertificateOptionsRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		if (c.type == "IMPORTED") {
+			throw api.invalidStateException("The selected certificate is not Issued and/or Valid.")
+		}
+		c.transparency = input.Options.CertificateTransparencyLoggingPreference ?? c.transparency
+		save(db, c)
+		return new Unit()
+	}
+
+	resendValidationEmail(caller: Caller, input: api.ResendValidationEmailRequest): Unit throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		throw api.invalidStateException(`Certificate ${c.arn} is not in pending validation state`)
+	}
+
+	renewCertificate(caller: Caller, input: api.RenewCertificateRequest): Unit throws Fault {
+		found(caller, input.CertificateArn)
+		return new Unit()
+	}
+
+	getAccountConfiguration(caller: Caller, input: Unit): api.GetAccountConfigurationResponse throws Fault {
+		caller.allow("*")
+		const a = accounts(caller.regional()).get("") ?? new Account()
+		const e = { ...new api.ExpiryEventsConfiguration(), DaysBeforeExpiry: a.daysBeforeExpiry }
+		return { ...new api.GetAccountConfigurationResponse(), ExpiryEvents: e }
+	}
+
+	putAccountConfiguration(caller: Caller, input: api.PutAccountConfigurationRequest): Unit throws Fault {
+		caller.allow("*")
+		const t = accounts(caller.regional())
+		const a = t.get("") ?? new Account()
+		const days = input.ExpiryEvents?.DaysBeforeExpiry
+		if (days != null) {
+			if (days > 45) {
+				throw api.validationException("DaysBeforeExpiry must be between 1 and 45.")
+			}
+			a.daysBeforeExpiry = days!
+		}
+		try {
+			t.put("", a)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		}
+		return new Unit()
+	}
+}
+
+/// The table of the caller's certificates and the one of arn, which the caller may act on.
+function found(caller: Caller, arn: string): [Table[Certificate], Certificate] throws Fault {
+	caller.allow(arn)
+	const db = certificates(caller.regional())
+	const prefix = `arn:aws:acm:${caller.region}:${caller.account}:certificate/`
+	const c = if (startsWith(arn, prefix)) db.get(arn.slice(prefix.length, arn.length)) else null
+	if (c == null) {
+		throw api.resourceNotFoundException(`Could not find certificate ${arn}.`)
+	}
+	return [db, c!]
+}
+
+/// Every certificate of db.
+function all(db: Table[Certificate]): Certificate[] {
+	const out: Certificate[] = []
+	let after: string | null = null
+	while (true) {
+		const chunk = db.scan(after, 100)
+		for (const [_, c] of chunk) {
+			out.push(c)
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+}
+
+/// Throws AWS's validation error unless n is a domain name of its pattern, of the member named.
+function named(n: string, member: string) throws Fault {
+	const labels = split(if (startsWith(n, "*.")) n.slice(2, n.length) else n, ".")
+	let ok = labels.length >= 2
+	for (let i = 0; i < labels.length && ok; i++) {
+		const l = labels[i]
+		const shortest = if (i == labels.length - 1) 2 else 1
+		ok = l.length >= shortest && l.length <= 63 && l[0] != "-"[0] && l[l.length - 1] != "-"[0]
+		for (let j = 0; j < l.length && ok; j++) {
+			ok = isAlphanumeric(l[j]) || l[j] == "-"[0]
+		}
+	}
+	if (!ok) {
+		throw api.validationException(`1 validation error detected: Value of the input at '${member}' failed to satisfy `
+			+ `constraint: Member must satisfy regular expression pattern: ${domainPattern}`)
+	}
+}
+
+/// How many PEM blocks of the label s holds, or -1 if anything else.
+function pems(s: string, label: string): i32 {
+	const begin = `-----BEGIN ${label}-----`
+	const end = `-----END ${label}-----`
+	let n = 0
+	let rest = s
+	while (true) {
+		const trimmed = trim(rest)
+		if (trimmed == "") {
+			return n
+		}
+		if (!startsWith(trimmed, begin)) {
+			return -1
+		}
+		const e = indexOf(trimmed, end)
+		if (e < 0) {
+			return -1
+		}
+		const body = trimmed.slice(begin.length, e)
+		for (let i = 0; i < body.length; i++) {
+			const b = body[i]
+			if (!isAlphanumeric(b) && b != "+"[0] && b != "/"[0] && b != "="[0] && b != "\n"[0] && b != "\r"[0]) {
+				return -1
+			}
+		}
+		n++
+		rest = trimmed.slice(e + end.length, trimmed.length)
+	}
+}
+
+/// The CertificateDetail of c, as DescribeCertificate answers it.
+function detail(c: Certificate): api.CertificateDetail {
+	const d = new api.CertificateDetail()
+	d.CertificateArn = c.arn
+	d.DomainName = c.domain
+	d.SubjectAlternativeNames = if (c.domains.length == 0) null else c.domains.map(n => n.name)
+	d.Serial = c.serial
+	d.Status = "ISSUED"
+	d.KeyAlgorithm = c.keyAlgorithm as api.KeyAlgorithm
+	d.SignatureAlgorithm = signature(c.keyAlgorithm)
+	d.InUseBy = []
+	d.Type = c.type as api.CertificateType
+	d.RenewalEligibility = "INELIGIBLE"
+	d.KeyUsages = []
+	d.ExtendedKeyUsages = []
+	d.CreatedAt = c.created
+	d.NotAfter = c.notAfter
+	d.CertificateKeyPairOrigin = origin(c) as api.CertificateKeyPairOrigin
+	if (c.type == "IMPORTED") {
+		d.ImportedAt = c.imported
+		return d
+	}
+	d.Subject = `CN=${c.domain ?? ""}`
+	d.Issuer = "Amazon"
+	d.IssuedAt = c.created
+	d.NotBefore = c.created
+	d.DomainValidationOptions = c.domains.map(n => validation(c, n))
+	d.KeyUsages = [{ ...new api.KeyUsage(), Name: "DIGITAL_SIGNATURE" },
+		{ ...new api.KeyUsage(), Name: "KEY_ENCIPHERMENT" }]
+	d.ExtendedKeyUsages = [{ ...new api.ExtendedKeyUsage(), Name: "TLS_WEB_SERVER_AUTHENTICATION",
+		OID: "1.3.6.1.5.5.7.3.1" }]
+	d.Options = { ...new api.CertificateOptions(),
+		CertificateTransparencyLoggingPreference: c.transparency as api.CertificateTransparencyLoggingPreference,
+		Export: c.exportable as api.CertificateExport }
+	return d
+}
+
+/// The validation of the name n of c, succeeded.
+function validation(c: Certificate, n: Domain): api.DomainValidation {
+	const v = { ...new api.DomainValidation(), DomainName: n.name, ValidationDomain: n.validation,
+		ValidationStatus: "SUCCESS", ValidationMethod: c.method as api.ValidationMethod }
+	if (c.method == "DNS") {
+		v.ResourceRecord = { ...new api.ResourceRecord(), Name: n.record, Value: n.value }
+	} else {
+		v.ValidationEmails = ["admin", "administrator", "hostmaster", "postmaster",
+			"webmaster"].map(u => `${u}@${n.validation}`)
+	}
+	return v
+}
+
+/// The summary of c, as ListCertificates answers it.
+function summary(c: Certificate): api.CertificateSummary {
+	const s = new api.CertificateSummary()
+	s.CertificateArn = c.arn
+	s.DomainName = c.domain
+	s.SubjectAlternativeNameSummaries = if (c.domains.length == 0) null else c.domains.map(n => n.name)
+	s.HasAdditionalSubjectAlternativeNames = false
+	s.Status = "ISSUED"
+	s.Type = c.type as api.CertificateType
+	s.KeyAlgorithm = c.keyAlgorithm as api.KeyAlgorithm
+	s.KeyUsages = []
+	s.ExtendedKeyUsages = []
+	s.ExportOption = c.exportable as api.CertificateExport
+	s.InUse = false
+	s.Exported = false
+	s.RenewalEligibility = "INELIGIBLE"
+	s.CreatedAt = c.created
+	s.NotAfter = c.notAfter
+	s.CertificateKeyPairOrigin = origin(c) as api.CertificateKeyPairOrigin
+	if (c.type == "IMPORTED") {
+		s.ImportedAt = c.imported
+	} else {
+		s.IssuedAt = c.created
+		s.NotBefore = c.created
+	}
+	return s
+}
+
+/// Where the key pair of c comes from.
+function origin(c: Certificate): string { return if (c.type == "IMPORTED") "CUSTOMER_PROVIDED" else "AWS_MANAGED" }
+
+/// The signature algorithm of a certificate of the key algorithm k.
+function signature(k: string): string {
+	return if (k == "EC_prime256v1") "SHA256WITHECDSA"
+		else if (k == "EC_secp384r1") "SHA384WITHECDSA"
+		else if (k == "EC_secp521r1") "SHA512WITHECDSA"
+		else "SHA256WITHRSA"
+}
+
+/// tags with given over them, by key.
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	for (const g of given) {
+		out.push([g.Key, g.Value ?? ""])
+	}
+	return out
+}
+
+/// The range of a page of n items from the token, of at most max, 1000 if null; and the next page's token.
+function paged(n: i32, token: string | null, max: i32 | null): [i32, i32, string | null] throws Fault {
+	let from = 0
+	if (token != null) {
+		try {
+			from = parseInt(base64.decode(token!))
+		} catch (e: ParseError) {
+			throw api.invalidArgsException("The NextToken value is invalid.")
+		}
+	}
+	const to = if (from + (max ?? 1000) < n) from + (max ?? 1000) else n
+	return [from, to, if (to < n) base64.encode(`${to}`) else null]
+}
+
+/// The serial number of the bytes b as AWS writes one: hex pairs joined by colons.
+function colons(b: string): string {
+	const h = hex.encode(b)
+	const pairs: string[] = []
+	for (let i = 0; i < h.length; i += 2) {
+		pairs.push(h.slice(i, i + 2))
+	}
+	return pairs.join(":")
+}
+
+/// n random lower-case letters.
+function letters(n: i32): string throws Fault {
+	const out: u8[] = []
+	for (const b of randomBytes(n)) {
+		out.push("a"[0] + b % 26)
+	}
+	return fromBytes(out)
+}
+
+/// A random UUID, as a certificate's id.
+function uuid(): string throws Fault {
+	const h = hex.encode(randomBytes(16))
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+/// n random bytes.
+function randomBytes(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}

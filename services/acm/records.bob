@@ -1,0 +1,61 @@
+//! ACM's state in an account's regional tree: its certificates by id, and the account's configuration.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+
+/// A name of a certificate and how its control is proven.
+export class Domain {
+	name = ""
+	/// The domain its validation is sent to, by email, or the name.
+	validation = ""
+	/// The CNAME record's name and value proving it by DNS.
+	record = ""
+	value = ""
+}
+
+export class Certificate {
+	id = ""
+	arn = ""
+	/// AMAZON_ISSUED or IMPORTED.
+	type = ""
+	/// The first of the names, null for an imported certificate, whose names are not read.
+	domain: string | null = null
+	domains: Domain[] = []
+	/// EMAIL or DNS, of a requested certificate.
+	method = ""
+	keyAlgorithm = ""
+	serial = ""
+	/// The idempotency token it was requested with, null if none.
+	token: string | null = null
+	transparency = "ENABLED"
+	exportable = "DISABLED"
+	tags: [string, string][] = []
+	created: i64 = 0
+	/// When it was imported last, 0 if it was requested.
+	imported: i64 = 0
+	notAfter: i64 = 0
+	/// The certificate's PEM: as imported, or self-signed for a request; an imported one's chain and key as given.
+	body = ""
+	chain: string | null = null
+	key = ""
+}
+
+/// The account's configuration: the days before a certificate expires that EventBridge is told of it.
+export class Account {
+	daysBeforeExpiry: i32 = 45
+}
+
+/// The certificates of an account's regional tree, by id.
+export function certificates(s: Store): Table[Certificate] { return new Table[Certificate](s, "acm/certificates") }
+/// The account's configuration in its regional tree, by "".
+export function accounts(s: Store): Table[Account] { return new Table[Account](s, "acm/account") }
+
+/// Puts c in t; a record holds no float, the one thing JSON cannot encode.
+export function save(t: Table[Certificate], c: Certificate) throws Fault {
+	try {
+		t.put(c.id, c)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

@@ -1,0 +1,57 @@
+//! Self-signed X.509 certificates of Ed25519 keys, in DER and PEM, as a requested certificate's stand-in.
+
+import { Fault } from "../../core/fault"
+import { CryptoError } from "std/crypto/error"
+import { ed25519PublicKey, ed25519Sign } from "std/crypto/curve25519"
+import * as base64 from "std/encoding/base64"
+import { iso8601Basic } from "std/time"
+
+const ed25519 = "\x06\x03\x2b\x65\x70"
+const commonName = "\x06\x03\x55\x04\x03"
+const subjectAltName = "\x06\x03\x55\x1d\x11"
+
+/// The PEM of a certificate of names, the first its subject's common name, of the serial's bytes, valid from and to,
+/// signed by the key of seed, which it is of.
+export function selfSigned(names: string[], serial: string, from: i64, to: i64, seed: string): string throws Fault {
+	try {
+		const subject = seq([set([seq([commonName, tlv(0x0c, names[0])])])])
+		const sans = seq([seq([subjectAltName, tlv(0x04, seq(names.map(n => tlv(0x82, n))))])])
+		const tbs = seq([tlv(0xa0, "\x02\x01\x02"), integer(serial), seq([ed25519]), subject,
+			seq([time(from), time(to)]), subject, seq([seq([ed25519]), tlv(0x03, "\x00" + ed25519PublicKey(seed))]),
+			tlv(0xa3, sans)])
+		return pem(seq([tbs, seq([ed25519]), tlv(0x03, "\x00" + ed25519Sign(seed, tbs))]))
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", `No certificate signed: ${e}`)
+	}
+}
+
+/// The DER of a tag and its content.
+function tlv(tag: i32, content: string): string {
+	const n = content.length
+	const length = if (n < 0x80) fromBytes([n as u8])
+		else if (n < 0x100) fromBytes([0x81, n as u8])
+		else fromBytes([0x82, (n >> 8) as u8, (n & 0xff) as u8])
+	return fromBytes([tag as u8]) + length + content
+}
+
+function seq(parts: string[]): string { return tlv(0x30, parts.join("")) }
+function set(parts: string[]): string { return tlv(0x31, parts.join("")) }
+/// The DER of the unsigned integer of the big-endian bytes b.
+function integer(b: string): string { return tlv(0x02, if (b[0] >= 0x80) "\x00" + b else b) }
+
+/// The UTCTime of t, as YYMMDDHHMMSSZ.
+function time(t: i64): string {
+	const s = iso8601Basic(t)
+	return tlv(0x17, `${s.slice(2, 8)}${s.slice(9, 15)}Z`)
+}
+
+/// The PEM of a certificate's DER, of lines of 64 characters.
+function pem(der: string): string {
+	const b = base64.encode(der)
+	const lines = ["-----BEGIN CERTIFICATE-----"]
+	for (let i = 0; i < b.length; i += 64) {
+		lines.push(b.slice(i, if (i + 64 < b.length) i + 64 else b.length))
+	}
+	lines.push("-----END CERTIFICATE-----")
+	return lines.join("\n") + "\n"
+}
