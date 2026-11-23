@@ -1,0 +1,92 @@
+//! CloudWatch Logs' state in an account's regional tree. Streams, filters and subscriptions are by the group's name, a
+//! NUL and their own; events by the stream's key, a NUL and the id, which starts with the timestamp.
+
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+
+export class Group {
+	name = ""
+	/// In ms, as are all times here.
+	created: i64 = 0
+	retention: i32 | null = null
+	kmsKey: string | null = null
+	class = "STANDARD"
+	tags: [string, string][] = []
+	protected = false
+}
+
+export class Stream {
+	name = ""
+	created: i64 = 0
+	/// The timestamps of its first and last events and when the last was put, 0 if it has none.
+	first: i64 = 0
+	last: i64 = 0
+	ingested: i64 = 0
+	token = ""
+}
+
+export class Event {
+	message = ""
+	ingested: i64 = 0
+}
+
+export class MetricFilter {
+	name = ""
+	pattern = ""
+	transformations: api.MetricTransformation[] = []
+	created: i64 = 0
+}
+
+export class Subscription {
+	name = ""
+	pattern = ""
+	destination = ""
+	role: string | null = null
+	distribution = "ByLogStream"
+	created: i64 = 0
+}
+
+export class Policy {
+	name = ""
+	document = ""
+	updated: i64 = 0
+}
+
+/// A Logs Insights query, of ./insights; its time range in seconds, as StartQuery gives it.
+export class Query {
+	id = ""
+	text = ""
+	groups: string[] = []
+	start: i64 = 0
+	end: i64 = 0
+	limit: i32 | null = null
+	created: i64 = 0
+	status = "Complete"
+}
+
+export class Definition {
+	id = ""
+	name = ""
+	text = ""
+	groups: string[] | null = null
+	updated: i64 = 0
+}
+
+/// The last event id's sequence, which makes ids unique in the region.
+export class Sequence {
+	n: i64 = 0
+}
+
+export function groups(s: Store): Table[Group] { return new Table[Group](s, "logs/groups") }
+export function streams(s: Store): Table[Stream] { return new Table[Stream](s, "logs/streams") }
+export function events(s: Store): Table[Event] { return new Table[Event](s, "logs/events") }
+
+export function metricFilters(s: Store): Table[MetricFilter] {
+	return new Table[MetricFilter](s, "logs/metric-filters")
+}
+
+export function subscriptions(s: Store): Table[Subscription] { return new Table[Subscription](s, "logs/subscriptions") }
+export function policies(s: Store): Table[Policy] { return new Table[Policy](s, "logs/policies") }
+export function queries(s: Store): Table[Query] { return new Table[Query](s, "logs/queries") }
+export function definitions(s: Store): Table[Definition] { return new Table[Definition](s, "logs/query-definitions") }
+export function sequence(s: Store): Table[Sequence] { return new Table[Sequence](s, "logs/sequence") }

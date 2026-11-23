@@ -1,0 +1,128 @@
+import { Fault } from "../../core/fault"
+import { match, parse } from "./pattern"
+
+const lines = ["ERROR one", "[ERROR] two", "error three", "ERRORS four", "xERRORx", "WARN five", "a-b c",
+	"Failed to start", "plain", "ERROR WARN", "x=1 y"]
+
+/// The numbers, from 1, of the messages the pattern p matches, as TestMetricFilter gives them.
+function hits(p: string, messages: string[] = lines): i32[] {
+	const parsed = parse(p)
+	const out: i32[] = []
+	for (let i = 0; i < messages.length; i++) {
+		if (match(parsed, messages[i]) != null) {
+			out.push(i + 1)
+		}
+	}
+	return out
+}
+
+function invalid(why: string): Fault { return new Fault(400, "InvalidParameterException", why) }
+
+test "terms, phrases, alternatives and exclusions, as AWS matched them" {
+	assert hits("") == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+	assert hits(" ") == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+	assert hits("ERROR") == [1, 2, 4, 5, 10]
+	assert hits("ERR") == [1, 2, 4, 5, 10]
+	assert hits("error") == [3]
+	assert hits("ERROR one") == [1]
+	assert hits("?ERROR ?WARN") == [1, 2, 4, 5, 6, 10]
+	assert hits("ERROR -one") == [2, 4, 5, 10]
+	assert hits("-ERROR") == [3, 6, 7, 8, 9, 11]
+	assert hits(`"Failed to"`) == [8]
+	assert hits("a-b") == [8, 9]
+	assert hits(`"a-b"`) == [7]
+	assert hits("x=1") == [11]
+	assert hits("?ERROR WARN") == [6, 10]
+	assert hits("ERROR ?WARN") == [1, 2, 4, 5, 10]
+	assert hits("?ERROR -two") == [1, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+	assert hits(`"ERR"`) == [1, 2, 4, 5, 10]
+	assert hits("%E.*R%") == [1, 2, 4, 5, 10]
+	assert hits("*") throws invalid("Invalid character(s) in term '*'")
+	assert hits("ERROR || WARN") throws invalid("Invalid character(s) in term '|'")
+	assert hits("(ERROR)") throws invalid("Invalid character(s) in term '('")
+	assert hits(`ERROR"`) throws invalid(`Invalid character(s) in term '"'`)
+}
+
+const documents = [`{"a": 1, "b": "xyz", "c": {"d": [1, 2, {"e": "f"}]}, "t": true, "n": null, "f": 1.5, "s": "1"}`,
+	`{"a": 2, "b": "abc"}`, "not json", "[1,2]", `{"a": "1"}`]
+
+test "JSON patterns, as AWS matched them" {
+	const j = (p: string) => hits(p, documents)
+	assert j("{ $.a = 1 }") == [1, 5]
+	assert j(`{ $.a = "1" }`) == [1, 5]
+	assert j("{$.a=1}") == [1, 5]
+	assert j("{ $.a > 1 }") == [2]
+	assert j("{ $.a >= 1 }") == [1, 2]
+	assert j("{ $.a != 1 }") == [2]
+	assert j(`{ $.b = "x*" }`) == [1]
+	assert j("{ $.b = *z }") == [1]
+	assert j(`{ $.b = "*y*" }`) == [1]
+	assert j("{ $.c.d[0] = 1 }") == [1]
+	assert j(`{ $.c.d[2].e = "f" }`) == [1]
+	assert j("{ $.c.d[*] = 2 }") == [1]
+	assert j("{ $.t IS TRUE }") == [1]
+	assert j("{ $.t IS FALSE }") == []
+	assert j("{ $.n IS NULL }") == [1]
+	assert j("{ $.zz NOT EXISTS }") == [1, 2, 5]
+	assert j(`{ $.a = 1 && $.b = "xyz" }`) == [1]
+	assert j(`{ $.a = 2 || $.b = "xyz" }`) == [1, 2]
+	assert j(`{ ($.a = 1 || $.a = 2) && $.b = "abc" }`) == [2]
+	assert j("{ $.f > 1.2 }") == [1]
+	assert j("{ $.s = 1 }") == [1]
+	assert j("{ $.a = * }") == [1, 2, 5]
+	assert j(`{ $.b = "XYZ" }`) == []
+	assert j(`{ $.b != "x*" }`) == [2]
+	assert j("{ $.a < 1.5e1 }") == [1, 2]
+	assert j("{ $.zz != 1 }") == []
+	assert j("{ $.c.d = 1 }") == []
+	assert j("{ $.b = %ab.%}") == [2]
+	assert j("{ $.a = 1") throws invalid("If a filter pattern starts with '{' it must end with '}'")
+	for (const p of ["{ $.a == 1 }", "{ $.a }", "{ a = 1 }", "{ $.c EXISTS }"]) {
+		assert j(p) throws invalid("Invalid metric filter pattern")
+	}
+}
+
+const access = `1.2.3.4 - bob [10/Oct/2000:13:55:36 -0700] "GET /a.gif HTTP/1.0" 200 2326`
+const records = [access, "a b c", "a b", "x  y   z", "a,b c", "5 hello"]
+
+function extracted(p: string): [i32, [string, string][]][] {
+	const parsed = parse(p)
+	const out: [i32, [string, string][]][] = []
+	for (let i = 0; i < records.length; i++) {
+		const m = match(parsed, records[i])
+		if (m != null) {
+			out.push([i + 1, m!])
+		}
+	}
+	return out
+}
+
+test "space-delimited patterns, as AWS matched them" {
+	const s = (p: string) => hits(p, records)
+	assert extracted("[ip, id, user, ts, req, status, size]")
+		== [[1,
+		[["$ip", "1.2.3.4"], ["$id", "-"], ["$user", "bob"], ["$ts", "10/Oct/2000:13:55:36 -0700"],
+		["$req", "GET /a.gif HTTP/1.0"], ["$status", "200"], ["$size", "2326"]]]]
+	assert extracted("[a, b, c]")
+		== [[1,
+		[["$a", "1.2.3.4"], ["$b", "-"], ["$c", `bob [10/Oct/2000:13:55:36 -0700] "GET /a.gif HTTP/1.0" 200 2326`]]],
+		[2, [["$a", "a"], ["$b", "b"], ["$c", "c"]]], [4, [["$a", "x"], ["$b", "y"], ["$c", "z"]]]]
+	assert extracted("[a, b]")[3] == [4, [["$a", "x"], ["$b", "y   z"]]]
+	assert extracted("[a, ...]")[2] == [3, [["$a", "a"], ["$2", "b"]]]
+	assert extracted("[..., last]")[1] == [2, [["$1", "a"], ["$2", "b"], ["$last", "c"]]]
+	assert extracted("[a, ..., z]")[1] == [2, [["$a", "a"], ["$2", "b"], ["$z", "c"]]]
+	assert extracted("[]")[2] == [3, [["$1", "a"], ["$2", "b"]]]
+	assert s("[a]") == [1, 2, 3, 4, 5, 6]
+	assert s("[ip, id, user, ts, req, status = 2*, size > 2000]") == [1]
+	assert s("[ip, id, user, ts, req, status != 200, size]") == []
+	assert s("[a, b = b, c]") == [2]
+	assert s("[a = 5 || a = a, ...]") == [2, 3, 6]
+	assert s("[n > 3, ...]") == [6]
+	assert s(`[a, b = "b", ...]`) == [2, 3]
+	assert s("[ip=1.2.3.4, ...]") == [1]
+	assert s("[a, b, c, ...]") == [1, 2, 4]
+	assert s("[..., status = %2..%, size]") == [1]
+	assert s("[a, b") throws invalid("If a filter pattern starts with '[' it must end with ']'")
+	const why = "Multiple variables used in a single filter. Var1 : status, Var2 : size"
+	assert s("[ip, ..., status = 200 && size > 1, size]") throws invalid(why)
+}

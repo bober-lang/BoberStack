@@ -1,0 +1,89 @@
+//! What metric filters publish: each matching event's transformations put a datum to CloudWatch, as CloudWatch Logs
+//! does on the account's behalf, with no role, within the request. A default value is put once, at the time of the
+//! batch's last event, for a batch of which no event matches.
+
+import { Caller } from "../../core/service"
+import { Fault } from "../../core/fault"
+import * as cloudwatchApi from "../cloudwatch/api"
+import * as api from "./api"
+import { match, parse, Pattern, valueOf } from "./pattern"
+import { MetricFilter } from "./records"
+import { parseFloat } from "std/float"
+import { ParseError } from "std/string"
+import { millisecond } from "std/time"
+
+const datumLimit = 1000
+
+export function publish(cw: cloudwatchApi.CloudWatch, caller: Caller, source: string, filters: MetricFilter[],
+	put: api.InputLogEvent[]) {
+	if (put.length == 0) {
+		return
+	}
+	const as = caller.internal("logs.amazonaws.com", source, [])
+	for (const f of filters) {
+		const p = pattern(f.pattern)
+		if (p == null) {
+			continue
+		}
+		const matches: [api.InputLogEvent, [string, string][]][] = []
+		for (const e of put) {
+			const values = match(p!, e.message)
+			if (values != null) {
+				matches.push([e, values!])
+			}
+		}
+		for (const t of f.transformations) {
+			const data: cloudwatchApi.MetricDatum[] = []
+			for (const [e, values] of matches) {
+				const d = datum(t, valueOf(values, e.message, t.metricValue) ?? t.metricValue, e.timestamp)
+				let complete = d != null
+				for (const [name, field] of t.dimensions ?? []) {
+					const v = valueOf(values, e.message, field)
+					if (v == null || v == "" || d == null) {
+						complete = false
+					} else {
+						d!.Dimensions!.push({ ...new cloudwatchApi.Dimension(), Name: name, Value: v! })
+					}
+				}
+				if (complete) {
+					data.push(d!)
+				}
+			}
+			if (matches.length == 0 && t.defaultValue != null) {
+				data.push(datum(t, `${t.defaultValue!}`, put[put.length - 1].timestamp)!)
+			}
+			for (let i = 0; i < data.length; i += datumLimit) {
+				const input = new cloudwatchApi.PutMetricDataInput()
+				input.Namespace = t.metricNamespace
+				input.MetricData = data.slice(i, if (i + datumLimit < data.length) i + datumLimit else data.length)
+				try {
+					cw.putMetricData(as, input)
+				} catch (e: Fault) {
+					// Dropped, as AWS drops what it cannot publish.
+				}
+			}
+		}
+	}
+}
+
+function pattern(s: string): Pattern | null {
+	try {
+		return parse(s)
+	} catch (e: Fault) {
+		return null
+	}
+}
+
+function datum(t: api.MetricTransformation, value: string, ms: i64): cloudwatchApi.MetricDatum | null {
+	const d = new cloudwatchApi.MetricDatum()
+	try {
+		d.Value = parseFloat(value)
+	} catch (e: ParseError) {
+		return null
+	}
+	d.MetricName = t.metricName
+	d.Dimensions = []
+	d.Timestamp = ms * millisecond
+	d.Unit = t.unit
+	return d
+}

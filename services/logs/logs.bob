@@ -1,0 +1,971 @@
+//! Amazon CloudWatch Logs: log groups, streams and events, filtered by ./pattern; metric and subscription filters,
+//! resource policies, and Logs Insights of ./insights. Exports, deliveries, anomaly detection, transformers and the
+//! rest are not implemented. Where AWS differs:
+//!
+//! - Nothing runs between requests: retention hides events older than it at each request, and a subscription filter
+//!   is sent the events of each PutLogEvents it matches within that request, by calling the Kinesis or Firehose handler
+//!   as a session of the filter's role; one refused is dropped, never retried. A Kinesis record's partition key is the
+//!   request's id, and its events carry no extractedFields. A filter to Lambda or a destination is refused.
+//! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
+//! - Stored bytes are always 0.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import * as insights from "./insights"
+import { match, parse } from "./pattern"
+import { list, member } from "../events/pattern"
+import * as firehoseApi from "../firehose/api"
+import * as kinesisApi from "../kinesis/api"
+import { actAs, passRole } from "../sts/sts"
+import * as cloudwatchApi from "../cloudwatch/api"
+import { publish } from "./metrics"
+
+import { events, Event, Group, groups, MetricFilter, metricFilters, policies, Policy, Sequence, sequence, Stream,
+	streams, Subscription, subscriptions } from "./records"
+
+import { endsWith, indexOf, sortBy, startsWith } from "std/algo"
+import { isDigit } from "std/ascii"
+import { gzip } from "std/compress/gzip"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { ParseError, parseInt, split } from "std/string"
+import { Decodable } from "std/types"
+import { day, hour, millisecond } from "std/time"
+
+const retentions = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288,
+	3653]
+
+/// The subscription filters a log group may have, and the resource policies a region.
+const subscriptionLimit = 2
+const policyLimit = 10
+/// The bytes a PutLogEvents batch may hold, each event counting its message and 26.
+const batchBytes = 1048576
+const noGroup = "The specified log group does not exist."
+const noStream = "The specified log stream does not exist."
+const badToken = "The specified nextToken is invalid."
+
+export class Handler {
+	...api.Unimplemented
+
+	/// What subscription filters deliver to, which the stack sets.
+	kinesis: kinesisApi.Kinesis | null = null
+	firehose: firehoseApi.Firehose | null = null
+	/// What metric filters publish to, which the stack sets.
+	cloudwatch: cloudwatchApi.CloudWatch | null = null
+
+	/// Whether the stream took data, put as CloudWatch Logs under role on behalf of the log group source.
+	private send(caller: Caller, stream: string, role: string, source: string, data: string): bool {
+		if (startsWith(stream, "arn:aws:firehose:")) {
+			if (this.firehose == null) {
+				return false
+			}
+			const p = new firehoseApi.PutRecordInput()
+			p.DeliveryStreamName = stream.slice(indexOf(stream, "/") + 1, stream.length)
+			p.Record.Data = gzip(data)
+			try {
+				this.firehose!.putRecord(assumed(caller, role, source, ["firehose:PutRecord"]), p)
+			} catch (f: Fault) {
+				return false
+			}
+			return true
+		}
+		if (this.kinesis == null) {
+			return false
+		}
+		const r = new kinesisApi.PutRecordInput()
+		r.StreamARN = stream
+		r.Data = gzip(data)
+		r.PartitionKey = caller.requestId
+		try {
+			this.kinesis!.putRecord(assumed(caller, role, source, ["kinesis:PutRecord"]), r)
+		} catch (f: Fault) {
+			return false
+		}
+		return true
+	}
+
+	createLogGroup(caller: Caller, input: api.CreateLogGroupRequest): Unit throws Fault {
+		const tags = input.tags ?? []
+		caller.actions = caller.actions.filter(a => a == "logs:CreateLogGroup" || tags.length > 0)
+		const name = input.logGroupName
+		caller.allow(arnOf(caller, name), null, requestTags(tags))
+		const db = groups(caller.regional())
+		if (db.get(name) != null) {
+			throw api.resourceAlreadyExistsException("The specified log group already exists")
+		}
+		db.put(name,
+			{ ...new Group(), name: name, created: ms(), kmsKey: input.kmsKeyId,
+			class: input.logGroupClass ?? "STANDARD", tags: tags, protected: input.deletionProtectionEnabled ?? false })
+		return new Unit()
+	}
+
+	deleteLogGroup(caller: Caller, input: api.DeleteLogGroupRequest): Unit throws Fault {
+		const name = input.logGroupName
+		caller.allow(arnOf(caller, name))
+		const s = caller.regional()
+		const g = found(caller, name)
+		if (g.protected) {
+			throw invalid("LogGroup has delete protection enabled. Disable delete protection before attempting to "
+				+ "delete the resource.")
+		}
+		groups(s).delete(name)
+		const under = name + "\x00"
+		clear(streams(s), under)
+		clear(events(s), under)
+		clear(metricFilters(s), under)
+		clear(subscriptions(s), under)
+		return new Unit()
+	}
+
+	describeLogGroups(caller: Caller, input: api.DescribeLogGroupsRequest): api.DescribeLogGroupsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:log-group::log-stream:`)
+		const pattern = input.logGroupNamePattern
+		if (input.logGroupNamePrefix != null && pattern != null) {
+			throw invalid("LogGroup name prefix and LogGroup name pattern are mutually exclusive parameters.")
+		}
+		const prefix = input.logGroupNamePrefix ?? ""
+		const token = input.nextToken
+		if (token != null && !startsWith(token!, prefix)) {
+			throw invalid(badToken)
+		}
+		const named = (input.logGroupIdentifiers ?? []).map(i => nameOf(i))
+		const s = caller.regional()
+		const [found, more] = page[Group](groups(s), prefix, token, input.limit ?? 50,
+			g => (pattern == null || indexOf(g.name, pattern!) >= 0) && (named.length == 0 || named.includes(g.name))
+			&& (input.logGroupClass == null || g.class == input.logGroupClass))
+		// AWS searches by pattern or class apart, giving a token after the last page too, of which the next is empty
+		const searched = pattern != null || input.logGroupClass != null
+		const r = new api.DescribeLogGroupsResponse()
+		r.logGroups = found.map(g => wire(caller, g, metricFilters(s).scan(null, 1000, g.name + "\x00").length,
+			!searched))
+		r.nextToken = if (more || searched && found.length > 0) found[found.length - 1].name else null
+		return r
+	}
+
+	listLogGroups(caller: Caller, input: api.ListLogGroupsRequest): api.ListLogGroupsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:log-group::log-stream:`)
+		// The model's pattern makes it alternatives, each a name's part or, after ^, its start.
+		const alternatives = if (input.logGroupNamePattern == null) [] else split(input.logGroupNamePattern!, "|")
+		const fits = (name: string) => alternatives.length == 0
+			|| alternatives.some(a => if (startsWith(a, "^")) startsWith(name, a.slice(1, a.length))
+			else indexOf(name, a) >= 0)
+		const [found, more] = page[Group](groups(caller.regional()), "", input.nextToken, input.limit ?? 50,
+			g => fits(g.name) && (input.logGroupClass == null || g.class == input.logGroupClass))
+		const r = new api.ListLogGroupsResponse()
+		r.logGroups = found.map(g => ({ ...new api.LogGroupSummary(), logGroupName: g.name,
+			logGroupArn: arnOf(caller, g.name), logGroupClass: g.class as api.LogGroupClass }))
+		r.nextToken = if (found.length > 0) found[found.length - 1].name else null
+		return r
+	}
+
+	putRetentionPolicy(caller: Caller, input: api.PutRetentionPolicyRequest): Unit throws Fault {
+		caller.allow(arnOf(caller, input.logGroupName))
+		if (!retentions.includes(input.retentionInDays)) {
+			throw invalid(`Invalid retention value. Valid values are: [${retentions.join(", ")}]`)
+		}
+		const g = found(caller, input.logGroupName)
+		g.retention = input.retentionInDays
+		(groups(caller.regional())).put(g.name, g)
+		return new Unit()
+	}
+
+	deleteRetentionPolicy(caller: Caller, input: api.DeleteRetentionPolicyRequest): Unit throws Fault {
+		caller.allow(arnOf(caller, input.logGroupName))
+		const g = found(caller, input.logGroupName)
+		g.retention = null
+		(groups(caller.regional())).put(g.name, g)
+		return new Unit()
+	}
+
+	putLogGroupDeletionProtection(caller: Caller, input: api.PutLogGroupDeletionProtectionRequest): Unit throws Fault {
+		const name = nameOf(input.logGroupIdentifier)
+		caller.allow(arnOf(caller, name))
+		const g = found(caller, name)
+		g.protected = input.deletionProtectionEnabled
+		(groups(caller.regional())).put(name, g)
+		return new Unit()
+	}
+
+	tagLogGroup(caller: Caller, input: api.TagLogGroupRequest): Unit throws Fault {
+		tag(caller, input.logGroupName, input.tags)
+		return new Unit()
+	}
+
+	untagLogGroup(caller: Caller, input: api.UntagLogGroupRequest): Unit throws Fault {
+		untag(caller, input.logGroupName, input.tags)
+		return new Unit()
+	}
+
+	listTagsLogGroup(caller: Caller, input: api.ListTagsLogGroupRequest): api.ListTagsLogGroupResponse throws Fault {
+		caller.allow(arnOf(caller, input.logGroupName))
+		const r = new api.ListTagsLogGroupResponse()
+		r.tags = found(caller, input.logGroupName).tags
+		return r
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): Unit throws Fault {
+		tag(caller, tagged(caller, input.resourceArn), input.tags)
+		return new Unit()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
+		untag(caller, tagged(caller, input.resourceArn), input.tagKeys)
+		return new Unit()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		const name = tagged(caller, input.resourceArn)
+		caller.allow(arnOf(caller, name))
+		const r = new api.ListTagsForResourceResponse()
+		r.tags = found(caller, name).tags
+		return r
+	}
+
+	createLogStream(caller: Caller, input: api.CreateLogStreamRequest): Unit throws Fault {
+		const [g, name] = [input.logGroupName, input.logStreamName]
+		caller.allow(streamArn(caller, g, name), accountPolicy(caller))
+		found(caller, g)
+		const db = streams(caller.regional())
+		if (db.get(keyOf(g, name)) != null) {
+			throw api.resourceAlreadyExistsException("The specified log stream already exists")
+		}
+		db.put(keyOf(g, name), { ...new Stream(), name: name, created: ms() })
+		return new Unit()
+	}
+
+	deleteLogStream(caller: Caller, input: api.DeleteLogStreamRequest): Unit throws Fault {
+		const [g, name] = [input.logGroupName, input.logStreamName]
+		caller.allow(streamArn(caller, g, name))
+		found(caller, g)
+		const s = caller.regional()
+		if (!streams(s).delete(keyOf(g, name))) {
+			throw api.resourceNotFoundException(noStream)
+		}
+		clear(events(s), keyOf(g, name) + "\x00")
+		return new Unit()
+	}
+
+	describeLogStreams(caller: Caller,
+		input: api.DescribeLogStreamsRequest): api.DescribeLogStreamsResponse throws Fault {
+		const g = groupOf(input.logGroupName, input.logGroupIdentifier)
+		caller.allow(arnOf(caller, g))
+		const prefix = input.logStreamNamePrefix
+		const byTime = input.orderBy == "LastEventTime"
+		if (byTime && prefix != null) {
+			throw invalid("Cannot order by LastEventTime with a logStreamNamePrefix.")
+		}
+		found(caller, g)
+		const db = streams(caller.regional())
+		const under = g + "\x00"
+		const n = input.limit ?? 50
+		const descending = input.descending ?? false
+		const r = new api.DescribeLogStreamsResponse()
+		if (!byTime) {
+			const token = input.nextToken
+			const [got, more] = page[Stream](db, under + (prefix ?? ""), if (token == null) null else under + token!, n,
+				s => true, descending)
+			r.logStreams = got.map(s => described(caller, g, s))
+			r.nextToken = if (more) got[got.length - 1].name else null
+			return r
+		}
+		const all = db.scan(null, 1000000, under).map(e => e[1])
+		sortBy(all, (a, b) => if (descending) a.last > b.last else a.last < b.last)
+		let from = 0
+		if (input.nextToken != null) {
+			const at = number(input.nextToken!) ?? -1
+			if (at < 0 || at > (all.length as i64)) {
+				throw invalid(badToken)
+			}
+			from = at as i32
+		}
+		const to = if (from + n < all.length) from + n else all.length
+		r.logStreams = all.slice(from, to).map(s => described(caller, g, s))
+		r.nextToken = if (to < all.length) `${to}` else null
+		return r
+	}
+
+	putLogEvents(caller: Caller, input: api.PutLogEventsRequest): api.PutLogEventsResponse throws Fault {
+		const [g, name] = [input.logGroupName, input.logStreamName]
+		caller.allow(streamArn(caller, g, name), accountPolicy(caller))
+		const given = input.logEvents
+		let bytes = 0
+		for (let i = 0; i < given.length; i++) {
+			if (i > 0 && given[i].timestamp < given[i - 1].timestamp) {
+				throw invalid("Log events in a single PutLogEvents request must be in chronological order.")
+			}
+			bytes += given[i].message.length + 26
+		}
+		if (bytes > batchBytes) {
+			throw invalid(`Upload too large: ${bytes} bytes exceeds limit of ${batchBytes}`)
+		}
+		const t = ms()
+		const group = found(caller, g)
+		const oldest = t - 14 * day / millisecond
+		const kept = since(group, t)
+		let tooOld = 0
+		while (tooOld < given.length && given[tooOld].timestamp < oldest) {
+			tooOld++
+		}
+		let expired = tooOld
+		while (expired < given.length && given[expired].timestamp < kept) {
+			expired++
+		}
+		let tooNew = expired
+		while (tooNew < given.length && given[tooNew].timestamp <= t + 2 * hour / millisecond) {
+			tooNew++
+		}
+		if (tooNew - expired > 1 && given[tooNew - 1].timestamp - given[expired].timestamp > day / millisecond) {
+			throw invalid("The batch of log events in a single PutLogEvents request cannot span more than 24 hours.")
+		}
+		const s = caller.regional()
+		const sdb = streams(s)
+		const stream = sdb.get(keyOf(g, name))
+		if (stream == null) {
+			throw api.resourceNotFoundException(noStream)
+		}
+		const st = stream!
+		const seq = sequence(s)
+		const counter = seq.get("") ?? new Sequence()
+		const edb = events(s)
+		const put: [string, api.InputLogEvent][] = []
+		for (const e of given.slice(expired, tooNew)) {
+			counter.n++
+			const id = pad(e.timestamp, 20) + pad(counter.n, 36)
+			put.push([id, e])
+			edb.put(keyOf(g, name) + "\x00" + id, { ...new Event(), message: e.message, ingested: t })
+			st.first = if (st.token == "" || e.timestamp < st.first) e.timestamp else st.first
+			st.last = if (st.token == "" || e.timestamp > st.last) e.timestamp else st.last
+			st.ingested = t
+			st.token = id
+		}
+		seq.put("", counter)
+		sdb.put(keyOf(g, name), st)
+		for (const [_, f] of subscriptions(s).scan(null, 1000, g + "\x00")) {
+			const p = parse(f.pattern)
+			const matched = put.filter(e => match(p, e[1].message) != null)
+			if (matched.length == 0 || f.role == null) {
+				continue
+			}
+			const logged = matched.map(e => `{"id":${json.quoted(e[0])},"timestamp":${e[1].timestamp},`
+				+ `"message":${json.quoted(e[1].message)}}`)
+			this.send(caller, f.destination, f.role!, arnOf(caller, g),
+				`{"messageType":"DATA_MESSAGE",`
+				+ `"owner":${json.quoted(caller.account)},"logGroup":${json.quoted(g)},"logStream":${json.quoted(name)},`
+				+ `"subscriptionFilters":[${json.quoted(f.name)}],"logEvents":[${logged.join(",")}]}`)
+		}
+		if (this.cloudwatch != null) {
+			publish(this.cloudwatch!, caller, arnOf(caller, g),
+				metricFilters(s).scan(null, 1000, g + "\x00").map(e => e[1]), put.map(e => e[1]))
+		}
+		const r = new api.PutLogEventsResponse()
+		r.nextSequenceToken = if (st.token == "") pad(0, 56) else st.token
+		if (tooOld > 0 || expired > tooOld || tooNew < given.length) {
+			const info = new api.RejectedLogEventsInfo()
+			info.tooOldLogEventEndIndex = if (tooOld > 0) tooOld else null
+			info.expiredLogEventEndIndex = if (expired > tooOld) expired else null
+			info.tooNewLogEventStartIndex = if (tooNew < given.length) tooNew else null
+			r.rejectedLogEventsInfo = info
+		}
+		return r
+	}
+
+	getLogEvents(caller: Caller, input: api.GetLogEventsRequest): api.GetLogEventsResponse throws Fault {
+		const g = groupOf(input.logGroupName, input.logGroupIdentifier)
+		const name = input.logStreamName
+		caller.actions = caller.actions.filter(a => a != "logs:Unmask" || input.unmask)
+		caller.allow(streamArn(caller, g, name))
+		const token = input.nextToken
+		if (token != null && !pointer(token!)) {
+			throw invalid(badToken)
+		}
+		const group = found(caller, g)
+		const s = caller.regional()
+		if (streams(s).get(keyOf(g, name)) == null) {
+			throw api.resourceNotFoundException(noStream)
+		}
+		const under = keyOf(g, name) + "\x00"
+		const t = ms()
+		const start = maximum(input.startTime ?? 0, since(group, t))
+		const end = input.endTime
+		const n = input.limit ?? 10000
+		const backward = if (token == null) !(input.startFromHead ?? false) else token![0] == 98
+		const after = if (token != null) under + token!.slice(2, 58)
+			else if (backward) (if (end == null) null else under + pad(end!, 20))
+			else under + pad(start, 20)
+		const got = scan(events(s), under, after, n, backward,
+			id => if (backward) stamp(id) >= start else end == null || stamp(id) < end!)
+		if (backward) {
+			got.reverse()
+		}
+		const r = new api.GetLogEventsResponse()
+		r.events = got.map(e => ({ ...new api.OutputLogEvent(), timestamp: stamp(e[0]), message: e[1].message,
+			ingestionTime: e[1].ingested, eventId: e[0] }))
+		const edge = if (token != null) token!.slice(2, 58) else pad(start, 20) + pad(0, 36)
+		r.nextForwardToken = `f/${if (got.length == 0) edge else got[got.length - 1][0]}/s`
+		r.nextBackwardToken = `b/${if (got.length == 0) edge else got[0][0]}/s`
+		return r
+	}
+
+	filterLogEvents(caller: Caller, input: api.FilterLogEventsRequest): api.FilterLogEventsResponse throws Fault {
+		const g = groupOf(input.logGroupName, input.logGroupIdentifier)
+		caller.actions = caller.actions.filter(a => a != "logs:Unmask" || input.unmask)
+		caller.allow(arnOf(caller, g))
+		const names = input.logStreamNames
+		if (names != null && input.logStreamNamePrefix != null) {
+			throw invalid("Cannot call FilterLogEvents with both logStreamNames and logStreamNamePrefix")
+		}
+		const token = input.nextToken
+		if (token != null && (token!.length != 56 || !digits(token!))) {
+			throw invalid(badToken)
+		}
+		const p = parse(input.filterPattern ?? "")
+		const group = found(caller, g)
+		const s = caller.regional()
+		const sdb = streams(s)
+		let chosen: string[] = []
+		if (names != null) {
+			for (const name of names!) {
+				if (sdb.get(keyOf(g, name)) == null) {
+					throw api.resourceNotFoundException(noStream)
+				}
+			}
+			chosen = names!
+		} else {
+			chosen = sdb.scan(null, 1000000, g + "\x00" + (input.logStreamNamePrefix ?? "")).map(e => e[1].name)
+		}
+		const start = maximum(input.startTime ?? 0, since(group, ms()))
+		const end = input.endTime
+		const edb = events(s)
+		const cursors = chosen.map(name => new Cursor(edb, name, keyOf(g, name) + "\x00",
+			if (token != null) token! else pad(start, 20)))
+		const n = input.limit ?? 10000
+		const r = new api.FilterLogEventsResponse()
+		r.events = []
+		r.searchedLogStreams = []
+		r.searchStatistics = new api.SearchStatistics() // AWS's counts are 0 too
+		while (r.events!.length < n) {
+			let next: Cursor | null = null
+			for (const c of cursors) {
+				if (c.head() != null && (next == null || c.head()![0] < next!.head()![0])) {
+					next = c
+				}
+			}
+			if (next == null) {
+				break
+			}
+			const [id, e] = next!.take()
+			if (end != null && stamp(id) > end!) {
+				break
+			}
+			if (match(p, e.message) != null) {
+				r.events!.push({ ...new api.FilteredLogEvent(), logStreamName: next!.name, timestamp: stamp(id),
+					message: e.message, ingestionTime: e.ingested, eventId: id })
+			}
+		}
+		r.nextToken = if (r.events!.length == 0) null else r.events![r.events!.length - 1].eventId
+		return r
+	}
+
+	putMetricFilter(caller: Caller, input: api.PutMetricFilterRequest): Unit throws Fault {
+		const g = input.logGroupName
+		caller.allow(arnOf(caller, g))
+		parse(input.filterPattern)
+		for (const t of input.metricTransformations) {
+			if ((t.dimensions ?? []).length > 0 && t.defaultValue != null) {
+				throw invalid("Invalid metric transformation: dimensions and default value are mutually exclusive "
+					+ "properties")
+			}
+		}
+		found(caller, g)
+		(metricFilters(caller.regional())).put(keyOf(g, input.filterName),
+			{ ...new MetricFilter(), name: input.filterName, pattern: input.filterPattern,
+			transformations: input.metricTransformations, created: ms() })
+		return new Unit()
+	}
+
+	describeMetricFilters(caller: Caller,
+		input: api.DescribeMetricFiltersRequest): api.DescribeMetricFiltersResponse throws Fault {
+		const g = input.logGroupName
+		caller.allow(if (g == null) `arn:aws:logs:${caller.region}:${caller.account}:log-group::log-stream:`
+			else arnOf(caller, g!))
+		const metric = input.metricName
+		if ((metric == null) != (input.metricNamespace == null)) {
+			throw invalid("Describe Metric Filters request must contain both MetricName and MetricNamespace")
+		}
+		if (g != null) {
+			found(caller, g!)
+		}
+		const prefix = if (g == null) "" else g! + "\x00" + (input.filterNamePrefix ?? "")
+		const [got, more] = keyed[MetricFilter](metricFilters(caller.regional()), prefix, unwrapped(input.nextToken),
+			input.limit ?? 50,
+			f => metric == null
+			|| f.transformations.some(t => t.metricName == metric! && t.metricNamespace == input.metricNamespace!))
+		const r = new api.DescribeMetricFiltersResponse()
+		r.metricFilters = got.map(e => ({ ...new api.MetricFilter(), filterName: e[1].name, filterPattern: e[1].pattern,
+			metricTransformations: e[1].transformations, creationTime: e[1].created,
+			logGroupName: e[0].slice(0, indexOf(e[0], "\x00")) }))
+		r.nextToken = if (more) base64.encode(got[got.length - 1][0]) else null
+		return r
+	}
+
+	deleteMetricFilter(caller: Caller, input: api.DeleteMetricFilterRequest): Unit throws Fault {
+		caller.allow(arnOf(caller, input.logGroupName))
+		found(caller, input.logGroupName)
+		if (!metricFilters(caller.regional()).delete(keyOf(input.logGroupName, input.filterName))) {
+			throw api.resourceNotFoundException("The specified metric filter does not exist.")
+		}
+		return new Unit()
+	}
+
+	testMetricFilter(caller: Caller, input: api.TestMetricFilterRequest): api.TestMetricFilterResponse throws Fault {
+		caller.allow("*")
+		const p = parse(input.filterPattern)
+		const r = new api.TestMetricFilterResponse()
+		r.matches = []
+		const messages = input.logEventMessages
+		for (let i = 0; i < messages.length; i++) {
+			const values = match(p, messages[i])
+			if (values != null) {
+				r.matches!.push({ ...new api.MetricFilterMatchRecord(), eventNumber: (i + 1) as i64,
+					eventMessage: messages[i], extractedValues: values })
+			}
+		}
+		return r
+	}
+
+	putSubscriptionFilter(caller: Caller, input: api.PutSubscriptionFilterRequest): Unit throws Fault {
+		const g = input.logGroupName
+		const role = input.roleArn
+		caller.actions = caller.actions.filter(a => a != "iam:PassRole")
+		caller.allow(arnOf(caller, g))
+		if (role != null) {
+			passRole(caller, role!, "logs.amazonaws.com")
+		}
+		parse(input.filterPattern)
+		found(caller, g)
+		const db = subscriptions(caller.regional())
+		const others = db.scan(null, 1000, g + "\x00").filter(e => e[1].name != input.filterName)
+		if (others.length >= subscriptionLimit) {
+			throw api.limitExceededException("Resource limit exceeded.")
+		}
+		const parts = split(input.destinationArn, ":")
+		if (parts.length < 6) {
+			throw invalid(`1 validation error detected: Unable to parse destinationArn ${input.destinationArn}`)
+		}
+		const vendor = parts[2]
+		if (vendor == "lambda") {
+			// There is no Lambda to execute.
+			throw invalid("Could not execute the lambda function. Make sure you have given CloudWatch Logs permission "
+				+ "to execute your function.")
+		}
+		if (vendor == "logs") {
+			throw api.resourceNotFoundException("The specified destination does not exist.")
+		}
+		if (vendor != "kinesis" && vendor != "firehose") {
+			throw invalid(`PutSubscriptionFilter operation cannot work with destinationArn for vendor ${vendor}`)
+		}
+		if (role == null) {
+			throw invalid(`destinationArn for vendor ${vendor} cannot be used without roleArn`)
+		}
+		const control = `{"messageType":"CONTROL_MESSAGE","owner":"CloudwatchLogs","logGroup":"","logStream":"",`
+			+ `"subscriptionFilters":[],"logEvents":[{"id":"","timestamp":${ms()},`
+			+ `"message":"CWL CONTROL MESSAGE: Checking health of destination `
+			+ (if (vendor == "kinesis") "Kinesis stream" else "Firehose") + `."}]}`
+		if (!this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
+			const named = if (vendor == "kinesis") "Kinesis" else "Firehose"
+			throw invalid(`Could not deliver test message to specified ${named} stream. Check if the given ${named} `
+				+ "stream is in ACTIVE state.")
+		}
+		db.put(keyOf(g, input.filterName),
+			{ ...new Subscription(), name: input.filterName, pattern: input.filterPattern,
+			destination: input.destinationArn, role: role, distribution: input.distribution ?? "ByLogStream",
+			created: ms() })
+		return new Unit()
+	}
+
+	describeSubscriptionFilters(caller: Caller,
+		input: api.DescribeSubscriptionFiltersRequest): api.DescribeSubscriptionFiltersResponse throws Fault {
+		const g = input.logGroupName
+		caller.allow(arnOf(caller, g))
+		found(caller, g)
+		const [got, more] = keyed[Subscription](subscriptions(caller.regional()),
+			g + "\x00" + (input.filterNamePrefix ?? ""), unwrapped(input.nextToken), input.limit ?? 50, f => true)
+		const r = new api.DescribeSubscriptionFiltersResponse()
+		r.subscriptionFilters = got.map(e => ({ ...new api.SubscriptionFilter(), filterName: e[1].name, logGroupName: g,
+			filterPattern: e[1].pattern, destinationArn: e[1].destination, roleArn: e[1].role,
+			distribution: e[1].distribution as api.Distribution, creationTime: e[1].created }))
+		r.nextToken = if (more) base64.encode(got[got.length - 1][0]) else null
+		return r
+	}
+
+	deleteSubscriptionFilter(caller: Caller, input: api.DeleteSubscriptionFilterRequest): Unit throws Fault {
+		caller.allow(arnOf(caller, input.logGroupName))
+		found(caller, input.logGroupName)
+		if (!subscriptions(caller.regional()).delete(keyOf(input.logGroupName, input.filterName))) {
+			throw api.resourceNotFoundException("The specified subscription filter does not exist.")
+		}
+		return new Unit()
+	}
+
+	putResourcePolicy(caller: Caller, input: api.PutResourcePolicyRequest): api.PutResourcePolicyResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		if (input.resourceArn != null) {
+			throw notImplemented("PutResourcePolicy of a resource")
+		}
+		const name = required(input.policyName, "policyName")
+		const document = required(input.policyDocument, "policyDocument")
+		try {
+			auth.parse(document, "resource")
+		} catch (f: Fault) {
+			throw invalid("Error occurred while parsing accessPolicy. Please check if the accessPolicy has been "
+				+ "constructed correctly using IAM grammar.")
+		}
+		const db = policies(caller.regional())
+		if (db.get(name) == null && db.scan(null, policyLimit).length >= policyLimit) {
+			throw api.limitExceededException("Resource limit exceeded.")
+		}
+		const p = { ...new Policy(), name: name, document: document, updated: ms() }
+		db.put(name, p)
+		const r = new api.PutResourcePolicyResponse()
+		r.resourcePolicy = resourcePolicy(p)
+		return r
+	}
+
+	describeResourcePolicies(caller: Caller,
+		input: api.DescribeResourcePoliciesRequest): api.DescribeResourcePoliciesResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		const [got, more] = page[Policy](policies(caller.regional()), "", input.nextToken, input.limit ?? 50, p => true)
+		const r = new api.DescribeResourcePoliciesResponse()
+		r.resourcePolicies = got.map(p => resourcePolicy(p))
+		r.nextToken = if (more) got[got.length - 1].name else null
+		return r
+	}
+
+	deleteResourcePolicy(caller: Caller, input: api.DeleteResourcePolicyRequest): Unit throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		const name = required(input.policyName, "policyName")
+		if (!policies(caller.regional()).delete(name)) {
+			throw api.resourceNotFoundException(`Policy with name [${name}] does not exist.`)
+		}
+		return new Unit()
+	}
+
+	startQuery(caller: Caller, input: api.StartQueryRequest): api.StartQueryResponse throws Fault {
+		return insights.startQuery(caller, input)
+	}
+
+	getQueryResults(caller: Caller, input: api.GetQueryResultsRequest): api.GetQueryResultsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.getQueryResults(caller, input)
+	}
+
+	stopQuery(caller: Caller, input: api.StopQueryRequest): api.StopQueryResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.stopQuery(caller, input)
+	}
+
+	describeQueries(caller: Caller, input: api.DescribeQueriesRequest): api.DescribeQueriesResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.describeQueries(caller, input)
+	}
+
+	getLogRecord(caller: Caller, input: api.GetLogRecordRequest): api.GetLogRecordResponse throws Fault {
+		return insights.getLogRecord(caller, input)
+	}
+
+	getLogGroupFields(caller: Caller, input: api.GetLogGroupFieldsRequest): api.GetLogGroupFieldsResponse throws Fault {
+		return insights.getLogGroupFields(caller, input)
+	}
+
+	putQueryDefinition(caller: Caller,
+		input: api.PutQueryDefinitionRequest): api.PutQueryDefinitionResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.putQueryDefinition(caller, input)
+	}
+
+	describeQueryDefinitions(caller: Caller,
+		input: api.DescribeQueryDefinitionsRequest): api.DescribeQueryDefinitionsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.describeQueryDefinitions(caller, input)
+	}
+
+	deleteQueryDefinition(caller: Caller,
+		input: api.DeleteQueryDefinitionRequest): api.DeleteQueryDefinitionResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.deleteQueryDefinition(caller, input)
+	}
+}
+
+class Cursor {
+	name: string
+	private db: Table[Event]
+	private under: string
+	private after: string
+	private chunk: [string, Event][] = []
+	private at = 0
+	private done = false
+
+	/// Of the stream name, whose events' keys db holds under under, those after the id, or prefix of one, from.
+	constructor(db: Table[Event], name: string, under: string, from: string) {
+		this.db = db
+		this.name = name
+		this.under = under
+		this.after = under + from
+	}
+
+	head(): [string, Event] | null {
+		if (this.at == this.chunk.length && !this.done) {
+			this.chunk = this.db.scan(this.after, 100,
+				this.under).map(e => [e[0].slice(this.under.length, e[0].length), e[1]])
+			this.at = 0
+			this.done = this.chunk.length < 100
+			if (this.chunk.length > 0) {
+				this.after = this.under + this.chunk[this.chunk.length - 1][0]
+			}
+		}
+		return if (this.at < this.chunk.length) this.chunk[this.at] else null
+	}
+
+	take(): [string, Event] {
+		const e = this.head()!
+		this.at++
+		return e
+	}
+}
+
+/// Up to n entries of db under prefix after the key after, while keep holds of their ids, the keys past prefix.
+function scan(db: Table[Event], prefix: string, after: string | null, n: i32, descending: bool,
+	keep: (id: string) => bool): [string, Event][] {
+	const out: [string, Event][] = []
+	let from = after
+	while (out.length < n) {
+		const chunk = db.scan(from, if (n - out.length < 100) n - out.length else 100, prefix, descending)
+		for (const [k, e] of chunk) {
+			const id = k.slice(prefix.length, k.length)
+			if (!keep(id)) {
+				return out
+			}
+			out.push([id, e])
+		}
+		if (chunk.length == 0) {
+			break
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+	return out
+}
+
+function page[V extends Decodable](t: Table[V], prefix: string, after: string | null, n: i32, keep: (v: V) => bool,
+	descending: bool = false): [V[], bool] {
+	const [got, more] = keyed[V](t, prefix, after, n, keep, descending)
+	return [got.map(e => e[1]), more]
+}
+
+function keyed[V extends Decodable](t: Table[V], prefix: string, after: string | null, n: i32, keep: (v: V) => bool,
+	descending: bool = false): [[string, V][], bool] {
+	const out: [string, V][] = []
+	let from = after
+	while (true) {
+		const chunk = t.scan(from, 100, prefix, descending)
+		for (const [k, v] of chunk) {
+			if (keep(v)) {
+				if (out.length == n) {
+					return [out, true]
+				}
+				out.push([k, v])
+			}
+		}
+		if (chunk.length < 100) {
+			return [out, false]
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+function clear[V extends Decodable](t: Table[V], prefix: string) throws Fault {
+	while (true) {
+		const chunk = t.scan(null, 1000, prefix)
+		if (chunk.length == 0) {
+			return
+		}
+		for (const [k, _] of chunk) {
+			t.delete(k)
+		}
+	}
+}
+
+function tag(caller: Caller, name: string, tags: [string, string][]) throws Fault {
+	const g = found(caller, name)
+	const context = resourceTags(g.tags)
+	context.append(requestTags(tags))
+	caller.allow(arnOf(caller, name), null, context)
+	for (const [k, v] of tags) {
+		g.tags = g.tags.filter(t => t[0] != k)
+		g.tags.push([k, v])
+	}
+	(groups(caller.regional())).put(name, g)
+}
+
+function untag(caller: Caller, name: string, keys: string[]) throws Fault {
+	const g = found(caller, name)
+	caller.allow(arnOf(caller, name), null, resourceTags(g.tags))
+	g.tags = g.tags.filter(t => !keys.includes(t[0]))
+	(groups(caller.regional())).put(name, g)
+}
+
+/// The log group of an ARN TagResource takes, which lacks the :* of a log group's other ARN.
+function tagged(caller: Caller, arn: string): string throws Fault {
+	const head = `arn:aws:logs:${caller.region}:${caller.account}:log-group:`
+	if (!startsWith(arn, head) || endsWith(arn, ":*") || arn.length == head.length) {
+		throw api.validationException("Invalid resourceArn")
+	}
+	return arn.slice(head.length, arn.length)
+}
+
+function found(caller: Caller, name: string): Group throws Fault {
+	const g = groups(caller.regional()).get(name)
+	if (g == null) {
+		throw api.resourceNotFoundException(noGroup)
+	}
+	return g!
+}
+
+function groupOf(name: string | null, identifier: string | null): string throws Fault {
+	if (name != null) {
+		return name!
+	}
+	if (identifier == null) {
+		throw invalid("1 validation error detected: Value at 'logGroupName' failed to satisfy constraint: Member must "
+			+ "not be null")
+	}
+	return nameOf(identifier!)
+}
+
+function nameOf(identifier: string): string {
+	if (!startsWith(identifier, "arn:")) {
+		return identifier
+	}
+	const at = indexOf(identifier, ":log-group:")
+	const name = if (at < 0) identifier else identifier.slice(at + 11, identifier.length)
+	return if (endsWith(name, ":*")) name.slice(0, name.length - 2) else name
+}
+
+/// The LogGroup of g, which has count metric filters; full as DescribeLogGroups answers but by pattern or class.
+function wire(caller: Caller, g: Group, count: i32, full: bool): api.LogGroup {
+	return { ...new api.LogGroup(), logGroupName: g.name, creationTime: g.created, retentionInDays: g.retention,
+		metricFilterCount: count, arn: arnOf(caller, g.name) + ":*", storedBytes: if (full) 0 as i64 else null,
+		kmsKeyId: g.kmsKey, logGroupClass: g.class as api.LogGroupClass, logGroupArn: arnOf(caller, g.name),
+		deletionProtectionEnabled: if (full) g.protected else null,
+		bearerTokenAuthenticationEnabled: if (full) false else null }
+}
+
+function described(caller: Caller, g: string, s: Stream): api.LogStream {
+	const r = { ...new api.LogStream(), logStreamName: s.name, creationTime: s.created,
+		arn: streamArn(caller, g, s.name), storedBytes: 0 as i64 }
+	if (s.token != "") {
+		r.firstEventTimestamp = s.first
+		r.lastEventTimestamp = s.last
+		r.lastIngestionTime = s.ingested
+		r.uploadSequenceToken = s.token
+	}
+	return r
+}
+
+function resourcePolicy(p: Policy): api.ResourcePolicy {
+	return { ...new api.ResourcePolicy(), policyName: p.name, policyDocument: p.document, lastUpdatedTime: p.updated,
+		policyScope: "ACCOUNT" }
+}
+
+function accountPolicy(caller: Caller): string | null throws Fault {
+	const statements: string[] = []
+	for (const [_, p] of policies(caller.regional()).scan(null, policyLimit, "")) {
+		const s = member(p.document, "Statement")
+		if (s != null) {
+			statements.append(if (startsWith(s!, "[")) list(s!) else [s!])
+		}
+	}
+	return if (statements.length == 0) null else `{"Version":"2012-10-17","Statement":[${statements.join(",")}]}`
+}
+
+function assumed(caller: Caller, role: string, source: string, actions: string[]): Caller throws Fault {
+	const c = actAs(caller, "logs.amazonaws.com", role, source, actions, "CWLtoKinesisSession")
+	if (c == null) {
+		throw new Fault(403, "AccessDenied", `logs.amazonaws.com may not assume ${role}`)
+	}
+	return c!
+}
+
+function arnOf(caller: Caller, name: string): string {
+	return `arn:aws:logs:${caller.region}:${caller.account}:log-group:${name}`
+}
+
+function streamArn(caller: Caller, g: string, s: string): string { return `${arnOf(caller, g)}:log-stream:${s}` }
+function keyOf(g: string, name: string): string { return g + "\x00" + name }
+
+function since(g: Group, t: i64): i64 {
+	return if (g.retention == null) 0 else t - (g.retention! as i64) * (day / millisecond)
+}
+
+/// n in decimal, padded with 0s to width digits, so that byte order is numeric order.
+function pad(n: i64, width: i32): string {
+	let s = `${n}`
+	while (s.length < width) {
+		s = "0" + s
+	}
+	return s
+}
+
+function stamp(id: string): i64 { return number(id.slice(0, 20)) ?? 0 }
+
+function number(s: string): i64 | null {
+	if (s == "" || !digits(s)) {
+		return null
+	}
+	try {
+		return parseInt[i64](s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function digits(s: string): bool {
+	for (let i = 0; i < s.length; i++) {
+		if (!isDigit(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether s is a token of GetLogEvents: f/ or b/, an event's id, /s.
+function pointer(s: string): bool {
+	return s.length == 60 && (startsWith(s, "f/") || startsWith(s, "b/")) && endsWith(s, "/s") && digits(s.slice(2, 58))
+}
+
+function unwrapped(token: string | null): string | null throws Fault {
+	if (token == null) {
+		return null
+	}
+	try {
+		return base64.decode(token!)
+	} catch (e: ParseError) {
+		throw invalid(badToken)
+	}
+}
+
+function maximum(a: i64, b: i64): i64 { return if (a > b) a else b }
+function ms(): i64 { return now() / millisecond }
+
+function required(v: string | null, member: string): string throws Fault {
+	if (v == null) {
+		throw invalid(`1 validation error detected: Value at '${member}' failed to satisfy constraint: Member must not `
+			+ "be null")
+	}
+	return v!
+}
+
+function invalid(why: string): Fault { return api.invalidParameterException(why) }

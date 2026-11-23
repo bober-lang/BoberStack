@@ -1,0 +1,748 @@
+//! CloudWatch Logs' filter patterns, as AWS matched them on 2026-11-23: terms, case-sensitive anywhere in the message,
+//! a - term one it must not hold and ? terms alternatives that count for nothing beside others (a - within a word
+//! starts an excluded term); JSON `{ selector op value }` conditions; and space-delimited `[name, …]` fields, the last
+//! named taking the rest of the message unless `...` stands for any number. A match extracts each field as `$name`,
+//! or `$n` of the n-th field that `...` covers.
+
+import { Fault } from "../../core/fault"
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import { parseFloat } from "std/float"
+import { compile, Regex } from "std/regex"
+import { ParseError, trim } from "std/string"
+
+export class Pattern {
+	/// "all", "terms", "json" or "fields".
+	kind = "all"
+	terms: Term[] = []
+	json: Expr | null = null
+	fields: Field[] = []
+}
+
+class Term {
+	text = ""
+	regex: Regex | null = null
+	excluded = false
+	alternative = false
+}
+
+class Expr {
+	/// "and", "or", or the comparison: one of = != > < >= <=, "true", "false", "null" or "missing".
+	op = ""
+	left: Expr | null = null
+	right: Expr | null = null
+	/// Each step: a member's name after ".", an index or * in brackets.
+	selector: string[] = []
+	value = new Operand()
+}
+
+class Operand {
+	text = ""
+	number: f64 | null = null
+	regex: Regex | null = null
+}
+
+/// A field of a space-delimited pattern; its conditions are any of these lists of which every comparison holds.
+class Field {
+	name = ""
+	conditions: Condition[][] = []
+}
+
+class Condition {
+	op = ""
+	value = new Operand()
+}
+
+class Value {
+	kind = ""
+	text = ""
+	members: [string, Value][] = []
+	items: Value[] = []
+}
+
+export function parse(p: string): Pattern throws Fault {
+	const t = trim(p)
+	const out = new Pattern()
+	if (t == "") {
+		return out
+	}
+	if (startsWith(t, "{")) {
+		if (!endsWith(t, "}")) {
+			throw invalid("If a filter pattern starts with '{' it must end with '}'")
+		}
+		out.kind = "json"
+		const s = new Scanner(t.slice(1, t.length - 1))
+		out.json = s.or()
+		s.space()
+		if (!s.done()) {
+			throw invalid("Invalid metric filter pattern")
+		}
+		return out
+	}
+	if (startsWith(t, "[")) {
+		if (!endsWith(t, "]")) {
+			throw invalid("If a filter pattern starts with '[' it must end with ']'")
+		}
+		out.kind = "fields"
+		out.fields = fields(t.slice(1, t.length - 1))
+		return out
+	}
+	out.kind = "terms"
+	out.terms = terms(t)
+	return out
+}
+
+export function match(p: Pattern, message: string): [string, string][] | null {
+	switch (p.kind) {
+		case "all": return []
+		case "terms": return if (holds(p.terms, message)) [] else null
+		case "json":
+			const v = document(message)
+			return if (v != null && v.kind == "object" && test(p.json!, v)) [] else null
+		default: return extract(p.fields, message)
+	}
+}
+
+/// `$name` or `$1` of the values a match extracted, or `$.selector` of the JSON message, its first scalar.
+export function valueOf(extracted: [string, string][], message: string, name: string): string | null {
+	if (!startsWith(name, "$.")) {
+		const f = extracted.find(e => e[0] == name)
+		return if (f == null) null else f[1]
+	}
+	const v = document(message)
+	if (v == null) {
+		return null
+	}
+	try {
+		const s = new Scanner(name.slice(1, name.length))
+		const found = select(v!, s.selector()).filter(x => x.kind != "object" && x.kind != "array")
+		return if (found.length == 0) null else found[0].text
+	} catch (f: Fault) {
+		return null
+	}
+}
+
+function terms(t: string): Term[] throws Fault {
+	const out: Term[] = []
+	let i = 0
+	while (i < t.length) {
+		if (isSpace(t[i])) {
+			i++
+			continue
+		}
+		const term = new Term()
+		if (t[i] == 63) {
+			// ?
+			term.alternative = true
+			i++
+		} else if (t[i] == 45) {
+			// -
+			term.excluded = true
+			i++
+		}
+		if (i < t.length && (t[i] == 34 || t[i] == 37)) {
+			// " or %
+			const end = indexOf(t, fromBytes([t[i]]), i + 1)
+			if (end < 0) {
+				throw invalid(`Invalid character(s) in term '${fromBytes([t[i]])}'`)
+			}
+			if (t[i] == 37) {
+				term.regex = regex(t.slice(i + 1, end))
+			}
+			term.text = t.slice(i + 1, end)
+			i = end + 1
+		} else {
+			const from = i
+			while (i < t.length && !isSpace(t[i]) && t[i] != 45) {
+				if (!isAlphanumeric(t[i]) && t[i] < 128 && indexOf("_=.:/@,;!#$&+<>~^`\\", fromBytes([t[i]])) < 0) {
+					throw invalid(`Invalid character(s) in term '${fromBytes([t[i]])}'`)
+				}
+				i++
+			}
+			term.text = t.slice(from, i)
+		}
+		if (term.text != "" || term.regex != null) {
+			out.push(term)
+		}
+	}
+	return out
+}
+
+function holds(terms: Term[], message: string): bool {
+	const plain = terms.filter(t => !t.alternative)
+	if (plain.length == 0) {
+		return terms.length == 0 || terms.some(t => has(t, message))
+	}
+	return plain.every(t => has(t, message) != t.excluded)
+}
+
+function has(t: Term, message: string): bool {
+	return if (t.regex != null) t.regex!.find(message) != null else indexOf(message, t.text) >= 0
+}
+
+class Scanner {
+	s: string
+	i = 0
+
+	constructor(s: string) { this.s = s }
+	done(): bool { return this.i >= this.s.length }
+
+	space() {
+		while (this.i < this.s.length && isSpace(this.s[this.i])) {
+			this.i++
+		}
+	}
+
+	take(word: string): bool {
+		this.space()
+		if (startsWith(this.s.slice(this.i, this.s.length), word)) {
+			this.i += word.length
+			return true
+		}
+		return false
+	}
+
+	or(): Expr throws Fault {
+		let e = this.and()
+		while (this.take("||")) {
+			e = { ...new Expr(), op: "or", left: e, right: this.and() }
+		}
+		return e
+	}
+
+	and(): Expr throws Fault {
+		let e = this.primary()
+		while (this.take("&&")) {
+			e = { ...new Expr(), op: "and", left: e, right: this.primary() }
+		}
+		return e
+	}
+
+	primary(): Expr throws Fault {
+		if (this.take("(")) {
+			const e = this.or()
+			if (!this.take(")")) {
+				throw malformed()
+			}
+			return e
+		}
+		if (!this.take("$")) {
+			throw malformed()
+		}
+		const e = new Expr()
+		e.selector = this.selector()
+		for (const [word,
+			op] of [["IS TRUE", "true"], ["IS FALSE", "false"], ["IS NULL", "null"], ["NOT EXISTS", "missing"]]) {
+			if (this.take(word)) {
+				e.op = op
+				return e
+			}
+		}
+		e.op = this.operator()
+		e.value = this.operand(e.op)
+		return e
+	}
+
+	selector(): string[] throws Fault {
+		const out: string[] = []
+		while (this.i < this.s.length) {
+			const c = this.s[this.i]
+			if (c == 46) {
+				// .
+				this.i++
+				const from = this.i
+				while (this.i < this.s.length
+					&& (isAlphanumeric(this.s[this.i]) || this.s[this.i] == 95 || this.s[this.i] == 45
+					|| this.s[this.i] == 64)) {
+					this.i++
+				}
+				if (this.i == from) {
+					throw malformed()
+				}
+				out.push(this.s.slice(from, this.i))
+			} else if (c == 91) {
+				// [
+				const end = indexOf(this.s, "]", this.i)
+				const index = if (end < 0) "" else this.s.slice(this.i + 1, end)
+				if (index != "*" && (index == "" || !index.every(d => isDigit(d)))) {
+					throw malformed()
+				}
+				out.push(`[${index}]`)
+				this.i = end + 1
+			} else {
+				break
+			}
+		}
+		if (out.length == 0) {
+			throw malformed()
+		}
+		return out
+	}
+
+	operator(): string throws Fault {
+		for (const op of ["!=", ">=", "<=", "=", ">", "<"]) {
+			if (this.take(op)) {
+				if (op == "=" && this.take("=")) {
+					throw malformed()
+				}
+				return op
+			}
+		}
+		throw malformed()
+	}
+
+	operand(op: string): Operand throws Fault {
+		this.space()
+		const from = this.i
+		let text = ""
+		if (this.i < this.s.length && (this.s[this.i] == 34 || this.s[this.i] == 37)) {
+			const end = indexOf(this.s, fromBytes([this.s[from]]), from + 1)
+			if (end < 0) {
+				throw malformed()
+			}
+			text = this.s.slice(from, end + 1)
+			this.i = end + 1
+		} else {
+			while (this.i < this.s.length && !isSpace(this.s[this.i]) && this.s[this.i] != 41 && this.s[this.i] != 38
+				&& this.s[this.i] != 124) {
+				this.i++
+			}
+			text = this.s.slice(from, this.i)
+		}
+		if (text == "") {
+			throw malformed()
+		}
+		return operand(text, op)
+	}
+}
+
+/// The operand of the text t, compared by op: a number unless quoted, which it must be to order by.
+function operand(t: string, op: string): Operand throws Fault {
+	const o = new Operand()
+	if (startsWith(t, "%") && endsWith(t, "%") && t.length >= 2) {
+		o.regex = regex(t.slice(1, t.length - 1))
+		return o
+	}
+	const quoted = startsWith(t, "\"") && endsWith(t, "\"") && t.length >= 2
+	o.text = if (quoted) t.slice(1, t.length - 1) else t
+	o.number = number(o.text)
+	if ([">", "<", ">=", "<="].includes(op) && o.number == null) {
+		throw malformed()
+	}
+	return o
+}
+
+function test(e: Expr, v: Value): bool {
+	switch (e.op) {
+		case "and": return test(e.left!, v) && test(e.right!, v)
+		case "or": return test(e.left!, v) || test(e.right!, v)
+		default:
+			const found = select(v, e.selector)
+			switch (e.op) {
+				case "missing": return found.length == 0
+				case "true", "false", "null": return found.some(x => x.kind == e.op)
+				default:
+					// A string orders as no number, though it equals one.
+					const ordered = e.op != "=" && e.op != "!="
+					return found.some(x => if (ordered) x.kind == "number" && compare(e.op, x.text, e.value)
+						else x.kind != "object" && x.kind != "array" && compare(e.op, x.text, e.value))
+			}
+	}
+}
+
+function select(v: Value, steps: string[]): Value[] {
+	let at = [v]
+	for (const step of steps) {
+		const next: Value[] = []
+		for (const x of at) {
+			if (!startsWith(step, "[")) {
+				for (const [k, m] of x.members) {
+					if (k == step) {
+						next.push(m)
+					}
+				}
+			} else if (x.kind == "array") {
+				const index = step.slice(1, step.length - 1)
+				if (index == "*") {
+					next.append(x.items)
+				} else {
+					const n = number(index) ?? -1.0
+					if (n < (x.items.length as f64)) {
+						next.push(x.items[n as i32])
+					}
+				}
+			}
+		}
+		at = next
+	}
+	return at
+}
+
+/// As numbers if both are, else as texts, o's * matching any characters.
+function compare(op: string, text: string, o: Operand): bool {
+	if (o.regex != null) {
+		const found = o.regex!.find(text) != null
+		return if (op == "!=") !found else op == "=" && found
+	}
+	const n = number(text)
+	if (o.number != null && n != null) {
+		const a = n!
+		const b = o.number!
+		switch (op) {
+			case "=": return a == b
+			case "!=": return a != b
+			case ">": return a > b
+			case "<": return a < b
+			case ">=": return a >= b
+			default: return a <= b
+		}
+	}
+	switch (op) {
+		case "=": return wild(o.text, text)
+		case "!=": return !wild(o.text, text)
+		default: return false
+	}
+}
+
+function wild(p: string, text: string): bool {
+	const parts: string[] = []
+	let from = 0
+	for (let i = 0; i <= p.length; i++) {
+		if (i == p.length || p[i] == 42) {
+			parts.push(p.slice(from, i))
+			from = i + 1
+		}
+	}
+	if (parts.length == 1) {
+		return p == text
+	}
+	if (!startsWith(text, parts[0]) || !endsWith(text, parts[parts.length - 1])
+		|| text.length < parts[0].length + parts[parts.length - 1].length) {
+		return false
+	}
+	let at = parts[0].length
+	const end = text.length - parts[parts.length - 1].length
+	for (const part of parts.slice(1, parts.length - 1)) {
+		const i = indexOf(text.slice(0, end), part, at)
+		if (i < 0) {
+			return false
+		}
+		at = i + part.length
+	}
+	return true
+}
+
+function fields(t: string): Field[] throws Fault {
+	const out: Field[] = []
+	if (trim(t) == "") {
+		return [{ ...new Field(), name: "..." }]
+	}
+	for (const part of commas(t)) {
+		const f = new Field()
+		const s = trim(part)
+		if (s == "...") {
+			f.name = s
+			out.push(f)
+			continue
+		}
+		for (const alternative of split(s, "||")) {
+			const all: Condition[] = []
+			for (const c of split(alternative, "&&")) {
+				const [name, cond] = condition(trim(c))
+				if (f.name != "" && f.name != name) {
+					throw invalid(`Multiple variables used in a single filter. Var1 : ${f.name}, Var2 : ${name}`)
+				}
+				f.name = name
+				if (cond != null) {
+					all.push(cond!)
+				}
+			}
+			if (all.length > 0) {
+				f.conditions.push(all)
+			}
+		}
+		out.push(f)
+	}
+	return out
+}
+
+function condition(c: string): [string, Condition | null] throws Fault {
+	for (const op of ["!=", ">=", "<=", "=", ">", "<"]) {
+		const at = indexOf(c, op)
+		if (at > 0) {
+			const name = trim(c.slice(0, at))
+			const cond = { ...new Condition(), op: op }
+			cond.value = operand(trim(c.slice(at + op.length, c.length)), op)
+			return [name, cond]
+		}
+	}
+	if (c == "" || !c.every(x => isAlphanumeric(x) || x == 95 || x == 45 || x == 46)) {
+		throw malformed()
+	}
+	return [c, null]
+}
+
+function extract(fields: Field[], message: string): [string, string][] | null {
+	const words = tokens(message)
+	const named = fields.filter(f => f.name != "...").length
+	if (words.length < named) {
+		return null
+	}
+	const out: [string, string][] = []
+	const spread = fields.some(f => f.name == "...")
+	let at = 0
+	for (let i = 0; i < fields.length; i++) {
+		const f = fields[i]
+		if (f.name == "...") {
+			const after = fields.length - i - 1
+			while (at < words.length - after) {
+				out.push([`$${at + 1}`, words[at][0]])
+				at++
+			}
+			continue
+		}
+		let value = words[at][0]
+		if (!spread && i == fields.length - 1 && at < words.length - 1) {
+			value = trim(message.slice(words[at][1], message.length))
+		}
+		if (f.conditions.length > 0 && !f.conditions.some(all => all.every(c => compare(c.op, value, c.value)))) {
+			return null
+		}
+		out.push([`$${f.name}`, value])
+		at++
+	}
+	return out
+}
+
+function tokens(message: string): [string, i32][] {
+	const out: [string, i32][] = []
+	let i = 0
+	while (i < message.length) {
+		if (isSpace(message[i])) {
+			i++
+			continue
+		}
+		const from = i
+		const close: u8 = if (message[i] == 34) 34 else if (message[i] == 91) 93 else 0
+		if (close != 0) {
+			const end = indexOf(message, fromBytes([close]), i + 1)
+			if (end > 0) {
+				out.push([message.slice(i + 1, end), from])
+				i = end + 1
+				continue
+			}
+		}
+		while (i < message.length && !isSpace(message[i])) {
+			i++
+		}
+		out.push([message.slice(from, i), from])
+	}
+	return out
+}
+
+function commas(s: string): string[] {
+	const out: string[] = []
+	let quoted = false
+	let from = 0
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == 34) {
+			quoted = !quoted
+		} else if (s[i] == 44 && !quoted) {
+			out.push(s.slice(from, i))
+			from = i + 1
+		}
+	}
+	out.push(s.slice(from, s.length))
+	return out
+}
+
+function split(s: string, sep: string): string[] {
+	const out: string[] = []
+	let quoted = false
+	let from = 0
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == 34) {
+			quoted = !quoted
+		} else if (!quoted && startsWith(s.slice(i, s.length), sep)) {
+			out.push(s.slice(from, i))
+			from = i + sep.length
+		}
+	}
+	out.push(s.slice(from, s.length))
+	return out
+}
+
+/// The fields of message if it is a JSON object, as Logs Insights discovers them: each scalar by its dotted path, an
+/// item by its index; a string's text, any other value's JSON.
+export function discovered(message: string): [string, string][] {
+	const out: [string, string][] = []
+	const v = document(message)
+	if (v != null && v!.kind == "object") {
+		flatten(v!, "", out)
+	}
+	return out
+}
+
+function flatten(v: Value, path: string, out: [string, string][]): void {
+	const dot = if (path == "") "" else path + "."
+	if (v.kind == "object") {
+		for (const [k, m] of v.members) {
+			flatten(m, dot + k, out)
+		}
+	} else if (v.kind == "array") {
+		for (let i = 0; i < v.items.length; i++) {
+			flatten(v.items[i], `${dot}${i}`, out)
+		}
+	} else {
+		out.push([path, v.text])
+	}
+}
+
+function document(message: string): Value | null {
+	const r = new Reader(message)
+	const v = r.value()
+	r.space()
+	return if (v != null && r.i == message.length) v else null
+}
+
+class Reader {
+	s: string
+	i = 0
+
+	constructor(s: string) { this.s = s }
+
+	space() {
+		while (this.i < this.s.length && isSpace(this.s[this.i])) {
+			this.i++
+		}
+	}
+
+	value(): Value | null {
+		this.space()
+		if (this.i >= this.s.length) {
+			return null
+		}
+		const v = new Value()
+		const c = this.s[this.i]
+		if (c == 123 || c == 91) {
+			// { or [
+			v.kind = if (c == 123) "object" else "array"
+			const close: u8 = if (c == 123) 125 else 93
+			this.i++
+			this.space()
+			if (this.i < this.s.length && this.s[this.i] == close) {
+				this.i++
+				return v
+			}
+			while (true) {
+				if (c == 123) {
+					this.space()
+					const k = this.string()
+					this.space()
+					if (k == null || this.i >= this.s.length || this.s[this.i] != 58) {
+						return null
+					}
+					this.i++
+					const m = this.value()
+					if (m == null) {
+						return null
+					}
+					v.members.push([k!, m!])
+				} else {
+					const m = this.value()
+					if (m == null) {
+						return null
+					}
+					v.items.push(m!)
+				}
+				this.space()
+				if (this.i >= this.s.length) {
+					return null
+				}
+				const next = this.s[this.i]
+				this.i++
+				if (next == close) {
+					return v
+				}
+				if (next != 44) {
+					return null
+				}
+			}
+		}
+		if (c == 34) {
+			const t = this.string()
+			if (t == null) {
+				return null
+			}
+			v.kind = "string"
+			v.text = t!
+			return v
+		}
+		const from = this.i
+		while (this.i < this.s.length && indexOf(",]} \t\r\n", fromBytes([this.s[this.i]])) < 0) {
+			this.i++
+		}
+		v.text = this.s.slice(from, this.i)
+		if (["true", "false", "null"].includes(v.text)) {
+			v.kind = v.text
+		} else if (number(v.text) != null) {
+			v.kind = "number"
+		} else {
+			return null
+		}
+		return v
+	}
+
+	string(): string | null {
+		if (this.i >= this.s.length || this.s[this.i] != 34) {
+			return null
+		}
+		this.i++
+		const out: u8[] = []
+		while (this.i < this.s.length && this.s[this.i] != 34) {
+			let c = this.s[this.i]
+			if (c == 92 && this.i + 1 < this.s.length) {
+				// a backslash
+				this.i++
+				c = this.s[this.i]
+				switch (c) {
+					case 110: c = 10
+					case 116: c = 9
+					case 114: c = 13
+					case 98: c = 8
+					case 102: c = 12
+					default: {}
+				}
+			}
+			out.push(c)
+			this.i++
+		}
+		if (this.i >= this.s.length) {
+			return null
+		}
+		this.i++
+		return fromBytes(out)
+	}
+}
+
+function number(s: string): f64 | null {
+	if (s == "" || !(isDigit(s[0]) || s[0] == 45 && s.length > 1)) {
+		return null
+	}
+	try {
+		return parseFloat[f64](s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function regex(text: string): Regex throws Fault {
+	try {
+		return compile(text)
+	} catch (e: ParseError) {
+		throw malformed()
+	}
+}
+
+function malformed(): Fault { return invalid("Invalid metric filter pattern") }
+function invalid(why: string): Fault { return new Fault(400, "InvalidParameterException", why) }

@@ -1,0 +1,1229 @@
+//! Logs Insights: its queries, which run when their results are asked for and are Complete at once, and its query
+//! language. A malformed query is answered in AWS's words, without a queryCompileError; AWS's positions on the first
+//! line count from 50 and the first log group name's length, a guess from one name. As AWS, a filter after a parse
+//! leaves recordsMatched as it was.
+//!
+//! Where AWS differs: results are newest first unless sorted, a query without fields or stats shows every field,
+//! bytesScanned is the messages' bytes, GetLogGroupFields knows a group's fields at once where AWS takes minutes, and
+//! commands and functions not implemented, as pattern, diff, anomaly and filterIndex, are compile errors.
+
+import { Fault } from "../../core/fault"
+import { uuid } from "../../core/random"
+import * as api from "./api"
+import { discovered } from "./pattern"
+import { definitions, Definition, Event, events, groups, queries, Query } from "./records"
+import { Caller } from "../../core/service"
+import { Store } from "../../core/state/store"
+import { indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import * as base64 from "std/encoding/base64"
+import { formatFloat, parseFloat } from "std/float"
+import { ceil, floor, sqrt } from "std/math"
+import { compile, Regex } from "std/regex"
+import { lower, ParseError, replace, split, trim } from "std/string"
+import { millisecond, parseRfc3339, rfc3339 } from "std/time"
+
+/// An expression: its op, field, string, number, regex, list, star, call, not, neg or a binary operator; its name
+/// or text; its operands; and where it is in the query.
+export class Expr {
+	op = ""
+	text = ""
+	args: Expr[] = []
+	regex: Regex | null = null
+}
+
+class Column {
+	name = ""
+	e = new Expr()
+	desc = false
+}
+
+class Command {
+	kind = ""
+	columns: Column[] = []
+	by: Column[] = []
+	e = new Expr()
+	n = 0
+	regex: Regex | null = null
+	names: string[] = []
+}
+
+export class Program {
+	commands: Command[] = []
+}
+
+export class Row {
+	fields: [string, string][] = []
+	ptr = ""
+}
+
+const aggregates = ["count", "count_distinct", "sum", "avg", "min", "max", "pct", "earliest", "latest", "stddev"]
+
+const functions = ["ispresent", "isempty", "isblank", "abs", "ceil", "floor", "greatest", "least", "concat", "strlen",
+	"toupper", "tolower", "trim", "ltrim", "rtrim", "substr", "replace", "strcontains", "isvalidip", "datefloor", "bin",
+	"frommillis", "tomillis", "coalesce"]
+
+class Parser {
+	s: string
+	i = 0
+	/// What AWS adds to a position on the query's first line; and the request's id, which AWS's messages carry.
+	base: i32
+	request: string
+
+	constructor(s: string, base: i32, request: string) {
+		this.s = s
+		this.base = base
+		this.request = request
+	}
+
+	fail(why: string): Fault {
+		return api.malformedQueryException(`${why} (Service: AWSLogs; Status Code: 400; Error Code: `
+			+ `MalformedQueryException; Request ID: ${this.request}; Proxy: null)`)
+	}
+
+	position(at: i32): i32 {
+		const line = this.s.slice(0, at)
+		const nl = lastIndexOf(line, "\n")
+		return if (nl < 0) this.base + at else at - nl - 1
+	}
+
+	space() {
+		while (this.i < this.s.length) {
+			const c = this.s[this.i]
+			if (c == 35) {
+				while (this.i < this.s.length && this.s[this.i] != 10) {
+					this.i++
+				}
+			} else if (isSpace(c)) {
+				this.i++
+			} else {
+				return
+			}
+		}
+	}
+
+	end(): bool {
+		this.space()
+		return this.i >= this.s.length || this.s[this.i] == 124
+	}
+
+	word(w: string): bool {
+		this.space()
+		const to = this.i + w.length
+		if (to > this.s.length || lower(this.s.slice(this.i, to)) != w || to < this.s.length && named(this.s[to])) {
+			return false
+		}
+		this.i = to
+		return true
+	}
+
+	symbol(y: string): bool {
+		this.space()
+		if (!startsWith(this.s.slice(this.i, this.s.length), y)) {
+			return false
+		}
+		this.i += y.length
+		return true
+	}
+
+	expect(y: string) throws Fault {
+		if (!this.symbol(y)) {
+			throw this.unexpected()
+		}
+	}
+
+	unexpected(): Fault {
+		this.space()
+		let to = this.i
+		while (to < this.s.length && named(this.s[to])) {
+			to++
+		}
+		if (to == this.i && to < this.s.length) {
+			to++
+		}
+		const symbol = if (to == this.i) "<EOF>" else this.s.slice(this.i, to)
+		const line = split(this.s.slice(0, this.i), "\n").length
+		return this.fail(`unexpected symbol found ${symbol} at line ${line} and position ${this.position(this.i)}`)
+	}
+
+	command(): Command throws Fault {
+		this.space()
+		const from = this.i
+		const c = new Command()
+		const kinds = ["fields", "display", "filter", "sort", "limit", "stats", "parse", "dedup", "unmask"]
+		for (const k of kinds) {
+			if (c.kind == "" && this.word(k)) {
+				c.kind = k
+			}
+		}
+		if (c.kind == "") {
+			throw this.unexpected()
+		}
+		if (c.kind == "fields" || c.kind == "display" || c.kind == "dedup") {
+			c.columns = this.columns(false)
+		} else if (c.kind == "stats") {
+			c.columns = this.columns(true)
+			if (this.word("by")) {
+				c.by = this.columns(false)
+			}
+		} else if (c.kind == "filter") {
+			c.e = this.expr()
+		} else if (c.kind == "sort") {
+			while (true) {
+				const k = { ...new Column(), e: this.expr() }
+				k.desc = this.word("desc")
+				if (!k.desc) {
+					this.word("asc")
+				}
+				c.columns.push(k)
+				if (!this.symbol(",")) {
+					break
+				}
+			}
+		} else if (c.kind == "limit") {
+			this.space()
+			const at = this.i
+			const e = this.primary()
+			if (e.op != "number" || indexOf(e.text, ".") >= 0) {
+				this.i = at
+				throw this.unexpected()
+			}
+			c.n = (number(e.text) ?? 0.0) as i32
+		} else if (c.kind == "parse") {
+			c.e = { ...new Expr(), op: "field", text: this.name() }
+			this.space()
+			const at = this.i
+			const e = this.primary()
+			if (e.op == "regex") {
+				c.regex = e.regex
+				c.names = e.regex!.names.filter(n => n != "")
+			} else if (e.op == "string") {
+				c.regex = glob(e.text)
+				if (!this.word("as")) {
+					throw this.unexpected()
+				}
+				while (true) {
+					c.names.push(this.name())
+					if (!this.symbol(",")) {
+						break
+					}
+				}
+				if (c.names.length != c.regex!.names.length - 1) {
+					throw this.fail("The number of fields does not match the number of wildcards")
+				}
+			} else {
+				this.i = at
+				throw this.unexpected()
+			}
+		} else {
+			while (!this.end()) {
+				this.i++
+			}
+		}
+		if (!this.end()) {
+			throw this.unexpected()
+		}
+		return c
+	}
+
+	columns(stats: bool): Column[] throws Fault {
+		const out: Column[] = []
+		while (true) {
+			this.space()
+			const from = this.i
+			const e = this.expr()
+			const call = e.op == "call" && aggregates.includes(e.text)
+			if (stats != call) {
+				this.i = from
+				throw this.unexpected()
+			}
+			const text = trim(this.s.slice(from, this.i))
+			out.push({ ...new Column(), e: e,
+				name: if (this.word("as")) this.name() else if (e.op == "field") e.text else text })
+			if (!this.symbol(",")) {
+				return out
+			}
+		}
+	}
+
+	expr(): Expr throws Fault {
+		let l = this.and()
+		while (this.word("or")) {
+			l = binary("or", l, this.and())
+		}
+		return l
+	}
+
+	and(): Expr throws Fault {
+		let l = this.not()
+		while (this.word("and")) {
+			l = binary("and", l, this.not())
+		}
+		return l
+	}
+
+	not(): Expr throws Fault {
+		if (this.word("not")) {
+			return { ...new Expr(), op: "not", args: [this.not()] }
+		}
+		return this.comparison()
+	}
+
+	comparison(): Expr throws Fault {
+		const l = this.additive()
+		for (const op of ["==", "<=", ">=", "!=", "=", "<", ">"]) {
+			if (this.symbol(op)) {
+				return binary(if (op == "==") "=" else op, l, this.additive())
+			}
+		}
+		const negated = this.word("not")
+		if (this.word("like")) {
+			return binary(if (negated) "not like" else "like", l, this.additive())
+		}
+		if (this.word("in")) {
+			return binary(if (negated) "not in" else "in", l, this.primary())
+		}
+		if (negated) {
+			throw this.unexpected()
+		}
+		return l
+	}
+
+	additive(): Expr throws Fault {
+		let l = this.term()
+		while (true) {
+			if (this.symbol("+")) {
+				l = binary("+", l, this.term())
+			} else if (this.symbol("-")) {
+				l = binary("-", l, this.term())
+			} else {
+				return l
+			}
+		}
+	}
+
+	term(): Expr throws Fault {
+		let l = this.unary()
+		while (true) {
+			if (this.symbol("*")) {
+				l = binary("*", l, this.unary())
+			} else if (this.symbol("/")) {
+				l = binary("/", l, this.unary())
+			} else if (this.symbol("%")) {
+				l = binary("%", l, this.unary())
+			} else {
+				return l
+			}
+		}
+	}
+
+	unary(): Expr throws Fault {
+		if (this.symbol("-")) {
+			return { ...new Expr(), op: "neg", args: [this.unary()] }
+		}
+		return this.primary()
+	}
+
+	primary(): Expr throws Fault {
+		this.space()
+		if (this.i >= this.s.length) {
+			throw this.unexpected()
+		}
+		const from = this.i
+		const c = this.s[this.i]
+		if (this.symbol("(")) {
+			const e = this.expr()
+			this.expect(")")
+			return e
+		}
+		if (this.symbol("[")) {
+			const e = { ...new Expr(), op: "list" }
+			if (!this.symbol("]")) {
+				while (true) {
+					e.args.push(this.expr())
+					if (!this.symbol(",")) {
+						break
+					}
+				}
+				this.expect("]")
+			}
+			return e
+		}
+		if (c == 34 || c == 39) {
+			return { ...new Expr(), op: "string", text: this.string(c) }
+		}
+		if (c == 47) {
+			const out: u8[] = []
+			this.i++
+			while (this.i < this.s.length && this.s[this.i] != 47) {
+				if (this.s[this.i] == 92 && this.i + 1 < this.s.length && this.s[this.i + 1] == 47) {
+					this.i++
+				}
+				out.push(this.s[this.i])
+				this.i++
+			}
+			if (this.i >= this.s.length) {
+				throw this.fail("Unterminated regex")
+			}
+			this.i++
+			try {
+				return { ...new Expr(), op: "regex", regex: compile(fromBytes(out)) }
+			} catch (e: ParseError) {
+				throw this.fail("Invalid regex")
+			}
+		}
+		if (isDigit(c)) {
+			while (this.i < this.s.length && (isDigit(this.s[this.i]) || this.s[this.i] == 46)) {
+				this.i++
+			}
+			const n = this.s.slice(from, this.i)
+			const at = this.i
+			while (this.i < this.s.length && named(this.s[this.i])) {
+				this.i++
+			}
+			const unit = this.s.slice(at, this.i)
+			if (unit == "") {
+				return { ...new Expr(), op: "number", text: n }
+			}
+			const scale = durations(unit)
+			if (scale == 0.0) {
+				throw this.fail(`Invalid time unit: ${unit}`)
+			}
+			return { ...new Expr(), op: "number", text: show((number(n) ?? 0.0) * scale) }
+		}
+		if (this.symbol("*")) {
+			return { ...new Expr(), op: "star" }
+		}
+		const name = this.name()
+		if (!this.symbol("(")) {
+			return { ...new Expr(), op: "field", text: name }
+		}
+		const f = lower(name)
+		const e = { ...new Expr(), op: "call", text: f }
+		if (!this.symbol(")")) {
+			while (true) {
+				e.args.push(this.expr())
+				if (!this.symbol(",")) {
+					break
+				}
+			}
+			this.expect(")")
+		}
+		if (!aggregates.includes(f) && !functions.includes(f)) {
+			throw this.fail(`Unrecognized function name: ${name} ([${this.position(from)},${this.position(this.i - 1)}])`)
+		}
+		return e
+	}
+
+	string(q: u8): string throws Fault {
+		const from = this.i
+		this.i++
+		const out: u8[] = []
+		while (this.i < this.s.length && this.s[this.i] != q) {
+			if (this.s[this.i] == 92 && this.i + 1 < this.s.length) {
+				this.i++
+			}
+			out.push(this.s[this.i])
+			this.i++
+		}
+		if (this.i >= this.s.length) {
+			throw this.fail("Unterminated string")
+		}
+		this.i++
+		return fromBytes(out)
+	}
+
+	name(): string throws Fault {
+		this.space()
+		const from = this.i
+		if (this.i < this.s.length && this.s[this.i] == 96) {
+			const to = indexOf(this.s, "`", this.i + 1)
+			if (to < 0) {
+				throw this.fail("Unterminated field name")
+			}
+			this.i = to + 1
+			return this.s.slice(from + 1, to)
+		}
+		while (this.i < this.s.length && (named(this.s[this.i]) || this.s[this.i] == 46)) {
+			this.i++
+		}
+		if (this.i == from) {
+			throw this.unexpected()
+		}
+		return this.s.slice(from, this.i)
+	}
+}
+
+export function parse(text: string, group = "", request = ""): Program throws Fault {
+	const p = new Parser(text, 50 + group.length, request)
+	const out = new Program()
+	if (p.end()) {
+		throw p.unexpected()
+	}
+	while (p.i < text.length) {
+		if (out.commands.length > 0) {
+			p.i++
+		}
+		out.commands.push(p.command())
+	}
+	return out
+}
+
+function named(c: u8): bool { return isAlphanumeric(c) || c == 95 || c == 64 || c == 36 }
+function binary(op: string, l: Expr, r: Expr): Expr { return { ...new Expr(), op: op, args: [l, r] } }
+
+function durations(unit: string): f64 {
+	return switch (unit) {
+		case "ms": 1.0
+		case "s": 1000.0
+		case "m": 60000.0
+		case "h": 3600000.0
+		case "d": 86400000.0
+		case "w": 604800000.0
+		default: 0.0
+	}
+}
+
+function glob(g: string): Regex throws Fault {
+	const out = split(g, "*").map(p => quote(p)).join("(.*?)")
+	try {
+		return compile(if (endsWith(g)) out.slice(0, out.length - 5) + "(.*)" else out)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A glob did not compile")
+	}
+}
+
+function endsWith(g: string): bool { return g.length > 0 && g[g.length - 1] == 42 }
+
+function quote(s: string): string {
+	const out: u8[] = []
+	for (let i = 0; i < s.length; i++) {
+		if (indexOf("\\.+*?()|[]{}^$", fromBytes([s[i]])) >= 0) {
+			out.push(92)
+		}
+		out.push(s[i])
+	}
+	return fromBytes(out)
+}
+
+/// The rows p makes of input, newest first, as GetQueryResults answers them; and how many its filters matched.
+export function run(p: Program, input: Row[], limit: i32): [api.ResultField[][], i32] {
+	let rows = input
+	let shown: string[] | null = null
+	let stats = false
+	/// Whether a parse came before, after which AWS counts no filter's rows as matched.
+	let parsed = false
+	let matched = rows.length
+	let n = limit
+	for (const c of p.commands) {
+		if (c.kind == "fields" || c.kind == "display") {
+			for (const r of rows) {
+				for (const col of c.columns) {
+					set(r, col.name, evaluate(col.e, r))
+				}
+			}
+			const names = c.columns.map(col => col.name)
+			if (c.kind == "display" || shown == null) {
+				shown = names
+			} else {
+				for (const x of names) {
+					if (!shown!.includes(x)) {
+						shown!.push(x)
+					}
+				}
+			}
+		} else if (c.kind == "filter") {
+			rows = rows.filter(r => truth(evaluate(c.e, r)))
+			matched = if (parsed) matched else rows.length
+		} else if (c.kind == "sort") {
+			sortBy(rows, (a, b) => before(c.columns, a, b))
+		} else if (c.kind == "limit") {
+			n = if (c.n < n) c.n else n
+			rows = rows.slice(0, if (n < rows.length) n else rows.length)
+		} else if (c.kind == "stats") {
+			rows = grouped(c, rows)
+			shown = [...c.by.map(col => col.name), ...c.columns.map(col => col.name)]
+			stats = true
+		} else if (c.kind == "parse") {
+			parsed = true
+			for (const r of rows) {
+				const v = evaluate(c.e, r)
+				const m = if (v == null) null else c.regex!.find(v!)
+				if (m != null) {
+					let k = 0
+					for (let g = 1; g < c.regex!.names.length; g++) {
+						const name = if (c.regex!.names[g] != "") c.regex!.names[g]
+							else if (k < c.names.length) c.names[k]
+							else ""
+						k++
+						if (name != "" && m![2 * g] >= 0) {
+							set(r, name, v!.slice(m![2 * g], m![2 * g + 1]))
+						}
+					}
+				}
+			}
+		} else if (c.kind == "dedup") {
+			const seen: string[] = []
+			const kept: Row[] = []
+			for (const r of rows) {
+				const key = c.columns.map(col => evaluate(col.e, r) ?? "\x01").join("\x00")
+				if (!seen.includes(key)) {
+					seen.push(key)
+					kept.push(r)
+				}
+			}
+			rows = kept
+		}
+	}
+	const out: api.ResultField[][] = []
+	for (const r of rows.slice(0, if (n < rows.length) n else rows.length)) {
+		const fields: api.ResultField[] = []
+		const names = shown ?? r.fields.map(f => f[0])
+		for (const name of names) {
+			const v = get(r, name)
+			if (v != null) {
+				fields.push({ ...new api.ResultField(), field: name, value: v })
+			}
+		}
+		if (!stats) {
+			fields.push({ ...new api.ResultField(), field: "@ptr", value: r.ptr })
+		}
+		out.push(fields)
+	}
+	return [out, matched]
+}
+
+function before(keys: Column[], a: Row, b: Row): bool {
+	for (const k of keys) {
+		const x = evaluate(k.e, a)
+		const y = evaluate(k.e, b)
+		const c = compare(x, y)
+		if (c != 0) {
+			return if (k.desc) c > 0 else c < 0
+		}
+	}
+	return false
+}
+
+function grouped(c: Command, rows: Row[]): Row[] {
+	const keys: string[] = []
+	const groups: Row[][] = []
+	for (const r of rows) {
+		const key = c.by.map(col => evaluate(col.e, r) ?? "\x01").join("\x00")
+		const at = keys.indexOf(key)
+		if (at < 0) {
+			keys.push(key)
+			groups.push([r])
+		} else {
+			groups[at].push(r)
+		}
+	}
+	const out: Row[] = []
+	for (const g of groups) {
+		const r = new Row()
+		for (const col of c.by) {
+			set(r, col.name, evaluate(col.e, g[0]))
+		}
+		for (const col of c.columns) {
+			set(r, col.name, aggregate(col.e, g))
+		}
+		out.push(r)
+	}
+	return out
+}
+
+function aggregate(e: Expr, rows: Row[]): string | null {
+	const f = e.text
+	const arg = if (e.args.length > 0) e.args[0] else new Expr()
+	if (f == "count" && (e.args.length == 0 || arg.op == "star")) {
+		return `${rows.length}`
+	}
+	const values: string[] = []
+	for (const r of rows) {
+		const v = evaluate(arg, r)
+		if (v != null) {
+			values.push(v!)
+		}
+	}
+	if (f == "count") {
+		return `${values.length}`
+	}
+	if (f == "count_distinct") {
+		const seen: string[] = []
+		for (const v of values) {
+			if (!seen.includes(v)) {
+				seen.push(v)
+			}
+		}
+		return `${seen.length}`
+	}
+	if (f == "earliest" || f == "latest") {
+		let best: Row | null = null
+		for (const r of rows) {
+			if (evaluate(arg, r) != null
+				&& (best == null
+				|| (compare(get(r, "@timestamp"), get(best!, "@timestamp")) < 0) == (f == "earliest"))) {
+				best = r
+			}
+		}
+		return if (best == null) null else evaluate(arg, best!)
+	}
+	const xs: f64[] = []
+	for (const v of values) {
+		const x = number(v)
+		if (x != null) {
+			xs.push(x!)
+		}
+	}
+	if (xs.length == 0) {
+		return null
+	}
+	let sum = 0.0
+	for (const x of xs) {
+		sum += x
+	}
+	const mean = sum / (xs.length as f64)
+	switch (f) {
+		case "sum": return show(sum)
+		case "avg": return show(mean)
+		case "min", "max":
+			let best = xs[0]
+			for (const x of xs) {
+				if ((x < best) == (f == "min") && x != best) {
+					best = x
+				}
+			}
+			return show(best)
+		case "stddev":
+			if (xs.length < 2) {
+				return "0"
+			}
+			let s = 0.0
+			for (const x of xs) {
+				s += (x - mean) * (x - mean)
+			}
+			return show(sqrt(s / ((xs.length - 1) as f64)))
+		default:
+			sortBy(xs, (a, b) => a < b)
+			const p = if (e.args.length > 1) number(evaluate(e.args[1], new Row()) ?? "") ?? 50.0 else 50.0
+			let at = (ceil(p / 100.0 * (xs.length as f64)) as i32) - 1
+			at = if (at < 0) 0 else if (at >= xs.length) xs.length - 1 else at
+			return show(xs[at])
+	}
+}
+
+function evaluate(e: Expr, r: Row): string | null {
+	const op = e.op
+	if (op == "field") {
+		return get(r, e.text)
+	}
+	if (op == "string" || op == "number") {
+		return e.text
+	}
+	if (op == "call") {
+		return call(e, r)
+	}
+	if (op == "not") {
+		return flag(!truth(evaluate(e.args[0], r)))
+	}
+	if (op == "neg") {
+		const x = number(evaluate(e.args[0], r) ?? "")
+		return if (x == null) null else show(-x!)
+	}
+	if (op == "and") {
+		return flag(truth(evaluate(e.args[0], r)) && truth(evaluate(e.args[1], r)))
+	}
+	if (op == "or") {
+		return flag(truth(evaluate(e.args[0], r)) || truth(evaluate(e.args[1], r)))
+	}
+	if (op == "regex" || op == "list" || op == "star") {
+		return null
+	}
+	const a = evaluate(e.args[0], r)
+	if (op == "like" || op == "not like") {
+		const pattern = e.args[1]
+		const found = a != null
+			&& (if (pattern.op == "regex") pattern.regex!.find(a!) != null
+			else indexOf(a!, evaluate(pattern, r) ?? "") >= 0)
+		return flag(found == (op == "like"))
+	}
+	if (op == "in" || op == "not in") {
+		let found = false
+		for (const x of e.args[1].args) {
+			if (a != null && compare(a, evaluate(x, r)) == 0) {
+				found = true
+			}
+		}
+		return flag(a != null && found == (op == "in"))
+	}
+	const b = evaluate(e.args[1], r)
+	if (op == "=" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
+		if (a == null || b == null) {
+			return flag(false)
+		}
+		const c = compare(a, b)
+		return flag(switch (op) {
+			case "=": c == 0
+			case "!=": c != 0
+			case "<": c < 0
+			case ">": c > 0
+			case "<=": c <= 0
+			default: c >= 0
+		})
+	}
+	const x = number(a ?? "")
+	const y = number(b ?? "")
+	if (x == null || y == null) {
+		return null
+	}
+	return show(switch (op) {
+		case "+": x! + y!
+		case "-": x! - y!
+		case "*": x! * y!
+		case "/": x! / y!
+		default: x! - y! * floor(x! / y!)
+	})
+}
+
+function call(e: Expr, r: Row): string | null {
+	const vs = e.args.map(a => evaluate(a, r))
+	const s = if (vs.length > 0) vs[0] else null
+	const x = number(s ?? "")
+	switch (e.text) {
+		case "ispresent": return flag(s != null)
+		case "isempty": return flag(s == null || s! == "")
+		case "isblank": return flag(s == null || trim(s!) == "")
+		case "abs": return if (x == null) null else show(if (x! < 0.0) -x! else x!)
+		case "ceil": return if (x == null) null else show(ceil(x!))
+		case "floor": return if (x == null) null else show(floor(x!))
+		case "greatest", "least":
+			let best: f64 | null = null
+			for (const v of vs) {
+				const y = number(v ?? "")
+				if (y != null && (best == null || (y! > best!) == (e.text == "greatest"))) {
+					best = y
+				}
+			}
+			return if (best == null) null else show(best!)
+		case "concat": return vs.map(v => v ?? "").join("")
+		case "coalesce":
+			for (const v of vs) {
+				if (v != null) {
+					return v
+				}
+			}
+			return null
+		case "strcontains": return if (s == null) null
+			else flag(indexOf(s!, if (vs.length > 1) vs[1] ?? "" else "") >= 0)
+		case "isvalidip": return flag(s != null && ip(s!))
+		case "frommillis": return if (x == null) null else time(x! as i64)
+		case "tomillis":
+			const ms = millis(s ?? "")
+			return if (ms == null) null else `${ms!}`
+		case "bin", "datefloor":
+			const at = if (e.text == "bin") get(r, "@timestamp") else s
+			const unit = number(if (e.text == "bin") s ?? "" else if (vs.length > 1) vs[1] ?? "" else "")
+			const t = millis(at ?? "")
+			if (t == null || unit == null || unit! <= 0.0) {
+				return null
+			}
+			const u = unit! as i64
+			return time(t! - t! % u)
+		default: return if (s == null) null else text(e.text, s!, vs)
+	}
+}
+
+function text(f: string, v: string, vs: (string | null)[]): string {
+	switch (f) {
+		case "strlen": return `${v.length}`
+		case "toupper": return mapped(v, true)
+		case "tolower": return lower(v)
+		case "trim": return trim(v)
+		case "ltrim": return v.slice(skip(v, true), v.length)
+		case "rtrim": return v.slice(0, skip(v, false))
+		case "substr":
+			const from = number(if (vs.length > 1) vs[1] ?? "" else "") ?? 0.0
+			let a = if (from < 0.0) 0 else from as i32
+			a = if (a > v.length) v.length else a
+			let b = v.length
+			if (vs.length > 2) {
+				const n = number(vs[2] ?? "") ?? 0.0
+				b = if (a + (n as i32) < b) a + (n as i32) else b
+			}
+			return v.slice(a, if (b < a) a else b)
+		default:
+			const old = if (vs.length > 1) vs[1] ?? "" else ""
+			return if (old == "") v else replace(v, old, if (vs.length > 2) vs[2] ?? "" else "")
+	}
+}
+
+function skip(s: string, leading: bool): i32 {
+	if (leading) {
+		let i = 0
+		while (i < s.length && isSpace(s[i])) {
+			i++
+		}
+		return i
+	}
+	let i = s.length
+	while (i > 0 && isSpace(s[i - 1])) {
+		i--
+	}
+	return i
+}
+
+function mapped(s: string, upper: bool): string {
+	const out: u8[] = []
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		out.push(if (upper && c >= 97 && c <= 122) c - 32 else c)
+	}
+	return fromBytes(out)
+}
+
+function ip(s: string): bool {
+	if (indexOf(s, ":") >= 0) {
+		const groups = split(s, ":")
+		if (groups.length < 3 || groups.length > 8) {
+			return false
+		}
+		for (const g of groups) {
+			for (let i = 0; i < g.length; i++) {
+				if (!isDigit(g[i]) && indexOf("abcdefABCDEF", fromBytes([g[i]])) < 0 || g.length > 4) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	const parts = split(s, ".")
+	if (parts.length != 4) {
+		return false
+	}
+	for (const p of parts) {
+		if (p == "" || p.length > 3 || !digits(p) || (number(p) ?? 256.0) > 255.0) {
+			return false
+		}
+	}
+	return true
+}
+
+function digits(s: string): bool {
+	for (let i = 0; i < s.length; i++) {
+		if (!isDigit(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+/// -1, 0 or 1 as a is before, as or after b: as numbers if both are, else as strings; null before all.
+function compare(a: string | null, b: string | null): i32 {
+	if (a == null || b == null) {
+		return if (a == null && b == null) 0 else if (a == null) -1 else 1
+	}
+	const x = number(a!)
+	const y = number(b!)
+	if (x != null && y != null) {
+		return if (x! < y!) -1 else if (x! > y!) 1 else 0
+	}
+	return if (a! < b!) -1 else if (a! > b!) 1 else 0
+}
+
+function truth(v: string | null): bool { return v != null && v! != "" && v! != "0" && v! != "false" }
+function flag(b: bool): string { return if (b) "1" else "0" }
+
+function number(s: string): f64 | null {
+	if (s == "" || !(isDigit(s[0]) || (s[0] == 45 || s[0] == 46) && s.length > 1)) {
+		return null
+	}
+	try {
+		return parseFloat[f64](s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// x as Logs Insights writes a number: whole without a point.
+export function show(x: f64): string {
+	if (x == floor(x) && x < 1e15 && x > -1e15) {
+		return `${x as i64}`
+	}
+	return formatFloat(x)
+}
+
+export function time(t: i64): string {
+	const ms = (t % 1000 + 1000) % 1000
+	const s = rfc3339((t - ms) * millisecond)
+	const m = `${ms + 1000}`
+	return `${s.slice(0, 10)} ${s.slice(11, 19)}.${m.slice(1, 4)}`
+}
+
+function millis(s: string): i64 | null {
+	if (s.length == 23 && s[10] == 32) {
+		try {
+			return parseRfc3339(`${s.slice(0, 10)}T${s.slice(11, 19)}Z`) / millisecond
+				+ ((number(s.slice(20, 23)) ?? 0.0) as i64)
+		} catch (e: ParseError) {
+			return null
+		}
+	}
+	const x = number(s)
+	return if (x == null) null else x! as i64
+}
+
+export function get(r: Row, name: string): string | null {
+	for (const f of r.fields) {
+		if (f[0] == name) {
+			return f[1]
+		}
+	}
+	return null
+}
+
+function set(r: Row, name: string, v: string | null) {
+	if (v == null) {
+		return
+	}
+	for (let i = 0; i < r.fields.length; i++) {
+		if (r.fields[i][0] == name) {
+			r.fields[i] = [name, v!]
+			return
+		}
+	}
+	r.fields.push([name, v!])
+}
+
+export function row(account: string, g: string, stream: string, id: string, e: Event, at: i64): Row {
+	const r = new Row()
+	r.fields = [["@timestamp", time(at)], ["@message", e.message], ["@logStream", stream], ["@log", `${account}:${g}`],
+		["@ingestionTime", time(e.ingested)]]
+	for (const f of discovered(e.message)) {
+		set(r, f[0], f[1])
+	}
+	r.ptr = `${base64.encode(`${g}\x00${stream}`)}:${id}`
+	return r
+}
+
+/// The log group, stream and event id of the pointer ptr, of AWS's form: the group and stream, and the id, by a colon.
+export function pointed(ptr: string): string[] | null {
+	const colon = indexOf(ptr, ":")
+	if (colon < 0) {
+		return null
+	}
+	try {
+		const parts = split(base64.decode(ptr.slice(0, colon)), "\x00")
+		return if (parts.length == 2) [...parts, ptr.slice(colon + 1, ptr.length)] else null
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+export function startQuery(caller: Caller, input: api.StartQueryRequest): api.StartQueryResponse throws Fault {
+	const names: string[] = []
+	if (input.logGroupName != null) {
+		names.push(input.logGroupName!)
+	}
+	for (const n of input.logGroupNames ?? []) {
+		names.push(n)
+	}
+	for (const n of input.logGroupIdentifiers ?? []) {
+		names.push(nameOf(n))
+	}
+	for (const n of names) {
+		caller.allow(arnOf(caller, n))
+	}
+	if (names.length == 0) {
+		throw api.invalidParameterException("Log group name or identifiers must be specified.")
+	}
+	if (input.endTime < input.startTime) {
+		throw api.invalidParameterException("End time should not be before the start time")
+	}
+	parse(input.queryString, names[0], caller.requestId)
+	const s = caller.regional()
+	for (const n of names) {
+		if (groups(s).get(n) == null) {
+			throw api.resourceNotFoundException(`Log group '${n}' does not exist for account ID '${caller.account}'`)
+		}
+	}
+	const q = { ...new Query(), id: uuid(), text: input.queryString, groups: names, start: input.startTime,
+		end: input.endTime, limit: input.limit, created: now() / millisecond }
+	queries(s).put(q.id, q)
+	return { ...new api.StartQueryResponse(), queryId: q.id }
+}
+
+export function getQueryResults(caller: Caller,
+	input: api.GetQueryResultsRequest): api.GetQueryResultsResponse throws Fault {
+	const s = caller.regional()
+	const q = queries(s).get(input.queryId)
+	if (q == null) {
+		throw api.resourceNotFoundException("Query does not exist.")
+	}
+	const rows: Row[] = []
+	let bytes: i64 = 0
+	for (const g of q!.groups) {
+		caller.allow(arnOf(caller, g))
+		for (const [stream, id, e] of all(s, g)) {
+			const at = stamp(id)
+			if (at >= q!.start * 1000 && at <= q!.end * 1000 + 999) {
+				rows.push(row(caller.account, g, stream, id, e, at))
+				bytes += e.message.length as i64
+			}
+		}
+	}
+	sortBy(rows, (a, b) => (get(a, "@timestamp") ?? "") > (get(b, "@timestamp") ?? ""))
+	const [results, matched] = run(parse(q!.text), rows, q!.limit ?? 1000)
+	const r = new api.GetQueryResultsResponse()
+	r.queryLanguage = "CWLI"
+	r.status = q!.status as api.QueryStatus
+	r.results = results
+	r.statistics = { ...new api.QueryStatistics(), recordsMatched: matched as f64, recordsScanned: rows.length as f64,
+		bytesScanned: bytes as f64, logGroupsScanned: q!.groups.length as f64, resultCount: results.length as f64 }
+	return r
+}
+
+/// StopQuery: a query is Complete at once, so there is none running to stop.
+export function stopQuery(caller: Caller, input: api.StopQueryRequest): api.StopQueryResponse throws Fault {
+	if (queries(caller.regional()).get(input.queryId) == null) {
+		throw api.resourceNotFoundException("Query does not exist.")
+	}
+	return { ...new api.StopQueryResponse(), success: false }
+}
+
+export function describeQueries(caller: Caller,
+	input: api.DescribeQueriesRequest): api.DescribeQueriesResponse throws Fault {
+	const r = new api.DescribeQueriesResponse()
+	r.queries = []
+	const n = input.maxResults ?? 1000
+	for (const [_, q] of queries(caller.regional()).scan(null, 1000000, "")) {
+		if (r.queries!.length < n && (input.status == null || input.status! == q.status)
+			&& (input.logGroupName == null || q.groups.includes(input.logGroupName!))) {
+			r.queries!.push({ ...new api.QueryInfo(), queryLanguage: "CWLI", queryId: q.id, queryString: q.text,
+				status: q.status as api.QueryStatus, createTime: q.created, logGroupName: q.groups[0] })
+		}
+	}
+	return r
+}
+
+export function getLogRecord(caller: Caller, input: api.GetLogRecordRequest): api.GetLogRecordResponse throws Fault {
+	const p = pointed(input.logRecordPointer)
+	if (p == null) {
+		throw api.invalidParameterException("The specified logRecordPointer is invalid.")
+	}
+	const g = p![0]
+	caller.allow(arnOf(caller, g))
+	const e = events(caller.regional()).get(`${g}\x00${p![1]}\x00${p![2]}`)
+	if (e == null) {
+		throw api.invalidParameterException("The specified logRecordPointer is invalid.")
+	}
+	const r = row(caller.account, g, p![1], p![2], e!, stamp(p![2]))
+	return { ...new api.GetLogRecordResponse(), logRecord: r.fields }
+}
+
+export function getLogGroupFields(caller: Caller,
+	input: api.GetLogGroupFieldsRequest): api.GetLogGroupFieldsResponse throws Fault {
+	const g = if (input.logGroupName != null) input.logGroupName! else nameOf(input.logGroupIdentifier ?? "")
+	caller.allow(arnOf(caller, g))
+	const s = caller.regional()
+	if (groups(s).get(g) == null) {
+		throw api.resourceNotFoundException("The specified log group does not exist.")
+	}
+	const until = (input.time ?? (now() / millisecond / 1000)) * 1000 + 999
+	const counts: [string, i32][] = []
+	let total = 0
+	for (const [stream, id, e] of all(s, g)) {
+		if (stamp(id) <= until) {
+			total++
+			for (const f of row(caller.account, g, stream, id, e, stamp(id)).fields) {
+				let found = false
+				for (let i = 0; i < counts.length; i++) {
+					if (counts[i][0] == f[0]) {
+						counts[i] = [f[0], counts[i][1] + 1]
+						found = true
+					}
+				}
+				if (!found) {
+					counts.push([f[0], 1])
+				}
+			}
+		}
+	}
+	const r = new api.GetLogGroupFieldsResponse()
+	r.logGroupFields = counts.map(c => ({ ...new api.LogGroupField(), name: c[0], percent: c[1] * 100 / total }))
+	return r
+}
+
+export function putQueryDefinition(caller: Caller,
+	input: api.PutQueryDefinitionRequest): api.PutQueryDefinitionResponse throws Fault {
+	const db = definitions(caller.regional())
+	let id = input.queryDefinitionId ?? ""
+	if (id != "" && db.get(id) == null) {
+		throw api.resourceNotFoundException("The specified query definition does not exist.")
+	}
+	if (id == "") {
+		id = uuid()
+	}
+	db.put(id,
+		{ ...new Definition(), id: id, name: input.name, text: input.queryString, groups: input.logGroupNames,
+		updated: now() / millisecond })
+	return { ...new api.PutQueryDefinitionResponse(), queryDefinitionId: id }
+}
+
+export function describeQueryDefinitions(caller: Caller,
+	input: api.DescribeQueryDefinitionsRequest): api.DescribeQueryDefinitionsResponse throws Fault {
+	const r = new api.DescribeQueryDefinitionsResponse()
+	r.queryDefinitions = []
+	const n = input.maxResults ?? 1000
+	const found = definitions(caller.regional()).scan(null, 1000000, "").map(e => e[1])
+	sortBy(found, (a, b) => a.name < b.name)
+	for (const d of found) {
+		if (r.queryDefinitions!.length < n && startsWith(d.name, input.queryDefinitionNamePrefix ?? "")) {
+			r.queryDefinitions!.push({ ...new api.QueryDefinition(), queryLanguage: "CWLI", queryDefinitionId: d.id,
+				name: d.name, queryString: d.text, lastModified: d.updated, logGroupNames: d.groups })
+		}
+	}
+	return r
+}
+
+export function deleteQueryDefinition(caller: Caller,
+	input: api.DeleteQueryDefinitionRequest): api.DeleteQueryDefinitionResponse throws Fault {
+	const db = definitions(caller.regional())
+	if (db.get(input.queryDefinitionId) == null) {
+		throw api.resourceNotFoundException("The specified query definition does not exist.")
+	}
+	db.delete(input.queryDefinitionId)
+	return { ...new api.DeleteQueryDefinitionResponse(), success: true }
+}
+
+function all(s: Store, g: string): [string, string, Event][] {
+	const out: [string, string, Event][] = []
+	const prefix = g + "\x00"
+	let from: string | null = null
+	while (true) {
+		const chunk = events(s).scan(from, 1000, prefix)
+		for (const [k, e] of chunk) {
+			const parts = split(k.slice(prefix.length, k.length), "\x00")
+			out.push([parts[0], parts[1], e])
+		}
+		if (chunk.length < 1000) {
+			return out
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+function stamp(id: string): i64 { return (number(id.slice(0, 20)) ?? 0.0) as i64 }
+
+function arnOf(caller: Caller, name: string): string {
+	return `arn:aws:logs:${caller.region}:${caller.account}:log-group:${name}`
+}
+
+function nameOf(identifier: string): string {
+	if (!startsWith(identifier, "arn:")) {
+		return identifier
+	}
+	const at = indexOf(identifier, ":log-group:")
+	const name = if (at < 0) identifier else identifier.slice(at + 11, identifier.length)
+	return if (name.length > 2 && name.slice(name.length - 2, name.length) == ":*") name.slice(0, name.length - 2)
+		else name
+}

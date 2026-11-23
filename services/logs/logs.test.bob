@@ -1,0 +1,210 @@
+import { sign } from "../../core/auth/sigv4"
+import { request } from "../../core/client.test"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import * as protocol from "../../core/protocol/json"
+import { Caller } from "../../core/service"
+import * as iamApi from "../iam/api"
+import { Catalog } from "../iam/catalog"
+import * as iam from "../iam/iam"
+import * as kinesisApi from "../kinesis/api"
+import * as api from "./api"
+import { Handler } from "./logs"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+import { Decodable } from "std/types"
+import { escape } from "std/url"
+
+const t: i64 = 1435327200000
+const day: i64 = 86400000
+
+class Sink {
+	...kinesisApi.Unimplemented
+
+	putRecord(caller: Caller, input: kinesisApi.PutRecordInput): kinesisApi.PutRecordOutput throws Fault {
+		return new kinesisApi.PutRecordOutput()
+	}
+}
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	h.kinesis = new Sink()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	const catalog = new Catalog("")
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(new iam.Handler(catalog), caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `Logs_20140328.${op}`)
+	sign(req, body, "logs", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function out[T extends Decodable](res: Response): T {
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+function fails(res: Response, code: string, why = ""): bool {
+	const body = res.body.whole ?? ""
+	return res.status == 400 && indexOf(body, `"__type":"${code}"`) >= 0 && indexOf(body, why) >= 0
+}
+
+function made(names: string[]): Gateway {
+	const g = gateway()
+	assert call(g, "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	for (const n of names) {
+		assert call(g, "CreateLogStream", `{"logGroupName":"/g","logStreamName":"${n}"}`).status == 200
+	}
+	return g
+}
+
+function put(g: Gateway, s: string, at: [i64, string][]): api.PutLogEventsResponse {
+	const events = at.map(e => `{"timestamp":${e[0]},"message":"${e[1]}"}`).join(",")
+	return out[api.PutLogEventsResponse](call(g, "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"${s}","logEvents":[${events}]}`))
+}
+
+function get(g: Gateway, s: string, more = ""): [string[], string, string] {
+	const r = out[api.GetLogEventsResponse](call(g, "GetLogEvents",
+		`{"logGroupName":"/g","logStreamName":"${s}"${more}}`))
+	return [r.events!.map(e => e.message!), r.nextForwardToken!, r.nextBackwardToken!]
+}
+
+function filter(g: Gateway, more = ""): [string[], string | null] {
+	const r = out[api.FilterLogEventsResponse](call(g, "FilterLogEvents", `{"logGroupName":"/g"${more}}`))
+	return [r.events!.map(e => `${e.logStreamName!} ${e.message!}`), r.nextToken]
+}
+
+test "events in timestamp order across batches, and the tokens of GetLogEvents" {
+	const g = made(["s"])
+	put(g, "s", [[t - 30, "c"], [t - 10, "e"]])
+	const r = put(g, "s", [[t - 40, "a"], [t - 35, "b"], [t - 20, "d"]])
+	assert r.rejectedLogEventsInfo == null && r.nextSequenceToken!.length == 56
+	assert get(g, "s")[0] == ["a", "b", "c", "d", "e"]
+	const [last, forth, back] = get(g, "s", `,"limit":2`)
+	assert last == ["d", "e"]
+	assert get(g, "s", `,"limit":2,"nextToken":"${back}"`)[0] == ["b", "c"]
+	assert get(g, "s", `,"limit":2,"nextToken":"${forth}"`)[0] == []
+	const [first, next, _] = get(g, "s", `,"limit":2,"startFromHead":true`)
+	assert first == ["a", "b"] && get(g, "s", `,"limit":2,"nextToken":"${next}"`)[0] == ["c", "d"]
+	assert get(g, "s", `,"startTime":${t - 35},"endTime":${t - 20}`)[0] == ["b", "c"]
+	put(g, "s", [[t - 10, "f"]])
+	assert get(g, "s", `,"nextToken":"${forth}"`)[0] == ["f"]
+}
+
+test "PutLogEvents' rejections and limits" {
+	const g = made(["s"])
+	const r = put(g, "s", [[t - 15 * day, "old"], [t, "now"], [t + 3 * 3600000, "new"]]).rejectedLogEventsInfo!
+	assert r.tooOldLogEventEndIndex == 1 && r.tooNewLogEventStartIndex == 2 && r.expiredLogEventEndIndex == null
+	assert get(g, "s")[0] == ["now"]
+	assert call(g, "PutRetentionPolicy", `{"logGroupName":"/g","retentionInDays":1}`).status == 200
+	const e = put(g, "s", [[t - 2 * day, "expired"], [t, "kept"]]).rejectedLogEventsInfo!
+	assert e.expiredLogEventEndIndex == 1 && e.tooOldLogEventEndIndex == null
+	let x = "x"
+	while (x.length < 524288) {
+		x += x
+	}
+	const big = `{"timestamp":${t},"message":"${x}"}`
+	assert fails(call(g, "PutLogEvents", `{"logGroupName":"/g","logStreamName":"s","logEvents":[${big},${big}]}`),
+		"InvalidParameterException", "Upload too large: 1048628 bytes exceeds limit of 1048576")
+	assert fails(call(g, "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"s","logEvents":[{"timestamp":${t},`
+		+ `"message":"a"}],"sequenceToken":"nope"}`), "") == false
+}
+
+test "retention hides events at each request, until it is deleted" {
+	const g = made(["s"])
+	put(g, "s", [[t - 2 * day, "two days"]])
+	put(g, "s", [[t - 1000, "now"]])
+	assert call(g, "PutRetentionPolicy", `{"logGroupName":"/g","retentionInDays":1}`).status == 200
+	assert get(g, "s")[0] == ["now"] && filter(g)[0] == ["s now"]
+	assert call(g, "DeleteRetentionPolicy", `{"logGroupName":"/g"}`).status == 200
+	assert get(g, "s")[0] == ["two days", "now"]
+}
+
+test "FilterLogEvents interleaves streams, pages and matches patterns" {
+	const g = made(["a", "b", "c"])
+	put(g, "a", [[t - 50, "ERROR 1"], [t - 30, "INFO 3"]])
+	put(g, "b", [[t - 40, "ERROR 2"], [t - 20, `{\\"code\\": 500}`]])
+	assert filter(g)[0] == ["a ERROR 1", "b ERROR 2", "a INFO 3", `b {"code": 500}`]
+	const [one, token] = filter(g, `,"limit":3`)
+	assert one.length == 3 && filter(g, `,"limit":3,"nextToken":"${token!}"`)[0] == [`b {"code": 500}`]
+	assert filter(g, `,"nextToken":"${filter(g)[1]!}"`) == [[], null]
+	assert filter(g, `,"filterPattern":"ERROR"`)[0] == ["a ERROR 1", "b ERROR 2"]
+	assert filter(g, `,"filterPattern":"{ $.code >= 500 }"`)[0] == [`b {"code": 500}`]
+	assert filter(g, `,"startTime":${t - 40},"endTime":${t - 30}`)[0] == ["b ERROR 2", "a INFO 3"]
+	assert filter(g, `,"logStreamNamePrefix":"a"`)[0] == ["a ERROR 1", "a INFO 3"]
+	assert filter(g, `,"logStreamNames":["c"]`) == [[], null]
+	assert fails(call(g, "FilterLogEvents", `{"logGroupName":"/g","nextToken":"nope"}`), "InvalidParameterException",
+		"The specified nextToken is invalid.")
+}
+
+test "streams ordered by name or last event, and deleting streams and groups" {
+	const g = made(["a", "b", "c"])
+	put(g, "b", [[t - 10, "x"]])
+	put(g, "a", [[t - 20, "x"]])
+	const by = (more: string) => out[api.DescribeLogStreamsResponse](call(g, "DescribeLogStreams",
+		`{"logGroupName":"/g"${more}}`))
+	assert by("").logStreams!.map(s => s.logStreamName!) == ["a", "b", "c"]
+	assert by(`,"descending":true`).logStreams!.map(s => s.logStreamName!) == ["c", "b", "a"]
+	const page = by(`,"orderBy":"LastEventTime","descending":true,"limit":2`)
+	assert page.logStreams!.map(s => s.logStreamName!) == ["b", "a"]
+	assert by(`,"orderBy":"LastEventTime","descending":true,"nextToken":"${page.nextToken!}"`).logStreams!.map(s => s.logStreamName!)
+		== ["c"]
+	const a = by(`,"logStreamNamePrefix":"a"`).logStreams![0]
+	assert a.firstEventTimestamp == t - 20 && a.lastIngestionTime == t && a.uploadSequenceToken != null
+	assert by(`,"logStreamNamePrefix":"c"`).logStreams![0].uploadSequenceToken == null
+	assert call(g, "DeleteLogStream", `{"logGroupName":"/g","logStreamName":"a"}`).status == 200
+	assert call(g, "CreateLogStream", `{"logGroupName":"/g","logStreamName":"a"}`).status == 200
+	assert get(g, "a")[0] == []
+	assert call(g, "PutLogGroupDeletionProtection",
+		`{"logGroupIdentifier":"arn:aws:logs:us-east-1:000000000000:`
+		+ `log-group:/g","deletionProtectionEnabled":true}`).status == 200
+	assert fails(call(g, "DeleteLogGroup", `{"logGroupName":"/g"}`), "InvalidParameterException",
+		"LogGroup has delete protection enabled.")
+	assert call(g, "PutLogGroupDeletionProtection",
+		`{"logGroupIdentifier":"/g","deletionProtectionEnabled":false}`).status == 200
+	assert call(g, "DeleteLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert call(g, "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert by("").logStreams! == []
+}
+
+test "subscription filters: stored, two a group, and resource policies" {
+	const g = made([])
+	const trust = escape(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":`
+		+ `{"Service":"logs.amazonaws.com"},"Action":"sts:AssumeRole"}]}`, "component")
+	assert g.handle(request("iam", "test", "test",
+		`Action=CreateRole&Version=2010-05-08&RoleName=r&AssumeRolePolicyDocument=${trust}`)).status == 200
+	const sub = (name: string) => call(g, "PutSubscriptionFilter",
+		`{"logGroupName":"/g","filterName":"${name}",`
+		+ `"filterPattern":"","destinationArn":"arn:aws:kinesis:us-east-1:000000000000:stream/s",`
+		+ `"roleArn":"arn:aws:iam::000000000000:role/r"}`)
+	assert sub("a").status == 200 && sub("b").status == 200 && sub("a").status == 200
+	assert fails(sub("c"), "LimitExceededException", "Resource limit exceeded.")
+	const described = out[api.DescribeSubscriptionFiltersResponse](call(g, "DescribeSubscriptionFilters",
+		`{"logGroupName":"/g"}`)).subscriptionFilters!
+	assert described.map(f => f.filterName!) == ["a", "b"] && described[0].distribution == "ByLogStream"
+	assert call(g, "DeleteSubscriptionFilter", `{"logGroupName":"/g","filterName":"a"}`).status == 200
+	const document = `{\\"Statement\\":[{\\"Effect\\":\\"Allow\\",\\"Principal\\":{\\"Service\\":\\"events.amazonaws.com\\"},`
+		+ `\\"Action\\":\\"logs:PutLogEvents\\",\\"Resource\\":\\"*\\"}]}`
+	const policy = (name: string) => call(g, "PutResourcePolicy",
+		`{"policyName":"${name}","policyDocument":"${document}"}`)
+	assert fails(call(g, "PutResourcePolicy", `{"policyName":"p","policyDocument":"{}"}`), "InvalidParameterException",
+		"Error occurred while parsing accessPolicy.")
+	for (let i = 0; i < 10; i++) {
+		assert policy(`p${i}`).status == 200
+	}
+	assert policy("p0").status == 200
+	assert fails(policy("p10"), "LimitExceededException")
+	assert out[api.DescribeResourcePoliciesResponse](call(g, "DescribeResourcePolicies", "{}")).resourcePolicies!.length
+		== 10
+}
