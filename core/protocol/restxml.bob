@@ -52,21 +52,30 @@ export class Timestamp[F extends string = ""] {}
 export class Unwrapped {}
 /// Tags a string member, or its items, as bytes: base64 on the wire, but as they are in a payload.
 export class Blob {}
+/// Tags a member that orders the flattened lists of items named A and B, written as one list: a bool[] of whether
+/// each item is a B.
+export class Interleave[A extends string, B extends string] {}
 
 /// A service of the shape id, its documents in the XML namespace ns, "" for none, its errors in an ErrorResponse
-/// if wrapped, and how it answers a request breaking its model.
+/// if wrapped, whether it writes a date-time to the millisecond, and how it answers a request breaking its model.
 export class Service {
 	id: string
 	ns: string
 	wrapped: bool
+	milliseconds: bool
 	validation: Validation
 
-	constructor(id: string, ns: string, wrapped: bool, validation: Validation = new Validation("ValidationException")) {
+	constructor(id: string, ns: string, wrapped: bool, milliseconds: bool = false,
+		validation: Validation = new Validation("ValidationException")) {
 		this.id = id
 		this.ns = ns
 		this.wrapped = wrapped
+		this.milliseconds = milliseconds
 		this.validation = validation
 	}
+
+	/// The format of a date-time in its documents.
+	dates(): string { return if (this.milliseconds) "milliseconds" else "date-time" }
 }
 
 /// Where a request is the operation named operation: of method, the path pattern path, of labels {L} and a last
@@ -641,6 +650,8 @@ export function reply[O](service: Service, out: O, requestId: string, code: i32 
 	let body = ""
 	let doc: Node | null = null
 	let kind = ""
+	let order: bool[] | null = null
+	let merged = ["", ""]
 	if (O != Unit) {
 		switch (O.kind) {
 			case "class": for (const f of O.fields) {
@@ -655,6 +666,13 @@ export function reply[O](service: Service, out: O, requestId: string, code: i32 
 					body = s
 					kind = k
 					doc = el
+				} else if (has(f.tags, Interleave)) {
+					order = flags(out[f.name])
+					for (const t of f.tags) {
+						if (t.base == Interleave) {
+							merged = [t.args[0].value as string, t.args[1].value as string]
+						}
+					}
 				} else {
 					// of the body, as an output's other bindings are ignored
 					if (doc == null) {
@@ -662,19 +680,22 @@ export function reply[O](service: Service, out: O, requestId: string, code: i32 
 						namespace(doc!, O.tags, service.ns)
 					}
 					if (has(f.tags, Attr)) {
-						const s = format(out[f.name], f.tags)
+						const s = format(out[f.name], f.tags, service.dates())
 						if (s != "") {
 							doc!.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
 						}
 					} else if (has(O.tags, Unwrapped)) {
-						doc!.insert(new Node("text", "", format(out[f.name], f.tags)))
+						doc!.insert(new Node("text", "", format(out[f.name], f.tags, service.dates())))
 					} else {
-						put(doc!, tag(f.tags, Name, f.name), out[f.name], f.tags)
+						put(doc!, tag(f.tags, Name, f.name), out[f.name], f.tags, service.dates())
 					}
 				}
 			}
 			default: {}
 		}
+	}
+	if (doc != null && order != null) {
+		interleave(doc!, merged[0], merged[1], order!)
 	}
 	if (doc != null) {
 		body = `<?xml version="1.0" encoding="UTF-8"?>\n${serialize(doc!)}`
@@ -694,13 +715,67 @@ function identify(res: Response, service: Service, requestId: string) {
 	if (service.wrapped) {
 		res.headers.set("x-amzn-requestid", requestId)
 	} else {
-		res.headers.set("x-amz-request-id", requestId)
+		res.headers.set("x-amz-request-id", shortened(requestId))
 		res.headers.set("x-amz-id-2", hostId(requestId))
 	}
 }
 
+/// The request id requestId as S3 writes one: of a UUID, its first 16 hex digits, upper case.
+function shortened(requestId: string): string {
+	if (requestId.length != 36) {
+		return requestId
+	}
+	let s = ""
+	for (let i = 0; i < requestId.length && s.length < 16; i++) {
+		const at = indexOf("0123456789abcdef", lower(requestId.slice(i, i + 1)))
+		if (at >= 0) {
+			s += "0123456789ABCDEF".slice(at, at + 1)
+		}
+	}
+	return s
+}
+
 /// The id of the host that answers the request requestId, as S3's HostId: here, of the request id alone.
-function hostId(requestId: string): string { return base64.encode(requestId) }
+function hostId(requestId: string): string { return base64.encode(shortened(requestId)) }
+
+/// x if it is a bool[], else null.
+function flags[T](x: T): bool[] | null {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return flags(x)
+				}
+			}
+			return null
+		case "array": return if (T == bool[]) x else null
+		default: return null
+	}
+}
+
+/// Writes the items of el named a and b, flattened lists one after the other, as one list in the order that b holds:
+/// whether each is a b.
+function interleave(el: Node, a: string, b: string, order: bool[]) {
+	const as = elements(el, a)
+	const bs = elements(el, b)
+	if (as.length + bs.length == 0) {
+		return
+	}
+	const last = if (bs.length > 0) bs[bs.length - 1] else as[as.length - 1]
+	const i = el.children.indexOf(last)
+	const after = if (i + 1 < el.children.length) el.children[i + 1] else null
+	let j = 0
+	let k = 0
+	for (const isB of order) {
+		if (isB && k < bs.length) {
+			el.insert(bs[k], after)
+			k++
+		} else if (!isB && j < as.length) {
+			el.insert(as[j], after)
+			j++
+		}
+	}
+}
 
 /// The status x is, if set, else otherwise.
 function status[T](x: T, otherwise: i32): i32 {
@@ -771,7 +846,7 @@ function written[T](service: Service, x: T, tags: Type[]): [string, string, Node
 /// The element of the payload x, a structure or union, of a member tagged tags.
 function document[T](service: Service, x: T, tags: Type[]): Node {
 	const holder = new Node("element", "")
-	put(holder, tag(tags, Name, ""), x, tags)
+	put(holder, tag(tags, Name, ""), x, tags, service.dates())
 	const el = holder.children[0]
 	if (!has(tags, Namespace)) {
 		namespace(el, if (T.kind == "class") T.tags else [], service.ns)
@@ -816,6 +891,8 @@ function header[T](x: T, tags: Type[]): string {
 	}
 }
 
+/// The text of the scalar v of a member tagged tags, a timestamp of the format otherwise unless tagged with one; a
+/// date-time to the millisecond where otherwise is "milliseconds".
 /// The text of the scalar v of a member tagged tags, a timestamp of the format otherwise unless tagged with one.
 function format[T](v: T, tags: Type[], otherwise: string = "date-time"): string {
 	if (T.kind == "union") {
@@ -828,7 +905,9 @@ function format[T](v: T, tags: Type[], otherwise: string = "date-time"): string 
 	}
 	if (T == i64 && has(tags, Timestamp)) {
 		const f = tag(tags, Timestamp, "")
-		return stamp(v, if (f == "") otherwise else f)
+		const g = if (f == "" || f == "date-time" && otherwise == "milliseconds") otherwise else f
+		const s = stamp(v, g)
+		return if (g == "milliseconds" && indexOf(s, ".") < 0) `${s.slice(0, s.length - 1)}.000Z` else s
 	}
 	if (T == string && has(tags, Blob)) {
 		return base64.encode(v)
@@ -838,12 +917,12 @@ function format[T](v: T, tags: Type[], otherwise: string = "date-time"): string 
 
 /// Into el, the element named n of v, of a member tagged tags: none for null, one per item for a flattened list or
 /// map.
-function put[T](el: Node, n: string, v: T, tags: Type[]): void {
+function put[T](el: Node, n: string, v: T, tags: Type[], dates: string = "date-time"): void {
 	switch (T.kind) {
 		case "null": return
 		case "union": for (const M of T.members) {
 			if (v instanceof M) {
-				put(el, n, v, tags)
+				put(el, n, v, tags, dates)
 			}
 		}
 		case "array":
@@ -851,28 +930,28 @@ function put[T](el: Node, n: string, v: T, tags: Type[]): void {
 			const box = if (flat) el else child(el, n, tags)
 			const item = if (flat) n else if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
 			for (const x of v) {
-				put(box, item, x, if (flat && T.elem.kind == "tuple") tags else inner(tags))
+				put(box, item, x, if (flat && T.elem.kind == "tuple") tags else inner(tags), dates)
 			}
 		case "tuple":
 			const e = child(el, n, if (has(tags, Flat)) tags else []) // a map's entry
 			for (const f of T.fields) {
 				const key = f.name == "0"
 				put(e, if (key) tag(tags, Key, "key") else tag(tags, Value, "value"), v[f.name],
-					if (key) [] else inner(tags))
+					if (key) [] else inner(tags), dates)
 			}
 		case "class", "object":
 			const c = child(el, n, tags)
 			for (const f of T.fields) {
 				if (has(f.tags, Attr)) {
-					const s = format(v[f.name], f.tags)
+					const s = format(v[f.name], f.tags, dates)
 					if (s != "") {
 						c.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
 					}
 				} else {
-					put(c, tag(f.tags, Name, f.name), v[f.name], f.tags)
+					put(c, tag(f.tags, Name, f.name), v[f.name], f.tags, dates)
 				}
 			}
-		default: child(el, n, tags).insert(new Node("text", "", format(v, tags)))
+		default: child(el, n, tags).insert(new Node("text", "", format(v, tags, dates)))
 	}
 }
 
@@ -895,12 +974,19 @@ export function error(service: Service, f: Fault, requestId: string): Response {
 	text(e, "Message", f.message)
 	let xml = serialize(e)
 	const end = indexOf(xml, "</Error>") // after the message, whose text cannot hold it
-	const id = serialize(text(new Node("element", ""), "RequestId", requestId))
+	const id = serialize(text(new Node("element", ""), "RequestId",
+		if (service.wrapped) requestId else shortened(requestId)))
 	const host = serialize(text(new Node("element", ""), "HostId", hostId(requestId)))
 	xml = if (service.wrapped) `<ErrorResponse>${xml.slice(0, end)}${f.members}</Error>${id}</ErrorResponse>`
 		else `${xml.slice(0, end)}${f.members}${id}${host}</Error>`
-	const res = new Response(f.status, `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`)
-	res.headers.set("content-type", "application/xml")
+	// a 304 is of no body
+	const res = new Response(f.status, if (f.status == 304) "" else `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`)
+	if (f.status != 304) {
+		res.headers.set("content-type", "application/xml")
+	}
+	for (const [k, v] of f.headers) {
+		res.headers.set(k, v)
+	}
 	identify(res, service, requestId)
 	return res
 }

@@ -155,7 +155,7 @@ test "listing: prefixes and delimiters, pages, start-after, url encoding, owners
 	const next = s3(g, "GET",
 		`/bkt?list-type=2&continuation-token=${escape(text(one, "NextContinuationToken")!, "component")}`)
 	assert texts(next, "Key") == ["b/1", "c", "d e"] && text(next, "IsTruncated") == "false"
-	assert texts(s3(g, "GET", "/bkt?list-type=2&start-after=b/1&encoding-type=url"), "Key") == ["c", "d%20e"]
+	assert texts(s3(g, "GET", "/bkt?list-type=2&start-after=b/1&encoding-type=url"), "Key") == ["c", "d+e"]
 	assert texts(s3(g, "GET", "/bkt?prefix=a/&marker=a/1"), "Key") == ["a/2"]
 	const del = `<Delete><Object><Key>a/1</Key></Object><Object><Key>zz</Key></Object></Delete>`
 	const deleted = s3(g, "POST", "/bkt?delete", del, [["content-md5", base64.encode(md5(del))]])
@@ -214,7 +214,9 @@ test "multipart: parts joined in order, the ETag of their MD5s, sizes checked, a
 	assert done.status == 200 && text(done, "ETag") == etag
 	const got = s3(g, "GET", "/bkt/m")
 	assert got.headers.get("etag") == etag && got.headers.get("content-type") == "text/plain"
-		&& got.headers.get("x-amz-mp-parts-count") == "2" && all(got) == five + "tail"
+		&& got.headers.get("x-amz-mp-parts-count") == null && all(got) == five + "tail"
+	const second = s3(g, "GET", "/bkt/m?partNumber=2")
+	assert second.status == 206 && second.headers.get("x-amz-mp-parts-count") == "2" && all(second) == "tail"
 	assert fails(s3(g, "GET", `/bkt/m?uploadId=${id}`), 404, "NoSuchUpload")
 	const small = text(s3(g, "POST", "/bkt/s?uploads"), "UploadId")!
 	const s1 = s3(g, "PUT", `/bkt/s?partNumber=1&uploadId=${small}`, "a").headers.get("etag")!
@@ -292,11 +294,11 @@ test "versioning: version ids, delete markers, versions read and deleted, the nu
 	assert fails(s3(g, "GET", "/bkt/k?versionId=0123456789abcdef0123456789abcdef"), 404, "NoSuchVersion")
 	assert texts(s3(g, "GET", "/bkt?list-type=2"), "Key") == []
 	const listed = s3(g, "GET", "/bkt?versions")
-	assert texts(listed, "VersionId") == [v2, v1, "null", marker]
-		&& texts(listed, "IsLatest") == ["false", "false", "false", "true"]
+	assert texts(listed, "VersionId") == [marker, v2, v1, "null"]
+		&& texts(listed, "IsLatest") == ["true", "false", "false", "false"]
 	assert s3(g, "DELETE", `/bkt/k?versionId=${marker}`).status == 204 && all(s3(g, "GET", "/bkt/k")) == "v2"
 	assert s3(g, "PUT", "/bkt?versioning", replace(on, "Enabled", "Suspended")).status == 200
-	assert s3(g, "PUT", "/bkt/k", "v3").headers.get("x-amz-version-id") == "null"
+	assert s3(g, "PUT", "/bkt/k", "v3").headers.get("x-amz-version-id") == null
 	assert texts(s3(g, "GET", "/bkt?versions"), "VersionId") == ["null", v2, v1]
 	const page = s3(g, "GET", "/bkt?versions&max-keys=1")
 	assert text(page, "NextVersionIdMarker") == "null"

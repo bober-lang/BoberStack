@@ -1,9 +1,10 @@
 //! The HTTP handler in front of every service: it authenticates a request by SigV4, in its Authorization header or
-//! its query, decodes an aws-chunked body, and hands it to the service its credential scope names, in a transaction
+//! its query, or by a SigV2 presigned URL, decodes an aws-chunked body, and hands it to the service its credential scope names, in a transaction
 //! over the state.
 
 import * as chunked from "./auth/chunked"
 import { accountOf, authenticate, credentials } from "./auth/credentials"
+import * as sigv2 from "./auth/sigv2"
 import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
 import * as query from "./protocol/query"
@@ -36,6 +37,9 @@ export class Gateway {
 	/// The committed state: each account's tree, from the first request that opens it, and the global one by "", which
 	/// holds the credentials issued. Access keys of none are taken, unchecked, for the root of accountOf's account.
 	trees = new HashMap[string, Store]()
+	/// The most bytes a request's body may hold, by signing name: S3's 5 GiB of a PutObject or UploadPart, else std's
+	/// 10 MiB. A body is read whole into memory, so a host short of it may lower S3's.
+	limits = limits()
 	/// How IAM sees a caller, which its requests are authorized by; without it only an account's root is allowed.
 	identify: Identify | null = null
 	/// Whether a request holds the lock on the trees, and what those waiting for it wait on.
@@ -46,7 +50,7 @@ export class Gateway {
 		const id = requestId()
 		let auth: sigv4.Authorization | null = null
 		try {
-			auth = sigv4.authorization(req)
+			auth = sigv2.presigned(req) ?? sigv4.authorization(req)
 		} catch (f: Fault) {
 			return query.error(f, id)
 		}
@@ -59,7 +63,14 @@ export class Gateway {
 		if (service == null) {
 			return query.error(new Fault(501, "NotImplemented", `The service ${name} is not implemented`), id)
 		}
-		const body = req.body.text()
+		const limit = this.limits.get(name!) ?? (10 << 20)
+		if ((req.body.length ?? 0) > limit) {
+			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
+				`<ProposedSize>${req.body.length}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
+			const faulted = this.faults.get(name!)
+			return if (faulted == null) query.error(why, id) else faulted!(why, id)
+		}
+		const body = req.body.text(limit)
 		req.body = new Body(body)
 		while (this.busy) {
 			this.freed.wait()
@@ -129,6 +140,13 @@ export class Gateway {
 		}
 		return res!
 	}
+}
+
+/// The limits on a body that are not std's.
+function limits(): HashMap[string, i64] {
+	const m = new HashMap[string, i64]()
+	m.set("s3", 5 << 30)
+	return m
 }
 
 /// A random UUID, as AWS's request ids are.

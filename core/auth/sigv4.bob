@@ -21,8 +21,11 @@ export class Authorization {
 	service = ""
 	signedHeaders: string[] = []
 	signature = ""
-	/// A presigned URL's X-Amz-Expires, the seconds it is valid for from its X-Amz-Date; 0 for a header.
+	/// A presigned URL's X-Amz-Expires, the seconds it is valid for from its X-Amz-Date; 0 for a header. Of SigV2, its
+	/// Expires, the second since the epoch it is valid until.
 	expires: i64 = 0
+	/// 2 of a SigV2 presigned URL, which has no scope but its access key, else 4.
+	version = 4
 }
 
 /// The values of X-Amz-Content-Sha256 that stand for a body not hashed: one not signed, and the aws-chunked encodings,
@@ -206,7 +209,7 @@ function value(v: string): string { return split(trim(v), " ").filter(w => w != 
 function basic(t: i64): string { return iso8601Basic(t - t % second) }
 
 /// t to the second as S3 writes an instant in an error: 2015-08-30T12:36:00Z.
-function iso(t: i64): string {
+export function iso(t: i64): string {
 	const b = basic(t)
 	return `${b.slice(0, 4)}-${b.slice(4, 6)}-${b.slice(6, 11)}:${b.slice(11, 13)}:${b.slice(13, 16)}`
 }

@@ -58,6 +58,8 @@ export class Version {
 	checksum = ""
 	/// The parts it was uploaded in, 0 if not by a multipart upload.
 	parts = 0
+	/// The sizes of those parts.
+	sizes: i64[] = []
 }
 
 /// A multipart upload, of what its object will have.
@@ -69,6 +71,10 @@ export class Upload {
 	/// The initiator's ARN.
 	initiator = ""
 	object = new Version()
+	/// Its place among the bucket's uploads, as Bucket.next, by which those of a key are listed.
+	order: i64 = 0
+	/// "" while it goes on, else completed or aborted: S3 answers completing or aborting it again.
+	state = ""
 }
 
 export class Part {
@@ -90,7 +96,7 @@ export class Tables {
 	objects: Table[Version]
 	/// By version(), every version.
 	versions: Table[Version]
-	/// By bucket/key, a NUL and the upload id.
+	/// By bucket/key, a NUL and the upload's order in twelve digits.
 	uploads: Table[Upload]
 	/// By the upload id, a NUL and the part number in five digits.
 	parts: Table[Part]

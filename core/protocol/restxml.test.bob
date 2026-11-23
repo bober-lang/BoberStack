@@ -1,7 +1,9 @@
 import { Fault } from "../fault"
 import { Caller } from "../service"
 import { Request, Response } from "std/http"
-import { call, Header, Label, Name, Payload, Prefix, Query, Route, Service, Unwrapped } from "./restxml"
+
+import { call, Flat, Header, Interleave, Label, Name, Payload, Prefix, Query, reply, Route, Service, Timestamp,
+	Unwrapped } from "./restxml"
 
 class Get {
 	Bucket: string @Label
@@ -112,4 +114,28 @@ test "a request of no route is MethodNotAllowed" {
 	const message = "The specified method is not allowed against this resource."
 	const body = `<Error><Code>MethodNotAllowed</Code><Message>${message}</Message><RequestId>R1</RequestId><HostId>UjE=</HostId></Error>`
 	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${body}`
+}
+
+class Versions @Name["ListVersionsResult"] {
+	Versions: string[] | null @Flat @Name["Version"]
+	DeleteMarkers: string[] | null @Flat @Name["DeleteMarker"]
+	Modified: i64 | null @Timestamp
+	order: bool[] | null @Interleave["Version", "DeleteMarker"]
+}
+
+test "two flattened lists are written as one in the order given, and S3's date-times to the millisecond" {
+	const out = { ...new Versions(), Versions: ["a", "b"], DeleteMarkers: ["m"], Modified: 0 }
+	const ms = new Service(s3.id, "", false, true)
+	const xml = "<ListVersionsResult><Version>a</Version><Version>b</Version><DeleteMarker>m</DeleteMarker>"
+	assert reply(ms, out, "R1").body.whole
+		== `<?xml version="1.0" encoding="UTF-8"?>\n${xml}<Modified>1970-01-01T00:00:00.000Z</Modified></ListVersionsResult>`
+	out.order = [false, true, false]
+	const merged = "<ListVersionsResult><Version>a</Version><DeleteMarker>m</DeleteMarker><Version>b</Version>"
+	assert reply(new Service(s3.id, "", false), out, "R1").body.whole
+		== `<?xml version="1.0" encoding="UTF-8"?>\n${merged}<Modified>1970-01-01T00:00:00Z</Modified></ListVersionsResult>`
+}
+
+test "S3's request ids are a UUID's first 16 hex digits, upper case" {
+	const res = reply(s3, new Versions(), "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+	assert res.headers.get("x-amz-request-id") == "0F1E2D3C4B5A6978"
 }

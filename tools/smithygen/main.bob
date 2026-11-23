@@ -208,6 +208,22 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 const strings: [string,
 	string[]][] = [["com.amazonaws.sqs#AmazonSQS", ["com.amazonaws.sqs#ReceiveMessageRequest$AttributeNames"]]]
 
+/// The services whose enums are all strings: AWS takes a value outside an enum, or answers it with an error of its own.
+const opened = ["com.amazonaws.s3#AmazonS3"]
+
+/// The statuses that operations of the services below answer with where their models say otherwise, as AWS did on
+/// 2026-11-23: by their shape ids, each operation's name and status.
+const statuses: [string,
+	[string, i32][]][] = [["com.amazonaws.s3#AmazonS3", [["PutBucketPolicy", 204], ["PutBucketTagging", 204]]]]
+
+/// The restXml services that write a date-time to the millisecond, .000 too, as S3 does.
+const milliseconds = ["com.amazonaws.s3#AmazonS3"]
+
+/// The flattened lists that the services below write as one, in the order that a field `order` of their structure
+/// gives: by their shape ids, each structure's and the names of the two lists' items.
+const interleaved: [string, [string, string, string][]][] = [["com.amazonaws.s3#AmazonS3",
+	[["com.amazonaws.s3#ListObjectVersionsOutput", "Version", "DeleteMarker"]]]]
+
 /// The codes the services below answer with besides the errors their models declare, as AWS did on 2026-11-23: by
 /// their shape ids, each code and its __type.
 const undeclared: [string, [string, string][]][] = [["com.amazonaws.sqs#AmazonSQS",
@@ -262,9 +278,12 @@ class Generator {
 	unchecked: string[] = []
 	/// The members whose constraints go unchecked.
 	unconstrained: string[] = []
-	/// The members whose enums are strings, and whether the member being typed is one.
+	/// The members whose enums are strings, or whether all are, and whether the member being typed is one.
 	strings: string[] = []
+	opened = false
 	open = false
+	/// The flattened lists written as one, by their structures' ids.
+	interleaved: [string, string, string][] = []
 	/// Whether the member being typed is a restXml payload, which may be a stream; and the operations the API cannot
 	/// express.
 	payload = false
@@ -307,6 +326,11 @@ class Generator {
 		this.unconstrained = if (exempt == null) [] else exempt[1]
 		const open = strings.find(s => s[0] == services[0][0])
 		this.strings = if (open == null) [] else open[1]
+		this.opened = opened.includes(services[0][0])
+		const merged = interleaved.find(i => i[0] == services[0][0])
+		this.interleaved = if (merged == null) [] else merged[1]
+		const fixed = statuses.find(c => c[0] == services[0][0])
+		const answered = if (fixed == null) [] else fixed[1]
 		const ops = s.operations.map(r => r.target)
 		sortNames(ops)
 		const errors = s.errors.map(r => r.target)
@@ -343,7 +367,8 @@ class Generator {
 			unimplemented.push(new Decl("method", method(head, [`\t\tthrow notImplemented(${json.quoted(name(id))})`])))
 			const authorized = actions.find(a => a[0] == name(id))
 			let by = if (authorized == null) "" else `, [${authorized[1].map(a => json.quoted(a)).join(", ")}]`
-			const code = op.traits.http?.code ?? 200
+			const given = answered.find(c => c[0] == name(id))
+			const code = if (given != null) given[1] else op.traits.http?.code ?? 200
 			if (rest && code != 200) {
 				by = `${if (by == "") ", []" else by}, ${code}`
 			}
@@ -400,7 +425,8 @@ class Generator {
 		} else if (rest) {
 			const ns = json.quoted(t.xmlNamespace?.uri ?? "")
 			const start = `export const service = new restxml.Service(${json.quoted(services[0][0])}, ${ns}`
-			const end = if (validated) ", validation" else ""
+			const ms = milliseconds.includes(services[0][0])
+			const end = if (validated) `, ${ms}, validation` else if (ms) ", true" else ""
 			head.push(new Decl("const", wrap(`${start}, ${!t.restXml!.noErrorWrapping}${end})`)))
 			sortBy(routes, (a, b) => a[0] > b[0] || a[0] == b[0] && a[1] < b[1])
 			const doc = "/// The operations' routes, the most specific first."
@@ -618,6 +644,13 @@ class Generator {
 		for (const m of s.members) {
 			fields.push(this.field(id, m, m[1].traits.required != null))
 		}
+		const merged = this.interleaved.find(i => i[0] == id)
+		if (merged != null) {
+			const [_, a, b] = merged
+			fields.push(new Decl("field",
+				[`\t/// The order of the ${a} and ${b} items, written as one list: whether each is a ${b}.`,
+				`\torder: bool[] | null @restxml.Interleave[${json.quoted(a)}, ${json.quoted(b)}]`]))
+		}
 		const lines = [`export class ${n}${tags} {`, ...layout(fields), "}"]
 		return [new Decl("class", lines)]
 	}
@@ -691,7 +724,7 @@ class Generator {
 			this.modeled = true
 		}
 		const valid = if (this.unconstrained.includes(`${id}$${m[0]}`)) "" else this.valid(m[1])
-		this.open = this.strings.includes(`${id}$${m[0]}`)
+		this.open = this.opened || this.strings.includes(`${id}$${m[0]}`)
 		this.payload = t.httpPayload != null
 		const ty = this.typeOf(m[1], tags, false)
 		this.open = false
@@ -793,7 +826,7 @@ class Generator {
 	initial(id: string, ty: string): string throws ModelError {
 		const s = this.shape(id)
 		if (enumerates(s)) {
-			return ` = ${this.values(id)[0]}`
+			return if (ty == "string") "" else ` = ${this.values(id)[0]}`
 		}
 		switch (s.type) {
 			case "list", "map": return " = []"
@@ -807,7 +840,11 @@ class Generator {
 	typeOf(r: Ref, tags: string[], inner: bool): string throws ModelError {
 		const s = this.shape(r.target)
 		if (enumerates(s)) {
-			return if (this.open) "string" else enumName(r.target)
+			if (this.open) {
+				this.reach(r.target)
+				return "string"
+			}
+			return enumName(r.target)
 		}
 		const xml = this.protocol == "awsQuery" || this.protocol == "restXml"
 		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
@@ -1348,7 +1385,7 @@ function signature(line: string): string[] {
 }
 
 /// The number of lines of d but its comments.
-function code(d: Decl): i32 { return d.lines.filter(l => !startsWith(l, "//")).length }
+function code(d: Decl): i32 { return d.lines.filter(l => !startsWith(l, "//") && !startsWith(l, "\t//")).length }
 
 /// The decls' lines, a blank line between two of different kinds or of more than a line of code, as bober format puts
 /// them.
