@@ -5,7 +5,7 @@ import { Caller } from "./service"
 import { Blob, live } from "./state/store"
 import { Request, Response } from "std/http"
 import { ParseError, parseInt } from "std/string"
-import { millisecond, second, sleep } from "std/time"
+import { iso8601Basic, millisecond, second, sleep } from "std/time"
 
 /// Waits 10 ms of logical time between reading the count of requests and writing it one more, so that overlapping
 /// requests would race; fails as the body asks.
@@ -243,5 +243,25 @@ test "a body longer than its service's limit is refused before it is read, by S3
 	g.limits.set("s3", 4)
 	const s3 = g.handle(request("s3", "s3", "s3", "large"))
 	assert s3.status == 400 && text(s3, "Code") == "EntityTooLarge" && text(s3, "MaxSizeAllowed") == "4"
+	g.close()
+}
+
+test "a presigned URL of a key never issued expires as one of an issued key does, by SigV4 and SigV2, lenient too" {
+	const g = gateway()
+	g.lenient = true
+	g.services.set("s3", g.services.get("test")!)
+	const v4 = (stamp: string) => g.handle(new Request("GET",
+		"http://localhost:4566/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+		+ `&X-Amz-Credential=test%2F${stamp.slice(0, 8)}%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=${stamp}`
+		+ "&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=00", ""))
+	const late = v4("20150625T140000Z")
+	assert late.status == 403 && text(late, "Code") == "AccessDenied" && text(late, "Message") == "Request has expired"
+		&& text(late, "Expires") == "2015-06-25T14:01:00Z"
+	assert v4(iso8601Basic(now() - now() % second)).status == 200
+	const v2 = (expires: i64) => g.handle(new Request("GET",
+		`http://localhost:4566/b/k?AWSAccessKeyId=test&Expires=${expires}&Signature=x`, ""))
+	const old = v2(1435240800)
+	assert old.status == 403 && text(old, "Message") == "Request has expired"
+	assert v2(now() / second + 60).status == 200
 	g.close()
 }

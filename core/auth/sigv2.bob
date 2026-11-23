@@ -39,14 +39,22 @@ export function presigned(req: Request): Authorization | null throws Fault {
 
 /// Why req does not bear auth's SigV2 signature by secret at the instant now, as S3 words it; null if it does.
 export function verify(req: Request, auth: Authorization, secret: string, now: i64): Fault | null throws CryptoError {
-	if (now > auth.expires * second) {
-		const members = `<Expires>${iso(auth.expires * second)}</Expires><ServerTime>${iso(now)}</ServerTime>`
-		return new Fault(403, "AccessDenied", "Request has expired", true, members)
+	const ended = expired(auth, now)
+	if (ended != null) {
+		return ended
 	}
 	if (!equal(signature(req, auth, secret), auth.signature)) {
 		return mismatch(auth, stringToSign(req, auth), [])
 	}
 	return null
+}
+
+export function expired(auth: Authorization, now: i64): Fault | null {
+	if (now <= auth.expires * second) {
+		return null
+	}
+	const members = `<Expires>${iso(auth.expires * second)}</Expires><ServerTime>${iso(now)}</ServerTime>`
+	return new Fault(403, "AccessDenied", "Request has expired", true, members)
 }
 
 export function signature(req: Request, auth: Authorization, secret: string): string throws CryptoError {

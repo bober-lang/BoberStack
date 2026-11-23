@@ -124,10 +124,9 @@ export function verify(req: Request, body: string, auth: Authorization, secret: 
 		return `X-Amz-Date ${stamp} is not a timestamp such as 20150830T123600Z`
 	}
 	const [early, late] = [now - 15 * minute, now + 15 * minute]
-	if (auth.expires != 0 && now > t + auth.expires * second) {
-		const members = `<X-Amz-Expires>${auth.expires}</X-Amz-Expires><Expires>${iso(t + auth.expires * second)}`
-			+ `</Expires><ServerTime>${iso(now)}</ServerTime>`
-		return new Fault(403, "AccessDenied", "Request has expired", true, members)
+	const ended = expired(req, auth, now)
+	if (ended != null) {
+		return ended
 	}
 	if (auth.expires == 0 && t < early) {
 		return `Signature expired: ${stamp} is now earlier than ${basic(early)} (${basic(now)} - 15 min.)`
@@ -205,6 +204,25 @@ export function key(auth: Authorization, secret: string): string throws CryptoEr
 }
 
 export function scope(auth: Authorization): string { return `${auth.date}/${auth.region}/${auth.service}/aws4_request` }
+
+/// The fault of a presigned URL past its expiry at now, else null; verify words one of a date that does not parse.
+export function expired(req: Request, auth: Authorization, now: i64): Fault | null {
+	if (auth.expires == 0) {
+		return null
+	}
+	let t: i64 = 0
+	try {
+		t = parseIso8601Basic(stampOf(req, auth))
+	} catch (e: ParseError) {
+		return null
+	}
+	if (now <= t + auth.expires * second) {
+		return null
+	}
+	const members = `<X-Amz-Expires>${auth.expires}</X-Amz-Expires><Expires>${iso(t + auth.expires * second)}`
+		+ `</Expires><ServerTime>${iso(now)}</ServerTime>`
+	return new Fault(403, "AccessDenied", "Request has expired", true, members)
+}
 
 export function stampOf(req: Request, auth: Authorization): string {
 	return (if (auth.expires != 0) req.url.query.get("X-Amz-Date") else req.headers.get("x-amz-date")) ?? ""
