@@ -7,6 +7,7 @@ import { accountOf, authenticate, credentials } from "./auth/credentials"
 import * as sigv2 from "./auth/sigv2"
 import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
+import { addressed, Internal } from "./internal"
 import * as query from "./protocol/query"
 import { Caller, Identify } from "./service"
 import { Store } from "./state/store"
@@ -37,6 +38,10 @@ export class Gateway {
 	/// The committed state: each account's tree, from the first request that opens it, and the global one by "", which
 	/// holds the credentials issued. Access keys of none are taken, unchecked, for the root of accountOf's account.
 	trees = new HashMap[string, Store]()
+	/// The names of the trees, as a HashMap lists none, for the endpoints that snapshot them.
+	named: string[] = []
+	/// The endpoints that are not AWS's, and the snapshots they keep.
+	internal = new Internal()
 	/// The most bytes a request's body may hold, by signing name: S3's 5 GiB of a PutObject or UploadPart, else std's
 	/// 10 MiB. A body is read whole into memory, so a host short of it may lower S3's.
 	limits = limits()
@@ -47,6 +52,9 @@ export class Gateway {
 	private freed = new Signal()
 
 	handle(req: Request): Response throws IoError | ParseError {
+		if (addressed(req.url.path)) {
+			return this.locked(() => this.internal.handle(req, this, n => this.services.has(n)))
+		}
 		const id = requestId()
 		let auth: sigv4.Authorization | null = null
 		try {
@@ -72,24 +80,31 @@ export class Gateway {
 		}
 		const body = req.body.text(limit)
 		req.body = new Body(body)
-		while (this.busy) {
-			this.freed.wait()
-		}
-		this.busy = true
-		try {
-			return this.serve(name!, service!, req, body, auth, id)
-		} finally {
-			this.busy = false
-			this.freed.wake()
-		}
+		return this.locked(() => this.serve(name!, service!, req, body, auth, id))
 	}
 
-	/// Closes the trees.
+	/// Closes the trees and the snapshots.
 	close() {
 		for (const t of this.trees.values()) {
 			t.close()
 		}
 		this.trees = new HashMap[string, Store]()
+		this.named = []
+		this.internal.close()
+	}
+
+	/// What f answers, run holding the lock on the trees once the requests before it have let it go.
+	private locked(f: () => Response throws IoError | ParseError): Response throws IoError | ParseError {
+		while (this.busy) {
+			this.freed.wait()
+		}
+		this.busy = true
+		try {
+			return f()
+		} finally {
+			this.busy = false
+			this.freed.wake()
+		}
 	}
 
 	/// The answer to req, with body, by service, named name, holding the lock: the credential of its access key is
@@ -131,6 +146,9 @@ export class Gateway {
 			const commit = res != null && res!.status < 300
 			for (const [account, tree] of caller.opened) {
 				if (commit) {
+					if (!this.trees.has(account)) {
+						this.named.push(account)
+					}
 					this.trees.get(account)?.close()
 					this.trees.set(account, tree)
 				} else {

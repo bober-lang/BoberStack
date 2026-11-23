@@ -1,11 +1,13 @@
 import { Catalog } from "./services/iam/catalog"
 import { stack } from "./stack"
 import { decode, help } from "std/encoding/optarg"
-import { serve } from "std/http"
+import { Server } from "std/http"
 import { ParseError } from "std/string"
 import { catalog_text } from "./services/iam/catalog.c"
 
 class Options {
+	/// The address to listen on, every one of the host's by default.
+	host = ""
 	/// The port to listen on, LocalStack's by default.
 	port: u16 = 4566
 }
@@ -27,11 +29,24 @@ function main(): i32 {
 		print(`boberstack: the AWS managed policies do not parse at byte ${e.at}`)
 		return 1
 	}
+	const server = new Server()
+	server.addr = `${o.host}:${o.port}`
+	// Serving runs until it parks, listening, or fails to listen; it is done first only if it failed.
+	const serving = async server.serve(stack(catalog!).handle)
+	const listening = async nothing()
 	try {
-		serve(stack(catalog!).handle, `:${o.port}`)
+		const [first, _] = await ...[serving, listening]
+		if (first == 1) {
+			// The line LocalStack prints once it serves, which the tools that start it wait for.
+			print("Ready.")
+		}
+		await serving
 	} catch (e: IoError | ParseError) {
 		print(`boberstack: ${e}`)
 		return 1
 	}
 	return 0
 }
+
+/// Done once run, which a race against serving needs.
+function nothing() {}
