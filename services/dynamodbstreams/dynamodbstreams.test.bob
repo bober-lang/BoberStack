@@ -1,0 +1,148 @@
+import { sign } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+
+/// The answer of g to the operation op of the service of the target prefix with the JSON body, from the root of
+/// 000000000000.
+function call(g: Gateway, prefix: string, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.0")
+	req.headers.set("x-amz-target", `${prefix}_20120810.${op}`)
+	sign(req, body, "dynamodb", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function table(g: Gateway, op: string, body: string): Response { return call(g, "DynamoDB", op, body) }
+function streams(g: Gateway, op: string, body: string): Response { return call(g, "DynamoDBStreams", op, body) }
+/// The body of res.
+function body(res: Response): string { return res.body.whole ?? "" }
+
+/// Whether res succeeded and its body holds each of parts.
+function ok(res: Response, ...parts: string[]): bool {
+	const b = body(res)
+	const fine = res.status == 200 && parts.every(p => indexOf(b, p) >= 0)
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+/// Whether res is the error of code, of message.
+function fails(res: Response, code: string, message: string): bool {
+	const b = body(res)
+	const fine = res.status == 400 && indexOf(b, `#${code}"`) >= 0 && indexOf(b, `"message":"${message}"`) >= 0
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+/// The string member name of res's body.
+function member(res: Response, name: string): string {
+	const b = body(res)
+	const at = indexOf(b, `"${name}":"`) + name.length + 4
+	return b.slice(at, at + indexOf(b.slice(at, b.length), "\""))
+}
+
+/// How many times part is in s.
+function count(s: string, part: string): i32 {
+	let n = 0
+	let at = indexOf(s, part)
+	while (at >= 0) {
+		n++
+		s = s.slice(at + part.length, s.length)
+		at = indexOf(s, part)
+	}
+	return n
+}
+
+const keyed = `"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],`
+	+ `"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"`
+
+test "a stream records every write, once, and closes when disabled" {
+	const g = stack(new Catalog(0, 0))
+	const spec = `"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}`
+	const made = table(g, "CreateTable", `{"TableName":"tab",${keyed},${spec}}`)
+	assert ok(made, `"LatestStreamArn":"arn:aws:dynamodb:us-east-1:000000000000:table/tab/stream/`)
+	const arn = member(made, "LatestStreamArn")
+	assert fails(table(g, "UpdateTable", `{"TableName":"tab",${spec}}`), "ValidationException",
+		"Table already has an enabled stream: TableName: tab")
+	assert ok(table(g, "PutItem", `{"TableName":"tab","Item":{"pk":{"S":"a"},"v":{"N":"1"}}}`))
+	assert ok(table(g, "PutItem", `{"TableName":"tab","Item":{"pk":{"S":"a"},"v":{"N":"1"}}}`))
+	assert ok(table(g, "UpdateItem",
+		`{"TableName":"tab","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET v = :v",`
+		+ `"ExpressionAttributeValues":{":v":{"N":"2"}}}`))
+	assert ok(table(g, "BatchWriteItem", `{"RequestItems":{"tab":[{"PutRequest":{"Item":{"pk":{"S":"b"}}}}]}}`))
+	assert ok(table(g, "TransactWriteItems",
+		`{"TransactItems":[{"Delete":{"TableName":"tab","Key":{"pk":{"S":"b"}}}}]}`))
+	assert ok(table(g, "ExecuteStatement", `{"Statement":"INSERT INTO tab VALUE {'pk': 'c'}"}`))
+	assert ok(table(g, "DeleteItem", `{"TableName":"tab","Key":{"pk":{"S":"a"}}}`))
+	assert ok(table(g, "DeleteItem", `{"TableName":"tab","Key":{"pk":{"S":"zz"}}}`))
+	assert fails(table(g, "PutItem",
+		`{"TableName":"tab","Item":{"pk":{"S":"d"}},"ConditionExpression":"v = :x",`
+		+ `"ExpressionAttributeValues":{":x":{"N":"1"}}}`), "ConditionalCheckFailedException",
+		"The conditional request failed")
+	assert ok(streams(g, "ListStreams", `{"TableName":"tab"}`), `"StreamArn":"${arn}"`, `"TableName":"tab"`)
+	const described = streams(g, "DescribeStream", `{"StreamArn":"${arn}"}`)
+	assert ok(described, `"StreamStatus":"ENABLED"`, `"StreamViewType":"NEW_AND_OLD_IMAGES"`,
+		`"StartingSequenceNumber":"100000000000000000001"`)
+	const shard = member(described, "ShardId")
+	const it = streams(g, "GetShardIterator",
+		`{"StreamArn":"${arn}","ShardId":"${shard}","ShardIteratorType":"TRIM_HORIZON"}`)
+	const page = streams(g, "GetRecords", `{"ShardIterator":"${member(it, "ShardIterator")}","Limit":4}`)
+	assert ok(page, `"eventName":"INSERT"`, `"eventName":"MODIFY"`, `"eventSource":"aws:dynamodb"`,
+		`"OldImage":{"pk":{"S":"a"},"v":{"N":"1"}}`, `"NewImage":{"pk":{"S":"a"},"v":{"N":"2"}}`,
+		`"SequenceNumber":"100000000000000000003"`)
+	assert count(body(page), `"eventID"`) == 4
+	assert ok(table(g, "UpdateTable", `{"TableName":"tab","StreamSpecification":{"StreamEnabled":false}}`))
+	assert fails(table(g, "UpdateTable", `{"TableName":"tab","StreamSpecification":{"StreamEnabled":false}}`),
+		"ValidationException", "Table does not have an enabled stream: TableName: tab")
+	assert ok(table(g, "PutItem", `{"TableName":"tab","Item":{"pk":{"S":"e"}}}`))
+	assert ok(streams(g, "DescribeStream", `{"StreamArn":"${arn}"}`), `"StreamStatus":"DISABLED"`,
+		`"EndingSequenceNumber":"100000000000000000006"`)
+	const rest = streams(g, "GetRecords", `{"ShardIterator":"${member(page, "NextShardIterator")}"}`)
+	assert ok(rest, `"eventName":"REMOVE"`, `"SequenceNumber":"100000000000000000006"`)
+	assert count(body(rest), `"eventID"`) == 2
+	assert indexOf(body(rest), "NextShardIterator") < 0
+	const again = table(g, "UpdateTable", `{"TableName":"tab",${spec}}`)
+	assert ok(again)
+	assert member(again, "LatestStreamArn") != arn
+	assert ok(streams(g, "ListStreams", `{}`), `"StreamArn":"${arn}"`,
+		`"StreamArn":"${member(again, "LatestStreamArn")}"`)
+}
+
+test "iterators and their errors" {
+	const g = stack(new Catalog(0, 0))
+	const spec = `"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}`
+	const arn = member(table(g, "CreateTable", `{"TableName":"tab",${keyed},${spec}}`), "LatestStreamArn")
+	assert ok(table(g, "PutItem", `{"TableName":"tab","Item":{"pk":{"S":"a"},"v":{"N":"1"}}}`))
+	assert ok(table(g, "PutItem", `{"TableName":"tab","Item":{"pk":{"S":"b"}}}`))
+	const shard = member(streams(g, "DescribeStream", `{"StreamArn":"${arn}"}`), "ShardId")
+	const at = `{"StreamArn":"${arn}","ShardId":"${shard}","ShardIteratorType":`
+	const after = streams(g, "GetShardIterator",
+		at + `"AFTER_SEQUENCE_NUMBER","SequenceNumber":"100000000000000000001"}`)
+	const got = streams(g, "GetRecords", `{"ShardIterator":"${member(after, "ShardIterator")}"}`)
+	assert ok(got, `"Keys":{"pk":{"S":"b"}}`, `"StreamViewType":"KEYS_ONLY"`)
+	assert indexOf(body(got), "NewImage") < 0
+	const latest = streams(g, "GetShardIterator", at + `"LATEST"}`)
+	assert ok(streams(g, "GetRecords", `{"ShardIterator":"${member(latest, "ShardIterator")}"}`), `"Records":[]`,
+		`"NextShardIterator"`)
+	assert fails(streams(g, "GetRecords", `{"ShardIterator":"nonsense"}`), "ValidationException",
+		"Invalid ShardIterator")
+	assert fails(streams(g, "DescribeStream", `{"StreamArn":"${arn}x"}`), "ValidationException", "Invalid StreamArn")
+	assert fails(streams(g, "ListStreams", `{"TableName":"t"}`), "ValidationException",
+		"TableName must be at least 3 characters long and at most 255 characters long")
+	assert fails(streams(g, "GetShardIterator", at + `"AT_SEQUENCE_NUMBER","SequenceNumber":"100000000000000000009"}`),
+		"ValidationException", "Invalid SequenceNumber: 100000000000000000009")
+	const gone = "arn:aws:dynamodb:us-east-1:000000000000:table/tab/stream/2000-01-01T00:00:00.000"
+	assert fails(streams(g, "DescribeStream", `{"StreamArn":"${gone}"}`), "ResourceNotFoundException",
+		`Requested resource not found: Stream: ${gone} not found`)
+	const stale = `${arn}|${shard}|0|1000`
+	const expired = streams(g, "GetRecords", `{"ShardIterator":"${stale}"}`)
+	assert expired.status == 400 && indexOf(body(expired), "#ExpiredIteratorException\"") >= 0
+	const kinesis = table(g, "EnableKinesisStreamingDestination", `{"TableName":"tab","StreamArn":"${arn}"}`)
+	assert kinesis.status == 501
+}

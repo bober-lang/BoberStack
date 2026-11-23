@@ -1,0 +1,272 @@
+//! Amazon DynamoDB Streams: the streams of ../dynamodb's tables, which its writes append to, read. A stream has one
+//! shard, open while the stream is enabled, closed at its last record once it is disabled or its table deleted. A
+//! record can be read for 24 hours and an iterator used for 15 minutes, both measured against the time of the request
+//! that reads them: nothing runs but requests, and nothing is deleted. Its requests are signed for dynamodb, as
+//! DynamoDB's are, which ../../stack tells apart by their X-Amz-Target.
+
+import { Fault } from "../../core/fault"
+import { decode } from "../../core/protocol/json"
+import { Validation, Violations } from "../../core/protocol/model"
+import { Caller } from "../../core/service"
+import { Change, sequence, sequenced, Stream, Tables } from "../dynamodb/records"
+import * as api from "./api"
+import { indexOf, startsWith } from "std/algo"
+import { split } from "std/string"
+import { hour, minute, second } from "std/time"
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	listStreams(caller: Caller, input: api.ListStreamsInput): api.ListStreamsOutput throws Fault {
+		const table = input.TableName
+		if (table != null && (table!.length < 3 || table!.length > 255)) {
+			throw validation("TableName must be at least 3 characters long and at most 255 characters long")
+		}
+		caller.allow(`${tables(caller)}${table ?? "*"}/stream/*`)
+		const n = limited(input.Limit, 100)
+		const db = new Tables(caller.regional())
+		const from = input.ExclusiveStartStreamArn
+		const after = if (from == null) null
+			else if (startsWith(from!, tables(caller))) from!.slice(tables(caller).length, from!.length)
+			else from
+		const got = db.streams.scan(after, n + 1, if (table == null) "" else `${table!}/stream/`)
+		if (table != null && got.length == 0 && after == null && db.get(table!) == null) {
+			throw api.resourceNotFoundException(`Requested resource not found: Table: ${table!} not found`)
+		}
+		const r = new api.ListStreamsOutput()
+		r.Streams = got.slice(0, if (got.length > n) n else got.length).map(e => ({ ...new api.Stream(),
+			StreamArn: tables(caller) + e[0], TableName: e[1].table, StreamLabel: e[1].label }))
+		r.LastEvaluatedStreamArn = if (got.length > n) tables(caller) + got[n - 1][0] else null
+		return r
+	}
+
+	describeStream(caller: Caller, input: api.DescribeStreamInput): api.DescribeStreamOutput throws Fault {
+		const key = streamOf(caller, input.StreamArn)
+		if (key == null) {
+			throw validation("Invalid StreamArn")
+		}
+		caller.allow(input.StreamArn)
+		limited(input.Limit, 100)
+		const db = new Tables(caller.regional())
+		const s = found(db, key!, input.StreamArn)
+		const d = new api.StreamDescription()
+		d.StreamArn = input.StreamArn
+		d.StreamLabel = s.label
+		d.StreamStatus = if (s.enabled) "ENABLED" else "DISABLED"
+		d.StreamViewType = s.view as api.StreamViewType
+		d.CreationRequestDateTime = s.created
+		d.TableName = s.table
+		d.KeySchema = [{ ...new api.KeySchemaElement(), AttributeName: s.hash.name, KeyType: "HASH" as api.KeyType }]
+		if (s.range != null) {
+			d.KeySchema!.push({ ...new api.KeySchemaElement(), AttributeName: s.range!.name,
+				KeyType: "RANGE" as api.KeyType })
+		}
+		d.Shards = []
+		const children = input.ShardFilter != null && input.ShardFilter!.Type == "CHILD_SHARDS"
+		if (!children && input.ExclusiveStartShardId != s.shard) {
+			const range = new api.SequenceNumberRange()
+			range.StartingSequenceNumber = sequence(horizon(db, key!, s))
+			range.EndingSequenceNumber = if (s.enabled) null else sequence(s.last)
+			d.Shards!.push({ ...new api.Shard(), ShardId: s.shard, SequenceNumberRange: range })
+		}
+		return { ...new api.DescribeStreamOutput(), StreamDescription: d }
+	}
+
+	getShardIterator(caller: Caller, input: api.GetShardIteratorInput): api.GetShardIteratorOutput throws Fault {
+		const key = streamOf(caller, input.StreamArn)
+		if (key == null) {
+			throw validation("Invalid StreamArn")
+		}
+		caller.allow(input.StreamArn)
+		const db = new Tables(caller.regional())
+		const s = found(db, key!, input.StreamArn)
+		shard(s, input.ShardId)
+		const kind = input.ShardIteratorType
+		const first = horizon(db, key!, s)
+		let after = s.last
+		if (kind == "TRIM_HORIZON") {
+			after = first - 1
+		} else if (kind == "AT_SEQUENCE_NUMBER" || kind == "AFTER_SEQUENCE_NUMBER") {
+			if (input.SequenceNumber == null) {
+				throw validation(`SequenceNumber is required for ShardIteratorType ${kind}`)
+			}
+			const n = sequenced(input.SequenceNumber!)
+			if (n == null || n! < 1 || n! > s.last) {
+				throw validation(`Invalid SequenceNumber: ${input.SequenceNumber!}`)
+			}
+			if (n! < first) {
+				throw trimmed()
+			}
+			after = if (kind == "AT_SEQUENCE_NUMBER") n! - 1 else n!
+		} else if (kind == "AT_TIMESTAMP") {
+			if (input.Timestamp == null) {
+				throw validation("Timestamp is required for ShardIteratorType AT_TIMESTAMP")
+			}
+			after = first - 1
+			for (const c of records(db, key!, after, s.last)) {
+				if (c.at >= input.Timestamp!) {
+					break
+				}
+				after = c.n
+			}
+		}
+		return { ...new api.GetShardIteratorOutput(), ShardIterator: iterator(input.StreamArn, s.shard, after) }
+	}
+
+	getRecords(caller: Caller, input: api.GetRecordsInput): api.GetRecordsOutput throws Fault {
+		const parts = split(input.ShardIterator, "|")
+		const key = if (parts.length == 4) streamOf(caller, parts[0]) else null
+		const after = if (parts.length == 4) digits(parts[2]) else null
+		const issued = if (parts.length == 4) digits(parts[3]) else null
+		if (key == null || after == null || issued == null) {
+			throw validation("Invalid ShardIterator")
+		}
+		caller.allow(parts[0])
+		const n = limited(input.Limit, 1000)
+		const db = new Tables(caller.regional())
+		const s = found(db, key!, parts[0])
+		shard(s, parts[1])
+		if (now() - issued! > 15 * minute) {
+			throw api.expiredIteratorException("Iterator expired. The iterator was created at time "
+				+ `${issued! / second} while right now it is ${now() / second}`)
+		}
+		if (after! < s.last && after! + 1 < horizon(db, key!, s)) {
+			throw trimmed()
+		}
+		const out: api.Record[] = []
+		let at = after!
+		let bytes: i64 = 0
+		for (const c of records(db, key!, after!, n)) {
+			out.push(record(caller, s, c))
+			at = c.n
+			bytes += c.size
+			if (bytes >= 1048576) {
+				break
+			}
+		}
+		const r = new api.GetRecordsOutput()
+		r.Records = out
+		r.NextShardIterator = if (!s.enabled && at >= s.last) null else iterator(parts[0], s.shard, at)
+		return r
+	}
+}
+
+/// The ARN of the caller's tables up to their names: arn:aws:dynamodb:REGION:ACCOUNT:table/.
+function tables(caller: Caller): string { return `arn:aws:dynamodb:${caller.region}:${caller.account}:table/` }
+
+/// The key of the stream of ARN a, null unless a is one of the caller's: a table's ARN, "/stream/" and a label of the
+/// form 2015-05-11T21:21:33.291.
+function streamOf(caller: Caller, a: string): string | null {
+	const at = indexOf(a, "/stream/")
+	if (!startsWith(a, tables(caller)) || at < 0) {
+		return null
+	}
+	const label = a.slice(at + 8, a.length)
+	const form = "0000-00-00T00:00:00.000"
+	if (label.length != form.length) {
+		return null
+	}
+	for (let i = 0; i < form.length; i++) {
+		if (if (form[i] == 48) label[i] < 48 || label[i] > 57 else label[i] != form[i]) {
+			return null
+		}
+	}
+	return a.slice(tables(caller).length, a.length)
+}
+
+/// The stream of key, of the ARN a, in db.
+function found(db: Tables, key: string, a: string): Stream throws Fault {
+	const s = db.streams.get(key)
+	if (s == null) {
+		throw api.resourceNotFoundException(`Requested resource not found: Stream: ${a} not found`)
+	}
+	return s!
+}
+
+/// Throws unless id is the id of s's shard.
+function shard(s: Stream, id: string) throws Fault {
+	if (id != s.shard) {
+		throw api.resourceNotFoundException(`Requested resource not found: Shard: ${id} not found`)
+	}
+}
+
+/// The number of the oldest record of the stream of key, s, not trimmed: the first of the last 24 hours, or the next
+/// to come if there is none.
+function horizon(db: Tables, key: string, s: Stream): i64 {
+	const since = now() - 24 * hour
+	let after: string | null = null
+	while (true) {
+		const page = db.changes.scan(after, 100, `${key}\x00`)
+		for (const [_, c] of page) {
+			if (c.at >= since) {
+				return c.n
+			}
+		}
+		if (page.length < 100) {
+			return s.last + 1
+		}
+		after = page[page.length - 1][0]
+	}
+}
+
+/// Up to limit records of the stream of key after its record numbered after.
+function records(db: Tables, key: string, after: i64, limit: i64): Change[] {
+	const n = if (limit > 1000) 1000 else limit as i32
+	return db.changes.scan(`${key}\x00${sequence(after)}`, n, `${key}\x00`).map(e => e[1])
+}
+
+/// A shard iterator of the shard of the stream of ARN a, after the record numbered after, issued now.
+function iterator(a: string, shard: string, after: i64): string { return `${a}|${shard}|${after}|${now()}` }
+
+/// The record c of the stream s as GetRecords gives it.
+function record(caller: Caller, s: Stream, c: Change): api.Record throws Fault {
+	const d = new api.StreamRecord()
+	d.ApproximateCreationDateTime = c.at - c.at % second
+	d.Keys = image(c.keys)
+	d.NewImage = if (c.newImage == null) null else image(c.newImage!)
+	d.OldImage = if (c.oldImage == null) null else image(c.oldImage!)
+	d.SequenceNumber = sequence(c.n)
+	d.SizeBytes = c.size
+	d.StreamViewType = s.view as api.StreamViewType
+	return { ...new api.Record(), eventID: c.id, eventName: c.kind as api.OperationType, eventVersion: "1.1",
+		eventSource: "aws:dynamodb", awsRegion: caller.region, dynamodb: d }
+}
+
+/// An item as ../dynamodb stores it, in this API's values.
+class Stored {
+	Item: [string, api.AttributeValue][] | null
+}
+
+/// The item that text holds, as stored.
+function image(text: string): [string, api.AttributeValue][] throws Fault { return decode[Stored](text).Item ?? [] }
+
+/// limit, if given, of 1 to max; else max.
+function limited(limit: i32 | null, max: i32): i32 throws Fault {
+	if (limit != null && (limit! < 1 || limit! > max)) {
+		const why = if (limit! < 1) "greater than or equal to 1" else `less than or equal to ${max}`
+		throw new Violations(new Validation("ValidationException")).fault(`${limit!}`, "limit",
+			`Member must have value ${why}`)
+	}
+	return limit ?? max
+}
+
+/// The non-negative decimal s, null if it is not one.
+function digits(s: string): i64 | null {
+	if (s.length == 0 || s.length > 19 || !s.every(c => c >= 48 && c <= 57)) {
+		return null
+	}
+	let n: i64 = 0
+	for (let i = 0; i < s.length; i++) {
+		n = n * 10 + ((s[i] - 48) as i64)
+	}
+	return n
+}
+
+/// The ValidationException of message.
+function validation(message: string): Fault { return new Fault(400, "ValidationException", message) }
+
+/// The TrimmedDataAccessException of a read before a shard's oldest record.
+function trimmed(): Fault {
+	return api.trimmedDataAccessException("The operation attempted to read past the oldest stream record in a shard.")
+}

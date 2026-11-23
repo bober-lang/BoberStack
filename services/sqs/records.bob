@@ -1,6 +1,7 @@
 //! SQS's state in an account's regional tree: its queues by name; their messages by queue, the instant they are next
 //! due and their order, so that a receive reads a queue's head; where each message is, by queue and id; and the
-//! deduplication ids a FIFO queue has seen.
+//! deduplication ids a FIFO queue has seen, the receive attempts it was asked for and the message move tasks of a
+//! dead-letter queue.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -82,6 +83,26 @@ export class Seen {
 	at: i64 = 0
 }
 
+/// A FIFO receive of a ReceiveRequestAttemptId: when, the messages it took, by id, under which receipts, and the
+/// instant they are visible again.
+export class Attempt {
+	at: i64 = 0
+	ids: string[] = []
+	receipts: string[] = []
+	until: i64 = 0
+}
+
+/// A message move task, done when started: its id, its destination's ARN and rate as given, and the messages moved
+/// of those there were to move.
+export class Task {
+	id = ""
+	started: i64 = 0
+	destination: string | null = null
+	rate: i32 | null = null
+	moved: i64 = 0
+	toMove: i64 = 0
+}
+
 /// The tables of an account's regional tree.
 export class Tables {
 	queues: Table[Queue]
@@ -94,6 +115,10 @@ export class Tables {
 	/// By within(queue, scope), the scope the deduplication id, after its group's and a NUL if a queue's scope is its
 	/// groups'.
 	seen: Table[Seen]
+	/// By within(queue, attempt id).
+	attempts: Table[Attempt]
+	/// By within(source queue, the instant started as 19 digits, a NUL and the id).
+	tasks: Table[Task]
 
 	constructor(s: Store) {
 		this.queues = new Table[Queue](s, "sqs/queues")
@@ -101,6 +126,8 @@ export class Tables {
 		this.messages = new Table[Message](s, "sqs/messages")
 		this.places = new Table[Place](s, "sqs/places")
 		this.seen = new Table[Seen](s, "sqs/seen")
+		this.attempts = new Table[Attempt](s, "sqs/attempts")
+		this.tasks = new Table[Task](s, "sqs/tasks")
 	}
 }
 

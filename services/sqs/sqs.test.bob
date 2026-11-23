@@ -367,6 +367,53 @@ test "FIFO: in order per group, a group held while in flight, deduplicated for f
 	done(c)
 }
 
+test "a FIFO receive retried by its attempt id takes the same messages, while they are unchanged and in flight" {
+	const c = caller()
+	const u = queue(c, "q.fifo", [["FifoQueue", "true"], ["VisibilityTimeout", "30"]])
+	put(c, u, "a1", 0, "a", "1")
+	put(c, u, "b1", 0, "b", "2")
+	const r = new api.ReceiveMessageRequest()
+	r.QueueUrl = u
+	r.ReceiveRequestAttemptId = "try"
+	r.MessageSystemAttributeNames = ["ApproximateReceiveCount"]
+	const first = receive(c, r, 0).Messages!
+	const again = receive(c, r, 20 * second).Messages!
+	assert bodies(again) == ["a1"] && again[0].ReceiptHandle == first[0].ReceiptHandle
+		&& system(again[0], "ApproximateReceiveCount") == "1"
+	// The retry made it visible again 30 seconds after itself.
+	assert take(c, u, 45 * second).length == 1
+	assert bodies(take(c, u, 50 * second)) == ["a1"]
+	// Received anew, under another receipt, it is no longer the attempt's.
+	assert receive(c, r, 60 * second).Messages == null
+	done(c)
+}
+
+test "a message move task returns a dead-letter queue's messages at once" {
+	const g = gateway()
+	const dlq = "arn:aws:sqs:us-east-1:000000000000:dlq"
+	call(g, "CreateQueue", `{"QueueName":"dlq"}`)
+	const policy = `{\\"deadLetterTargetArn\\":\\"${dlq}\\",\\"maxReceiveCount\\":\\"1\\"}`
+	call(g, "CreateQueue", `{"QueueName":"src","Attributes":{"RedrivePolicy":"${policy}","VisibilityTimeout":"0"}}`)
+	call(g, "SendMessage", `{"QueueUrl":"${base}src","MessageBody":"m"}`)
+	const take = `{"QueueUrl":"${base}src"}`
+	assert (out[api.ReceiveMessageResult](call(g, "ReceiveMessage", take)).Messages ?? []).length == 1
+	assert out[api.ReceiveMessageResult](call(g, "ReceiveMessage", take)).Messages == null
+	assert fails(call(g, "StartMessageMoveTask", `{"SourceArn":"${base}dlq"}`), 400, "InvalidParameterValue")
+	assert fails(call(g, "StartMessageMoveTask", `{"SourceArn":"${dlq}x"}`), 404, "ResourceNotFoundException")
+	assert fails(call(g, "StartMessageMoveTask", `{"SourceArn":"arn:aws:sqs:us-east-1:000000000000:src"}`), 400,
+		"InvalidParameterValue")
+	const started = out[api.StartMessageMoveTaskResult](call(g, "StartMessageMoveTask", `{"SourceArn":"${dlq}"}`))
+	const got = out[api.ReceiveMessageResult](call(g, "ReceiveMessage", take)).Messages!
+	assert bodies(got) == ["m"]
+	const listed = out[api.ListMessageMoveTasksResult](call(g, "ListMessageMoveTasks", `{"SourceArn":"${dlq}"}`))
+	const task = listed.Results![0]
+	assert task.Status == "COMPLETED" && task.ApproximateNumberOfMessagesMoved == 1
+		&& task.ApproximateNumberOfMessagesToMove == 1 && task.TaskHandle == null
+	assert fails(call(g, "CancelMessageMoveTask", `{"TaskHandle":"${started.TaskHandle!}"}`), 404,
+		"ResourceNotFoundException")
+	assert fails(call(g, "CancelMessageMoveTask", `{"TaskHandle":"x"}`), 400, "InvalidParameterValue")
+}
+
 test "purging, at most once a minute" {
 	const c = caller()
 	const u = queue(c, "q")

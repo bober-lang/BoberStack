@@ -1,10 +1,14 @@
 //! Amazon DynamoDB: tables with their secondary indexes, tags and time to live; items, read and written one at a time,
 //! in batches and in transactions, with condition, update and projection expressions or the parameters they replaced;
 //! Query and Scan; and PartiQL's statements, as the operations they amount to. A request is one transaction over the
-//! state, so a write and its indexes' entries commit together or not at all. Known differences from AWS, as nothing
-//! here runs but requests: tables and indexes are ACTIVE at once, time to live is stored but nothing expires, streams
-//! are described but never written, and point-in-time recovery is stored but nothing can be restored. Scan, and a
-//! SELECT, which is one, return items in the order of their keys' encoding.
+//! state, so a write, its indexes' entries and its stream record commit together or not at all; a write that changes
+//! nothing writes no record, as AWS's. Each time a table's stream is enabled it gets a new one, of a single shard,
+//! which ../dynamodbstreams reads. Time to live is as AWS's until its background deletes an expired item, which it
+//! does within days and until then reads still return the item: here nothing runs but requests, so that time never
+//! comes and expired items stay, as their TTL deletions' stream records never are. Other known differences from AWS,
+//! for the same reason: tables and indexes are ACTIVE at once, time to live is ENABLED or DISABLED at once and may
+//! change again within the hour, and point-in-time recovery is stored but nothing can be restored. Scan, and a SELECT,
+//! which is one, return items in the order of their keys' encoding.
 
 import { Fault } from "../../core/fault"
 import { result } from "../../core/protocol/json"
@@ -21,15 +25,15 @@ import { attributes, expected, filter, unmixed, updates } from "./legacy"
 import { format, parse } from "./number"
 import { joined, statement, Statement, Term } from "./partiql"
 
-import { attribute, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected, sizeOf,
-	stored, Tables, Token, typeOf } from "./records"
+import { attribute, Change, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected,
+	sizeOf, stored, Stream, streamKey, Tables, Token, typeOf } from "./records"
 
 import { id } from "../../core/auth/credentials"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as b64 from "std/encoding/base64"
 import { EncodeError } from "std/encoding/json"
-import { ParseError } from "std/string"
-import { minute } from "std/time"
+import { ParseError, replace } from "std/string"
+import { millisecond, minute } from "std/time"
 
 /// The service, of the operations implemented.
 export class Handler {
@@ -98,7 +102,7 @@ export class Handler {
 		d.tableClass = input.TableClass ?? "STANDARD"
 		d.deletionProtection = input.DeletionProtectionEnabled ?? false
 		d.tags = tagged([], input.Tags ?? [])
-		stream(d, input.StreamSpecification)
+		stream(db, d, input.StreamSpecification, false)
 		db.save(d)
 		const r = new api.CreateTableOutput()
 		r.TableDescription = describe(caller, d, "ACTIVE")
@@ -137,6 +141,9 @@ export class Handler {
 		clear(db, items(d.name))
 		for (const x of d.indexes) {
 			clear(db, entries(d.name, x.name))
+		}
+		if (d.stream) {
+			close(db, d)
 		}
 		db.definitions.delete(d.name)
 		const r = new api.DeleteTableOutput()
@@ -202,9 +209,7 @@ export class Handler {
 				x!.write = w
 			}
 		}
-		if (input.StreamSpecification != null) {
-			stream(d, input.StreamSpecification)
-		}
+		stream(db, d, input.StreamSpecification, true)
 		d.tableClass = input.TableClass ?? d.tableClass
 		d.deletionProtection = input.DeletionProtectionEnabled ?? d.deletionProtection
 		db.save(d)
@@ -1285,7 +1290,7 @@ function scalar(v: api.AttributeValue): string {
 }
 
 /// Puts after, or deletes the item if null, at the key k of table d, where the item was before, and the entries of
-/// d's indexes; and counts them.
+/// d's indexes; counts them; and appends its record to d's stream, if enabled, unless it changes nothing.
 function write(db: Tables, d: Definition, k: string, before: Item | null, after: Item | null) throws Fault {
 	if (after != null) {
 		const size = sizeOf(after!)
@@ -1321,6 +1326,33 @@ function write(db: Tables, d: Definition, k: string, before: Item | null, after:
 		db.store.delete(items(d.name) + k)
 	}
 	db.save(d)
+	if (d.stream
+		&& (before == null || after == null
+		|| !same({ ...new api.AttributeValue$M(), M: before! }, { ...new api.AttributeValue$M(), M: after! }))) {
+		changed(db, d, before, after)
+	}
+}
+
+/// Appends to d's stream the record of the write that replaces before with after, either null for none.
+function changed(db: Tables, d: Definition, before: Item | null, after: Item | null) throws Fault {
+	const key = streamKey(d.name, d.streamLabel)
+	const s = db.streams.get(key)!
+	const c = new Change()
+	c.at = now()
+	c.id = replace(uuid(), "-", "")
+	c.kind = if (before == null) "INSERT" else if (after == null) "REMOVE" else "MODIFY"
+	const k = project(after ?? before!, keyNames(d, null).map(n => [{ ...new Step(), name: n }]))
+	c.keys = stored(k)
+	c.size = sizeOf(k)
+	if (after != null && (s.view == "NEW_IMAGE" || s.view == "NEW_AND_OLD_IMAGES")) {
+		c.newImage = stored(after!)
+		c.size += sizeOf(after!)
+	}
+	if (before != null && (s.view == "OLD_IMAGE" || s.view == "NEW_AND_OLD_IMAGES")) {
+		c.oldImage = stored(before!)
+		c.size += sizeOf(before!)
+	}
+	db.append(key, s, c)
 }
 
 /// Throws if item has a key attribute of one of d's indexes of another type than the index's.
@@ -1734,8 +1766,9 @@ function index(d: Definition, name: string, keys: api.KeySchemaElement[], p: api
 	return x
 }
 
-/// Sets the stream of d as s specifies it.
-function stream(d: Definition, s: api.StreamSpecification | null) throws Fault {
+/// Sets the stream of d, in db, as s specifies it, of an update if updating: enabled, a new stream, of a label no other
+/// of d's name has had; disabled, the one there is closed.
+function stream(db: Tables, d: Definition, s: api.StreamSpecification | null, updating: bool) throws Fault {
 	if (s == null) {
 		return
 	}
@@ -1743,11 +1776,40 @@ function stream(d: Definition, s: api.StreamSpecification | null) throws Fault {
 		throw validation("One or more parameter values were invalid: StreamViewType is required when StreamEnabled is "
 			+ "true")
 	}
-	d.stream = s!.StreamEnabled
-	d.streamView = s!.StreamViewType ?? ""
-	if (d.stream) {
-		d.streamLabel = stamp(now())
+	if (updating && s!.StreamEnabled == d.stream) {
+		throw validation(if (d.stream) `Table already has an enabled stream: TableName: ${d.name}`
+			else `Table does not have an enabled stream: TableName: ${d.name}`)
 	}
+	if (d.stream) {
+		close(db, d)
+	}
+	d.stream = s!.StreamEnabled
+	if (!d.stream) {
+		return
+	}
+	d.streamView = s!.StreamViewType!
+	let t = now()
+	while (db.streams.get(streamKey(d.name, stamp(t))) != null) {
+		t += millisecond
+	}
+	d.streamLabel = stamp(t)
+	const made = new Stream()
+	made.table = d.name
+	made.label = d.streamLabel
+	made.view = d.streamView
+	made.hash = d.hash
+	made.range = d.range
+	made.created = t
+	made.shard = `shardId-${pad(t / millisecond, 20)}-${d.id.slice(0, 8)}`
+	db.saveStream(streamKey(d.name, d.streamLabel), made)
+}
+
+/// Closes d's stream, which is enabled: its shard ends at its last record.
+function close(db: Tables, d: Definition) throws Fault {
+	const key = streamKey(d.name, d.streamLabel)
+	const s = db.streams.get(key)!
+	s.enabled = false
+	db.saveStream(key, s)
 }
 
 /// The label of a stream made at t, ns since 1970: its time to the millisecond, as AWS's are, of the form
@@ -1836,6 +1898,8 @@ function describe(caller: Caller, d: Definition, status: api.TableStatus): api.T
 	if (d.stream) {
 		t.StreamSpecification = { ...new api.StreamSpecification(), StreamEnabled: true,
 			StreamViewType: d.streamView as api.StreamViewType }
+	}
+	if (d.streamLabel != "") {
 		t.LatestStreamLabel = d.streamLabel
 		t.LatestStreamArn = `${t.TableArn!}/stream/${d.streamLabel}`
 	}

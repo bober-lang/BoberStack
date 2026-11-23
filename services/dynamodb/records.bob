@@ -1,7 +1,8 @@
 //! DynamoDB's state in the tree of an account's region: the definitions of its tables, by name; each table's items,
 //! by the table's name, a NUL and the encoding of their key; each index's entries, the items as it projects them, by
 //! the table's and the index's names, each followed by a NUL, the encoding of the item's key in the index, then of its
-//! key in the table; and the client tokens of the transactions written, by token.
+//! key in the table; the client tokens of the transactions written, by token; and the tables' streams and their
+//! records, which DynamoDB Streams reads.
 
 import { Fault } from "../../core/fault"
 import { decode, result } from "../../core/protocol/json"
@@ -69,16 +70,48 @@ export class Token {
 	request = ""
 }
 
+/// A table's stream, by its key, the table's name, "/stream/" and its label, which its ARN ends with: of a view type
+/// and the table's key, made when, ns since 1970; its one shard's id; the number of its last record, 0 for none; and
+/// whether it is still enabled, its shard open.
+export class Stream {
+	table = ""
+	label = ""
+	view = ""
+	hash = new Key()
+	range: Key | null = null
+	created: i64 = 0
+	shard = ""
+	last: i64 = 0
+	enabled = true
+}
+
+/// A record of a stream, by the stream's key, a NUL and its sequence number: its number, made when, ns since 1970; its
+/// event's id; INSERT, MODIFY or REMOVE; the item's key and the images its view type keeps, each as stored; its size.
+export class Change {
+	n: i64 = 0
+	at: i64 = 0
+	id = ""
+	kind = ""
+	keys = ""
+	newImage: string | null = null
+	oldImage: string | null = null
+	size: i64 = 0
+}
+
 /// The state of a region of an account.
 export class Tables {
 	store: Store
 	definitions: Table[Definition]
 	tokens: Table[Token]
+	streams: Table[Stream]
+	changes: Table[Change]
 
 	constructor(s: Store) {
 		this.store = s
 		this.definitions = new Table[Definition](s, "dynamodb/tables")
 		this.tokens = new Table[Token](s, "dynamodb/tokens")
+		this.streams = new Table[Stream](s, "dynamodb/streams")
+		this.changes = new Table[Change](s, "dynamodb/changes")
 	}
 
 	/// The definition of the table named name, null if there is none.
@@ -90,6 +123,26 @@ export class Tables {
 		} catch (e: EncodeError) {
 			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
 		}
+	}
+
+	saveStream(key: string, s: Stream) throws Fault {
+		try {
+			this.streams.put(key, s)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		}
+	}
+
+	/// Appends c to the stream of key, s, as its next record.
+	append(key: string, s: Stream, c: Change) throws Fault {
+		s.last++
+		c.n = s.last
+		try {
+			this.changes.put(`${key}\x00${sequence(c.n)}`, c)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		}
+		this.saveStream(key, s)
 	}
 
 	/// The item of table d at the key k, as encoded, null if there is none.
@@ -107,6 +160,29 @@ export function entries(table: string, index: string): string { return `dynamodb
 export function parsed(text: string): Item throws Fault { return decode[api.GetItemOutput](text).Item ?? [] }
 /// item as stored.
 export function stored(item: Item): string { return result({ ...new api.GetItemOutput(), Item: item }) }
+/// The key of the stream of the table named table, of label.
+export function streamKey(table: string, label: string): string { return `${table}/stream/${label}` }
+
+/// The sequence number of a stream's nth record: 21 digits, a 1 and n's, so that their order is the records'.
+export function sequence(n: i64): string {
+	let s = `${n}`
+	while (s.length < 20) {
+		s = "0" + s
+	}
+	return "1" + s
+}
+
+/// The n of the sequence number s, null if s is not one.
+export function sequenced(s: string): i64 | null {
+	if (s.length != 21 || s[0] != 49 || !s.every(c => c >= 48 && c <= 57)) {
+		return null
+	}
+	let n: i64 = 0
+	for (let i = 1; i < s.length; i++) {
+		n = n * 10 + ((s[i] - 48) as i64)
+	}
+	return n
+}
 
 /// The value of item's attribute name, null if it has none.
 export function attribute(item: Item, name: string): api.AttributeValue | null {

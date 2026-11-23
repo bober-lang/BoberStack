@@ -4,6 +4,8 @@ import { Gateway } from "./core/gateway"
 import * as restxml from "./core/protocol/restxml"
 import * as dynamodbApi from "./services/dynamodb/api"
 import * as dynamodb from "./services/dynamodb/dynamodb"
+import * as streamsApi from "./services/dynamodbstreams/api"
+import * as streams from "./services/dynamodbstreams/dynamodbstreams"
 import * as eventsApi from "./services/events/api"
 import * as events from "./services/events/events"
 import * as iamApi from "./services/iam/api"
@@ -28,6 +30,7 @@ import * as ssmApi from "./services/ssm/api"
 import * as ssm from "./services/ssm/ssm"
 import * as stsApi from "./services/sts/api"
 import * as sts from "./services/sts/sts"
+import { startsWith } from "std/algo"
 
 /// A gateway to every service, each by its signing name, with catalog as the policies AWS manages; those that
 /// deliver to others call them directly.
@@ -51,7 +54,12 @@ export function stack(catalog: Catalog): Gateway {
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
 	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
-	g.services.set(dynamodbApi.signingName, (caller, req) => dynamodbApi.handle(d, caller, req))
+	// DynamoDB Streams signs as DynamoDB does, its operations named apart by X-Amz-Target.
+	const t = new streams.Handler()
+	g.services.set(dynamodbApi.signingName, (caller, req) => {
+		const streamed = startsWith(req.headers.get("x-amz-target") ?? "", "DynamoDBStreams_")
+		return if (streamed) streamsApi.handle(t, caller, req) else dynamodbApi.handle(d, caller, req)
+	})
 	g.services.set(snsApi.signingName, (caller, req) => snsApi.handle(n, caller, req))
 	g.services.set(eventsApi.signingName, (caller, req) => eventsApi.handle(e, caller, req))
 	g.services.set(secretsmanagerApi.signingName, (caller, req) => secretsmanagerApi.handle(m, caller, req))
