@@ -1,0 +1,347 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UserId"
+	],
+	"steps": [
+		{
+			"name": "allow one action of two",
+			"service": "iam",
+			"differs": "MatchedStatements carry no StartPosition and EndPosition, which the policy parser does not keep, and no SourcePolicyType: the model has no \"IAM Policy\"",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ActionNames.member.2": "s3:PutObject"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>95</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>allowed</EvalDecision>\n      </member>\n      <member>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:PutObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a deny over an allow",
+			"service": "iam",
+			"differs": "MatchedStatements carry no StartPosition and EndPosition, which the policy parser does not keep, and no SourcePolicyType: the model has no \"IAM Policy\"",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"PolicyInputList.member.2": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"s3:*\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>86</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.2</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>explicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a condition of a key not given",
+			"service": "iam",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/Team\":\"red\"}}}]}",
+				"ActionNames.member.1": "s3:GetObject"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements/>\n        <MissingContextValues>\n          <member>aws:RequestTag/Team</member>\n        </MissingContextValues>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a condition of a key given",
+			"service": "iam",
+			"differs": "MatchedStatements carry no StartPosition and EndPosition, which the policy parser does not keep, and no SourcePolicyType: the model has no \"IAM Policy\"",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/Team\":\"red\"}}}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ContextEntries.member.1.ContextKeyName": "aws:RequestTag/Team",
+				"ContextEntries.member.1.ContextKeyValues.member.1": "red",
+				"ContextEntries.member.1.ContextKeyType": "string"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>154</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>allowed</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "two resources",
+			"service": "iam",
+			"differs": "Of several resources AWS answers one result, of the action's resource pattern, with ResourceSpecificResults; BoberStack one result for each",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::b/*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ResourceArns.member.1": "arn:aws:s3:::b/k",
+				"ResourceArns.member.2": "arn:aws:s3:::c/k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <EvalDecisionDetails/>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>110</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>arn:aws:s3:::${BucketName}/${KeyName}</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n        <ResourceSpecificResults>\n          <member>\n            <MatchedStatements>\n              <member>\n                <EndPosition>\n                  <Line>1</Line>\n                  <Column>110</Column>\n                </EndPosition>\n                <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n                <SourcePolicyType>IAM Policy</SourcePolicyType>\n                <StartPosition>\n                  <Line>1</Line>\n                  <Column>38</Column>\n                </StartPosition>\n              </member>\n            </MatchedStatements>\n            <EvalResourceDecision>allowed</EvalResourceDecision>\n            <EvalResourceName>arn:aws:s3:::b/k</EvalResourceName>\n          </member>\n          <member>\n            <EvalResourceDecision>implicitDeny</EvalResourceDecision>\n            <EvalResourceName>arn:aws:s3:::c/k</EvalResourceName>\n          </member>\n        </ResourceSpecificResults>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "two actions, a page of one",
+			"service": "iam",
+			"differs": "MatchedStatements carry no StartPosition and EndPosition, which the policy parser does not keep, and no SourcePolicyType: the model has no \"IAM Policy\"",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ActionNames.member.2": "s3:PutObject",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"marker": "Marker"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>true</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>95</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>allowed</EvalDecision>\n      </member>\n    </EvaluationResults>\n    <Marker>PS:1</Marker>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "the next page",
+			"service": "iam",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ActionNames.member.2": "s3:PutObject",
+				"MaxItems": "1",
+				"Marker": "${marker}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:PutObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a permissions boundary that does not allow",
+			"service": "iam",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"PermissionsBoundaryPolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <PermissionsBoundaryDecisionDetail>\n          <AllowedByPermissionsBoundary>false</AllowedByPermissionsBoundary>\n        </PermissionsBoundaryDecisionDetail>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a resource policy of another account",
+			"service": "iam",
+			"differs": "BoberStack answers no ResourceSpecificResults or EvalDecisionDetails, and MatchedStatements without positions or SourcePolicyType",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"ActionNames.member.1": "s3:GetObject",
+				"ResourceArns.member.1": "arn:aws:s3:::b/k",
+				"ResourcePolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::111122223333:root\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::b/*\"}]}",
+				"ResourceOwner": "arn:aws:iam::444455556666:root",
+				"CallerArn": "arn:aws:iam::111122223333:user/alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <EvalDecisionDetails>\n          <entry>\n            <key>Resource Policy</key>\n            <value>allowed</value>\n          </entry>\n          <entry>\n            <key>IAM Policy</key>\n            <value>allowed</value>\n          </entry>\n        </EvalDecisionDetails>\n        <MatchedStatements>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>163</Column>\n            </EndPosition>\n            <SourcePolicyId>ResourcePolicy</SourcePolicyId>\n            <SourcePolicyType>Resource Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n          <member>\n            <EndPosition>\n              <Line>1</Line>\n              <Column>95</Column>\n            </EndPosition>\n            <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n            <SourcePolicyType>IAM Policy</SourcePolicyType>\n            <StartPosition>\n              <Line>1</Line>\n              <Column>38</Column>\n            </StartPosition>\n          </member>\n        </MatchedStatements>\n        <MissingContextValues/>\n        <EvalResourceName>arn:aws:s3:::b/k</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>allowed</EvalDecision>\n        <ResourceSpecificResults>\n          <member>\n            <EvalDecisionDetails>\n              <entry>\n                <key>IAM Policy</key>\n                <value>allowed</value>\n              </entry>\n              <entry>\n                <key>Resource Policy</key>\n                <value>allowed</value>\n              </entry>\n            </EvalDecisionDetails>\n            <MatchedStatements>\n              <member>\n                <EndPosition>\n                  <Line>1</Line>\n                  <Column>95</Column>\n                </EndPosition>\n                <SourcePolicyId>PolicyInputList.1</SourcePolicyId>\n                <SourcePolicyType>IAM Policy</SourcePolicyType>\n                <StartPosition>\n                  <Line>1</Line>\n                  <Column>38</Column>\n                </StartPosition>\n              </member>\n              <member>\n                <EndPosition>\n                  <Line>1</Line>\n                  <Column>163</Column>\n                </EndPosition>\n                <SourcePolicyId>ResourcePolicy</SourcePolicyId>\n                <SourcePolicyType>Resource Policy</SourcePolicyType>\n                <StartPosition>\n                  <Line>1</Line>\n                  <Column>38</Column>\n                </StartPosition>\n              </member>\n            </MatchedStatements>\n            <EvalResourceDecision>allowed</EvalResourceDecision>\n            <EvalResourceName>arn:aws:s3:::b/k</EvalResourceName>\n          </member>\n        </ResourceSpecificResults>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a malformed policy",
+			"service": "iam",
+			"query": {
+				"Action": "SimulateCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}",
+				"ActionNames.member.1": "s3:GetObject"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulateCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulateCustomPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>implicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulateCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulateCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "context keys of custom policies",
+			"service": "iam",
+			"differs": "AWS orders a statement's keys by no rule found: condition keys and a variable of its resource interleaved",
+			"query": {
+				"Action": "GetContextKeysForCustomPolicy",
+				"Version": "2010-05-08",
+				"PolicyInputList.member.1": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/Team\":\"red\"}}}]}",
+				"PolicyInputList.member.2": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:*\",\"Resource\":\"arn:aws:s3:::b/${aws:username}/*\",\"Condition\":{\"IpAddress\":{\"aws:SourceIp\":\"10.0.0.0/8\"},\"Bool\":{\"aws:SecureTransport\":\"true\"}}}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetContextKeysForCustomPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetContextKeysForCustomPolicyResult>\n    <ContextKeyNames>\n      <member>aws:RequestTag/Team</member>\n      <member>aws:SourceIp</member>\n      <member>aws:username</member>\n      <member>aws:SecureTransport</member>\n    </ContextKeyNames>\n  </GetContextKeysForCustomPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetContextKeysForCustomPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "create the user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-sim"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-sim</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-sim</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "give it a policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-sim",
+				"PolicyName": "tagged",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/Team\":\"red\"}}}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "simulate the user",
+			"service": "iam",
+			"differs": "An SCP of the recording account's organization denies S3; BoberStack has no organizations",
+			"query": {
+				"Action": "SimulatePrincipalPolicy",
+				"Version": "2010-05-08",
+				"PolicySourceArn": "arn:aws:iam::${account}:user/${prefix}-sim",
+				"ActionNames.member.1": "s3:GetObject",
+				"ActionNames.member.2": "s3:PutObject",
+				"ContextEntries.member.1.ContextKeyName": "aws:RequestTag/Team",
+				"ContextEntries.member.1.ContextKeyValues.member.1": "red",
+				"ContextEntries.member.1.ContextKeyType": "string"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SimulatePrincipalPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <SimulatePrincipalPolicyResult>\n    <IsTruncated>false</IsTruncated>\n    <EvaluationResults>\n      <member>\n        <OrganizationsDecisionDetail>\n          <AllowedByOrganizations>false</AllowedByOrganizations>\n        </OrganizationsDecisionDetail>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:GetObject</EvalActionName>\n        <EvalDecision>explicitDeny</EvalDecision>\n      </member>\n      <member>\n        <OrganizationsDecisionDetail>\n          <AllowedByOrganizations>false</AllowedByOrganizations>\n        </OrganizationsDecisionDetail>\n        <MatchedStatements/>\n        <MissingContextValues/>\n        <EvalResourceName>*</EvalResourceName>\n        <EvalActionName>s3:PutObject</EvalActionName>\n        <EvalDecision>explicitDeny</EvalDecision>\n      </member>\n    </EvaluationResults>\n  </SimulatePrincipalPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SimulatePrincipalPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "context keys of the user",
+			"service": "iam",
+			"query": {
+				"Action": "GetContextKeysForPrincipalPolicy",
+				"Version": "2010-05-08",
+				"PolicySourceArn": "arn:aws:iam::${account}:user/${prefix}-sim"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetContextKeysForPrincipalPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetContextKeysForPrincipalPolicyResult>\n    <ContextKeyNames>\n      <member>aws:RequestTag/Team</member>\n    </ContextKeyNames>\n  </GetContextKeysForPrincipalPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetContextKeysForPrincipalPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "simulate a user of none",
+			"service": "iam",
+			"query": {
+				"Action": "SimulatePrincipalPolicy",
+				"Version": "2010-05-08",
+				"PolicySourceArn": "arn:aws:iam::${account}:user/${prefix}-none",
+				"ActionNames.member.1": "s3:GetObject"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Unable to retrieve specified IAM entity.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-sim",
+				"PolicyName": "tagged"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-sim"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

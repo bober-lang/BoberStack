@@ -3,7 +3,7 @@
 //! over the state.
 
 import * as chunked from "./auth/chunked"
-import { accountOf, authenticate, credentials } from "./auth/credentials"
+import { accountOf, authenticate, credentials, use } from "./auth/credentials"
 import * as sigv2 from "./auth/sigv2"
 import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
@@ -108,8 +108,8 @@ export class Gateway {
 	}
 
 	/// The answer to req, with body, by service, named name, holding the lock: the credential of its access key is
-	/// checked, an aws-chunked body decoded, and the trees it opens committed if it succeeds, else closed. Without auth
-	/// the caller is anonymous.
+	/// checked and its use recorded, an aws-chunked body decoded, and the trees it opens committed if it succeeds, else
+	/// closed. Without auth the caller is anonymous.
 	private serve(name: string, service: Service, req: Request, body: string, auth: sigv4.Authorization | null,
 		id: string): Response throws IoError | ParseError {
 		const global = this.trees.get("")
@@ -118,6 +118,9 @@ export class Gateway {
 		try {
 			if (known != null) {
 				why = authenticate(known, req, body, auth!, now())
+				if (why == null) {
+					use(global!, auth!.accessKey, known, name, auth!.region, now())
+				}
 			}
 			if (why == null && auth != null && chunked.chunked(req)) {
 				req.body = new Body(chunked.decode(req, body, auth!, known?.secret))

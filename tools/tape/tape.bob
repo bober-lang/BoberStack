@@ -357,10 +357,23 @@ export function captured(res: Response, body: string, path: string): string | nu
 	return if (startsWith(path, header)) res.headers.get(path.slice(header.length, path.length)) else find(body, path)
 }
 
-/// The texts of the members named one of names in body, those of 8 characters or more.
-export function volatiles(body: string, names: string[]): string[] throws ParseError {
-	const out: string[] = []
+/// The members named one of names in body: each name and text.
+export function volatiles(body: string, names: string[]): [string, string][] throws ParseError {
+	const out: [string, string][] = []
 	collect(tree(body), names, out)
+	return out
+}
+
+/// body with the text v, of the member name, as its form where it is that member's, as an XML element or a JSON
+/// member, quoted, so that the body stays JSON: of a text too short to be told apart where else it is.
+export function hidden(body: string, name: string, v: string): string {
+	let out = replace(body, `<${name}>${v}</${name}>`, `<${name}>${form(v)}</${name}>`)
+	for (const colon of [":", ": "]) {
+		out = replace(out, `"${name}"${colon}"${v}"`, `"${name}"${colon}"${form(v)}"`)
+		for (const end of [",", "}"]) {
+			out = replace(out, `"${name}"${colon}${v}${end}`, `"${name}"${colon}"${form(v)}"${end}`)
+		}
+	}
 	return out
 }
 
@@ -674,11 +687,11 @@ function below(t: Tree, name: string): Tree | null {
 	return null
 }
 
-/// Adds to out the texts of 8 characters or more of the leaves below t named one of names.
-function collect(t: Tree, names: string[], out: string[]): void {
+/// Adds to out the names and texts of the leaves below t named one of names.
+function collect(t: Tree, names: string[], out: [string, string][]): void {
 	for (const c of t.children) {
-		if (c.leaf && names.includes(c.name) && c.text.length >= 8) {
-			out.push(c.text)
+		if (c.leaf && names.includes(c.name)) {
+			out.push([c.name, c.text])
 		}
 		collect(c, names, out)
 	}

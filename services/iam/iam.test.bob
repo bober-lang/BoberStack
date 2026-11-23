@@ -8,8 +8,9 @@ import { Catalog } from "./catalog"
 import { Handler } from "./iam"
 import { identify } from "./identities"
 import { indexOf } from "std/algo"
+import * as base64 from "std/encoding/base64"
 import { Response } from "std/http"
-import { ParseError, replace } from "std/string"
+import { ParseError, replace, split } from "std/string"
 import { escape } from "std/url"
 import { malloc } from "stdlib.h"
 import { memcpy } from "string.h"
@@ -259,6 +260,139 @@ test "a deleted access key is refused, where one never issued is taken for a roo
 	assert fails(call(g, "GetUser", [], key, secret), 403, "InvalidClientTokenId")
 	res = call(g, "GetUser", [], "AKIANEVERISSUEDKEY00", "anything")
 	assert res.status == 200 && text(res, "Arn") == "arn:aws:iam::000000000000:root"
+	g.close()
+}
+
+test "an access key's last use: the service and region of the last request it signed" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	const res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const key = text(res, "AccessKeyId")!
+	let used = call(g, "GetAccessKeyLastUsed", [["AccessKeyId", key]])
+	assert text(used, "UserName") == "bob" && text(used, "ServiceName") == "N/A" && text(used, "Region") == "N/A"
+	assert text(used, "LastUsedDate") == null
+	call(g, "GetUser", [], key, text(res, "SecretAccessKey")!)
+	used = call(g, "GetAccessKeyLastUsed", [["AccessKeyId", key]])
+	assert text(used, "ServiceName") == "iam" && text(used, "Region") == "us-east-1"
+	assert text(used, "LastUsedDate") == "2015-06-26T14:00:00Z"
+	assert fails(call(g, "GetAccessKeyLastUsed", [["AccessKeyId", "AKIANEVERISSUEDKEY00"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "login profiles: kept to the password policy; a user that has one is not deleted" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	assert fails(call(g, "GetLoginProfile", [["UserName", "bob"]]), 404, "NoSuchEntity",
+		"Login Profile for User bob cannot be found.")
+	let res = call(g, "CreateLoginProfile", [["UserName", "bob"], ["Password", "a"], ["PasswordResetRequired", "true"]])
+	assert res.status == 200 && text(res, "PasswordResetRequired") == "true"
+	assert fails(call(g, "CreateLoginProfile", [["UserName", "bob"], ["Password", "a"]]), 409, "EntityAlreadyExists")
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete login profile first.")
+	call(g, "UpdateAccountPasswordPolicy",
+		[["MinimumPasswordLength", "10"], ["RequireNumbers", "true"], ["RequireSymbols", "true"]])
+	assert fails(call(g, "UpdateLoginProfile", [["UserName", "bob"], ["Password", "short"]]), 400,
+		"PasswordPolicyViolation", "Password should have a minimum length of 10")
+	assert fails(call(g, "UpdateLoginProfile", [["UserName", "bob"], ["Password", "longenough1"]]), 400,
+		"PasswordPolicyViolation", "Password should have at least one symbol")
+	res = call(g, "UpdateLoginProfile",
+		[["UserName", "bob"], ["Password", "long-enough1"], ["PasswordResetRequired", "false"],
+		["MaxSigninSessionDuration", "7200"]])
+	assert res.status == 200
+	res = call(g, "GetLoginProfile", [["UserName", "bob"]])
+	assert text(res, "PasswordResetRequired") == "false" && text(res, "MaxSigninSessionDuration") == "7200"
+	assert call(g, "DeleteLoginProfile", [["UserName", "bob"]]).status == 200
+	assert fails(call(g, "DeleteLoginProfile", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	g.close()
+}
+
+test "service-linked roles: made as AWS makes them, changed by no ordinary operation, deleted at once" {
+	const g = gateway()
+	let res = call(g, "CreateServiceLinkedRole", [["AWSServiceName", "ops.apigateway.amazonaws.com"]])
+	assert res.status == 200 && text(res, "RoleName") == "AWSServiceRoleForAPIGateway"
+	assert text(res, "Path") == "/aws-service-role/ops.apigateway.amazonaws.com/"
+	assert text(res, "Arn")
+		== "arn:aws:iam::000000000000:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway"
+	assert texts(call(g, "ListAttachedRolePolicies", [["RoleName", "AWSServiceRoleForAPIGateway"]]), "PolicyArn")
+		== ["arn:aws:iam::aws:policy/aws-service-role/APIGatewayServiceRolePolicy"]
+	assert fails(call(g, "CreateServiceLinkedRole", [["AWSServiceName", "ops.apigateway.amazonaws.com"]]), 400,
+		"InvalidInput")
+	assert fails(call(g, "CreateServiceLinkedRole",
+		[["AWSServiceName", "ops.apigateway.amazonaws.com"], ["CustomSuffix", "x"]]), 400, "InvalidInput")
+	assert fails(call(g, "CreateServiceLinkedRole", [["AWSServiceName", "nothing.amazonaws.com"]]), 400, "InvalidInput")
+	assert fails(call(g, "DeleteRole", [["RoleName", "AWSServiceRoleForAPIGateway"]]), 400, "UnmodifiableEntity",
+		"Cannot perform the operation on the protected role 'AWSServiceRoleForAPIGateway' - this role is only "
+		+ "modifiable by AWS")
+	assert fails(call(g, "PutRolePolicy",
+		[["RoleName", "AWSServiceRoleForAPIGateway"], ["PolicyName", "p"], ["PolicyDocument", allow]]), 400,
+		"UnmodifiableEntity")
+	call(g, "CreateRole", [["RoleName", "plain"], ["AssumeRolePolicyDocument", trust]])
+	assert fails(call(g, "DeleteServiceLinkedRole", [["RoleName", "plain"]]), 400, "InvalidInput")
+	res = call(g, "DeleteServiceLinkedRole", [["RoleName", "AWSServiceRoleForAPIGateway"]])
+	const task = text(res, "DeletionTaskId")!
+	assert indexOf(task, "task/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway/") == 0
+	assert text(call(g, "GetServiceLinkedRoleDeletionStatus", [["DeletionTaskId", task]]), "Status") == "SUCCEEDED"
+	assert fails(call(g, "GetRole", [["RoleName", "AWSServiceRoleForAPIGateway"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "the policy simulator: a principal's policies, its groups', and those given" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateGroup", [["GroupName", "g"]])
+	call(g, "AddUserToGroup", [["GroupName", "g"], ["UserName", "bob"]])
+	const tagged = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*",`
+		+ `"Condition":{"StringEquals":{"aws:RequestTag/Team":"red"}}}]}`
+	call(g, "PutGroupPolicy", [["GroupName", "g"], ["PolicyName", "tagged"], ["PolicyDocument", tagged]])
+	const bob: [string, string][] = [["PolicySourceArn", "arn:aws:iam::000000000000:user/bob"],
+		["ActionNames.member.1", "s3:GetObject"]]
+	let res = call(g, "SimulatePrincipalPolicy", bob)
+	assert text(res, "EvalDecision") == "implicitDeny" && texts(res, "MissingContextValues") == ["aws:RequestTag/Team"]
+	const given = bob.slice(0, 2)
+	given.append([["ContextEntries.member.1.ContextKeyName", "aws:requesttag/team"],
+		["ContextEntries.member.1.ContextKeyValues.member.1", "red"],
+		["ContextEntries.member.1.ContextKeyType", "string"]])
+	res = call(g, "SimulatePrincipalPolicy", given)
+	assert text(res, "EvalDecision") == "allowed" && text(res, "SourcePolicyId") == "tagged"
+	assert text(res, "SourcePolicyType") == "group"
+	const deny = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:*","Resource":"*"}]}`
+	given.push(["PolicyInputList.member.1", deny])
+	res = call(g, "SimulatePrincipalPolicy", given)
+	assert text(res, "EvalDecision") == "explicitDeny" && text(res, "SourcePolicyId") == "PolicyInputList.1"
+	res = call(g, "GetContextKeysForPrincipalPolicy", [["PolicySourceArn", "arn:aws:iam::000000000000:user/bob"]])
+	assert texts(res, "member") == ["aws:RequestTag/Team"]
+	assert fails(call(g, "SimulatePrincipalPolicy",
+		[["PolicySourceArn", "arn:aws:iam::000000000000:role/none"], ["ActionNames.member.1", "s3:GetObject"]]), 404,
+		"NoSuchEntity", "Unable to retrieve specified IAM entity.")
+	g.close()
+}
+
+test "the account's details and credential report: every user, group, role and policy in it" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateGroup", [["GroupName", "devs"]])
+	call(g, "AddUserToGroup", [["GroupName", "devs"], ["UserName", "bob"]])
+	call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "s3"], ["PolicyDocument", allow]])
+	call(g, "CreateRole", [["RoleName", "app"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "AttachRolePolicy", [["RoleName", "app"], ["PolicyArn", "arn:aws:iam::aws:policy/ReadOnlyAccess"]])
+	call(g, "CreatePolicy", [["PolicyName", "mine"], ["PolicyDocument", allow]])
+	let res = call(g, "GetAccountAuthorizationDetails")
+	assert texts(res, "UserName") == ["bob"] && texts(res, "GroupName") == ["devs"] && texts(res, "RoleName") == ["app"]
+	assert texts(res, "PolicyName").includes("s3") && texts(res, "PolicyDocument").includes(escape(allow, "component"))
+	assert texts(res, "Arn").includes("arn:aws:iam::aws:policy/ReadOnlyAccess") && texts(res, "VersionId").length == 4
+	res = call(g, "GetAccountAuthorizationDetails", [["Filter.member.1", "Role"], ["MaxItems", "1"]])
+	assert texts(res, "RoleName") == ["app"] && texts(res, "UserName").length == 0
+		&& text(res, "IsTruncated") == "false"
+	res = call(g, "GetAccountAuthorizationDetails", [["MaxItems", "2"]])
+	assert text(res, "IsTruncated") == "true" && texts(res, "UserName") == ["bob"]
+		&& texts(res, "GroupName") == ["devs"]
+	call(g, "CreateAccessKey", [["UserName", "bob"]])
+	assert text(call(g, "GenerateCredentialReport"), "State") == "COMPLETE"
+	const lines = split(base64.decode(text(call(g, "GetCredentialReport"), "Content")!), "\n")
+	assert lines.length == 3 && split(lines[0], ",").length == 22 && split(lines[1], ",").length == 22
+	assert indexOf(lines[1], "<root_account>,") == 0 && indexOf(lines[2], "bob,") == 0
+	assert indexOf(lines[2], ",false,N/A,N/A,N/A,false,true,") > 0
 	g.close()
 }
 

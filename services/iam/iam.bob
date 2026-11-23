@@ -14,24 +14,38 @@ import { accessKey, attach, attached, aws, bound, detach, document, embed, ident
 	tagPage, unknownVersion, user, userOf, uses, version, versionId, versionOf } from "./common"
 
 import { Groups } from "./groups"
+import { Linked, modifiable } from "./linked"
+import { Logins } from "./logins"
 import { Profiles } from "./profiles"
 import { Providers } from "./providers"
+import { Simulation } from "./simulation"
 import { Accounts } from "./account"
+import { Details, details } from "./details"
 import { AccessKey, arn, key, number, Policy, Role, save, stamp, Tables, User, Version, within } from "./records"
-import { indexOf, sortBy, startsWith } from "std/algo"
+import { indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
 import { lower } from "std/string"
 import { escape } from "std/url"
 
-/// The service, of the operations implemented: those of groups in ./groups, of instance profiles in ./profiles, of
-/// identity providers in ./providers, of the account in ./account.
+/// The service, of the operations implemented: those of groups in ./groups, of service-linked roles in ./linked, of
+/// login profiles in ./logins, of instance profiles in ./profiles, of identity providers in ./providers, of the
+/// simulator in ./simulation, of the account in ./account and ./details.
 export class Handler {
 	...Groups
+	...Linked
+	...Logins
 	...Profiles
 	...Providers
+	...Simulation
 	...Accounts
+	...Details
 	...api.Unimplemented
 
 	constructor(catalog: Catalog) { this.catalog = catalog }
+
+	getAccountAuthorizationDetails(caller: Caller,
+		input: api.GetAccountAuthorizationDetailsRequest): api.GetAccountAuthorizationDetailsResponse throws Fault {
+		return details(caller, this.catalog, input)
+	}
 
 	createUser(caller: Caller, input: api.CreateUserRequest): api.CreateUserResponse throws Fault {
 		tagging(caller, input.Tags)
@@ -96,6 +110,11 @@ export class Handler {
 		})
 		move(db.userAttached, was, k, a => {})
 		move(db.userInline, was, k, p => {})
+		const l = db.logins.get(was)
+		if (l != null) {
+			db.logins.delete(was)
+			save(db.logins, k, l!)
+		}
 		for (const [at, m] of db.members.scan(null, 2147483647).filter(e => key(e[1].user) == was)) {
 			db.members.delete(at)
 			m.user = name
@@ -114,6 +133,9 @@ export class Handler {
 		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const k = key(user(db, input.UserName).name)
+		if (db.logins.get(k) != null) {
+			throw api.deleteConflictException("Cannot delete entity, must delete login profile first.")
+		}
 		if (db.keys.scan(null, 1, within(k, "")).length > 0) {
 			throw api.deleteConflictException("Cannot delete entity, must delete access keys first.")
 		}
@@ -225,6 +247,26 @@ export class Handler {
 		return new Unit()
 	}
 
+	/// The service and region of the last request the key signed that the gateway let in, at once: AWS's lag behind.
+	getAccessKeyLastUsed(caller: Caller,
+		input: api.GetAccessKeyLastUsedRequest): api.GetAccessKeyLastUsedResponse throws Fault {
+		const c = credentials(caller.global()).get(input.AccessKeyId)
+		const users = ":user/"
+		if (c == null || c.account != caller.account || c.status == "Deleted" || indexOf(c.arn, users) < 0) {
+			caller.allow(arn(caller.account, "user", "/", "*"))
+			throw api.noSuchEntityException(`The Access Key with id ${input.AccessKeyId} cannot be found.`)
+		}
+		caller.allow(c.arn)
+		const r = new api.GetAccessKeyLastUsedResponse()
+		r.UserName = c.arn.slice(lastIndexOf(c.arn, "/") + 1, c.arn.length)
+		const u = new api.AccessKeyLastUsed()
+		u.LastUsedDate = if (c.used == 0) null else c.used
+		u.ServiceName = if (c.used == 0) "N/A" else c.usedService
+		u.Region = if (c.used == 0) "N/A" else c.usedRegion
+		r.AccessKeyLastUsed = u
+		return r
+	}
+
 	deleteAccessKey(caller: Caller, input: api.DeleteAccessKeyRequest): Unit throws Fault {
 		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
@@ -292,6 +334,7 @@ export class Handler {
 	updateAssumeRolePolicy(caller: Caller, input: api.UpdateAssumeRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const r = role(db, input.RoleName)
 		r.trust = document(input.PolicyDocument, "trust")
 		save(db.roles, key(r.name), r)
@@ -301,6 +344,7 @@ export class Handler {
 	deleteRole(caller: Caller, input: api.DeleteRoleRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const k = key(role(db, input.RoleName).name)
 		if (db.roleAttached.scan(null, 1, within(k, "")).length > 0) {
 			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
@@ -367,6 +411,7 @@ export class Handler {
 	putRolePermissionsBoundary(caller: Caller, input: api.PutRolePermissionsBoundaryRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const r = role(db, input.RoleName)
 		r.boundary = bound(caller, db, this.catalog, r.boundary, input.PermissionsBoundary)
 		save(db.roles, key(r.name), r)
@@ -376,6 +421,7 @@ export class Handler {
 	deleteRolePermissionsBoundary(caller: Caller, input: api.DeleteRolePermissionsBoundaryRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const r = role(db, input.RoleName)
 		r.boundary = bound(caller, db, this.catalog, unbound(r.boundary, r.id), "")
 		save(db.roles, key(r.name), r)
@@ -647,6 +693,7 @@ export class Handler {
 	attachRolePolicy(caller: Caller, input: api.AttachRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "role")
 		return new Unit()
 	}
@@ -654,6 +701,7 @@ export class Handler {
 	detachRolePolicy(caller: Caller, input: api.DetachRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		detach(caller, db, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn)
 		return new Unit()
 	}
@@ -765,6 +813,7 @@ export class Handler {
 	putRolePolicy(caller: Caller, input: api.PutRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const owner = key(role(db, input.RoleName).name)
 		embed(db.roleInline, owner, input.PolicyName, input.PolicyDocument)
 		return new Unit()
@@ -797,6 +846,7 @@ export class Handler {
 	deleteRolePolicy(caller: Caller, input: api.DeleteRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
 		const owner = key(role(db, input.RoleName).name)
 		inline(db.roleInline, owner, input.PolicyName, "role")
 		db.roleInline.delete(within(owner, key(input.PolicyName)))

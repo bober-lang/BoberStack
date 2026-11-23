@@ -1,6 +1,6 @@
 import * as sigv4 from "../../core/auth/sigv4"
 import { Gateway } from "../../core/gateway"
-import { authorize, content, play, regionOf, request, Step, Tape, unorganized } from "./tape"
+import { authorize, content, hidden, play, regionOf, request, Step, Tape, unorganized, volatiles } from "./tape"
 import * as json from "std/encoding/json"
 import { Request, Response } from "std/http"
 import { second } from "std/time"
@@ -76,6 +76,19 @@ test "a presigned URL verifies until it expires, and not once tampered with" {
 	const unsigned = request(anonymous, [], "http://h")
 	authorize(unsigned, anonymous, [], by, t0)
 	assert unsigned.headers.get("authorization") == null
+}
+
+test "a volatile member's text is hidden whatever its length, where it is that member's" {
+	const xml = "<m><entry><key>Users</key><value>5</value></entry><entry><key>5</key><value>12</value></entry></m>"
+	let out = xml
+	for (const [name, v] of volatiles(xml, ["value"])) {
+		out = hidden(out, name, v)
+	}
+	assert out == "<m><entry><key>Users</key><value>x</value></entry><entry><key>5</key><value>x</value></entry></m>"
+	assert hidden(`{"Users":5,"Roles": 5, "n":5,"Name":"5"}`, "Users", "5")
+		== `{"Users":"x","Roles": 5, "n":5,"Name":"5"}`
+	assert hidden(`{"Roles": 5}`, "Roles", "5") == `{"Roles": "x"}`
+	assert hidden(`{"Name":"5"}`, "Name", "5") == `{"Name":"x"}`
 }
 
 test "an organization's ARNs lose their ids" {

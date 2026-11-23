@@ -1,0 +1,361 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UserId",
+		"AccessKeyId",
+		"SecretAccessKey"
+	],
+	"steps": [
+		{
+			"name": "create the user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-k</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-k</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "allow it to get itself and update its keys",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"PolicyName": "self",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"iam:GetUser\",\"iam:UpdateAccessKey\"],\"Resource\":\"arn:aws:iam::${account}:user/${prefix}-k\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"capture": {
+				"k.key": "AccessKey/AccessKeyId",
+				"k.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${k.key}</AccessKeyId>\n      <SecretAccessKey>${k.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-k</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user gets itself, once its key works",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "k",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-k</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-k</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "deactivate the key",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "${k.key}",
+				"Status": "Inactive"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user gets itself by its inactive key",
+			"service": "iam",
+			"differs": "The gateway refuses the key in awsQuery's XML without IAM's namespace: no fault handler is registered for IAM",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "k",
+			"until": 403,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidClientTokenId</Code>\n    <Message>The security token included in the request is invalid.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list keys, inactive",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAccessKeysResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAccessKeysResult>\n    <IsTruncated>false</IsTruncated>\n    <AccessKeyMetadata>\n      <member>\n        <AccessKeyId>${k.key}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-k</UserName>\n        <Status>Inactive</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </AccessKeyMetadata>\n  </ListAccessKeysResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAccessKeysResponse>\n"
+			}
+		},
+		{
+			"name": "deactivate it again",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "${k.key}",
+				"Status": "Inactive"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "set a status of the wrong case",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "${k.key}",
+				"Status": "active"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'status' failed to satisfy constraint: Member must satisfy enum value set: [Expired, Active, Inactive]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "update a key of none",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "XXXXXXXXXXXXXXXXXXXX",
+				"Status": "Active"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The Access Key with id XXXXXXXXXXXXXXXXXXXX cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "update the key of a missing user",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-missing",
+				"AccessKeyId": "${k.key}",
+				"Status": "Active"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-missing cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "reactivate the key",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "${k.key}",
+				"Status": "Active"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user gets itself, once its key works again",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "k",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-k</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-k</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "list keys, active",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAccessKeysResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAccessKeysResult>\n    <IsTruncated>false</IsTruncated>\n    <AccessKeyMetadata>\n      <member>\n        <AccessKeyId>${k.key}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-k</UserName>\n        <Status>Active</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </AccessKeyMetadata>\n  </ListAccessKeysResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAccessKeysResponse>\n"
+			}
+		},
+		{
+			"name": "the user deactivates its own key",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"AccessKeyId": "${k.key}",
+				"Status": "Inactive"
+			},
+			"as": "k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user gets itself by the key it deactivated",
+			"service": "iam",
+			"differs": "The gateway refuses the key in awsQuery's XML without IAM's namespace: no fault handler is registered for IAM",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "k",
+			"until": 403,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidClientTokenId</Code>\n    <Message>The security token included in the request is invalid.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list keys, inactive again",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAccessKeysResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAccessKeysResult>\n    <IsTruncated>false</IsTruncated>\n    <AccessKeyMetadata>\n      <member>\n        <AccessKeyId>${k.key}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-k</UserName>\n        <Status>Inactive</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </AccessKeyMetadata>\n  </ListAccessKeysResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAccessKeysResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"PolicyName": "self"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k",
+				"AccessKeyId": "${k.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

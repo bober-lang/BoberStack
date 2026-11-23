@@ -1,0 +1,220 @@
+//! What IAM tells of an account as a whole: the authorization details of its users, groups, roles and managed policies,
+//! and the credential report of its users. The operations of the Handler of ./iam, which mixes in Details.
+
+import { credentials } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+import { boundaryOf, part, policyOf, roleOf, tagsOf, versionOf } from "./common"
+import { profileOf } from "./profiles"
+import { arn, Attachment, Inline, key, Tables, User, within } from "./records"
+import { Table } from "../../core/state/store"
+import { sortBy } from "std/algo"
+import { escape } from "std/url"
+import { rfc3339, second } from "std/time"
+
+/// The operations on the account as a whole.
+export class Details {
+	/// Complete at once: the report is made when it is asked for.
+	generateCredentialReport(caller: Caller, input: Unit): api.GenerateCredentialReportResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GenerateCredentialReportResponse()
+		r.State = "COMPLETE"
+		return r
+	}
+
+	/// The CSV of AWS's columns: the root, then each user, as things are now.
+	getCredentialReport(caller: Caller, input: Unit): api.GetCredentialReportResponse throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const issued = credentials(caller.global())
+		const lines = ["user,arn,user_creation_time,password_enabled,password_last_used,password_last_changed,"
+			+ "password_next_rotation,mfa_active,access_key_1_active,access_key_1_last_rotated,"
+			+ "access_key_1_last_used_date,access_key_1_last_used_region,access_key_1_last_used_service,"
+			+ "access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,access_key_2_last_used_region,"
+			+ "access_key_2_last_used_service,cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"]
+		const at = now()
+		const keys = (k: string) => {
+			const ks = db.keys.scan(null, 2, within(k, "")).map(e => e[1])
+			sortBy(ks, (a, b) => a.serial > b.serial)
+			let out = ""
+			for (let i = 0; i < 2; i++) {
+				if (i >= ks.length) {
+					out += ",false,N/A,N/A,N/A,N/A"
+				} else {
+					const c = issued.get(ks[i].id)
+					const used = c != null && c!.used != 0
+					out += `,${ks[i].status == "Active"},${time(ks[i].created)},`
+						+ (if (used) `${time(c!.used)},${c!.usedRegion},${c!.usedService}` else "N/A,N/A,N/A")
+				}
+			}
+			return out
+		}
+		lines.push(`<root_account>,arn:aws:iam::${caller.account}:root,${time(db.root.get("")?.created ?? 0)},`
+			+ `not_supported,no_information,not_supported,not_supported,false${keys("")},false,N/A,false,N/A`)
+		for (const [k, u] of db.users.scan(null, 2147483647)) {
+			const l = db.logins.get(k)
+			const password = if (l == null) "false,N/A,N/A,N/A" else `true,no_information,${time(l!.created)},N/A`
+			lines.push(`${u.name},${arn(caller.account, "user", u.path, u.name)},${time(u.created)},${password},false`
+				+ `${keys(k)},false,N/A,false,N/A`)
+		}
+		const r = new api.GetCredentialReportResponse()
+		r.Content = lines.join("\n")
+		r.ReportFormat = "text/csv"
+		r.GeneratedTime = at - at % second
+		return r
+	}
+}
+
+/// u of account, as the authorization details have it.
+function userDetail(account: string, db: Tables, u: User): api.UserDetail {
+	const k = key(u.name)
+	const d = new api.UserDetail()
+	d.Path = u.path
+	d.UserName = u.name
+	d.UserId = u.id
+	d.Arn = arn(account, "user", u.path, u.name)
+	d.CreateDate = u.created
+	d.UserPolicyList = embedded(db.userInline, k)
+	d.GroupList = db.members.scan(null, 2147483647).filter(e => key(e[1].user) == k).map(e => e[1].group)
+	d.AttachedManagedPolicies = attachedTo(db.userAttached, k)
+	d.PermissionsBoundary = boundaryOf(u.boundary)
+	d.Tags = tagsOf(u.tags)
+	return d
+}
+
+/// The policies embedded in the user, group or role of key owner, of t, their documents URL-encoded.
+function embedded(t: Table[Inline], owner: string): api.PolicyDetail[] {
+	return t.scan(null, 2147483647, within(owner, "")).map(e => {
+		const d = new api.PolicyDetail()
+		d.PolicyName = e[1].name
+		d.PolicyDocument = escape(e[1].document, "component")
+		return d
+	})
+}
+
+/// The managed policies attached to the user, group or role of key owner, of t, in the order attached.
+function attachedTo(t: Table[Attachment], owner: string): api.AttachedPolicy[] {
+	const all = t.scan(null, 2147483647, within(owner, "")).map(e => e[1])
+	sortBy(all, (a, b) => a.serial > b.serial)
+	return all.map(a => {
+		const w = new api.AttachedPolicy()
+		w.PolicyName = a.name
+		w.PolicyArn = a.arn
+		return w
+	})
+}
+
+/// p with its versions, as the authorization details have a managed policy.
+function detail(p: api.Policy, versions: api.PolicyVersion[]): api.ManagedPolicyDetail {
+	const d = new api.ManagedPolicyDetail()
+	d.PolicyName = p.PolicyName
+	d.PolicyId = p.PolicyId
+	d.Arn = p.Arn
+	d.Path = p.Path
+	d.DefaultVersionId = p.DefaultVersionId
+	d.AttachmentCount = p.AttachmentCount
+	d.PermissionsBoundaryUsageCount = p.PermissionsBoundaryUsageCount
+	d.IsAttachable = p.IsAttachable
+	d.Description = p.Description
+	d.CreateDate = p.CreateDate
+	d.UpdateDate = p.UpdateDate
+	d.PolicyVersionList = versions
+	return d
+}
+
+/// The instant t as the credential report writes it, 2015-06-26T14:00:00+00:00.
+function time(t: i64): string {
+	const s = rfc3339(t - t % second)
+	return s.slice(0, s.length - 1) + "+00:00"
+}
+
+/// GetAccountAuthorizationDetails, of AWS's managed policies in catalog: of the kinds of the filter, all if none, in the
+/// order users, groups, roles, the account's policies, then AWS's that are attached in it; each policy with all its
+/// versions. The Handler calls it with its catalog, which a field of Details would not share: two mixins' fields of
+/// one name are two fields.
+export function details(caller: Caller, catalog: Catalog,
+	input: api.GetAccountAuthorizationDetailsRequest): api.GetAccountAuthorizationDetailsResponse throws Fault {
+	caller.allow("*")
+	const db = new Tables(caller.store())
+	const all = 2147483647
+	const kinds = input.Filter ?? []
+	const wants = (k: api.EntityType) => kinds.length == 0 || kinds.includes(k)
+	const items: [string, string][] = []
+	if (wants("User")) {
+		items.append(db.users.scan(null, all).map(e => ["User", e[0]]))
+	}
+	if (wants("Group")) {
+		items.append(db.groups.scan(null, all).map(e => ["Group", e[0]]))
+	}
+	if (wants("Role")) {
+		items.append(db.roles.scan(null, all).map(e => ["Role", e[0]]))
+	}
+	if (wants("LocalManagedPolicy")) {
+		items.append(db.policies.scan(null, all).map(e => ["LocalManagedPolicy", e[0]]))
+	}
+	if (wants("AWSManagedPolicy")) {
+		const used: string[] = []
+		for (const t of [db.userAttached, db.groupAttached, db.roleAttached]) {
+			for (const [_, at] of t.scan(null, all)) {
+				if (catalog.find(at.arn) >= 0 && !used.includes(at.arn)) {
+					used.push(at.arn)
+				}
+			}
+		}
+		items.append(used.map(a => ["AWSManagedPolicy", a]))
+	}
+	const [page, next] = part(items, input.Marker, input.MaxItems)
+	const r = new api.GetAccountAuthorizationDetailsResponse()
+	r.UserDetailList = []
+	r.GroupDetailList = []
+	r.RoleDetailList = []
+	r.Policies = []
+	for (const [kind, k] of page) {
+		if (kind == "User") {
+			r.UserDetailList!.push(userDetail(caller.account, db, db.users.get(k)!))
+		} else if (kind == "Group") {
+			const g = db.groups.get(k)!
+			const d = new api.GroupDetail()
+			d.Path = g.path
+			d.GroupName = g.name
+			d.GroupId = g.id
+			d.Arn = arn(caller.account, "group", g.path, g.name)
+			d.CreateDate = g.created
+			d.GroupPolicyList = embedded(db.groupInline, k)
+			d.AttachedManagedPolicies = attachedTo(db.groupAttached, k)
+			r.GroupDetailList!.push(d)
+		} else if (kind == "Role") {
+			const x = db.roles.get(k)!
+			const w = roleOf(caller.account, x, true)
+			const d = new api.RoleDetail()
+			d.Path = w.Path
+			d.RoleName = w.RoleName
+			d.RoleId = w.RoleId
+			d.Arn = w.Arn
+			d.CreateDate = w.CreateDate
+			d.AssumeRolePolicyDocument = w.AssumeRolePolicyDocument
+			d.InstanceProfileList = db.profiles.scan(null,
+				all).filter(e => key(e[1].role) == k).map(e => profileOf(caller.account, db, e[1], false))
+			d.RolePolicyList = embedded(db.roleInline, k)
+			d.AttachedManagedPolicies = attachedTo(db.roleAttached, k)
+			d.PermissionsBoundary = boundaryOf(x.boundary)
+			d.Tags = w.Tags
+			d.RoleLastUsed = new api.RoleLastUsed()
+			r.RoleDetailList!.push(d)
+		} else if (kind == "LocalManagedPolicy") {
+			const p = db.policies.get(k)!
+			const versions = db.versions.scan(null, all, within(k, "")).map(e => versionOf(p, e[1], true))
+			r.Policies!.push(detail(policyOf(caller.account, p, false), versions))
+		} else {
+			const i = catalog.find(k)
+			const p = catalog.policy(i)
+			const versions = catalog.versions(i).map(v => versionOf(p, catalog.version(i, v.id)!, true))
+			r.Policies!.push(detail(policyOf("aws", p, false), versions))
+		}
+	}
+	r.IsTruncated = next != null
+	r.Marker = next
+	return r
+}

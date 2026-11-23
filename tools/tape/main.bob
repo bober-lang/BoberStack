@@ -4,7 +4,7 @@
 //! ./tape.bob says what a scenario is.
 
 import { answer, authorize, bodyOf, captured, find, form, load, opaque, regionOf, request, signer, Step, Tape, text,
-	unlinked, organizations, unorganized, volatiles } from "./tape"
+	unlinked, organizations, unorganized, volatiles, hidden } from "./tape"
 
 import * as tape from "./tape"
 import { endsWith, indexOf, sortBy } from "std/algo"
@@ -78,9 +78,9 @@ class Recording {
 		let normal = body
 		if (!opaque(s.service, body)) {
 			normal = this.normal(body)
-			for (const v of volatiles(normal, names)) {
+			for (const [name, v] of volatiles(normal, names)) {
 				if (!this.captured.some(c => c[1] == v)) {
-					normal = masked(normal, v)
+					normal = if (v.length >= 8) masked(normal, v) else hidden(normal, name, v)
 				}
 			}
 			normal = this.held(normal)

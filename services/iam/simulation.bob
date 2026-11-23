@@ -1,0 +1,312 @@
+//! IAM's policy simulator: what core/auth/policy decides for actions on resources under the policies given, or those of
+//! a user, group or role, and the context keys policies test. The operations of the Handler of ./iam that it mixes in.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { Caller } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+import { managed } from "./identities"
+import { arn, Attachment, Inline, key, Tables, within } from "./records"
+import { endsWith, indexOf, lastIndexOf } from "std/algo"
+import { lower, ParseError, parseInt, split } from "std/string"
+
+/// A policy the simulator weighs: its id and type as MatchedStatements names them, its document and what it is.
+class Source {
+	id = ""
+	kind: api.PolicySourceType | null = null
+	document = ""
+	policy = new auth.Policy()
+}
+
+/// The operations of the simulator.
+export class Simulation {
+	/// AWS's managed policies, which the Handler sets.
+	catalog: Catalog = new Catalog(0, 0)
+
+	simulateCustomPolicy(caller: Caller,
+		input: api.SimulateCustomPolicyRequest): api.SimulatePolicyResponse throws Fault {
+		caller.allow("*")
+		return simulate(caller, inputs(input.PolicyInputList), input.PermissionsBoundaryPolicyInputList,
+			input.ActionNames, input.ResourceArns, input.ResourcePolicy, input.ResourceOwner, input.CallerArn,
+			input.ContextEntries, input.MaxItems, input.Marker)
+	}
+
+	simulatePrincipalPolicy(caller: Caller,
+		input: api.SimulatePrincipalPolicyRequest): api.SimulatePolicyResponse throws Fault {
+		caller.allow(input.PolicySourceArn)
+		const db = new Tables(caller.store())
+		const [own, bound] = principal(caller, db, this.catalog, input.PolicySourceArn)
+		own.append(inputs(input.PolicyInputList ?? []))
+		const boundary = input.PermissionsBoundaryPolicyInputList ?? (if (bound == "") null else [bound])
+		return simulate(caller, own, boundary, input.ActionNames, input.ResourceArns, input.ResourcePolicy,
+			input.ResourceOwner, input.CallerArn ?? input.PolicySourceArn, input.ContextEntries, input.MaxItems,
+			input.Marker)
+	}
+
+	getContextKeysForCustomPolicy(caller: Caller,
+		input: api.GetContextKeysForCustomPolicyRequest): api.GetContextKeysForPolicyResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetContextKeysForPolicyResponse()
+		r.ContextKeyNames = keysOf(inputs(input.PolicyInputList))
+		return r
+	}
+
+	getContextKeysForPrincipalPolicy(caller: Caller,
+		input: api.GetContextKeysForPrincipalPolicyRequest): api.GetContextKeysForPolicyResponse throws Fault {
+		caller.allow(input.PolicySourceArn)
+		const [own, _] = principal(caller, new Tables(caller.store()), this.catalog, input.PolicySourceArn)
+		own.append(inputs(input.PolicyInputList ?? []))
+		const r = new api.GetContextKeysForPolicyResponse()
+		r.ContextKeyNames = keysOf(own)
+		return r
+	}
+}
+
+/// The answer of the simulator, a page of its results, one for each action and resource in turn.
+function simulate(caller: Caller, identity: Source[], boundary: string[] | null, actions: string[],
+	resources: string[] | null, resource: string | null, owner: string | null, by: string | null,
+	context: api.ContextEntry[] | null, max: i32 | null,
+	marker: string | null): api.SimulatePolicyResponse throws Fault {
+	const ps = new auth.Policies()
+	ps.identity = identity.map(s => s.policy)
+	ps.boundary = if (boundary == null || boundary!.length == 0) null else parsed(boundary![0], "identity")
+	const rp = if (resource == null) null else source("ResourcePolicy", null, resource!, "resource")
+	ps.resource = rp?.policy
+	const r = new auth.Request()
+	r.principal.arn = by ?? ""
+	r.principal.account = if (by == null) caller.account else split(by!, ":")[4]
+	r.owner = if (owner == null) r.principal.account else split(owner!, ":")[4]
+	for (const e of context ?? []) {
+		const vs = e.ContextKeyValues ?? []
+		const t: string = e.ContextKeyType ?? "string"
+		r.context.push([e.ContextKeyName ?? "", if (endsWith(t, "List") || vs.length == 0) vs else vs[0]])
+	}
+	if (by != null && !r.context.some(c => lower(c[0]) == "aws:username")) {
+		r.context.push(["aws:username", split(by!, "/").pop()!])
+	}
+	const all: [string, string][] = []
+	for (const a of actions) {
+		for (const x of resources ?? ["*"]) {
+			all.push([a, x])
+		}
+	}
+	const n = max ?? 100
+	let from = 0
+	try {
+		from = if (marker == null) 0 else parseInt(marker!.slice(3, marker!.length))
+	} catch (e: ParseError) {
+		throw new Fault(400, api.validation.code, "Invalid Marker.")
+	}
+	const to = if (from + n < all.length) from + n else all.length
+	const out = new api.SimulatePolicyResponse()
+	out.EvaluationResults = all.slice(from, to).map(ar => {
+		r.action = ar[0]
+		r.resource = ar[1]
+		const d = auth.evaluate(r, ps)
+		const res = new api.EvaluationResult()
+		res.EvalActionName = ar[0]
+		res.EvalResourceName = ar[1]
+		res.EvalDecision = d.effect
+		const sources = identity.slice(0, identity.length)
+		if (rp != null) {
+			sources.push(rp!)
+		}
+		res.MatchedStatements = matched(r, sources, d.effect)
+		res.MissingContextValues = missing(r, identity)
+		if (ps.boundary != null) {
+			const alone = new auth.Policies()
+			alone.identity = [ps.boundary!]
+			const b = new api.PermissionsBoundaryDecisionDetail()
+			b.AllowedByPermissionsBoundary = auth.evaluate(r, alone).effect == "allowed"
+			res.PermissionsBoundaryDecisionDetail = b
+		}
+		return res
+	})
+	out.IsTruncated = to < all.length
+	out.Marker = if (to < all.length) `PS:${to}` else null
+	return out
+}
+
+/// The statements of sources that decide as effect does, each as MatchedStatements names it, without its position,
+/// which the parser does not keep: those that allow for allowed, deny for explicitDeny, none for implicitDeny.
+function matched(r: auth.Request, sources: Source[], effect: auth.Effect): api.Statement[] {
+	const out: api.Statement[] = []
+	if (effect == "implicitDeny") {
+		return out
+	}
+	for (const s of sources) {
+		for (let i = 0; i < s.policy.statements.length; i++) {
+			if (s.policy.statements[i].allow == (effect == "allowed") && alone(r, s.policy, i, true)) {
+				const m = new api.Statement()
+				m.SourcePolicyId = s.id
+				m.SourcePolicyType = s.kind
+				out.push(m)
+			}
+		}
+	}
+	return out
+}
+
+/// The keys, as the policies write them, of the conditions of those statements of sources that would apply to r but
+/// for their conditions, that r's context lacks.
+function missing(r: auth.Request, sources: Source[]): string[] {
+	const out: string[] = []
+	for (const s of sources) {
+		for (let i = 0; i < s.policy.statements.length; i++) {
+			if (alone(r, s.policy, i, false)) {
+				for (const c of s.policy.statements[i].conditions) {
+					const k = written(s.document, c.key)
+					if (!r.context.some(e => lower(e[0]) == c.key) && !out.includes(k)) {
+						out.push(k)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+/// Whether the i-th statement of p applies to r by itself, with its conditions if conditioned: as an allow of a policy
+/// of it alone, for a principal of its own account.
+function alone(r: auth.Request, p: auth.Policy, i: i32, conditioned: bool): bool {
+	const st = p.statements[i]
+	const one = new auth.Policy()
+	one.kind = p.kind
+	one.version = p.version
+	one.statements = [{ ...st, allow: true, principals: [], notPrincipal: false,
+		conditions: if (conditioned) st.conditions else [] }]
+	const ps = new auth.Policies()
+	if (p.kind == "identity") {
+		ps.identity = [one]
+	} else {
+		ps.resource = one
+	}
+	const q = { ...r }
+	q.principal = { ...r.principal, kind: "user" }
+	q.owner = if (p.kind == "identity") r.principal.account else r.owner
+	return auth.evaluate(q, ps).effect == "allowed"
+}
+
+/// The context keys the conditions of sources test and their resources' variables name, each once, as written.
+function keysOf(sources: Source[]): string[] {
+	const out: string[] = []
+	for (const s of sources) {
+		for (const st of s.policy.statements) {
+			for (const c of st.conditions) {
+				const k = written(s.document, c.key)
+				if (!out.some(o => lower(o) == c.key)) {
+					out.push(k)
+				}
+			}
+			for (const x of st.resources ?? []) {
+				for (let i = indexOf(x, "${"); i >= 0; i = indexOf(x, "${", i + 2)) {
+					const end = indexOf(x, "}", i)
+					const k = if (end < 0) "" else x.slice(i + 2, end)
+					if (indexOf(k, ":") >= 0 && !out.some(o => lower(o) == lower(k))) {
+						out.push(k)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+/// The key k, lower-cased, as the document d writes it.
+function written(d: string, k: string): string {
+	const at = indexOf(lower(d), `"${k}"`)
+	return if (at < 0) k else d.slice(at + 1, at + 1 + k.length)
+}
+
+/// The identity-based policies of PolicyInputList, of ids PolicyInputList.1 and on, of no type of the model's: AWS
+/// answers "IAM Policy", which the model does not have.
+function inputs(documents: string[]): Source[] {
+	const out: Source[] = []
+	for (let i = 0; i < documents.length; i++) {
+		out.push(source(`PolicyInputList.${i + 1}`, null, documents[i]))
+	}
+	return out
+}
+
+/// The policy d is, of kind k; one of no statements if it does not parse.
+function parsed(d: string, k: auth.Kind): auth.Policy {
+	try {
+		return auth.parse(d, k)
+	} catch (f: Fault) {
+		const p = new auth.Policy()
+		p.kind = k
+		return p
+	}
+}
+
+/// The policies of the user, group or role of ARN a, a user's groups' too, and the ARN of its permissions boundary,
+/// "" if none.
+function principal(caller: Caller, db: Tables, catalog: Catalog, a: string): [Source[], string] throws Fault {
+	const parts = split(a, ":")
+	const path = if (parts.length == 6) parts[5] else ""
+	const slash = indexOf(path, "/")
+	const kind = if (slash < 0) "" else path.slice(0, slash)
+	const name = path.slice(lastIndexOf(path, "/") + 1, path.length)
+	const unknown = api.noSuchEntityException("Unable to retrieve specified IAM entity.")
+	const out: Source[] = []
+	if (parts.length != 6 || parts[4] != caller.account) {
+		throw unknown
+	}
+	const k = key(name)
+	if (kind == "user") {
+		const u = db.users.get(k)
+		if (u == null || a != arn(caller.account, "user", u.path, u.name)) {
+			throw unknown
+		}
+		owned(catalog, db, caller.account, db.userInline, db.userAttached, k, "user", out)
+		for (const [_, m] of db.members.scan(null, 2147483647).filter(e => key(e[1].user) == k)) {
+			owned(catalog, db, caller.account, db.groupInline, db.groupAttached, key(m.group), "group", out)
+		}
+		return [out, u.boundary]
+	}
+	if (kind == "role") {
+		const r = db.roles.get(k)
+		if (r == null || a != arn(caller.account, "role", r.path, r.name)) {
+			throw unknown
+		}
+		owned(catalog, db, caller.account, db.roleInline, db.roleAttached, k, "role", out)
+		return [out, r.boundary]
+	}
+	if (kind == "group") {
+		const g = db.groups.get(k)
+		if (g == null || a != arn(caller.account, "group", g.path, g.name)) {
+			throw unknown
+		}
+		owned(catalog, db, caller.account, db.groupInline, db.groupAttached, k, "group", out)
+		return [out, ""]
+	}
+	throw unknown
+}
+
+/// Adds to out the policies of the user, group or role of key owner, of kind, embedded, in inline, and attached, in
+/// attached: an embedded one by its name, an attached one by its ARN.
+function owned(catalog: Catalog, db: Tables, account: string, inline: Table[Inline], attached: Table[Attachment],
+	owner: string, kind: api.PolicySourceType, out: Source[]) throws Fault {
+	for (const [_, p] of inline.scan(null, 2147483647, within(owner, ""))) {
+		out.push(source(p.name, kind, p.document))
+	}
+	for (const [_, at] of attached.scan(null, 2147483647, within(owner, ""))) {
+		const d = managed(catalog, db, account, at.arn)
+		if (d != null) {
+			out.push(source(at.arn, if (indexOf(at.arn, ":aws:policy/") >= 0) "aws-managed" else "user-managed", d!))
+		}
+	}
+}
+
+/// The policy of document d, of id and type kind, an identity-based one unless k says otherwise; one that does not
+/// parse matches nothing, as the simulator has it.
+function source(id: string, kind: api.PolicySourceType | null, d: string, k: auth.Kind = "identity"): Source {
+	const s = new Source()
+	s.id = id
+	s.kind = kind
+	s.document = d
+	s.policy = parsed(d, k)
+	return s
+}
