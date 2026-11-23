@@ -1,14 +1,27 @@
-import { sign } from "../../core/client"
+import { request, sign } from "../../core/client"
 import { Gateway } from "../../core/gateway"
+import * as iamApi from "../iam/api"
+import { Catalog } from "../iam/catalog"
+import * as iam from "../iam/iam"
 import * as api from "./api"
 import { Handler } from "./firehose"
 import { indexOf } from "std/algo"
 import { Request, Response } from "std/http"
+import { escape } from "std/url"
 
+/// A gateway of Firehose and IAM, with the role r, which Firehose may assume, and u, which it may not.
 function gateway(): Gateway {
 	const g = new Gateway()
 	const h = new Handler()
 	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	const catalog = new Catalog(0, 0)
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(new iam.Handler(catalog), caller, req))
+	for (const [name, service] of [["r", "firehose.amazonaws.com"], ["u", "logs.amazonaws.com"]]) {
+		const trust = escape(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":`
+			+ `{"Service":"${service}"},"Action":"sts:AssumeRole"}]}`, "component")
+		assert g.handle(request("iam", "test", "test",
+			`Action=CreateRole&Version=2010-05-08&RoleName=${name}&AssumeRolePolicyDocument=${trust}`)).status == 200
+	}
 	return g
 }
 
@@ -61,6 +74,23 @@ test "UpdateDestination needs the current version, and takes the next" {
 	assert update("1").status == 200
 	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"s"}`)
 	assert has(d, `"VersionId":"2"`) && has(d, `"Prefix":"p/"`) && has(d, `"LastUpdateTimestamp":`)
+	g.close()
+}
+
+test "a role that does not trust Firehose, or is not there, is refused when a stream is made or updated" {
+	const g = gateway()
+	const of = (role: string) => `"S3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/${role}"}`
+	for (const role of ["u", "none"]) {
+		assert fails(call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${of(role)}}`),
+			"InvalidArgumentException",
+			`Firehose is unable to assume role arn:aws:iam::000000000000:role/${role}. Please check the role provided.`)
+	}
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${of("r")}}`).status == 200
+	assert fails(call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"s","CurrentDeliveryStreamVersionId":"1","DestinationId":"destinationId-000000000001",`
+		+ `"S3DestinationUpdate":{"RoleARN":"arn:aws:iam::000000000000:role/u"}}`), "InvalidArgumentException",
+		"Firehose is unable to assume role arn:aws:iam::000000000000:role/u. Please check the role provided.")
 	g.close()
 }
 

@@ -6,7 +6,11 @@ import { Caller, Unit } from "../../core/service"
 import * as api from "./api"
 import { onUser, owner } from "./common"
 import { key, Login, save, stamp, Tables, User } from "./records"
+import { indexOf } from "std/algo"
 import { isDigit, isLower, isUpper } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { sha256 } from "std/crypto/hash"
+import * as hex from "std/encoding/hex"
 
 /// The operations on login profiles.
 export class Logins {
@@ -24,6 +28,7 @@ export class Logins {
 		}
 		conform(db, input.Password!)
 		const l = new Login()
+		l.password = digest(input.Password!)
 		l.created = stamp()
 		l.reset = input.PasswordResetRequired
 		l.maxSession = input.MaxSigninSessionDuration
@@ -49,6 +54,7 @@ export class Logins {
 		const l = login(db, u)
 		if (input.Password != null) {
 			conform(db, input.Password!)
+			l.password = digest(input.Password!)
 		}
 		l.reset = input.PasswordResetRequired ?? l.reset
 		l.maxSession = if (input.ResetMaxSigninSessionDuration ?? false) null
@@ -64,6 +70,33 @@ export class Logins {
 		login(db, u)
 		db.logins.delete(key(u.name))
 		return new Unit()
+	}
+
+	/// Of the calling user only, the old password given, the new one kept to the account's password policy.
+	changePassword(caller: Caller, input: api.ChangePasswordRequest): Unit throws Fault {
+		if (indexOf(caller.arn, ":user/") < 0) {
+			throw api.invalidUserTypeException("Only IAM Users can change their own password.")
+		}
+		const db = new Tables(caller.store())
+		const u = owner(caller, db, null)
+		const l = login(db, u)
+		if (digest(input.OldPassword) != l.password) {
+			throw api.invalidUserTypeException("The old password is incorrect.")
+		}
+		conform(db, input.NewPassword)
+		l.password = digest(input.NewPassword)
+		l.reset = false
+		save(db.logins, key(u.name), l)
+		return new Unit()
+	}
+}
+
+/// password's SHA-256, in hex.
+function digest(password: string): string throws Fault {
+	try {
+		return hex.encode(sha256(password))
+	} catch (e: CryptoError) {
+		throw new Fault(500, "ServiceFailure", "Request processing has failed due to an internal error.")
 	}
 }
 

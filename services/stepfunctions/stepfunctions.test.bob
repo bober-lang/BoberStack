@@ -129,6 +129,29 @@ test "a task its role may not perform fails the execution" {
 		"assumed-role/r/x is not authorized to perform: dynamodb:GetItem")
 }
 
+test "a role that does not trust Step Functions is refused when a machine is made, and fails a task run as it" {
+	const g = world()
+	const untrusted = "Neither the global service principal states.amazonaws.com, nor the regional one is authorized to "
+		+ "assume the provided role."
+	const elsewhere = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},`
+		+ `"Action":"sts:AssumeRole"}]}`
+	assert iam(g, [["Action", "CreateRole"], ["RoleName", "u"], ["AssumeRolePolicyDocument", elsewhere]]).status == 200
+	const d = `{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"arn:aws:states:::sqs:sendMessage",`
+		+ `"Parameters":{"QueueUrl":"http://localhost:4566/000000000000/q","MessageBody":"m"},"End":true}}}`
+	assert fails(sfn(g, "CreateStateMachine",
+		`{"name":"m","roleArn":"arn:aws:iam::000000000000:role/u","definition":${json.quoted(d)}}`),
+		"AccessDeniedException", untrusted)
+	assert ok(sfn(g, "CreateStateMachine", create(d)))
+	assert fails(sfn(g, "UpdateStateMachine",
+		`{"stateMachineArn":"${machine}","roleArn":"arn:aws:iam::000000000000:role/u"}`), "AccessDeniedException",
+		untrusted)
+	assert iam(g, [["Action", "UpdateAssumeRolePolicy"], ["RoleName", "r"], ["PolicyDocument", elsewhere]]).status
+		== 200
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"x"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:m:x"}`),
+		`"status":"FAILED"`, `"error":"States.TaskFailed"`, "nor the regional one")
+}
+
 test "state machines" {
 	const g = world()
 	assert fails(sfn(g, "CreateStateMachine", `{"name":"m","roleArn":"x","definition":"{}"}`), "InvalidArn",

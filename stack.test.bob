@@ -90,6 +90,7 @@ function call(g: Gateway, service: string, op: string, body: string, k: Key = ro
 	const [target, version] = switch (service) {
 		case "sqs": ["AmazonSQS", "1.0"]
 		case "dynamodb": ["DynamoDB_20120810", "1.0"]
+		case "states": ["AWSStepFunctions", "1.0"]
 		default: ["AWSEvents", "1.1"]
 	}
 	const req = new Request("POST", "http://localhost:4566/", body)
@@ -1297,6 +1298,53 @@ test "Firehose writes each put as one S3 object as its role, from Logs, EventBri
 	assert got.length == 5
 	assert got.some(o => indexOf(o[1], `"source":"app"`) > 0)
 	assert got.some(o => indexOf(o[1], `"Type":"Notification"`) > 0 && indexOf(o[1], `"Message":"hello"`) > 0)
+	g.close()
+}
+
+test "EventBridge, SNS and Step Functions take a role only as the caller may pass it, and act only as it trusts them" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	const firehose = "arn:aws:firehose:us-east-1:000000000000:deliverystream/d"
+	const can = policy([statement("Allow", `["kinesis:PutRecord","firehose:PutRecord"]`, "*")])
+	role(g, "elsewhere", "logs.amazonaws.com", can)
+	role(g, "write", "firehose.amazonaws.com", policy([statement("Allow", `"s3:PutObject"`, "*")]))
+	const elsewhere = "arn:aws:iam::000000000000:role/elsewhere"
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "firehose", "CreateDeliveryStream",
+		`{"DeliveryStreamName":"d","ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::bkt",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/write"}}`).status == 200
+	const k = user(g, "u", policy([statement("Allow", `["events:*","sns:*","states:*"]`, "*")]))
+	// No iam:PassRole: each service refuses as it words it.
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", "arn:aws:events:us-east-1:000000000000:rule/r"))
+	const target = `{"Rule":"r","Targets":[{"Id":"k","Arn":"${stream}","RoleArn":"${elsewhere}",`
+		+ `"DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}]}`
+	assert fails(call(g, "events", "PutTargets", target, k), 400, "AccessDeniedException",
+		`is not authorized to perform: iam:PassRole on resource: ${elsewhere}`)
+	topic(g, "t")
+	const subscription: [string, string][] = [["Action", "Subscribe"], ["TopicArn", topicArn("t")],
+		["Protocol", "firehose"], ["Endpoint", firehose], ["Attributes.entry.1.key", "SubscriptionRoleArn"],
+		["Attributes.entry.1.value", elsewhere]]
+	assert fails(query(g, "sns", subscription, k), 403, "AuthorizationError")
+	const d = `{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}}`
+	assert fails(call(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"${elsewhere}","definition":${json.quoted(d)}}`, k), 400, "AccessDeniedException",
+		"iam:PassRole")
+	// Passed by the root, a role that does not trust the service: the event goes to the dead-letter queue, the
+	// notification nowhere, and the machine is not made.
+	assert call(g, "events", "PutTargets", target).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	assert streamed(g, "s").length == 0
+	const [dead] = bodies(g, "dlq")
+	assert indexOf(dead, `"source":"app"`) >= 0
+	assert query(g, "sns", subscription).status == 200
+	assert publish(g, topicArn("t"), "hello").status == 200
+	assert objects(g, "bkt").length == 0
+	assert fails(call(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"${elsewhere}","definition":${json.quoted(d)}}`), 400, "AccessDeniedException",
+		"Neither the global service principal states.amazonaws.com, nor the regional one is authorized to assume the "
+		+ "provided role.")
 	g.close()
 }
 

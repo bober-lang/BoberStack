@@ -107,6 +107,12 @@ export class Handler {
 				passRole(caller, d.role, "firehose.amazonaws.com")
 			}
 		}
+		if (source != null) {
+			trusted(caller, source!.RoleARN, arn)
+		}
+		if (d.role != "") {
+			trusted(caller, d.role, arn)
+		}
 		const db = streams(caller.regional())
 		if (db.get(name) != null) {
 			throw api.resourceInUseException(`Firehose ${name} under accountId ${caller.account} already exists`)
@@ -233,6 +239,9 @@ export class Handler {
 		if (passed.length > 0 && role != null) {
 			caller.actions = passed
 			passRole(caller, role!, "firehose.amazonaws.com")
+		}
+		if (role != null) {
+			trusted(caller, role!, arnOf(caller, s.name))
 		}
 		s.version += 1
 		s.updated = now()
@@ -596,6 +605,14 @@ function described(d: Destination): api.DestinationDescription throws Fault {
 	r.S3DestinationDescription = p
 	r.ExtendedS3DestinationDescription = x
 	return r
+}
+
+/// Refuses the role of the ARN role unless it lets Firehose act for the delivery stream of the ARN source, as AWS does
+/// when the stream is made or its destination updated.
+function trusted(caller: Caller, role: string, source: string) throws Fault {
+	if (actAs(caller, "firehose.amazonaws.com", role, source, [], "") == null) {
+		throw api.invalidArgumentException(`Firehose is unable to assume role ${role}. Please check the role provided.`)
+	}
 }
 
 /// The caller that Firehose is in a session of the role of the ARN role, on behalf of the delivery stream of the ARN
