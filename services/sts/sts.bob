@@ -4,7 +4,7 @@ import { Credential, credentials, id, secret } from "../../core/auth/credentials
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, Context } from "../../core/service"
-import { arn, key, stamp, Tables } from "../iam/records"
+import { arn, key, Role, stamp, Tables } from "../iam/records"
 
 import { AssumedRoleUser, AssumeRoleRequest, AssumeRoleResponse, Credentials, FederatedUser, GetCallerIdentityRequest,
 	GetCallerIdentityResponse, GetFederationTokenRequest, GetFederationTokenResponse, GetSessionTokenRequest,
@@ -37,8 +37,8 @@ export class Handler {
 		caller.actions = caller.actions.filter(x => x == "sts:AssumeRole" || x == "sts:TagSession" && tags.length > 0
 			|| x == "sts:SetSourceIdentity" && input.SourceIdentity != null
 			|| x == "sts:SetContext" && input.ProvidedContexts != null)
-		const role = new Tables(caller.tree(account)).roles.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
-		if (role == null || arn(account, "role", role.path, role.name) != a) {
+		const role = assumable(caller, a)
+		if (role == null) {
 			const why = `User: ${caller.arn} is not authorized to perform: sts:AssumeRole on resource: ${a}`
 			throw new Fault(403, "AccessDenied", why)
 		}
@@ -127,8 +127,8 @@ export function actAs(caller: Caller, principal: string, role: string, source: s
 		return null
 	}
 	const account = role.slice(13, 25)
-	const r = new Tables(caller.tree(account)).roles.get(key(role.slice(lastIndexOf(role, "/") + 1, role.length)))
-	if (r == null || arn(account, "role", r.path, r.name) != role) {
+	const r = assumable(caller, role)
+	if (r == null) {
 		return null
 	}
 	try {
@@ -142,6 +142,22 @@ export function actAs(caller: Caller, principal: string, role: string, source: s
 	c.userId = `${r.id}:${session}`
 	c.source = ""
 	return c
+}
+
+/// The role of ARN a, which is of the form arn:aws:iam::<account>:role/…, or null; when lenient, one not there stands
+/// in, trusting none and allowing the longest session.
+function assumable(caller: Caller, a: string): Role | null throws Fault {
+	const account = a.slice(13, 25)
+	const name = a.slice(lastIndexOf(a, "/") + 1, a.length)
+	const r = new Tables(caller.tree(account)).roles.get(key(name))
+	if (r != null && arn(account, "role", r.path, r.name) == a) {
+		return r
+	}
+	if (!caller.lenient) {
+		return null
+	}
+	return { ...new Role(), name: name, path: a.slice(30, lastIndexOf(a, "/") + 1), id: id("AROA", 17),
+		maxSession: 43200 }
 }
 
 /// Throws access denied unless caller may pass role to the service: iam:PassRole with iam:PassedToService.

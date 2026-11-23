@@ -2044,3 +2044,40 @@ test "Scheduler fires its schedules' targets at the tick, as their role: at() th
 	assert bodies(g, "once") == [] && bodies(g, "often").length == 1 && bodies(g, "off") == []
 	g.close()
 }
+
+/// What a setup that grants nothing gets: SNS's and Scheduler's deliveries to queues of no policy, by a role not
+/// there; the statuses of CreateSchedule, CreateFunction and AssumeRole naming that role, and of an anonymous GetObject.
+function ungranted(lenient: bool): [i32, i32, i32, i32, i32, i32] {
+	const g = gateway()
+	g.lenient = lenient
+	const none = `arn:aws:iam::${account}:role/none`
+	const t = topicArn("t")
+	topic(g, "t")
+	queue(g, "notified")
+	queue(g, "scheduled")
+	subscribe(g, t, queueArn("notified"))
+	assert publish(g, t, "hello").status == 200
+	const scheduled = schedule(g, "s",
+		`{"ScheduleExpression":"rate(5 minutes)","FlexibleTimeWindow":{"Mode":"OFF"},`
+		+ `"Target":{"Arn":"${queueArn("scheduled")}","RoleArn":"${none}"}}`).status
+	tick(g, now())
+	const created = lambdaCall(g, "POST", "/2015-03-31/functions",
+		`{"FunctionName":"f","Runtime":"python3.12","Handler":"h.h","Role":"${none}",`
+		+ `"Code":{"ZipFile":"${base64.encode("PK\x03\x04")}"}}`).status
+	const assumed = query(g, "sts",
+		[["Action", "AssumeRole"], ["RoleArn", none], ["RoleSessionName", "session"]]).status
+	assert s3(g, "PUT", "/private").status == 200 && s3(g, "PUT", "/private/k", "secret").status == 200
+	const read = g.handle(new Request("GET", "http://localhost:4566/private/k", "")).status
+	const out: [i32, i32, i32, i32, i32, i32] = [bodies(g, "notified").length as i32, scheduled,
+		bodies(g, "scheduled").length as i32, created, assumed, read]
+	g.close()
+	return out
+}
+
+test "lenient, no request is refused for lack of permission or trust, and a role checked only for trust need not exist" {
+	assert ungranted(true) == [1, 200, 1, 201, 200, 200]
+}
+
+test "by default, a queue of no policy takes nothing, a role not there is refused, a private object is not read" {
+	assert ungranted(false) == [0, 400, 0, 400, 403, 403]
+}

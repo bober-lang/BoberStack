@@ -50,6 +50,8 @@ export class Gateway {
 	limits = limits()
 	/// How IAM sees a caller; without it only an account's root is allowed.
 	identify: Identify | null = null
+	/// Refuse no request for lack of permission or trust.
+	lenient = false
 	private busy = false
 	private freed = new Signal()
 	/// Woken by each commit, tick, reset and restore, for the requests held.
@@ -115,6 +117,7 @@ export class Gateway {
 					const c = new Caller(account, n.slice(slash + 1, n.length), `arn:aws:iam::${account}:root`, uuid(),
 						account, this.trees)
 					c.identify = this.identify
+					c.lenient = this.lenient
 					c.opened = opened
 					timed(c, t)
 				}
@@ -225,6 +228,7 @@ export class Gateway {
 		caller.credential = known
 		caller.userAgent = req.headers.get("user-agent") ?? ""
 		caller.identify = this.identify
+		caller.lenient = this.lenient
 		caller.arrived = arrived
 		let res: Response | null = null
 		let held = false

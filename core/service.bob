@@ -38,6 +38,8 @@ export class Caller {
 	identify: Identify | null = null
 	/// When the request came: the same each time the gateway runs it again.
 	arrived = now()
+	/// Refuses nothing for lack of permission or trust, as --lenient asks; carried to the callers a service acts as.
+	lenient = false
 	/// The instant hold was given, if it was.
 	held: i64 | null = null
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
@@ -106,6 +108,10 @@ export class Caller {
 			r.principal.arn = this.arn
 			r.principal.account = this.account
 		}
+		// After identify, which refuses what is not a matter of permission, as IAM called with a session of no MFA.
+		if (this.lenient) {
+			return
+		}
 		if (r.principal.kind != "service" && r.principal.kind != "anonymous") {
 			this.describe(r.principal, r.context)
 		}
@@ -134,6 +140,7 @@ export class Caller {
 		c.actions = actions
 		c.endpoint = this.endpoint
 		c.identify = this.identify
+		c.lenient = this.lenient
 		c.arrived = this.arrived
 		c.opened = this.opened
 		return c
