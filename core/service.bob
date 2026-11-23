@@ -14,6 +14,8 @@ export class Caller {
 	requestId: string
 	/// The actions of the operation being served, as IAM names them, set by its service's dispatch.
 	actions: string[] = []
+	/// The ARN of the resource a service calls on behalf of; "" for a request from outside.
+	source = ""
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
@@ -50,8 +52,20 @@ export class Caller {
 		// Policies are not evaluated yet: everything is allowed.
 	}
 
+	/// The caller that a service is, by its principal as sns.amazonaws.com, when it calls another for this request on
+	/// behalf of source, its resource's ARN: of the request's account, region and trees, so that what it writes
+	/// commits with the request or not at all.
+	internal(principal: string, source: string): Caller {
+		const c = new Caller(this.account, this.region, principal, this.requestId, principal, this.committed)
+		c.source = source
+		c.opened = this.opened
+		return c
+	}
+
 	/// The state of the caller's account.
 	store(): Store throws Fault { return this.tree(this.account) }
+	/// The state of the caller's account in the caller's region, where a regional service keeps its resources.
+	regional(): Store throws Fault { return this.tree(`${this.account}/${this.region}`) }
 	/// The global state.
 	global(): Store throws Fault { return this.tree("") }
 }

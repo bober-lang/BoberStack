@@ -73,3 +73,22 @@ test "a request that opens no tree commits none" {
 	g.services.set("test", (caller: Caller, req: Request) => new Response(200, ""))
 	assert g.handle(request("test", "test", "test", "")).status == 200 && g.trees.size == 0 && live() == before
 }
+
+test "a service called for a request writes into the request's trees" {
+	const before = live()
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => {
+		const sns = caller.internal("sns.amazonaws.com", "arn:aws:sns:us-east-1:000000000000:t")
+		try {
+			sns.regional().put("k", `${sns.arn} ${sns.source.slice(0, 11)} ${caller.regional().get("k")}`)
+		} catch (f: Fault) {
+			return new Response(f.status, f.message)
+		}
+		return new Response(if (req.body.text() == "fail") 400 else 200, "")
+	})
+	assert g.handle(request("test", "test", "test", "fail")).status == 400 && g.trees.size == 0
+	assert g.handle(request("test", "test", "test", "ok")).status == 200
+	assert g.trees.get("000000000000/us-east-1")?.get("k") == "sns.amazonaws.com arn:aws:sns null"
+	g.close()
+	assert live() == before
+}
