@@ -56,6 +56,12 @@ export interface Host {
 	/// counts "total", "succeeded", "failed", "written" and "executions", and its limits "concurrency", "percentage"
 	/// and "count"; its ARN.
 	mapRun(label: string, id: string, run: Json): string
+
+	/// Keeps the child execution of the name id of the map run of the ARN run, given input, of its items size: its
+	/// output if it succeeded, else the failure that ended it; and its events, each a type, the member of its details
+	/// and the details.
+	child(run: string, id: string, input: Json, output: Json | null, failure: Failure | null, size: i32,
+		events: [string, string, Json][])
 }
 
 /// The diagnostics of the definition text, each its code, message and location: none if it is valid.
@@ -178,6 +184,8 @@ export class Execution {
 	time: string
 	/// How deep within the child executions of map runs it is, whose events are not the execution's.
 	muted = 0
+	/// The events of the child execution being run, each its type, the member of its details and the details.
+	heard: [string, string, Json][] = []
 
 	constructor(host: Host, context: Json, time: string) {
 		this.host = host
@@ -185,10 +193,12 @@ export class Execution {
 		this.time = time
 	}
 
-	/// Records an event of the history unless within a map run's child execution.
+	/// Records an event of the history, or within a map run's child execution, of the child's.
 	private event(kind: string, field: string, details: Json) {
 		if (this.muted == 0) {
 			this.host.event(kind, field, details)
+		} else {
+			this.heard.push([kind, field, details])
 		}
 	}
 
@@ -578,17 +588,24 @@ export class Execution {
 		}
 		const arn = this.host.mapRun(label, id, run("RUNNING", 0, 0, 0))
 		this.event("MapRunStarted", "mapRunStartedEventDetails", obj([["mapRunArn", str(arn)]]))
-		const outcomes: [Json, Json, Failure | null][] = []
-		this.muted++
+		const outcomes: [Json, Json, Failure | null, string][] = []
 		for (const input of inputs) {
+			const child = this.host.uuid()
+			const outer = this.heard
+			this.heard = []
+			this.muted++
 			try {
-				outcomes.push([input, this.states(processor, copy(input)), null])
+				outcomes.push([input, this.states(processor, copy(input)), null, child])
 			} catch (f: Failure) {
-				outcomes.push([input, nul(), f])
+				outcomes.push([input, nul(), f, child])
 			}
+			this.muted--
+			const o = outcomes[outcomes.length - 1]
+			const size = if (batcher == null) 1 else input.get("Items")?.items?.length ?? 0
+			this.host.child(arn, child, o[0], if (o[2] == null) o[1] else null, o[2], size, this.heard)
+			this.heard = outer
 			this.context.set("State", state)
 		}
-		this.muted--
 		const failed = outcomes.filter(o => o[2] != null).length
 		const ok = outcomes.length - failed
 		const exceeded = if (percentage == null && count == null) failed > 0
@@ -604,7 +621,8 @@ export class Execution {
 			const bucket = where.str("Bucket") ?? ""
 			const prefix = where.str("Prefix") ?? ""
 			const dir = `${if (prefix == "" || endsWith(prefix, "/")) prefix else `${prefix}/`}${id}/`
-			const machine = replaced(arn, ":mapRun:", ":stateMachine:")
+			// The children's machine: the run's machine's name, a slash and the label.
+			const machine = replaced(arn.slice(0, arn.length - id.length - 1), ":mapRun:", ":stateMachine:")
 			const files: [string, Json][] = []
 			for (const status of ["SUCCEEDED", "FAILED"]) {
 				const entries: Json[] = []
@@ -612,7 +630,7 @@ export class Execution {
 					if ((o[2] == null) != (status == "SUCCEEDED")) {
 						continue
 					}
-					const child = this.host.uuid()
+					const child = o[3]
 					const keys: [string, Json][] = [["ExecutionArn",
 						str(`${replaced(machine, ":stateMachine:", ":execution:")}:${child}`)],
 						["Input", str(write(o[0]))], ["InputDetails", obj([["Included", boolean(true)]])],

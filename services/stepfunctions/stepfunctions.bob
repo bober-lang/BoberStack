@@ -44,13 +44,17 @@
 //! - A redrive takes the execution again from the task whose failure ended it, its history kept, the task's earlier
 //!   events not made again; any other failed or aborted execution is taken again from its start, its steps replayed.
 //! - A DISTRIBUTED Map is processed inline within the request, like everything else here: its map run is kept and
-//!   described, MapRunStarted and MapRunSucceeded or MapRunFailed in the history, but its child executions run one
-//!   after the other within the run, their events not kept and none of them listed, even by the map run's ARN; and
-//!   its ARN is of the machine's name, a slash, the state's Label or else its name, a colon and a UUID. Its ItemReader
-//!   reads an S3 object, JSON, JSONL or CSV (not MANIFEST), or an S3 listing, through S3's handler as the role, as does
-//!   its ResultWriter write SUCCEEDED_0.json, FAILED_0.json if any failed, and manifest.json under the Prefix and the
-//!   run's UUID, all child executions dated the execution's start. A run with no ResultWriter outputs each item's
-//!   result, or {"Error", "Cause"} of a tolerated failure. UpdateMapRun keeps the limits it sets, which change nothing.
+//!   described, MapRunStarted and MapRunSucceeded or MapRunFailed in the history. Its child executions run one after
+//!   the other within the run, MaxConcurrency kept and shown by DescribeMapRun but changing nothing; each is kept once
+//!   it ends, listed by ListExecutions of the map run's ARN with its itemCount, described with the map run's ARN, its
+//!   history its own events, all at the time it ended; a child that pauses is not supported. From memory, not checked
+//!   against AWS: a map run's ARN is of the machine's name, a slash, the state's Label or else its name, a colon and a
+//!   UUID; a child's, an execution's of that name and slash and label, a colon and a UUID, its stateMachineArn the
+//!   same; and the layout of the files below. Its ItemReader reads an S3 object, JSON, JSONL or CSV (not MANIFEST), or
+//!   an S3 listing, through S3's handler as the role, as does its ResultWriter write SUCCEEDED_0.json, FAILED_0.json if
+//!   any failed, and manifest.json under the Prefix and the run's UUID, the children dated there the execution's
+//!   start. A run with no ResultWriter outputs each item's result, or {"Error", "Cause"} of a tolerated failure.
+//!   UpdateMapRun keeps the limits it sets, which change nothing. DeleteStateMachine leaves the children kept.
 //! - The other aws-sdk integrations are not implemented; nor is JSONata, which CreateStateMachine refuses.
 //! - Branches of a Parallel and iterations of a Map run one after the other, and a pause in one stops the others.
 //!   Timeouts never pass, and an EXPRESS machine's executions are kept and described as a STANDARD one's.
@@ -552,6 +556,7 @@ export class Handler {
 		out.cause = e.cause
 		out.stateMachineVersionArn = e.version
 		out.stateMachineAliasArn = e.alias
+		out.mapRunArn = e.mapRun
 		out.redriveCount = e.redrives
 		out.redriveDate = e.redriven
 		const reason = this.refusal(e)
@@ -644,9 +649,29 @@ export class Handler {
 			throw api.validationException("Cannot provide both a StateMachine ARN and a MapRun ARN")
 		}
 		if (input.mapRunArn != null) {
-			// A map run's child executions run within its execution's run, and are not kept.
-			mapRun(caller, input.mapRunArn!)
-			return new api.ListExecutionsOutput()
+			// A map run's child executions, of the machine the run's machine's name, a slash and the label.
+			const run = input.mapRunArn!
+			const [k, m] = mapRun(caller, run)
+			const machine = split(k, ":")[0]
+			const all = new Tables(caller.regional()).executions.scan(null, 2147483647, `${machine}\x00`).map(e => e[1]).filter(e => e.mapRun
+				== run && (input.statusFilter == null || e.status == input.statusFilter))
+			const [page, next] = part(all, input.nextToken, input.maxResults)
+			const out = new api.ListExecutionsOutput()
+			out.executions = page.map(e => {
+				const w = new api.ExecutionListItem()
+				w.executionArn = executionArn(caller, e)
+				w.stateMachineArn = machineArn(caller, e.machine)
+				w.name = e.name
+				w.status = statusOf(e.status)
+				w.startDate = e.started
+				w.stopDate = e.stopped
+				w.mapRunArn = run
+				w.itemCount = e.items
+				w.redriveCount = 0
+				return w
+			})
+			out.nextToken = next
+			return out
 		}
 		if (input.stateMachineArn == null) {
 			throw api.validationException("Must provide a StateMachine ARN or MapRun ARN")
@@ -1448,6 +1473,52 @@ class Host {
 		} catch (e: IoError) {}
 		this.record(num(x))
 		return x
+	}
+
+	child(run: string, id: string, input: Json, output: Json | null, failure: asl.Failure | null, size: i32,
+		events: [string, string, Json][]) {
+		if (this.paused) {
+			return
+		}
+		const e = new Execution()
+		e.machine = split(run, ":")[6]
+		e.name = id
+		e.mapRun = run
+		e.items = size
+		e.input = write(input)
+		e.output = if (output == null) null else write(output!)
+		e.status = if (failure == null) "SUCCEEDED" else "FAILED"
+		e.error = failure?.error
+		e.cause = failure?.cause
+		e.definition = this.e.definition
+		e.role = this.e.role
+		e.started = now()
+		e.stopped = e.started
+		const all: [string, string, Json][] = [["ExecutionStarted", "executionStartedEventDetails",
+			obj([["input", str(e.input)], ["inputDetails", obj([["truncated", boolean(false)]])],
+			["roleArn", str(e.role)]])]]
+		for (const v of events) {
+			all.push(v)
+		}
+		all.push(if (failure == null) ["ExecutionSucceeded", "executionSucceededEventDetails",
+			obj([["output", str(e.output ?? "")], ["outputDetails", obj([["truncated", boolean(false)]])]])]
+			else ["ExecutionFailed", "executionFailedEventDetails",
+			obj([["error", str(failure!.error)], ["cause", str(failure!.cause)]])])
+		const ms = (e.started % second) / 1000000
+		const at = num(((e.started / second) as f64) + (ms as f64) / 1000.0)
+		for (let i = 0; i < all.length; i++) {
+			const keys: [string, Json][] = [["timestamp", at], ["type", str(all[i][0])], ["id", num((i + 1) as f64)],
+				["previousEventId", num(i as f64)]]
+			if (all[i][1] != "") {
+				keys.push([all[i][1], all[i][2]])
+			}
+			e.events.push(write(obj(keys)))
+		}
+		try {
+			save(new Tables(this.caller.regional()).executions, `${e.machine}\x00${id}`, e)
+		} catch (f: Fault) {
+			this.fault = f
+		}
 	}
 
 	mapRun(label: string, id: string, run: Json): string {
