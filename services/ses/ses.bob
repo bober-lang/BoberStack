@@ -1,0 +1,2265 @@
+//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state.
+//!
+//! An identity is verified at once, as nobody can follow a verification mail's link. Nothing is sent anywhere: each
+//! message is stored, as LocalStack's /_aws/ses lists it (core/internal), and delivered, or bounced or complained of
+//! as the mailbox simulator's addresses ask, as the notifications published inside the request tell. A template's
+//! message that cannot be rendered is accepted with a message id and then not sent, as AWS reports it by a rendering
+//! failure event, so it is not stored.
+//!
+//! Where AWS differs: the account has production access, out of its sandbox, so recipients are never checked.
+//! Nothing is received: receipt rules are kept and none is followed. A rendered template's MIME message has no Date or
+//! Message-ID header, nor a list's unsubscribe headers; event destinations other than SNS are stored but nothing is
+//! published to them, nor are open, click or rendering failure events; send statistics, message insights and metrics
+//! are empty; a configuration set's sending, delivery, reputation and tracking options are kept, not followed; a
+//! request to v2 that fails before it is routed is answered as the classic API answers it, but for a bad signature.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import * as v2 from "./v2/api"
+import * as snsApi from "../sns/api"
+import { indexOf, lastIndexOf } from "std/algo"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import { min } from "std/math"
+import { ParseError, parseInt, replace, split, trim, utf8 } from "std/string"
+import { day, millisecond, rfc3339, second } from "std/time"
+import { Body, Request } from "std/http"
+
+/// The table of the messages sent, which ./internal reads.
+export const messages = "ses.messages"
+
+class Identity {
+	name = ""
+	domain = false
+	created: i64 = 0
+	/// For a domain, its TXT record's value; and its DKIM tokens, none before DKIM is asked for by v1.
+	token = ""
+	dkim: string[] = []
+	tags: [string, string][] = []
+	/// DKIM signing turned off, though its tokens were given.
+	unsigned = false
+	/// The selector of a DKIM key of the owner's own (Easy DKIM's otherwise), its tokens none.
+	selector: string | null = null
+	mailFrom: string | null = null
+	mxFailure = "UseDefaultValue"
+	/// The SNS topics of notifications, by v1's type, Bounce, Complaint or Delivery, and the types with headers.
+	topics: [string, string][] = []
+	headers: string[] = []
+	forwarding = true
+	policies: [string, string][] = []
+	configurationSet: string | null = null
+}
+
+class Template {
+	name = ""
+	subject: string | null = null
+	text: string | null = null
+	html: string | null = null
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+class ConfigurationSet {
+	name = ""
+	created: i64 = 0
+	tags: [string, string][] = []
+	destinations: Destination[] = []
+	tracking: v2.TrackingOptions | null = null
+	delivery: v2.DeliveryOptions | null = null
+	reputation: v2.ReputationOptions | null = null
+	sending: v2.SendingOptions | null = null
+	suppression: v2.SuppressionOptions | null = null
+}
+
+class Account {
+	details: v2.AccountDetails | null = null
+	production = true
+	sending = true
+	reasons: string[] = ["BOUNCE", "COMPLAINT"]
+	active: string | null = null
+}
+
+class RuleSet {
+	name = ""
+	created: i64 = 0
+	rules: api.ReceiptRule[] = []
+}
+
+class Destination {
+	name = ""
+	enabled = false
+	types: string[] = []
+	sns: string | null = null
+	firehoseStream: string | null = null
+	firehoseRole: string | null = null
+	eventBus: string | null = null
+	pinpoint: string | null = null
+	dimensions: Dimension[] | null = null
+}
+
+class Dimension {
+	name = ""
+	source = ""
+	fallback = ""
+}
+
+const eventTypes: [api.EventType, v2.EventType][] = [["send", "SEND"], ["reject", "REJECT"], ["bounce", "BOUNCE"],
+	["complaint", "COMPLAINT"], ["delivery", "DELIVERY"], ["open", "OPEN"], ["click", "CLICK"],
+	["renderingFailure", "RENDERING_FAILURE"]]
+
+const sources: [api.DimensionValueSource, v2.DimensionValueSource][] = [["messageTag", "MESSAGE_TAG"],
+	["emailHeader", "EMAIL_HEADER"], ["linkTag", "LINK_TAG"]]
+
+class Recipients {
+	ToAddresses: string[] | null @json.OmitEmpty = null
+	CcAddresses: string[] | null @json.OmitEmpty = null
+	BccAddresses: string[] | null @json.OmitEmpty = null
+}
+
+class Parts {
+	text_part: string | null = null
+	html_part: string | null = null
+}
+
+/// A message sent, as LocalStack keeps one.
+class Sent {
+	Id = ""
+	Region = ""
+	Destination: Recipients | null @json.OmitEmpty = null
+	Source = ""
+	Subject: string | null @json.OmitEmpty = null
+	Body: Parts | null @json.OmitEmpty = null
+	RawData: string | null @json.OmitEmpty = null
+	Template: string | null @json.OmitEmpty = null
+	TemplateData: string | null @json.OmitEmpty = null
+	Timestamp = ""
+}
+
+class Suppressed {
+	address = ""
+	reason = ""
+	updated: i64 = 0
+}
+
+class Contact {
+	address = ""
+	topics: v2.TopicPreference[] = []
+	unsubscribed = false
+	attributes: string | null = null
+	created: i64 = 0
+	updated: i64 = 0
+}
+
+class ContactList {
+	name = ""
+	description: string | null = null
+	topics: v2.Topic[] = []
+	tags: [string, string][] = []
+	created: i64 = 0
+	updated: i64 = 0
+	contacts: Contact[] = []
+}
+
+class Tables {
+	account: Table[Account]
+	lists: Table[ContactList]
+	ruleSets: Table[RuleSet]
+	filters: Table[api.ReceiptFilter]
+	identities: Table[Identity]
+	suppressed: Table[Suppressed]
+	templates: Table[Template]
+	sets: Table[ConfigurationSet]
+	sent: Table[Sent]
+
+	constructor(s: Store) {
+		this.account = new Table[Account](s, "ses.account")
+		this.lists = new Table[ContactList](s, "ses.lists")
+		this.ruleSets = new Table[RuleSet](s, "ses.ruleSets")
+		this.filters = new Table[api.ReceiptFilter](s, "ses.filters")
+		this.identities = new Table[Identity](s, "ses.identities")
+		this.suppressed = new Table[Suppressed](s, "ses.suppressed")
+		this.templates = new Table[Template](s, "ses.templates")
+		this.sets = new Table[ConfigurationSet](s, "ses.sets")
+		this.sent = new Table[Sent](s, messages)
+	}
+}
+
+export class Handler {
+	...api.Unimplemented
+
+	sns: snsApi.SNS | null = null
+
+	verifyEmailIdentity(caller: Caller,
+		input: api.VerifyEmailIdentityRequest): api.VerifyEmailIdentityResponse throws Fault {
+		verify(caller, input.EmailAddress, false)
+		return new api.VerifyEmailIdentityResponse()
+	}
+
+	verifyEmailAddress(caller: Caller, input: api.VerifyEmailAddressRequest): Unit throws Fault {
+		verify(caller, input.EmailAddress, false)
+		return new Unit()
+	}
+
+	verifyDomainIdentity(caller: Caller,
+		input: api.VerifyDomainIdentityRequest): api.VerifyDomainIdentityResponse throws Fault {
+		const r = new api.VerifyDomainIdentityResponse()
+		r.VerificationToken = verify(caller, input.Domain, true).token
+		return r
+	}
+
+	verifyDomainDkim(caller: Caller, input: api.VerifyDomainDkimRequest): api.VerifyDomainDkimResponse throws Fault {
+		const i = verify(caller, input.Domain, true)
+		if (i.dkim.length == 0) {
+			i.dkim = [token(16), token(16), token(16)]
+			(new Tables(caller.regional()).identities).put(i.name, i)
+		}
+		const r = new api.VerifyDomainDkimResponse()
+		r.DkimTokens = i.dkim
+		return r
+	}
+
+	listIdentities(caller: Caller, input: api.ListIdentitiesRequest): api.ListIdentitiesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const domain = input.IdentityType == "Domain"
+		const all = keyed(identities(caller).filter(i => input.IdentityType == null || i.domain == domain), i => i.name)
+		const [items, next] = paged(all, input.NextToken, input.MaxItems ?? 1000, "NextToken", false)
+		const r = new api.ListIdentitiesResponse()
+		r.Identities = items.map(i => i.name)
+		r.NextToken = next
+		return r
+	}
+
+	listVerifiedEmailAddresses(caller: Caller, input: Unit): api.ListVerifiedEmailAddressesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const r = new api.ListVerifiedEmailAddressesResponse()
+		r.VerifiedEmailAddresses = identities(caller).filter(i => !i.domain).map(i => i.name)
+		return r
+	}
+
+	getIdentityVerificationAttributes(caller: Caller, input: api.GetIdentityVerificationAttributesRequest): api.GetIdentityVerificationAttributesResponse throws Fault {
+		const r = new api.GetIdentityVerificationAttributesResponse()
+		const t = new Tables(caller.regional()).identities
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = t.get(n)
+			if (i != null) {
+				const a = new api.IdentityVerificationAttributes()
+				a.VerificationStatus = "Success"
+				a.VerificationToken = if (i.domain) i.token else null
+				r.VerificationAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	getIdentityDkimAttributes(caller: Caller,
+		input: api.GetIdentityDkimAttributesRequest): api.GetIdentityDkimAttributesResponse throws Fault {
+		const r = new api.GetIdentityDkimAttributesResponse()
+		const t = new Tables(caller.regional()).identities
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = t.get(n)
+			if (i != null) {
+				const a = new api.IdentityDkimAttributes()
+				a.DkimEnabled = i.dkim.length > 0 && !i.unsigned
+				a.DkimVerificationStatus = if (i.dkim.length > 0) "Success" else "NotStarted"
+				a.DkimTokens = if (i.dkim.length > 0) i.dkim else null
+				r.DkimAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	deleteIdentity(caller: Caller, input: api.DeleteIdentityRequest): api.DeleteIdentityResponse throws Fault {
+		caller.allow(identityArn(caller, input.Identity))
+		new Tables(caller.regional()).identities.delete(input.Identity)
+		return new api.DeleteIdentityResponse()
+	}
+
+	setIdentityMailFromDomain(caller: Caller,
+		input: api.SetIdentityMailFromDomainRequest): api.SetIdentityMailFromDomainResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.mailFrom = input.MailFromDomain
+			i.mxFailure = input.BehaviorOnMXFailure ?? "UseDefaultValue"
+		})
+		return new api.SetIdentityMailFromDomainResponse()
+	}
+
+	setIdentityNotificationTopic(caller: Caller,
+		input: api.SetIdentityNotificationTopicRequest): api.SetIdentityNotificationTopicResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.topics = i.topics.filter(t => t[0] != input.NotificationType)
+			if (input.SnsTopic != null) {
+				i.topics.push([input.NotificationType, input.SnsTopic!])
+			}
+		})
+		return new api.SetIdentityNotificationTopicResponse()
+	}
+
+	setIdentityFeedbackForwardingEnabled(caller: Caller, input: api.SetIdentityFeedbackForwardingEnabledRequest): api.SetIdentityFeedbackForwardingEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.forwarding = input.ForwardingEnabled
+		})
+		return new api.SetIdentityFeedbackForwardingEnabledResponse()
+	}
+
+	setIdentityHeadersInNotificationsEnabled(caller: Caller, input: api.SetIdentityHeadersInNotificationsEnabledRequest): api.SetIdentityHeadersInNotificationsEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.headers = i.headers.filter(h => h != input.NotificationType)
+			if (input.Enabled) {
+				i.headers.push(input.NotificationType)
+			}
+		})
+		return new api.SetIdentityHeadersInNotificationsEnabledResponse()
+	}
+
+	setIdentityDkimEnabled(caller: Caller,
+		input: api.SetIdentityDkimEnabledRequest): api.SetIdentityDkimEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.unsigned = !input.DkimEnabled
+		})
+		return new api.SetIdentityDkimEnabledResponse()
+	}
+
+	getIdentityNotificationAttributes(caller: Caller, input: api.GetIdentityNotificationAttributesRequest): api.GetIdentityNotificationAttributesResponse throws Fault {
+		const r = new api.GetIdentityNotificationAttributesResponse()
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = new Tables(caller.regional()).identities.get(n)
+			if (i != null) {
+				const a = new api.IdentityNotificationAttributes()
+				a.BounceTopic = topicOf(i!, "Bounce") ?? ""
+				a.ComplaintTopic = topicOf(i!, "Complaint") ?? ""
+				a.DeliveryTopic = topicOf(i!, "Delivery") ?? ""
+				a.ForwardingEnabled = i!.forwarding
+				a.HeadersInBounceNotificationsEnabled = i!.headers.includes("Bounce")
+				a.HeadersInComplaintNotificationsEnabled = i!.headers.includes("Complaint")
+				a.HeadersInDeliveryNotificationsEnabled = i!.headers.includes("Delivery")
+				r.NotificationAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	getIdentityMailFromDomainAttributes(caller: Caller, input: api.GetIdentityMailFromDomainAttributesRequest): api.GetIdentityMailFromDomainAttributesResponse throws Fault {
+		const r = new api.GetIdentityMailFromDomainAttributesResponse()
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = new Tables(caller.regional()).identities.get(n)
+			if (i != null && i!.mailFrom != null) {
+				const a = new api.IdentityMailFromDomainAttributes()
+				a.MailFromDomain = i!.mailFrom!
+				a.MailFromDomainStatus = "Success"
+				a.BehaviorOnMXFailure = if (i!.mxFailure == "RejectMessage") "RejectMessage" else "UseDefaultValue"
+				r.MailFromDomainAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	putIdentityPolicy(caller: Caller, input: api.PutIdentityPolicyRequest): api.PutIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, false)
+		changeIdentity(caller, input.Identity, false, i => {
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+			i.policies.push([input.PolicyName, input.Policy])
+		})
+		return new api.PutIdentityPolicyResponse()
+	}
+
+	getIdentityPolicies(caller: Caller,
+		input: api.GetIdentityPoliciesRequest): api.GetIdentityPoliciesResponse throws Fault {
+		const i = changeIdentity(caller, input.Identity, false, null)
+		const r = new api.GetIdentityPoliciesResponse()
+		r.Policies = i.policies.filter(p => input.PolicyNames.includes(p[0]))
+		return r
+	}
+
+	listIdentityPolicies(caller: Caller,
+		input: api.ListIdentityPoliciesRequest): api.ListIdentityPoliciesResponse throws Fault {
+		const i = changeIdentity(caller, input.Identity, false, null)
+		const r = new api.ListIdentityPoliciesResponse()
+		r.PolicyNames = i.policies.map(p => p[0])
+		return r
+	}
+
+	deleteIdentityPolicy(caller: Caller,
+		input: api.DeleteIdentityPolicyRequest): api.DeleteIdentityPolicyResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+		})
+		return new api.DeleteIdentityPolicyResponse()
+	}
+
+	sendEmail(caller: Caller, input: api.SendEmailRequest): api.SendEmailResponse throws Fault {
+		authorized(caller, "ses:SendEmail")
+		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
+		s.Subject = input.Message.Subject.Data
+		s.Body = parts(input.Message.Body.Text?.Data, input.Message.Body.Html?.Data)
+		const r = new api.SendEmailResponse()
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
+		return r
+	}
+
+	sendRawEmail(caller: Caller, input: api.SendRawEmailRequest): api.SendRawEmailResponse throws Fault {
+		authorized(caller, "ses:SendRawEmail")
+		const data = input.RawMessage.Data
+		const source = input.Source ?? header(data, "From")
+		if (source == null) {
+			throw new Fault(400, "InvalidParameterValue", "Missing required header 'From'.")
+		}
+		const s = sent(caller, source!, null, input.SourceArn)
+		s.RawData = data
+		const r = new api.SendRawEmailResponse()
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
+		return r
+	}
+
+	sendTemplatedEmail(caller: Caller,
+		input: api.SendTemplatedEmailRequest): api.SendTemplatedEmailResponse throws Fault {
+		authorized(caller, "ses:SendTemplatedEmail")
+		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
+		const t = template(caller, input.Template)
+		const r = new api.SendTemplatedEmailResponse()
+		r.MessageId = storeRendered(caller, s, t, input.TemplateData, null, input.ConfigurationSetName, this.sns)
+		return r
+	}
+
+	sendBulkTemplatedEmail(caller: Caller,
+		input: api.SendBulkTemplatedEmailRequest): api.SendBulkTemplatedEmailResponse throws Fault {
+		authorized(caller, "ses:SendBulkTemplatedEmail")
+		const t = template(caller, input.Template)
+		const r = new api.SendBulkTemplatedEmailResponse()
+		for (const d of input.Destinations) {
+			const s = sent(caller, input.Source, v1Recipients(d.Destination), input.SourceArn)
+			const status = new api.BulkEmailDestinationStatus()
+			status.Status = "Success"
+			status.MessageId = storeRendered(caller, s, t, d.ReplacementTemplateData ?? "{}", input.DefaultTemplateData,
+				input.ConfigurationSetName, this.sns)
+			r.Status.push(status)
+		}
+		return r
+	}
+
+	createTemplate(caller: Caller, input: api.CreateTemplateRequest): api.CreateTemplateResponse throws Fault {
+		const n = input.Template.TemplateName
+		caller.allow(templateArn(caller, n))
+		const t = new Tables(caller.regional()).templates
+		if (t.get(n) != null) {
+			throw api.alreadyExistsException(`Template ${n} already exists for account id ${caller.account}`)
+		}
+		t.put(n, fromV1(input.Template, now()))
+		return new api.CreateTemplateResponse()
+	}
+
+	updateTemplate(caller: Caller, input: api.UpdateTemplateRequest): api.UpdateTemplateResponse throws Fault {
+		const t = template(caller, input.Template.TemplateName)
+		const u = fromV1(input.Template, t.created)
+		u.tags = t.tags
+		(new Tables(caller.regional()).templates).put(t.name, u)
+		return new api.UpdateTemplateResponse()
+	}
+
+	getTemplate(caller: Caller, input: api.GetTemplateRequest): api.GetTemplateResponse throws Fault {
+		const t = template(caller, input.TemplateName)
+		const r = new api.GetTemplateResponse()
+		r.Template = { ...new api.Template(), TemplateName: t.name, SubjectPart: t.subject, TextPart: t.text,
+			HtmlPart: t.html }
+		return r
+	}
+
+	deleteTemplate(caller: Caller, input: api.DeleteTemplateRequest): api.DeleteTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		new Tables(caller.regional()).templates.delete(input.TemplateName)
+		return new api.DeleteTemplateResponse()
+	}
+
+	createReceiptRuleSet(caller: Caller,
+		input: api.CreateReceiptRuleSetRequest): api.CreateReceiptRuleSetResponse throws Fault {
+		newRuleSet(caller, input.RuleSetName, [])
+		return new api.CreateReceiptRuleSetResponse()
+	}
+
+	cloneReceiptRuleSet(caller: Caller,
+		input: api.CloneReceiptRuleSetRequest): api.CloneReceiptRuleSetResponse throws Fault {
+		newRuleSet(caller, input.RuleSetName, ruleSet(caller, input.OriginalRuleSetName).rules)
+		return new api.CloneReceiptRuleSetResponse()
+	}
+
+	describeReceiptRuleSet(caller: Caller,
+		input: api.DescribeReceiptRuleSetRequest): api.DescribeReceiptRuleSetResponse throws Fault {
+		const r = ruleSet(caller, input.RuleSetName)
+		return { ...new api.DescribeReceiptRuleSetResponse(), Metadata: metadata(r), Rules: r.rules }
+	}
+
+	describeActiveReceiptRuleSet(caller: Caller,
+		input: api.DescribeActiveReceiptRuleSetRequest): api.DescribeActiveReceiptRuleSetResponse throws Fault {
+		caller.allow("*")
+		const name = account(caller).active
+		const r = if (name == null) null else new Tables(caller.regional()).ruleSets.get(name!)
+		const o = new api.DescribeActiveReceiptRuleSetResponse()
+		if (r != null) {
+			o.Metadata = metadata(r!)
+			o.Rules = r!.rules
+		}
+		return o
+	}
+
+	setActiveReceiptRuleSet(caller: Caller,
+		input: api.SetActiveReceiptRuleSetRequest): api.SetActiveReceiptRuleSetResponse throws Fault {
+		const name = input.RuleSetName
+		if (name != null) {
+			ruleSet(caller, name!)
+		}
+		changeAccount(caller, a => {
+			a.active = name
+		})
+		return new api.SetActiveReceiptRuleSetResponse()
+	}
+
+	listReceiptRuleSets(caller: Caller,
+		input: api.ListReceiptRuleSetsRequest): api.ListReceiptRuleSetsResponse throws Fault {
+		caller.allow("*")
+		const all = keyed(new Tables(caller.regional()).ruleSets.scan(null, 1000000).map(e => e[1]), r => r.name)
+		const [items, next] = paged(all, input.NextToken, 100, "NextToken", false)
+		return { ...new api.ListReceiptRuleSetsResponse(), RuleSets: items.map(metadata), NextToken: next }
+	}
+
+	deleteReceiptRuleSet(caller: Caller,
+		input: api.DeleteReceiptRuleSetRequest): api.DeleteReceiptRuleSetResponse throws Fault {
+		const name = input.RuleSetName
+		if (account(caller).active == name) {
+			throw api.cannotDeleteException(`Cannot delete active rule set: ${name}`)
+		}
+		new Tables(caller.regional()).ruleSets.delete(name)
+		return new api.DeleteReceiptRuleSetResponse()
+	}
+
+	createReceiptRule(caller: Caller, input: api.CreateReceiptRuleRequest): api.CreateReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const n = input.Rule.Name
+			if (r.rules.some(e => e.Name == n)) {
+				throw api.alreadyExistsException(`Rule already exists: ${n}`)
+			}
+			r.rules = placed(r.rules, input.Rule, input.After)
+		})
+		return new api.CreateReceiptRuleResponse()
+	}
+
+	describeReceiptRule(caller: Caller,
+		input: api.DescribeReceiptRuleRequest): api.DescribeReceiptRuleResponse throws Fault {
+		return { ...new api.DescribeReceiptRuleResponse(),
+			Rule: rule(ruleSet(caller, input.RuleSetName), input.RuleName) }
+	}
+
+	updateReceiptRule(caller: Caller, input: api.UpdateReceiptRuleRequest): api.UpdateReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			rule(r, input.Rule.Name)
+			r.rules = r.rules.map(e => if (e.Name == input.Rule.Name) input.Rule else e)
+		})
+		return new api.UpdateReceiptRuleResponse()
+	}
+
+	setReceiptRulePosition(caller: Caller,
+		input: api.SetReceiptRulePositionRequest): api.SetReceiptRulePositionResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const moved = rule(r, input.RuleName)
+			r.rules = placed(r.rules.filter(e => e.Name != moved.Name), moved, input.After)
+		})
+		return new api.SetReceiptRulePositionResponse()
+	}
+
+	reorderReceiptRuleSet(caller: Caller,
+		input: api.ReorderReceiptRuleSetRequest): api.ReorderReceiptRuleSetResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const names = input.RuleNames
+			for (const n of names) {
+				rule(r, n)
+			}
+			if (names.length != r.rules.length) {
+				throw new Fault(400, "InvalidParameterValue", "Not all rules are in the rule set.")
+			}
+			r.rules = names.map(n => r.rules.find(e => e.Name == n)!)
+		})
+		return new api.ReorderReceiptRuleSetResponse()
+	}
+
+	deleteReceiptRule(caller: Caller, input: api.DeleteReceiptRuleRequest): api.DeleteReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			r.rules = r.rules.filter(e => e.Name != input.RuleName)
+		})
+		return new api.DeleteReceiptRuleResponse()
+	}
+
+	createReceiptFilter(caller: Caller,
+		input: api.CreateReceiptFilterRequest): api.CreateReceiptFilterResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.regional()).filters
+		const n = input.Filter.Name
+		if (t.get(n) != null) {
+			throw api.alreadyExistsException(`Filter already exists: ${n}`)
+		}
+		t.put(n, input.Filter)
+		return new api.CreateReceiptFilterResponse()
+	}
+
+	listReceiptFilters(caller: Caller,
+		input: api.ListReceiptFiltersRequest): api.ListReceiptFiltersResponse throws Fault {
+		caller.allow("*")
+		return { ...new api.ListReceiptFiltersResponse(),
+			Filters: new Tables(caller.regional()).filters.scan(null, 1000000).map(e => e[1]) }
+	}
+
+	deleteReceiptFilter(caller: Caller,
+		input: api.DeleteReceiptFilterRequest): api.DeleteReceiptFilterResponse throws Fault {
+		caller.allow("*")
+		new Tables(caller.regional()).filters.delete(input.FilterName)
+		return new api.DeleteReceiptFilterResponse()
+	}
+
+	listTemplates(caller: Caller, input: api.ListTemplatesRequest): api.ListTemplatesResponse throws Fault {
+		caller.allow(templateArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).templates.scan(null, 1000000).map(e => e[1]), t => t.name)
+		const [items, next] = paged(all, input.NextToken, min(input.MaxItems ?? 10, 100), "PageToken", false)
+		const r = new api.ListTemplatesResponse()
+		r.TemplatesMetadata = items.map(t => {
+			return { ...new api.TemplateMetadata(), Name: t.name, CreatedTimestamp: t.created }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	testRenderTemplate(caller: Caller,
+		input: api.TestRenderTemplateRequest): api.TestRenderTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		const t = new Tables(caller.regional()).templates.get(input.TemplateName)
+		if (t == null) {
+			throw api.templateDoesNotExistException(`Unable to find <${input.TemplateName}> for <${caller.account}>`)
+		}
+		const data = dataOf(input.TemplateData)
+		if (data == null) {
+			throw api.invalidRenderingParameterException("Template rendering data is invalid")
+		}
+		const r = new api.TestRenderTemplateResponse()
+		r.RenderedTemplate = mime(rendered(t!, data!))
+		return r
+	}
+
+	createConfigurationSet(caller: Caller,
+		input: api.CreateConfigurationSetRequest): api.CreateConfigurationSetResponse throws Fault {
+		createSet(caller, input.ConfigurationSet.Name, [], false)
+		return new api.CreateConfigurationSetResponse()
+	}
+
+	describeConfigurationSet(caller: Caller,
+		input: api.DescribeConfigurationSetRequest): api.DescribeConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, false)
+		const r = new api.DescribeConfigurationSetResponse()
+		r.ConfigurationSet = { ...new api.ConfigurationSet(), Name: c.name }
+		if ((input.ConfigurationSetAttributeNames ?? []).some(a => a == "eventDestinations")) {
+			r.EventDestinations = c.destinations.map(toV1)
+		}
+		return r
+	}
+
+	listConfigurationSets(caller: Caller,
+		input: api.ListConfigurationSetsRequest): api.ListConfigurationSetsResponse throws Fault {
+		caller.allow(setArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).sets.scan(null, 1000000).map(e => e[1]), c => c.name)
+		const [items, next] = paged(all, input.NextToken, input.MaxItems ?? 1000, "NextToken", false)
+		const r = new api.ListConfigurationSetsResponse()
+		r.ConfigurationSets = items.map(c => {
+			return { ...new api.ConfigurationSet(), Name: c.name }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	deleteConfigurationSet(caller: Caller,
+		input: api.DeleteConfigurationSetRequest): api.DeleteConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, false)
+		new Tables(caller.regional()).sets.delete(c.name)
+		return new api.DeleteConfigurationSetResponse()
+	}
+
+	createConfigurationSetEventDestination(caller: Caller, input: api.CreateConfigurationSetEventDestinationRequest): api.CreateConfigurationSetEventDestinationResponse throws Fault {
+		addDestination(caller, input.ConfigurationSetName, fromV1Destination(input.EventDestination), false)
+		return new api.CreateConfigurationSetEventDestinationResponse()
+	}
+
+	deleteConfigurationSetEventDestination(caller: Caller, input: api.DeleteConfigurationSetEventDestinationRequest): api.DeleteConfigurationSetEventDestinationResponse throws Fault {
+		dropDestination(caller, input.ConfigurationSetName, input.EventDestinationName, false)
+		return new api.DeleteConfigurationSetEventDestinationResponse()
+	}
+
+	getSendQuota(caller: Caller, input: Unit): api.GetSendQuotaResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetSendQuotaResponse()
+		r.Max24HourSend = 200.0
+		r.MaxSendRate = 1.0
+		r.SentLast24Hours = lastDay(caller)
+		return r
+	}
+
+	getSendStatistics(caller: Caller, input: Unit): api.GetSendStatisticsResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetSendStatisticsResponse()
+		r.SendDataPoints = []
+		return r
+	}
+
+	getAccountSendingEnabled(caller: Caller, input: Unit): api.GetAccountSendingEnabledResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetAccountSendingEnabledResponse()
+		r.Enabled = account(caller).sending
+		return r
+	}
+
+	updateAccountSendingEnabled(caller: Caller, input: api.UpdateAccountSendingEnabledRequest): Unit throws Fault {
+		changeAccount(caller, a => {
+			a.sending = input.Enabled
+		})
+		return new Unit()
+	}
+}
+
+export class V2 {
+	...v2.Unimplemented
+
+	sns: snsApi.SNS | null = null
+
+	createEmailIdentity(caller: Caller,
+		input: v2.CreateEmailIdentityRequest): v2.CreateEmailIdentityResponse throws Fault {
+		const n = input.EmailIdentity
+		caller.allow(identityArn(caller, n))
+		const t = new Tables(caller.regional()).identities
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`Email identity ${n} already exist.`)
+		}
+		if (input.ConfigurationSetName != null) {
+			configurationSet(caller, input.ConfigurationSetName!, true)
+		}
+		const i = verify(caller, n, indexOf(n, "@") < 0)
+		const own = input.DkimSigningAttributes?.DomainSigningSelector
+		if (i.domain && own != null) {
+			i.selector = own
+		} else if (i.domain) {
+			i.dkim = [token(16), token(16), token(16)]
+		}
+		i.tags = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		i.configurationSet = input.ConfigurationSetName
+		t.put(n, i)
+		const r = new v2.CreateEmailIdentityResponse()
+		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+		r.VerifiedForSendingStatus = true
+		r.DkimAttributes = dkim(i)
+		return r
+	}
+
+	getEmailIdentity(caller: Caller, input: v2.GetEmailIdentityRequest): v2.GetEmailIdentityResponse throws Fault {
+		const i = emailIdentity(caller, input.EmailIdentity, `<${input.EmailIdentity}>`)
+		const r = new v2.GetEmailIdentityResponse()
+		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+		r.FeedbackForwardingStatus = i.forwarding
+		r.VerifiedForSendingStatus = true
+		r.DkimAttributes = dkim(i)
+		r.Policies = i.policies
+		r.ConfigurationSetName = i.configurationSet
+		if (i.mailFrom != null) {
+			const m = new v2.MailFromAttributes()
+			m.MailFromDomain = i.mailFrom!
+			m.MailFromDomainStatus = "SUCCESS"
+			m.BehaviorOnMxFailure = if (i.mxFailure == "RejectMessage") "REJECT_MESSAGE" else "USE_DEFAULT_VALUE"
+			r.MailFromAttributes = m
+		}
+		r.Tags = i.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		r.VerificationStatus = "SUCCESS"
+		return r
+	}
+
+	putSuppressedDestination(caller: Caller,
+		input: v2.PutSuppressedDestinationRequest): v2.PutSuppressedDestinationResponse throws Fault {
+		caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+		const a = addressOf(input.EmailAddress)
+		(new Tables(caller.regional()).suppressed).put(a,
+			{ ...new Suppressed(), address: a, reason: input.Reason, updated: now() })
+		return new v2.PutSuppressedDestinationResponse()
+	}
+
+	getSuppressedDestination(caller: Caller,
+		input: v2.GetSuppressedDestinationRequest): v2.GetSuppressedDestinationResponse throws Fault {
+		const d = suppressed(caller, input.EmailAddress)
+		const r = new v2.GetSuppressedDestinationResponse()
+		r.SuppressedDestination.EmailAddress = d.address
+		r.SuppressedDestination.Reason = if (d.reason == "COMPLAINT") "COMPLAINT" else "BOUNCE"
+		r.SuppressedDestination.LastUpdateTime = d.updated
+		return r
+	}
+
+	listSuppressedDestinations(caller: Caller,
+		input: v2.ListSuppressedDestinationsRequest): v2.ListSuppressedDestinationsResponse throws Fault {
+		caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+		const reasons = input.Reasons ?? []
+		const all = new Tables(caller.regional()).suppressed.scan(null, 1000000).map(e => e[1]).filter(d => (reasons.length
+			== 0 || reasons.some(r => r == d.reason)) && (input.StartDate == null || d.updated >= input.StartDate!)
+			&& (input.EndDate == null || d.updated <= input.EndDate!))
+		const [items, next] = paged(keyed(all, d => d.address), input.NextToken, min(input.PageSize ?? 100, 1000),
+			"NextToken", true)
+		const r = new v2.ListSuppressedDestinationsResponse()
+		r.SuppressedDestinationSummaries = items.map(d => {
+			return { ...new v2.SuppressedDestinationSummary(), EmailAddress: d.address,
+				Reason: if (d.reason == "COMPLAINT") "COMPLAINT" else "BOUNCE", LastUpdateTime: d.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	deleteSuppressedDestination(caller: Caller,
+		input: v2.DeleteSuppressedDestinationRequest): v2.DeleteSuppressedDestinationResponse throws Fault {
+		const d = suppressed(caller, input.EmailAddress)
+		new Tables(caller.regional()).suppressed.delete(d.address)
+		return new v2.DeleteSuppressedDestinationResponse()
+	}
+
+	putEmailIdentityDkimAttributes(caller: Caller,
+		input: v2.PutEmailIdentityDkimAttributesRequest): v2.PutEmailIdentityDkimAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.unsigned = !input.SigningEnabled
+		})
+		return new v2.PutEmailIdentityDkimAttributesResponse()
+	}
+
+	putEmailIdentityDkimSigningAttributes(caller: Caller, input: v2.PutEmailIdentityDkimSigningAttributesRequest): v2.PutEmailIdentityDkimSigningAttributesResponse throws Fault {
+		const i = changeIdentity(caller, input.EmailIdentity, true, i => {
+			const own = input.SigningAttributes?.DomainSigningSelector
+			if (input.SigningAttributesOrigin == "EXTERNAL" && own != null) {
+				i.selector = own
+				i.dkim = []
+			} else if (input.SigningAttributesOrigin != "EXTERNAL") {
+				i.selector = null
+				if (i.dkim.length == 0) {
+					i.dkim = [token(16), token(16), token(16)]
+				}
+			}
+			i.unsigned = false
+		})
+		const r = new v2.PutEmailIdentityDkimSigningAttributesResponse()
+		r.DkimStatus = "SUCCESS"
+		r.DkimTokens = if (input.SigningAttributesOrigin == "EXTERNAL") null else i.dkim
+		return r
+	}
+
+	putEmailIdentityMailFromAttributes(caller: Caller, input: v2.PutEmailIdentityMailFromAttributesRequest): v2.PutEmailIdentityMailFromAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.mailFrom = input.MailFromDomain
+			i.mxFailure = if (input.BehaviorOnMxFailure == "REJECT_MESSAGE") "RejectMessage" else "UseDefaultValue"
+		})
+		return new v2.PutEmailIdentityMailFromAttributesResponse()
+	}
+
+	putEmailIdentityFeedbackAttributes(caller: Caller, input: v2.PutEmailIdentityFeedbackAttributesRequest): v2.PutEmailIdentityFeedbackAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.forwarding = input.EmailForwardingEnabled
+		})
+		return new v2.PutEmailIdentityFeedbackAttributesResponse()
+	}
+
+	putEmailIdentityConfigurationSetAttributes(caller: Caller,
+		input: v2.PutEmailIdentityConfigurationSetAttributesRequest): v2.PutEmailIdentityConfigurationSetAttributesResponse throws Fault {
+		if (input.ConfigurationSetName != null) {
+			configurationSet(caller, input.ConfigurationSetName!, true)
+		}
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.configurationSet = input.ConfigurationSetName
+		})
+		return new v2.PutEmailIdentityConfigurationSetAttributesResponse()
+	}
+
+	createEmailIdentityPolicy(caller: Caller,
+		input: v2.CreateEmailIdentityPolicyRequest): v2.CreateEmailIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, true)
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.alreadyExistsException(`Policy ${input.PolicyName} already exists.`)
+			}
+			i.policies.push([input.PolicyName, input.Policy])
+		})
+		return new v2.CreateEmailIdentityPolicyResponse()
+	}
+
+	updateEmailIdentityPolicy(caller: Caller,
+		input: v2.UpdateEmailIdentityPolicyRequest): v2.UpdateEmailIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, true)
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (!i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.notFoundException(`Policy ${input.PolicyName} does not exist.`)
+			}
+			i.policies = i.policies.map(p => if (p[0] == input.PolicyName) [p[0], input.Policy] else p)
+		})
+		return new v2.UpdateEmailIdentityPolicyResponse()
+	}
+
+	getEmailIdentityPolicies(caller: Caller,
+		input: v2.GetEmailIdentityPoliciesRequest): v2.GetEmailIdentityPoliciesResponse throws Fault {
+		const r = new v2.GetEmailIdentityPoliciesResponse()
+		r.Policies = changeIdentity(caller, input.EmailIdentity, true, null).policies
+		return r
+	}
+
+	deleteEmailIdentityPolicy(caller: Caller,
+		input: v2.DeleteEmailIdentityPolicyRequest): v2.DeleteEmailIdentityPolicyResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (!i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.notFoundException(`Policy ${input.PolicyName} does not exist.`)
+			}
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+		})
+		return new v2.DeleteEmailIdentityPolicyResponse()
+	}
+
+	listEmailIdentities(caller: Caller,
+		input: v2.ListEmailIdentitiesRequest): v2.ListEmailIdentitiesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const [items, next] = paged(keyed(identities(caller), i => i.name), input.NextToken, input.PageSize ?? 1000,
+			"NextToken", true)
+		const r = new v2.ListEmailIdentitiesResponse()
+		r.EmailIdentities = items.map(i => {
+			const o = new v2.IdentityInfo()
+			o.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+			o.IdentityName = i.name
+			o.SendingEnabled = true
+			o.VerificationStatus = "SUCCESS"
+			return o
+		})
+		r.NextToken = next
+		return r
+	}
+
+	deleteEmailIdentity(caller: Caller,
+		input: v2.DeleteEmailIdentityRequest): v2.DeleteEmailIdentityResponse throws Fault {
+		const i = emailIdentity(caller, input.EmailIdentity, input.EmailIdentity)
+		new Tables(caller.regional()).identities.delete(i.name)
+		return new v2.DeleteEmailIdentityResponse()
+	}
+
+	sendEmail(caller: Caller, input: v2.SendEmailRequest): v2.SendEmailResponse throws Fault {
+		authorized(caller, "ses:SendEmail", true)
+		const c = input.Content
+		const raw = c.Raw
+		const from = input.FromEmailAddress ?? (if (raw == null) null else header(raw!.Data, "From"))
+		if (from == null) {
+			throw v2.badRequestException("Missing required parameter: FromEmailAddress")
+		}
+		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!),
+			input.FromEmailAddressIdentityArn)
+		const m = input.ListManagementOptions
+		const d = s.Destination
+		if (m != null && d != null) {
+			const l = contactList(caller, m!.ContactListName)
+			const keep = (xs: string[]
+				| null): string[] | null => if (xs == null) null else xs!.filter(x => !unsubscribed(l, x, m!.TopicName))
+			s.Destination = { ...new Recipients(), ToAddresses: keep(d!.ToAddresses), CcAddresses: keep(d!.CcAddresses),
+				BccAddresses: keep(d!.BccAddresses) }
+		}
+		const simple = c.Simple
+		const t = c.Template
+		const r = new v2.SendEmailResponse()
+		if (simple != null) {
+			s.Subject = simple!.Subject.Data
+			s.Body = parts(simple!.Body.Text?.Data, simple!.Body.Html?.Data)
+		} else if (raw != null) {
+			s.RawData = raw!.Data
+		} else if (t != null) {
+			r.MessageId = storeRendered(caller, s, inline(caller, t!), t!.TemplateData ?? "{}", null,
+				input.ConfigurationSetName, this.sns)
+			return r
+		} else {
+			throw v2.badRequestException("Missing required parameter: Content")
+		}
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
+		return r
+	}
+
+	sendBulkEmail(caller: Caller, input: v2.SendBulkEmailRequest): v2.SendBulkEmailResponse throws Fault {
+		authorized(caller, "ses:SendBulkEmail", true)
+		const t = input.DefaultContent.Template
+		if (t == null || input.FromEmailAddress == null) {
+			throw v2.badRequestException(if (t == null) "Missing required parameter: DefaultContent.Template"
+				else "Missing required parameter: FromEmailAddress")
+		}
+		const template = inline(caller, t!)
+		const r = new v2.SendBulkEmailResponse()
+		for (const e of input.BulkEmailEntries) {
+			const s = sent(caller, input.FromEmailAddress!, v2Recipients(e.Destination),
+				input.FromEmailAddressIdentityArn)
+			const o = new v2.BulkEmailEntryResult()
+			o.Status = "SUCCESS"
+			o.MessageId = storeRendered(caller, s, template,
+				e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? "{}", t!.TemplateData,
+				input.ConfigurationSetName, this.sns)
+			r.BulkEmailEntryResults.push(o)
+		}
+		return r
+	}
+
+	createEmailTemplate(caller: Caller,
+		input: v2.CreateEmailTemplateRequest): v2.CreateEmailTemplateResponse throws Fault {
+		const n = input.TemplateName
+		caller.allow(templateArn(caller, n))
+		const t = new Tables(caller.regional()).templates
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`Template ${n} already exists.`)
+		}
+		const c = input.TemplateContent
+		t.put(n,
+			{ ...new Template(), name: n, subject: c.Subject, text: c.Text, html: c.Html, created: now(),
+			tags: (input.Tags ?? []).map(t => [t.Key, t.Value]) })
+		return new v2.CreateEmailTemplateResponse()
+	}
+
+	getEmailTemplate(caller: Caller, input: v2.GetEmailTemplateRequest): v2.GetEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		const r = new v2.GetEmailTemplateResponse()
+		r.TemplateName = t.name
+		r.TemplateContent = { ...new v2.EmailTemplateContent(), Subject: t.subject, Text: t.text, Html: t.html }
+		r.Tags = t.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		return r
+	}
+
+	updateEmailTemplate(caller: Caller,
+		input: v2.UpdateEmailTemplateRequest): v2.UpdateEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		const c = input.TemplateContent
+		t.subject = c.Subject
+		t.text = c.Text
+		t.html = c.Html
+		(new Tables(caller.regional()).templates).put(t.name, t)
+		return new v2.UpdateEmailTemplateResponse()
+	}
+
+	deleteEmailTemplate(caller: Caller,
+		input: v2.DeleteEmailTemplateRequest): v2.DeleteEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		new Tables(caller.regional()).templates.delete(t.name)
+		return new v2.DeleteEmailTemplateResponse()
+	}
+
+	getAccount(caller: Caller, input: v2.GetAccountRequest): v2.GetAccountResponse throws Fault {
+		caller.allow("*")
+		const r = new v2.GetAccountResponse()
+		const a = account(caller)
+		r.DedicatedIpAutoWarmupEnabled = true
+		r.EnforcementStatus = "HEALTHY"
+		r.ProductionAccessEnabled = a.production
+		r.SendingEnabled = a.sending
+		r.Details = a.details
+		r.SuppressionAttributes = { ...new v2.SuppressionAttributes(),
+			SuppressedReasons: a.reasons.map(e => if (e == "COMPLAINT") "COMPLAINT" else "BOUNCE") }
+		r.SendQuota = { ...new v2.SendQuota(), Max24HourSend: 200.0, MaxSendRate: 1.0,
+			SentLast24Hours: lastDay(caller) }
+		return r
+	}
+
+	putAccountDetails(caller: Caller, input: v2.PutAccountDetailsRequest): v2.PutAccountDetailsResponse throws Fault {
+		changeAccount(caller, a => {
+			a.details = { ...new v2.AccountDetails(), MailType: input.MailType, WebsiteURL: input.WebsiteURL,
+				ContactLanguage: input.ContactLanguage, UseCaseDescription: input.UseCaseDescription,
+				AdditionalContactEmailAddresses: input.AdditionalContactEmailAddresses }
+			a.production = input.ProductionAccessEnabled ?? a.production
+		})
+		return new v2.PutAccountDetailsResponse()
+	}
+
+	putAccountSendingAttributes(caller: Caller,
+		input: v2.PutAccountSendingAttributesRequest): v2.PutAccountSendingAttributesResponse throws Fault {
+		changeAccount(caller, a => {
+			a.sending = input.SendingEnabled
+		})
+		return new v2.PutAccountSendingAttributesResponse()
+	}
+
+	putAccountSuppressionAttributes(caller: Caller,
+		input: v2.PutAccountSuppressionAttributesRequest): v2.PutAccountSuppressionAttributesResponse throws Fault {
+		changeAccount(caller, a => {
+			a.reasons = (input.SuppressedReasons ?? []).map(e => e as string)
+		})
+		return new v2.PutAccountSuppressionAttributesResponse()
+	}
+
+	putConfigurationSetSuppressionOptions(caller: Caller, input: v2.PutConfigurationSetSuppressionOptionsRequest): v2.PutConfigurationSetSuppressionOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.suppression = { ...new v2.SuppressionOptions(), SuppressedReasons: input.SuppressedReasons,
+				SuppressionScope: input.SuppressionScope, ValidationOptions: input.ValidationOptions }
+		})
+		return new v2.PutConfigurationSetSuppressionOptionsResponse()
+	}
+
+	putConfigurationSetSendingOptions(caller: Caller,
+		input: v2.PutConfigurationSetSendingOptionsRequest): v2.PutConfigurationSetSendingOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.sending = { ...new v2.SendingOptions(), SendingEnabled: input.SendingEnabled }
+		})
+		return new v2.PutConfigurationSetSendingOptionsResponse()
+	}
+
+	putConfigurationSetReputationOptions(caller: Caller, input: v2.PutConfigurationSetReputationOptionsRequest): v2.PutConfigurationSetReputationOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.reputation = { ...new v2.ReputationOptions(), ReputationMetricsEnabled: input.ReputationMetricsEnabled }
+		})
+		return new v2.PutConfigurationSetReputationOptionsResponse()
+	}
+
+	putConfigurationSetTrackingOptions(caller: Caller, input: v2.PutConfigurationSetTrackingOptionsRequest): v2.PutConfigurationSetTrackingOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			const domain = input.CustomRedirectDomain
+			c.tracking = null
+			if (domain != null) {
+				c.tracking = { ...new v2.TrackingOptions(), CustomRedirectDomain: domain!,
+					HttpsPolicy: input.HttpsPolicy }
+			}
+		})
+		return new v2.PutConfigurationSetTrackingOptionsResponse()
+	}
+
+	putConfigurationSetDeliveryOptions(caller: Caller, input: v2.PutConfigurationSetDeliveryOptionsRequest): v2.PutConfigurationSetDeliveryOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.delivery = { ...new v2.DeliveryOptions(), TlsPolicy: input.TlsPolicy,
+				SendingPoolName: input.SendingPoolName, MaxDeliverySeconds: input.MaxDeliverySeconds,
+				SharedPoolDeliveryMode: input.SharedPoolDeliveryMode }
+		})
+		return new v2.PutConfigurationSetDeliveryOptionsResponse()
+	}
+
+	createContactList(caller: Caller, input: v2.CreateContactListRequest): v2.CreateContactListResponse throws Fault {
+		const n = input.ContactListName
+		caller.allow(listArn(caller, n))
+		const t = new Tables(caller.regional()).lists
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`List with name ${n} already exists.`)
+		}
+		if (t.scan(null, 1).length > 0) {
+			throw v2.limitExceededException("Maximum number of contact lists per account reached.")
+		}
+		const at = now()
+		t.put(n,
+			{ ...new ContactList(), name: n, description: input.Description, topics: input.Topics ?? [],
+			tags: (input.Tags ?? []).map(t => [t.Key, t.Value]), created: at, updated: at })
+		return new v2.CreateContactListResponse()
+	}
+
+	getContactList(caller: Caller, input: v2.GetContactListRequest): v2.GetContactListResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const r = new v2.GetContactListResponse()
+		r.ContactListName = l.name
+		r.Description = l.description
+		r.Topics = l.topics
+		r.CreatedTimestamp = l.created
+		r.LastUpdatedTimestamp = l.updated
+		r.Tags = l.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		return r
+	}
+
+	listContactLists(caller: Caller, input: v2.ListContactListsRequest): v2.ListContactListsResponse throws Fault {
+		caller.allow(listArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).lists.scan(null, 1000000).map(e => e[1]), l => l.name)
+		const [items, next] = paged(all, input.NextToken, min(input.PageSize ?? 1000, 1000), "NextToken", true)
+		const r = new v2.ListContactListsResponse()
+		r.ContactLists = items.map(l => {
+			return { ...new v2.ContactList(), ContactListName: l.name, LastUpdatedTimestamp: l.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	updateContactList(caller: Caller, input: v2.UpdateContactListRequest): v2.UpdateContactListResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			l.topics = input.Topics ?? l.topics
+			l.description = input.Description ?? l.description
+		})
+		return new v2.UpdateContactListResponse()
+	}
+
+	deleteContactList(caller: Caller, input: v2.DeleteContactListRequest): v2.DeleteContactListResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		new Tables(caller.regional()).lists.delete(l.name)
+		return new v2.DeleteContactListResponse()
+	}
+
+	createContact(caller: Caller, input: v2.CreateContactRequest): v2.CreateContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			if (l.contacts.some(c => c.address == input.EmailAddress)) {
+				throw v2.alreadyExistsException(`Contact already exists in list ${l.name}`)
+			}
+			const at = now()
+			const c = { ...new Contact(), address: input.EmailAddress, topics: input.TopicPreferences ?? [],
+				unsubscribed: input.UnsubscribeAll, attributes: input.AttributesData, created: at, updated: at }
+			// Kept in order of address, as a page is.
+			l.contacts = [...l.contacts.filter(e => e.address < c.address), c,
+				...l.contacts.filter(e => e.address > c.address)]
+		})
+		return new v2.CreateContactResponse()
+	}
+
+	getContact(caller: Caller, input: v2.GetContactRequest): v2.GetContactResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const c = contact(l, input.EmailAddress)
+		const r = new v2.GetContactResponse()
+		r.ContactListName = l.name
+		r.EmailAddress = c.address
+		r.TopicPreferences = c.topics
+		r.TopicDefaultPreferences = defaults(l)
+		r.UnsubscribeAll = c.unsubscribed
+		r.AttributesData = c.attributes
+		r.CreatedTimestamp = c.created
+		r.LastUpdatedTimestamp = c.updated
+		return r
+	}
+
+	listContacts(caller: Caller, input: v2.ListContactsRequest): v2.ListContactsResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const status = input.Filter?.FilteredStatus
+		const topic = input.Filter?.TopicFilter
+		const matching = l.contacts.filter(c => {
+			if (status == null) {
+				return true
+			}
+			if (topic == null || topic!.TopicName == null) {
+				return c.unsubscribed == (status == "OPT_OUT")
+			}
+			const own = c.topics.find(p => p.TopicName == topic!.TopicName)
+			if (own == null && !topic!.UseDefaultIfPreferenceUnavailable) {
+				return false
+			}
+			return (own?.SubscriptionStatus ?? defaultOf(l, topic!.TopicName!)) == status
+		})
+		const [items, next] = paged(keyed(matching, c => c.address), input.NextToken, min(input.PageSize ?? 1000, 1000),
+			"NextToken", true)
+		const r = new v2.ListContactsResponse()
+		r.Contacts = items.map(c => {
+			return { ...new v2.Contact(), EmailAddress: c.address, TopicPreferences: c.topics,
+				TopicDefaultPreferences: defaults(l), UnsubscribeAll: c.unsubscribed, LastUpdatedTimestamp: c.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	updateContact(caller: Caller, input: v2.UpdateContactRequest): v2.UpdateContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			const c = contact(l, input.EmailAddress)
+			c.topics = input.TopicPreferences ?? c.topics
+			c.unsubscribed = input.UnsubscribeAll
+			c.attributes = input.AttributesData ?? c.attributes
+			c.updated = now()
+		})
+		return new v2.UpdateContactResponse()
+	}
+
+	deleteContact(caller: Caller, input: v2.DeleteContactRequest): v2.DeleteContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			const c = contact(l, input.EmailAddress)
+			l.contacts = l.contacts.filter(e => e.address != c.address)
+		})
+		return new v2.DeleteContactResponse()
+	}
+
+	listEmailTemplates(caller: Caller,
+		input: v2.ListEmailTemplatesRequest): v2.ListEmailTemplatesResponse throws Fault {
+		caller.allow(templateArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).templates.scan(null, 1000000).map(e => e[1]), t => t.name)
+		const [items, next] = paged(all, input.NextToken, min(input.PageSize ?? 10, 100), "PageToken", true)
+		const r = new v2.ListEmailTemplatesResponse()
+		r.TemplatesMetadata = items.map(t => {
+			return { ...new v2.EmailTemplateMetadata(), TemplateName: t.name, CreatedTimestamp: t.created }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	testRenderEmailTemplate(caller: Caller,
+		input: v2.TestRenderEmailTemplateRequest): v2.TestRenderEmailTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		const t = new Tables(caller.regional()).templates.get(input.TemplateName)
+		if (t == null) {
+			throw v2.notFoundException(`Unable to find <${input.TemplateName}> for <${caller.account}>`)
+		}
+		const data = dataOf(input.TemplateData)
+		if (data == null) {
+			throw v2.badRequestException("Template rendering data is invalid")
+		}
+		let m = ""
+		try {
+			m = mime(rendered(t!, data!))
+		} catch (f: Fault) {
+			throw v2.badRequestException(f.message)
+		}
+		const r = new v2.TestRenderEmailTemplateResponse()
+		r.RenderedTemplate = m
+		return r
+	}
+
+	createConfigurationSet(caller: Caller,
+		input: v2.CreateConfigurationSetRequest): v2.CreateConfigurationSetResponse throws Fault {
+		createSet(caller, input.ConfigurationSetName, (input.Tags ?? []).map(t => [t.Key, t.Value]), true)
+		return new v2.CreateConfigurationSetResponse()
+	}
+
+	getConfigurationSet(caller: Caller,
+		input: v2.GetConfigurationSetRequest): v2.GetConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		const r = new v2.GetConfigurationSetResponse()
+		r.ConfigurationSetName = c.name
+		r.Tags = c.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		r.TrackingOptions = c.tracking
+		r.DeliveryOptions = c.delivery
+		r.ReputationOptions = c.reputation
+		r.SendingOptions = c.sending
+		r.SuppressionOptions = c.suppression
+		return r
+	}
+
+	listConfigurationSets(caller: Caller,
+		input: v2.ListConfigurationSetsRequest): v2.ListConfigurationSetsResponse throws Fault {
+		caller.allow(setArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).sets.scan(null, 1000000).map(e => e[1]), c => c.name)
+		const [items, next] = paged(all, input.NextToken, input.PageSize ?? 1000, "NextToken", true)
+		const r = new v2.ListConfigurationSetsResponse()
+		r.ConfigurationSets = items.map(c => c.name)
+		r.NextToken = next
+		return r
+	}
+
+	deleteConfigurationSet(caller: Caller,
+		input: v2.DeleteConfigurationSetRequest): v2.DeleteConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		new Tables(caller.regional()).sets.delete(c.name)
+		return new v2.DeleteConfigurationSetResponse()
+	}
+
+	createConfigurationSetEventDestination(caller: Caller, input: v2.CreateConfigurationSetEventDestinationRequest): v2.CreateConfigurationSetEventDestinationResponse throws Fault {
+		const d = fromV2Destination(input.EventDestination)
+		d.name = input.EventDestinationName
+		addDestination(caller, input.ConfigurationSetName, d, true)
+		return new v2.CreateConfigurationSetEventDestinationResponse()
+	}
+
+	getConfigurationSetEventDestinations(caller: Caller, input: v2.GetConfigurationSetEventDestinationsRequest): v2.GetConfigurationSetEventDestinationsResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		const r = new v2.GetConfigurationSetEventDestinationsResponse()
+		r.EventDestinations = c.destinations.map(toV2)
+		return r
+	}
+
+	deleteConfigurationSetEventDestination(caller: Caller, input: v2.DeleteConfigurationSetEventDestinationRequest): v2.DeleteConfigurationSetEventDestinationResponse throws Fault {
+		dropDestination(caller, input.ConfigurationSetName, input.EventDestinationName, true)
+		return new v2.DeleteConfigurationSetEventDestinationResponse()
+	}
+
+	tagResource(caller: Caller, input: v2.TagResourceRequest): v2.TagResourceResponse throws Fault {
+		const added: [string, string][] = input.Tags.map(t => [t.Key, t.Value])
+		retag(caller, input.ResourceArn, tags => {
+			const kept = tags.filter(t => !added.some(a => a[0] == t[0]))
+			for (const a of added) {
+				kept.push(a)
+			}
+			return kept
+		})
+		return new v2.TagResourceResponse()
+	}
+
+	untagResource(caller: Caller, input: v2.UntagResourceRequest): v2.UntagResourceResponse throws Fault {
+		retag(caller, input.ResourceArn, tags => tags.filter(t => !input.TagKeys.some(k => k == t[0])))
+		return new v2.UntagResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: v2.ListTagsForResourceRequest): v2.ListTagsForResourceResponse throws Fault {
+		const r = new v2.ListTagsForResourceResponse()
+		retag(caller, input.ResourceArn, tags => {
+			r.Tags = tags.map(t => {
+				return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+			})
+			return tags
+		})
+		return r
+	}
+}
+
+/// The lists v2's model POSTs to paths of its own, their paging in the body, which SDKs of earlier models GET, paging
+/// in the query, and AWS still serves so.
+const lists: [string, string][] = [["/v2/email/identities", "/v2/email/list-identities"],
+	["/v2/email/configuration-sets", "/v2/email/list-configuration-sets"]]
+
+export function routed(req: Request): Request {
+	if (req.method != "GET") {
+		return req
+	}
+	for (const [listed, path] of lists) {
+		if (req.url.path == listed || req.url.path == `${listed}/`) {
+			const q = req.url.query
+			const b = new v2.ListEmailIdentitiesRequest()
+			b.NextToken = q.get("NextToken")
+			const size = q.get("PageSize")
+			try {
+				b.PageSize = if (size == null) null else parseInt[i32](size!)
+			} catch (e: ParseError) {}
+			req.method = "POST"
+			req.url.path = path
+			try {
+				req.body = new Body(json.encode(b))
+			} catch (e: json.EncodeError) {}
+		}
+	}
+	return req
+}
+
+function identityArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:identity/${name}`
+}
+
+function templateArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:template/${name}`
+}
+
+function setArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:configuration-set/${name}`
+}
+
+function verify(caller: Caller, name: string, domain: bool): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const t = new Tables(caller.regional()).identities
+	const found = t.get(name)
+	if (found != null) {
+		return found!
+	}
+	const i = { ...new Identity(), name: name, domain: domain, created: now() }
+	if (domain) {
+		i.token = base64.encode(random(32))
+	}
+	t.put(name, i)
+	return i
+}
+
+function identities(caller: Caller): Identity[] throws Fault {
+	return new Tables(caller.regional()).identities.scan().map(e => e[1])
+}
+
+function emailIdentity(caller: Caller, name: string, shown: string): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const i = new Tables(caller.regional()).identities.get(name)
+	if (i == null) {
+		throw v2.notFoundException(`Email identity ${shown} does not exist.`)
+	}
+	return i!
+}
+
+function changeIdentity(caller: Caller, name: string, ofV2: bool,
+	f: ((i: Identity) => void throws Fault) | null): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const t = new Tables(caller.regional()).identities
+	const i = t.get(name)
+	if (i == null) {
+		throw if (ofV2) v2.notFoundException(`Email identity <${name}> does not exist.`)
+			else new Fault(400, "InvalidParameterValue", `Identity <${name}> does not exist.`)
+	}
+	if (f != null) {
+		f!(i!)
+		t.put(name, i!)
+	}
+	return i!
+}
+
+function checkPolicy(policy: string, ofV2: bool) throws Fault {
+	if (dataOf(policy) == null) {
+		throw if (ofV2) v2.badRequestException("Policy is not valid JSON.")
+			else api.invalidPolicyException("Policy is not valid JSON.")
+	}
+	try {
+		auth.parse(policy, "resource")
+	} catch (f: Fault) {
+		throw if (ofV2) v2.badRequestException(`Policy is not valid: ${f.message}`)
+			else api.invalidPolicyException(`Policy is not valid: ${f.message}`)
+	}
+}
+
+function suppressed(caller: Caller, address: string): Suppressed throws Fault {
+	caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+	const d = new Tables(caller.regional()).suppressed.get(addressOf(address))
+	if (d == null) {
+		throw v2.notFoundException(`Email address ${address} does not exist on your suppression list.`)
+	}
+	return d!
+}
+
+function account(caller: Caller): Account throws Fault {
+	return new Tables(caller.regional()).account.get("") ?? new Account()
+}
+
+function changeAccount(caller: Caller, f: (a: Account) => void) throws Fault {
+	caller.allow("*")
+	const a = account(caller)
+	f(a)
+	(new Tables(caller.regional()).account).put("", a)
+}
+
+function changeSet(caller: Caller, name: string, f: (c: ConfigurationSet) => void) throws Fault {
+	const c = configurationSet(caller, name, true)
+	f(c)
+	(new Tables(caller.regional()).sets).put(name, c)
+}
+
+function topicOf(i: Identity, kind: string): string | null {
+	for (const [k, t] of i.topics) {
+		if (k == kind) {
+			return t
+		}
+	}
+	return null
+}
+
+function dkim(i: Identity): v2.DkimAttributes {
+	const d = new v2.DkimAttributes()
+	const signing = i.dkim.length > 0 || i.selector != null
+	d.SigningEnabled = signing && !i.unsigned
+	d.Status = if (signing) "SUCCESS" else "NOT_STARTED"
+	d.Tokens = if (i.selector != null) [i.selector!] else if (i.dkim.length > 0) i.dkim else null
+	d.SigningAttributesOrigin = if (i.selector != null) "EXTERNAL" else "AWS_SES"
+	return d
+}
+
+function template(caller: Caller, name: string): Template throws Fault {
+	caller.allow(templateArn(caller, name))
+	const t = new Tables(caller.regional()).templates.get(name)
+	if (t == null) {
+		throw api.templateDoesNotExistException(`Template ${name} does not exist.`)
+	}
+	return t!
+}
+
+function ruleSet(caller: Caller, name: string): RuleSet throws Fault {
+	caller.allow("*")
+	const r = new Tables(caller.regional()).ruleSets.get(name)
+	if (r == null) {
+		throw api.ruleSetDoesNotExistException(`Rule set does not exist: ${name}`,
+			{ ...new api.RuleSetDoesNotExistException(), Name: name })
+	}
+	return r!
+}
+
+function newRuleSet(caller: Caller, name: string, rules: api.ReceiptRule[]) throws Fault {
+	caller.allow("*")
+	const t = new Tables(caller.regional()).ruleSets
+	if (t.get(name) != null) {
+		throw api.alreadyExistsException(`Rule set already exists: ${name}`,
+			{ ...new api.AlreadyExistsException(), Name: name })
+	}
+	t.put(name, { ...new RuleSet(), name: name, created: now(), rules: rules })
+}
+
+function changeRules(caller: Caller, name: string, f: (r: RuleSet) => void throws Fault) throws Fault {
+	const r = ruleSet(caller, name)
+	f(r)
+	(new Tables(caller.regional()).ruleSets).put(name, r)
+}
+
+function rule(r: RuleSet, name: string): api.ReceiptRule throws Fault {
+	const e = r.rules.find(e => e.Name == name)
+	if (e == null) {
+		throw api.ruleDoesNotExistException(`Rule does not exist: ${name}`,
+			{ ...new api.RuleDoesNotExistException(), Name: name })
+	}
+	return e!
+}
+
+function placed(rules: api.ReceiptRule[], rule: api.ReceiptRule, after: string | null): api.ReceiptRule[] throws Fault {
+	if (after == null) {
+		return [rule, ...rules]
+	}
+	let i = -1
+	for (let j = 0; j < rules.length; j++) {
+		if (rules[j].Name == after!) {
+			i = j
+		}
+	}
+	if (i < 0) {
+		throw api.ruleDoesNotExistException(`Rule does not exist: ${after!}`,
+			{ ...new api.RuleDoesNotExistException(), Name: after })
+	}
+	return [...rules.slice(0, i + 1), rule, ...rules.slice(i + 1, rules.length)]
+}
+
+function metadata(r: RuleSet): api.ReceiptRuleSetMetadata {
+	return { ...new api.ReceiptRuleSetMetadata(), Name: r.name, CreatedTimestamp: r.created }
+}
+
+function listArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:contact-list/${name}`
+}
+
+function contactList(caller: Caller, name: string): ContactList throws Fault {
+	caller.allow(listArn(caller, name))
+	const l = new Tables(caller.regional()).lists.get(name)
+	if (l == null) {
+		throw v2.notFoundException(`List with name ${name} does not exist.`)
+	}
+	return l!
+}
+
+function changeList(caller: Caller, name: string, f: (l: ContactList) => void throws Fault) throws Fault {
+	const l = contactList(caller, name)
+	f(l)
+	l.updated = now()
+	(new Tables(caller.regional()).lists).put(name, l)
+}
+
+function contact(l: ContactList, address: string): Contact throws Fault {
+	const c = l.contacts.find(c => c.address == address)
+	if (c == null) {
+		throw v2.notFoundException(`Contact ${address} does not exist in list ${l.name}`)
+	}
+	return c!
+}
+
+function defaults(l: ContactList): v2.TopicPreference[] {
+	return l.topics.map(t => {
+		return { ...new v2.TopicPreference(), TopicName: t.TopicName, SubscriptionStatus: t.DefaultSubscriptionStatus }
+	})
+}
+
+function defaultOf(l: ContactList, name: string): v2.SubscriptionStatus {
+	return l.topics.find(t => t.TopicName == name)?.DefaultSubscriptionStatus ?? "OPT_OUT"
+}
+
+/// Whether address is unsubscribed from all of l or from its topic of name; one not a contact is sent to.
+function unsubscribed(l: ContactList, address: string, topic: string | null): bool {
+	const c = l.contacts.find(c => c.address == addressOf(address))
+	if (c == null) {
+		return false
+	}
+	if (c!.unsubscribed || topic == null) {
+		return c!.unsubscribed
+	}
+	return (c!.topics.find(p => p.TopicName == topic)?.SubscriptionStatus ?? defaultOf(l, topic!)) == "OPT_OUT"
+}
+
+function emailTemplate(caller: Caller, name: string): Template throws Fault {
+	caller.allow(templateArn(caller, name))
+	const t = new Tables(caller.regional()).templates.get(name)
+	if (t == null) {
+		throw v2.notFoundException(`Template ${name} does not exist.`)
+	}
+	return t!
+}
+
+function inline(caller: Caller, t: v2.Template): Template throws Fault {
+	const c = t.TemplateContent
+	if (c != null) {
+		return { ...new Template(), subject: c!.Subject, text: c!.Text, html: c!.Html }
+	}
+	const n = t.TemplateName ?? ""
+	caller.allow(templateArn(caller, n))
+	const found = new Tables(caller.regional()).templates.get(n)
+	if (found == null) {
+		throw v2.notFoundException(`Template ${n} does not exist.`)
+	}
+	return found!
+}
+
+/// Stored if t renders, else only answered, as AWS answers a message it then fails to render.
+function storeRendered(caller: Caller, s: Sent, t: Template, data: string, fallback: string | null, set: string | null,
+	sns: snsApi.SNS | null): string throws Fault {
+	s.Template = if (t.name == "") null else t.name
+	s.TemplateData = data
+	const given = dataOf(data)
+	const defaults = if (fallback == null) [] else dataOf(fallback!)
+	if (given == null || defaults == null) {
+		return unstored(s)
+	}
+	const merged: json.Unknown[] = []
+	for (const d of given!) {
+		merged.push(d)
+	}
+	for (const d of defaults!) {
+		merged.push(d)
+	}
+	try {
+		rendered(t, merged)
+	} catch (f: Fault) {
+		return unstored(s)
+	}
+	return store(caller, s, set, sns)
+}
+
+function unstored(s: Sent): string throws Fault {
+	s.Id = id(now())
+	return s.Id
+}
+
+class Rendered {
+	subject = ""
+	text: string | null = null
+	html: string | null = null
+}
+
+function rendered(t: Template, data: json.Unknown[]): Rendered throws Fault {
+	const r = new Rendered()
+	r.subject = render(t.subject ?? "", data)
+	r.text = if (t.text == null) null else render(t.text!, data)
+	r.html = if (t.html == null) null else render(t.html!, data)
+	return r
+}
+
+function dataOf(s: string): json.Unknown[] | null {
+	try {
+		return json.decode[json.Keys](s).all
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// r as the MIME message AWS renders: a part of each of its text and HTML, alternatives if both.
+function mime(r: Rendered): string throws Fault {
+	const parts: [string, string][] = []
+	if (r.text != null) {
+		parts.push(["text/plain", r.text!])
+	}
+	if (r.html != null) {
+		parts.push(["text/html", r.html!])
+	}
+	const lines = [`Subject: ${r.subject}`, "MIME-Version: 1.0"]
+	if (parts.length == 1) {
+		lines.push(`Content-Type: ${parts[0][0]}; charset=UTF-8`)
+		lines.push("Content-Transfer-Encoding: 7bit")
+		lines.push("")
+		lines.push(parts[0][1])
+		return lines.join("\r\n")
+	}
+	const boundary = `----=_Part_${token(8)}`
+	lines.push("Content-Type: multipart/alternative; ")
+	lines.push(`\tboundary="${boundary}"`)
+	for (const [kind, body] of parts) {
+		lines.push("")
+		lines.push(`--${boundary}`)
+		lines.push(`Content-Type: ${kind}; charset=UTF-8`)
+		lines.push("Content-Transfer-Encoding: 7bit")
+		lines.push("")
+		lines.push(body)
+	}
+	lines.push(`--${boundary}--`)
+	return lines.join("\r\n")
+}
+
+function keyed[V](xs: V[], key: (v: V) => string): [string, V][] {
+	const out: [string, V][] = []
+	for (const x of xs) {
+		out.push([key(x), x])
+	}
+	return out
+}
+
+function paged[V](all: [string, V][], token: string | null, size: i32, name: string,
+	ofV2: bool): [V[], string | null] throws Fault {
+	let after: string | null = null
+	if (token != null) {
+		let s = ""
+		try {
+			s = base64.decode(token!)
+		} catch (e: ParseError) {}
+		if (indexOf(s, "ses:") != 0) {
+			const why = `Invalid ${name} <${token!}>.`
+			throw if (ofV2) v2.badRequestException(why) else new Fault(400, "InvalidParameterValue", why)
+		}
+		after = s.slice(4, s.length)
+	}
+	const rest = all.filter(e => after == null || e[0] > after!)
+	const n = if (size < 1) rest.length else size
+	if (rest.length <= n) {
+		return [rest.map(e => e[1]), null]
+	}
+	return [rest.slice(0, n).map(e => e[1]), base64.encode(`ses:${rest[n - 1][0]}`)]
+}
+
+function createSet(caller: Caller, name: string, tags: [string, string][], ofV2: bool) throws Fault {
+	caller.allow(setArn(caller, name))
+	const t = new Tables(caller.regional()).sets
+	if (t.get(name) != null) {
+		const why = `Configuration set <${name}> already exists.`
+		throw if (ofV2) v2.alreadyExistsException(why) else api.configurationSetAlreadyExistsException(why)
+	}
+	t.put(name, { ...new ConfigurationSet(), name: name, created: now(), tags: tags })
+}
+
+function configurationSet(caller: Caller, name: string, ofV2: bool): ConfigurationSet throws Fault {
+	caller.allow(setArn(caller, name))
+	const c = new Tables(caller.regional()).sets.get(name)
+	if (c == null) {
+		const why = `Configuration set <${name}> does not exist.`
+		throw if (ofV2) v2.notFoundException(why) else api.configurationSetDoesNotExistException(why)
+	}
+	return c!
+}
+
+function addDestination(caller: Caller, set: string, d: Destination, ofV2: bool) throws Fault {
+	const c = configurationSet(caller, set, ofV2)
+	if (c.destinations.some(e => e.name == d.name)) {
+		const why = `Event destination ${d.name} already exists.`
+		throw if (ofV2) v2.alreadyExistsException(why) else api.eventDestinationAlreadyExistsException(why)
+	}
+	c.destinations.push(d)
+	(new Tables(caller.regional()).sets).put(c.name, c)
+}
+
+function dropDestination(caller: Caller, set: string, name: string, ofV2: bool) throws Fault {
+	const c = configurationSet(caller, set, ofV2)
+	if (!c.destinations.some(e => e.name == name)) {
+		const why = `No EventDestination found for ${name}`
+		throw if (ofV2) v2.notFoundException(why) else api.eventDestinationDoesNotExistException(why)
+	}
+	c.destinations = c.destinations.filter(e => e.name != name)
+	(new Tables(caller.regional()).sets).put(c.name, c)
+}
+
+function fromV1Destination(e: api.EventDestination): Destination {
+	const d = new Destination()
+	d.name = e.Name
+	d.enabled = e.Enabled
+	for (const t of e.MatchingEventTypes) {
+		for (const [one, two] of eventTypes) {
+			if (one == t) {
+				d.types.push(two)
+			}
+		}
+	}
+	d.sns = e.SNSDestination?.TopicARN
+	d.firehoseStream = e.KinesisFirehoseDestination?.DeliveryStreamARN
+	d.firehoseRole = e.KinesisFirehoseDestination?.IAMRoleARN
+	const w = e.CloudWatchDestination
+	if (w != null) {
+		d.dimensions = w!.DimensionConfigurations.map(c => {
+			let source = ""
+			for (const [one, two] of sources) {
+				if (one == c.DimensionValueSource) {
+					source = two
+				}
+			}
+			return { ...new Dimension(), name: c.DimensionName, source: source, fallback: c.DefaultDimensionValue }
+		})
+	}
+	return d
+}
+
+function fromV2Destination(e: v2.EventDestinationDefinition): Destination {
+	const d = new Destination()
+	d.enabled = e.Enabled
+	d.types = (e.MatchingEventTypes ?? []).map(t => t as string)
+	d.sns = e.SnsDestination?.TopicArn
+	d.firehoseStream = e.KinesisFirehoseDestination?.DeliveryStreamArn
+	d.firehoseRole = e.KinesisFirehoseDestination?.IamRoleArn
+	d.eventBus = e.EventBridgeDestination?.EventBusArn
+	d.pinpoint = e.PinpointDestination?.ApplicationArn
+	const w = e.CloudWatchDestination
+	if (w != null) {
+		d.dimensions = w!.DimensionConfigurations.map(c => {
+			return { ...new Dimension(), name: c.DimensionName, source: c.DimensionValueSource as string,
+				fallback: c.DefaultDimensionValue }
+		})
+	}
+	return d
+}
+
+function toV1(d: Destination): api.EventDestination {
+	const e = new api.EventDestination()
+	e.Name = d.name
+	e.Enabled = d.enabled
+	for (const t of d.types) {
+		for (const [one, two] of eventTypes) {
+			if (two == t) {
+				e.MatchingEventTypes.push(one)
+			}
+		}
+	}
+	if (d.sns != null) {
+		e.SNSDestination = { ...new api.SNSDestination(), TopicARN: d.sns! }
+	}
+	if (d.firehoseStream != null) {
+		e.KinesisFirehoseDestination = { ...new api.KinesisFirehoseDestination(), DeliveryStreamARN: d.firehoseStream!,
+			IAMRoleARN: d.firehoseRole ?? "" }
+	}
+	if (d.dimensions != null) {
+		const w = new api.CloudWatchDestination()
+		for (const c of d.dimensions!) {
+			for (const [one, two] of sources) {
+				if (two == c.source) {
+					w.DimensionConfigurations.push({ ...new api.CloudWatchDimensionConfiguration(),
+						DimensionName: c.name, DimensionValueSource: one, DefaultDimensionValue: c.fallback })
+				}
+			}
+		}
+		e.CloudWatchDestination = w
+	}
+	return e
+}
+
+function toV2(d: Destination): v2.EventDestination {
+	const e = new v2.EventDestination()
+	e.Name = d.name
+	e.Enabled = d.enabled
+	for (const t of d.types) {
+		for (const [_, two] of eventTypes) {
+			if (two == t) {
+				e.MatchingEventTypes.push(two)
+			}
+		}
+	}
+	if (d.sns != null) {
+		e.SnsDestination = { ...new v2.SnsDestination(), TopicArn: d.sns! }
+	}
+	if (d.firehoseStream != null) {
+		e.KinesisFirehoseDestination = { ...new v2.KinesisFirehoseDestination(), DeliveryStreamArn: d.firehoseStream!,
+			IamRoleArn: d.firehoseRole ?? "" }
+	}
+	if (d.eventBus != null) {
+		e.EventBridgeDestination = { ...new v2.EventBridgeDestination(), EventBusArn: d.eventBus! }
+	}
+	if (d.pinpoint != null) {
+		e.PinpointDestination = { ...new v2.PinpointDestination(), ApplicationArn: d.pinpoint }
+	}
+	if (d.dimensions != null) {
+		const w = new v2.CloudWatchDestination()
+		for (const c of d.dimensions!) {
+			for (const [_, two] of sources) {
+				if (two == c.source) {
+					w.DimensionConfigurations.push({ ...new v2.CloudWatchDimensionConfiguration(),
+						DimensionName: c.name, DimensionValueSource: two, DefaultDimensionValue: c.fallback })
+				}
+			}
+		}
+		e.CloudWatchDestination = w
+	}
+	return e
+}
+
+function retag(caller: Caller, arn: string, f: (tags: [string, string][]) => [string, string][]) throws Fault {
+	const prefix = `arn:aws:ses:${caller.region}:`
+	const mine = `${prefix}${caller.account}:`
+	if (indexOf(arn, prefix) != 0) {
+		throw v2.badRequestException("Invalid Resource Arn")
+	}
+	if (indexOf(arn, mine) != 0) {
+		throw v2.badRequestException("Operations on a resource created in a different account is not allowed")
+	}
+	caller.allow(arn)
+	const resource = arn.slice(mine.length, arn.length)
+	const slash = indexOf(resource, "/")
+	const kind = if (slash < 0) resource else resource.slice(0, slash)
+	const name = if (slash < 0) "" else resource.slice(slash + 1, resource.length)
+	const db = new Tables(caller.regional())
+	if (kind == "identity") {
+		const i = db.identities.get(name)
+		if (i == null) {
+			throw v2.notFoundException(`Email identity <${name}> does not exist.`)
+		}
+		i!.tags = f(i!.tags)
+		db.identities.put(name, i!)
+	} else if (kind == "template") {
+		const t = db.templates.get(name)
+		if (t == null) {
+			throw v2.notFoundException(`Template ${name} does not exist.`)
+		}
+		t!.tags = f(t!.tags)
+		db.templates.put(name, t!)
+	} else if (kind == "configuration-set") {
+		const c = db.sets.get(name)
+		if (c == null) {
+			throw v2.notFoundException(`Configuration set <${name}> does not exist.`)
+		}
+		c!.tags = f(c!.tags)
+		db.sets.put(name, c!)
+	} else {
+		throw v2.badRequestException("Invalid Resource Arn")
+	}
+}
+
+function fromV1(t: api.Template, created: i64): Template {
+	return { ...new Template(), name: t.TemplateName, subject: t.SubjectPart, text: t.TextPart, html: t.HtmlPart,
+		created: created }
+}
+
+function render(s: string, data: json.Unknown[]): string throws Fault {
+	let out = ""
+	let at = 0
+	while (true) {
+		const open = indexOf(s, "{{", at)
+		if (open < 0) {
+			return out + s.slice(at, s.length)
+		}
+		const close = indexOf(s, "}}", open)
+		if (close < 0) {
+			return out + s.slice(at, s.length)
+		}
+		const name = trim(s.slice(open + 2, close))
+		const v = data.find(d => d[0] == name)
+		if (v == null) {
+			throw api.missingRenderingAttributeException(`Attribute '${name}' is not present in the rendering data.`)
+		}
+		out += s.slice(at, open) + unquoted(v![1])
+		at = close + 2
+	}
+}
+
+function unquoted(s: string): string {
+	try {
+		return json.decode[string](s)
+	} catch (e: ParseError) {
+		return s
+	}
+}
+
+function v1Recipients(d: api.Destination): Recipients {
+	return { ...new Recipients(), ToAddresses: d.ToAddresses, CcAddresses: d.CcAddresses, BccAddresses: d.BccAddresses }
+}
+
+function v2Recipients(d: v2.Destination): Recipients {
+	return { ...new Recipients(), ToAddresses: d.ToAddresses, CcAddresses: d.CcAddresses, BccAddresses: d.BccAddresses }
+}
+
+function parts(text: string | null, html: string | null): Parts {
+	return { ...new Parts(), text_part: text, html_part: html }
+}
+
+/// A message from source to recipients, if the caller may send from source: by an identity of its account, of the
+/// address or its domain, or of another's that arn names, as the identity's sending authorization policies allow.
+function sent(caller: Caller, source: string, recipients: Recipients | null,
+	arn: string | null = null): Sent throws Fault {
+	const address = addressOf(source)
+	const at = lastIndexOf(address, "@")
+	const fields = split(arn ?? "", ":")
+	const slash = indexOf(arn ?? "", ":identity/")
+	const account = if (arn == null || fields.length < 6) caller.account else fields[4]
+	const tree = if (account == caller.account) caller.regional() else caller.existing(`${account}/${caller.region}`)
+	const t = if (tree == null) null else new Tables(tree!).identities
+	let i: Identity | null = null
+	if (t != null && arn != null && slash >= 0) {
+		i = t!.get(arn!.slice(slash + 10, arn!.length))
+	} else if (t != null) {
+		i = t!.get(address) ?? (if (at < 0) null else t!.get(address.slice(at + 1, address.length)))
+	}
+	caller.allow(arn ?? identityArn(caller, i?.name ?? address), if (i == null) null else policyOf(i!))
+	if (i == null) {
+		throw api.messageRejected("Email address is not verified. The following identities failed the check in region "
+			+ `${upper(caller.region)}: ${address}`)
+	}
+	const s = new Sent()
+	s.Region = caller.region
+	s.Source = source
+	s.Destination = recipients
+	return s
+}
+
+/// Has the caller authorized by action alone, as AWS authorizes a send: SendEmail gives all three of v1's sending
+/// actions, and some sends none.
+function authorized(caller: Caller, action: string, ofV2 = false) throws Fault {
+	caller.actions = [action]
+	if (!account(caller).sending) {
+		throw if (ofV2) v2.sendingPausedException("Sending is paused for this account.")
+			else api.accountSendingPausedException("Email sending is disabled for this account.")
+	}
+}
+
+function policyOf(i: Identity): string | null {
+	const statements: string[] = []
+	for (const [_, p] of i.policies) {
+		try {
+			for (const [k, v] of json.decode[json.Keys](p).all) {
+				if (k == "Statement") {
+					const raw = trim(v)
+					statements.push(if (raw.length > 1 && raw.slice(0, 1) == "[") raw.slice(1, raw.length - 1) else raw)
+				}
+			}
+		} catch (e: ParseError) {}
+	}
+	return if (statements.length == 0) null else `{"Version": "2012-10-17", "Statement": [${statements.join(", ")}]}`
+}
+
+function addressOf(mailbox: string): string {
+	const open = lastIndexOf(mailbox, "<")
+	const close = lastIndexOf(mailbox, ">")
+	return if (open >= 0 && close > open) mailbox.slice(open + 1, close) else trim(mailbox)
+}
+
+function header(data: string, name: string): string | null {
+	const lower = name + ":"
+	for (const line of split(replace(data, "\r\n", "\n"), "\n")) {
+		if (line == "") {
+			return null
+		}
+		if (line.length > lower.length && line.slice(0, lower.length) == lower) {
+			return trim(line.slice(lower.length, line.length))
+		}
+	}
+	return null
+}
+
+function store(caller: Caller, s: Sent, set: string | null = null, sns: snsApi.SNS | null = null): string throws Fault {
+	const t = now()
+	s.Id = id(t)
+	s.Timestamp = rfc3339(t - t % second).slice(0, 19)
+	(new Tables(caller.regional()).sent).put(s.Id, s)
+	if (sns != null) {
+		notify(caller, s, set, sns!)
+	}
+	return s.Id
+}
+
+/// The outcomes of a message, by v1's name, event publishing's and the member of a notification that tells it.
+const outcomes: [string, string, string][] = [["Delivery", "DELIVERY", "delivery"], ["Bounce", "BOUNCE", "bounce"],
+	["Complaint", "COMPLAINT", "complaint"]]
+
+/// A bounce if the account suppresses address, else as the mailbox simulator's addresses ask, else delivered.
+function outcome(address: string, suppressing: string[]): string {
+	const a = addressOf(address)
+	if (suppressing.includes(a) || a == "bounce@simulator.amazonses.com"
+		|| a == "suppressionlist@simulator.amazonses.com") {
+		return "Bounce"
+	}
+	return if (a == "complaint@simulator.amazonses.com") "Complaint" else "Delivery"
+}
+
+/// As AWS documents them: to its identity's topic of each outcome, and to each matching SNS event destination.
+function notify(caller: Caller, s: Sent, set: string | null, sns: snsApi.SNS) throws Fault {
+	const db = new Tables(caller.regional())
+	const address = addressOf(s.Source)
+	const at = lastIndexOf(address, "@")
+	const i = db.identities.get(address)
+		?? (if (at < 0) null else db.identities.get(address.slice(at + 1, address.length)))
+	const named = set ?? i?.configurationSet
+	const c = if (named == null) null else db.sets.get(named!)
+	const to = s.Destination
+	const recipients: string[] = []
+	if (to != null) {
+		for (const r of [to!.ToAddresses ?? [], to!.CcAddresses ?? [], to!.BccAddresses ?? []]) {
+			for (const a of r) {
+				recipients.push(addressOf(a))
+			}
+		}
+	}
+	const at0 = `${s.Timestamp}.000Z`
+	const own = c?.suppression
+	const reasons = if (own != null
+		&& own!.SuppressionScope != "ACCOUNT") (own!.SuppressedReasons ?? []).map(e => e as string)
+		else account(caller).reasons
+	const suppressing = recipients.filter(r => reasons.includes(db.suppressed.get(r)?.reason ?? ""))
+	const source = identityArn(caller, i?.name ?? address)
+	let mail = `{"timestamp":${json.quoted(at0)},"source":${json.quoted(s.Source)},"sourceArn":${json.quoted(source)},`
+		+ `"sendingAccountId":${json.quoted(caller.account)},"messageId":${json.quoted(s.Id)},`
+		+ `"destination":[${recipients.map(r => json.quoted(r)).join(",")}],"headersTruncated":false`
+	if (c != null) {
+		mail = `${mail},"tags":{"ses:configuration-set":[${json.quoted(c!.name)}]}`
+	}
+	mail = `${mail}}`
+	const destinations = if (c == null) [] else c!.destinations.filter(d => d.enabled && d.sns != null)
+	const setArnOf = if (c == null) "" else setArn(caller, c!.name)
+	for (const d of destinations) {
+		if (d.types.includes("SEND")) {
+			publish(caller, sns, d.sns!, setArnOf, `{"eventType":"Send","mail":${mail},"send":{}}`)
+		}
+	}
+	for (const [kind, event, member] of outcomes) {
+		const these = recipients.filter(r => outcome(r, suppressing) == kind)
+		if (these.length == 0) {
+			continue
+		}
+		const body = outcomeJson(kind, these, suppressing, at0, s.Id)
+		for (const d of destinations) {
+			if (d.types.includes(event)) {
+				publish(caller, sns, d.sns!, setArnOf, `{"eventType":"${kind}","mail":${mail},"${member}":${body}}`)
+			}
+		}
+		const topic = if (i == null) null else topicOf(i!, kind)
+		if (topic != null) {
+			publish(caller, sns, topic!, source, `{"notificationType":"${kind}","mail":${mail},"${member}":${body}}`)
+		}
+	}
+}
+
+function outcomeJson(kind: string, recipients: string[], suppressing: string[], at: string, id: string): string {
+	const feedback = json.quoted(`${id}-feedback`)
+	if (kind == "Bounce") {
+		const bounced = recipients.map(r => `{"emailAddress":${json.quoted(r)},"action":"failed","status":"5.1.1",`
+			+ `"diagnosticCode":"smtp; 550 5.1.1 user unknown"}`)
+		const sub = if (recipients.every(r => suppressing.includes(r))) "OnAccountSuppressionList"
+			else if (recipients.every(r => r == "suppressionlist@simulator.amazonses.com")) "Suppressed"
+			else "General"
+		return `{"bounceType":"Permanent","bounceSubType":"${sub}","bouncedRecipients":[${bounced.join(",")}],`
+			+ `"timestamp":${json.quoted(at)},"feedbackId":${feedback},"reportingMTA":"dsn; amazonses.com"}`
+	}
+	if (kind == "Complaint") {
+		const complained = recipients.map(r => `{"emailAddress":${json.quoted(r)}}`)
+		return `{"complainedRecipients":[${complained.join(",")}],"timestamp":${json.quoted(at)},`
+			+ `"feedbackId":${feedback},"complaintFeedbackType":"abuse","arrivalDate":${json.quoted(at)}}`
+	}
+	return `{"timestamp":${json.quoted(at)},"processingTimeMillis":0,`
+		+ `"recipients":[${recipients.map(r => json.quoted(r)).join(",")}],`
+		+ `"smtpResponse":"250 2.6.0 Message received","reportingMTA":"amazonses.com"}`
+}
+
+/// As SES does: a failure is not the sender's.
+function publish(caller: Caller, sns: snsApi.SNS, topic: string, source: string, message: string) throws Fault {
+	const input = new snsApi.PublishInput()
+	input.TopicArn = topic
+	input.Message = message
+	try {
+		sns.publish(caller.internal("ses.amazonaws.com", source, ["sns:Publish"]), input)
+	} catch (f: Fault) {}
+}
+
+/// A message id, beginning with the millisecond t is in.
+function id(t: i64): string throws Fault {
+	const h = token(16)
+	const uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+	return `0100${hex12(t / millisecond)}-${uuid}-000000`
+}
+
+function lastDay(caller: Caller): f64 throws Fault {
+	const since = `0100${hex12((now() - day) / millisecond)}`
+	return new Tables(caller.regional()).sent.scan(since, 1000000).length as f64
+}
+
+function upper(s: string): string {
+	let out = ""
+	for (const c of s) {
+		out += utf8(if (c >= 0x61 && c <= 0x7a) c - 0x20 else c)
+	}
+	return out
+}
+
+function hex12(v: i64): string {
+	const digits = "0123456789abcdef"
+	let s = ""
+	for (let i = 11; i >= 0; i--) {
+		const d = ((v >> (i * 4)) & 15) as i32
+		s += digits.slice(d, d + 1)
+	}
+	return s
+}
+
+function token(n: i32): string throws Fault { return hex.encode(random(n)) }
+
+function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}
