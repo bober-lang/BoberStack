@@ -1,0 +1,33 @@
+//! Randomness for handlers: std's bytes and UUIDs, a system that has none answered as a fault.
+
+import { Fault } from "./fault"
+import { bytes } from "std/crypto/random"
+import { v4 } from "std/uuid"
+
+export function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw none(e)
+	}
+}
+
+/// n characters of alphabet, each as likely as another only if its length divides 256.
+export function pick(n: i32, alphabet: string): string throws Fault {
+	const out: u8[] = []
+	for (const b of random(n)) {
+		out.push(alphabet[(b as i32) % alphabet.length])
+	}
+	return fromBytes(out)
+}
+
+/// A UUID of version 4, as AWS's ids and request ids are.
+export function uuid(): string throws Fault {
+	try {
+		return v4()
+	} catch (e: IoError) {
+		throw none(e)
+	}
+}
+
+function none(e: IoError): Fault { return new Fault(500, "InternalFailure", `No random bytes: ${e.message()}`) }
