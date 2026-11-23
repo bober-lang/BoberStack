@@ -1,0 +1,154 @@
+//! The destinations other than S3, and the sources other than DirectPut and Kinesis, stored as the JSON of their
+//! configuration and described by it as AWS shapes it.
+
+import { Fault } from "../../core/fault"
+import * as protocol from "../../core/protocol/json"
+import * as api from "./api"
+import { quoted } from "std/encoding/json"
+
+export function configured(input: api.CreateDeliveryStreamInput): [string, string][] {
+	const out: [string, string][] = []
+	if (input.RedshiftDestinationConfiguration != null) {
+		out.push(["Redshift", protocol.put(input.RedshiftDestinationConfiguration!, [])])
+	}
+	if (input.ElasticsearchDestinationConfiguration != null) {
+		out.push(["Elasticsearch", protocol.put(input.ElasticsearchDestinationConfiguration!, [])])
+	}
+	if (input.AmazonopensearchserviceDestinationConfiguration != null) {
+		out.push(["Amazonopensearchservice", protocol.put(input.AmazonopensearchserviceDestinationConfiguration!, [])])
+	}
+	if (input.SplunkDestinationConfiguration != null) {
+		out.push(["Splunk", protocol.put(input.SplunkDestinationConfiguration!, [])])
+	}
+	if (input.HttpEndpointDestinationConfiguration != null) {
+		out.push(["HttpEndpoint", protocol.put(input.HttpEndpointDestinationConfiguration!, [])])
+	}
+	if (input.AmazonOpenSearchServerlessDestinationConfiguration != null) {
+		out.push(["AmazonOpenSearchServerless",
+			protocol.put(input.AmazonOpenSearchServerlessDestinationConfiguration!, [])])
+	}
+	if (input.SnowflakeDestinationConfiguration != null) {
+		out.push(["Snowflake", protocol.put(input.SnowflakeDestinationConfiguration!, [])])
+	}
+	if (input.IcebergDestinationConfiguration != null) {
+		out.push(["Iceberg", protocol.put(input.IcebergDestinationConfiguration!, [])])
+	}
+	return out
+}
+
+/// The kind an UpdateDestination changes besides S3, its update's JSON named as a configuration's members.
+export function updated(input: api.UpdateDestinationInput): [string, string] | null {
+	let kind = ""
+	let json = ""
+	if (input.RedshiftDestinationUpdate != null) {
+		kind = "Redshift"
+		json = protocol.put(input.RedshiftDestinationUpdate!, [])
+	} else if (input.ElasticsearchDestinationUpdate != null) {
+		kind = "Elasticsearch"
+		json = protocol.put(input.ElasticsearchDestinationUpdate!, [])
+	} else if (input.AmazonopensearchserviceDestinationUpdate != null) {
+		kind = "Amazonopensearchservice"
+		json = protocol.put(input.AmazonopensearchserviceDestinationUpdate!, [])
+	} else if (input.SplunkDestinationUpdate != null) {
+		kind = "Splunk"
+		json = protocol.put(input.SplunkDestinationUpdate!, [])
+	} else if (input.HttpEndpointDestinationUpdate != null) {
+		kind = "HttpEndpoint"
+		json = protocol.put(input.HttpEndpointDestinationUpdate!, [])
+	} else if (input.AmazonOpenSearchServerlessDestinationUpdate != null) {
+		kind = "AmazonOpenSearchServerless"
+		json = protocol.put(input.AmazonOpenSearchServerlessDestinationUpdate!, [])
+	} else if (input.SnowflakeDestinationUpdate != null) {
+		kind = "Snowflake"
+		json = protocol.put(input.SnowflakeDestinationUpdate!, [])
+	} else if (input.IcebergDestinationUpdate != null) {
+		kind = "Iceberg"
+		json = protocol.put(input.IcebergDestinationUpdate!, [])
+	} else {
+		return null
+	}
+	return [kind, json]
+}
+
+/// The configuration's JSON config changed by the update's JSON given: its members replacing config's, those of its
+/// S3 updates merged into config's S3 configurations; of a destination of another kind, as given alone.
+export function merged(config: string, given: string, same: bool): string throws Fault {
+	const out: [string, string][] = if (same) object(config) else []
+	for (const [k0, v] of object(given)) {
+		const k = if (k0 == "S3Update") "S3Configuration"
+			else if (k0 == "S3BackupUpdate") "S3BackupConfiguration"
+			else k0
+		let at = -1
+		for (let i = 0; i < out.length; i++) {
+			if (out[i][0] == k) {
+				at = i
+			}
+		}
+		if (at < 0) {
+			out.push([k, v])
+		} else if (k == "S3Configuration" || k == "S3BackupConfiguration") {
+			out[at] = [k, merged(out[at][1], v, true)]
+		} else {
+			out[at] = [k, v]
+		}
+	}
+	return joined(out)
+}
+
+export function describe(r: api.DestinationDescription, kind: string, config: string,
+	s3: (c: api.S3DestinationConfiguration) => api.S3DestinationDescription) throws Fault {
+	const out: [string, string][] = []
+	for (const [k, v] of object(config)) {
+		if (k == "S3Configuration" || k == "S3BackupConfiguration") {
+			const name = if (k == "S3Configuration") "S3DestinationDescription" else "S3BackupDescription"
+			out.push([name, protocol.put(s3(protocol.decode[api.S3DestinationConfiguration](v)), [])])
+		} else if (k == "VpcConfiguration") {
+			const members = object(v)
+			members.push(["VpcId", quoted("")])
+			out.push(["VpcConfigurationDescription", joined(members)])
+		} else if (k != "Password" && k != "PrivateKey" && k != "KeyPassphrase") {
+			out.push([k, v])
+		}
+	}
+	const json = joined(out)
+	switch (kind) {
+		case "Redshift": r.RedshiftDestinationDescription = protocol.decode[api.RedshiftDestinationDescription](json)
+		case "Elasticsearch": r.ElasticsearchDestinationDescription = protocol.decode[api.ElasticsearchDestinationDescription](json)
+		case "Amazonopensearchservice": r.AmazonopensearchserviceDestinationDescription = protocol.decode[api.AmazonopensearchserviceDestinationDescription](json)
+		case "Splunk": r.SplunkDestinationDescription = protocol.decode[api.SplunkDestinationDescription](json)
+		case "HttpEndpoint": r.HttpEndpointDestinationDescription = protocol.decode[api.HttpEndpointDestinationDescription](json)
+		case "AmazonOpenSearchServerless": r.AmazonOpenSearchServerlessDestinationDescription = protocol.decode[api.AmazonOpenSearchServerlessDestinationDescription](json)
+		case "Snowflake": r.SnowflakeDestinationDescription = protocol.decode[api.SnowflakeDestinationDescription](json)
+		default: r.IcebergDestinationDescription = protocol.decode[api.IcebergDestinationDescription](json)
+	}
+}
+
+export function source(kind: string, config: string, started: i64): api.SourceDescription throws Fault {
+	const r = new api.SourceDescription()
+	if (kind == "MSKAsSource") {
+		const m = protocol.decode[api.MSKSourceDescription](config)
+		m.DeliveryStartTimestamp = started
+		r.MSKSourceDescription = m
+	} else {
+		r.DatabaseSourceDescription = protocol.decode[api.DatabaseSourceDescription](config)
+	}
+	return r
+}
+
+export function member(json: string, name: string): string | null throws Fault {
+	for (const [k, v] of object(json)) {
+		if (k == name) {
+			return protocol.decode[string](v)
+		}
+	}
+	return null
+}
+
+function joined(members: [string, string][]): string {
+	return `{${members.map(m => `${quoted(m[0])}:${m[1]}`).join(",")}}`
+}
+
+/// The members of the object s, each value as its text.
+function object(s: string): [string, string][] throws Fault {
+	return protocol.object(s, "").map(e => [e[0], e[1].text])
+}

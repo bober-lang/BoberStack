@@ -1,0 +1,149 @@
+import { sign } from "../../core/auth/sigv4"
+import { request } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import * as iamApi from "../iam/api"
+import { Catalog } from "../iam/catalog"
+import * as iam from "../iam/iam"
+import * as api from "./api"
+import { Handler } from "./firehose"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+/// A gateway of Firehose and IAM, with the role r, which Firehose may assume, and u, which it may not.
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	const catalog = new Catalog("")
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(new iam.Handler(catalog), caller, req))
+	for (const [name, service] of [["r", "firehose.amazonaws.com"], ["u", "logs.amazonaws.com"]]) {
+		const trust = escape(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":`
+			+ `{"Service":"${service}"},"Action":"sts:AssumeRole"}]}`, "component")
+		assert g.handle(request("iam", "test", "test",
+			`Action=CreateRole&Version=2010-05-08&RoleName=${name}&AssumeRolePolicyDocument=${trust}`)).status == 200
+	}
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `Firehose_20150804.${op}`)
+	sign(req, body, "firehose", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function has(res: Response, text: string): bool { return indexOf(res.body.whole ?? "", text) >= 0 }
+
+function fails(res: Response, code: string, message: string): bool {
+	return res.status == 400 && has(res, `"__type":"${code}"`) && has(res, `"message":"${message}"`)
+}
+
+const destination = `"S3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+	+ `"RoleARN":"arn:aws:iam::000000000000:role/r"}`
+
+test "a delivery stream is ACTIVE at once, described as both an S3 and an extended S3 destination" {
+	const g = gateway()
+	const res = call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`)
+	assert res.status == 200
+		&& has(res, `"DeliveryStreamARN":"arn:aws:firehose:us-east-1:000000000000:deliverystream/s"`)
+	assert fails(call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`), "ResourceInUseException",
+		"Firehose s under accountId 000000000000 already exists")
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"s"}`)
+	assert has(d, `"DeliveryStreamStatus":"ACTIVE"`) && has(d, `"VersionId":"1"`)
+		&& has(d, `"DestinationId":"destinationId-000000000001"`) && has(d, `"ExtendedS3DestinationDescription":{`)
+		&& has(d, `"BufferingHints":{"SizeInMBs":5,"IntervalInSeconds":300}`)
+		&& has(d, `"EncryptionConfiguration":{"NoEncryptionConfig":"NoEncryption"}`)
+		&& has(d, `"DeliveryStreamEncryptionConfiguration":{"Status":"DISABLED"}`)
+	assert fails(call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"x"}`), "ResourceNotFoundException",
+		"Firehose x under account 000000000000 not found.")
+	assert has(call(g, "ListDeliveryStreams", "{}"), `"DeliveryStreamNames":["s"],"HasMoreDeliveryStreams":false`)
+	g.close()
+}
+
+test "UpdateDestination needs the current version, and takes the next" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`).status == 200
+	const update = (v: string) => call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"s",`
+		+ `"CurrentDeliveryStreamVersionId":"${v}","DestinationId":"destinationId-000000000001",`
+		+ `"S3DestinationUpdate":{"Prefix":"p/"}}`)
+	assert fails(update("2"), "ConcurrentModificationException",
+		"Cannot update firehose: s since the current version id: 1 and specified version id: 2 do not match")
+	assert update("1").status == 200
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"s"}`)
+	assert has(d, `"VersionId":"2"`) && has(d, `"Prefix":"p/"`) && has(d, `"LastUpdateTimestamp":`)
+	g.close()
+}
+
+test "a role that does not trust Firehose, or is not there, is refused when a stream is made or updated" {
+	const g = gateway()
+	const of = (role: string) => `"S3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/${role}"}`
+	for (const role of ["u", "none"]) {
+		assert fails(call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${of(role)}}`),
+			"InvalidArgumentException",
+			`Firehose is unable to assume role arn:aws:iam::000000000000:role/${role}. Please check the role provided.`)
+	}
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${of("r")}}`).status == 200
+	assert fails(call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"s","CurrentDeliveryStreamVersionId":"1","DestinationId":"destinationId-000000000001",`
+		+ `"S3DestinationUpdate":{"RoleARN":"arn:aws:iam::000000000000:role/u"}}`), "InvalidArgumentException",
+		"Firehose is unable to assume role arn:aws:iam::000000000000:role/u. Please check the role provided.")
+	g.close()
+}
+
+test "tags, encryption, and a Kinesis-sourced stream refusing records" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`).status == 200
+	assert call(g, "TagDeliveryStream", `{"DeliveryStreamName":"s","Tags":[{"Key":"a","Value":"1"}]}`).status == 200
+	assert has(call(g, "ListTagsForDeliveryStream", `{"DeliveryStreamName":"s"}`),
+		`"Tags":[{"Key":"a","Value":"1"}],"HasMoreTags":false`)
+	assert call(g, "UntagDeliveryStream", `{"DeliveryStreamName":"s","TagKeys":["a"]}`).status == 200
+	assert call(g, "StartDeliveryStreamEncryption", `{"DeliveryStreamName":"s"}`).status == 200
+	assert has(call(g, "PutRecord", `{"DeliveryStreamName":"s","Record":{"Data":"YQ=="}}`), `"Encrypted":true`)
+	assert call(g, "StopDeliveryStreamEncryption", `{"DeliveryStreamName":"s"}`).status == 200
+	assert call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"k","DeliveryStreamType":"KinesisStreamAsSource",`
+		+ `"KinesisStreamSourceConfiguration":{"KinesisStreamARN":"arn:aws:kinesis:us-east-1:000000000000:stream/s",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r"},${destination}}`).status == 200
+	assert fails(call(g, "PutRecord", `{"DeliveryStreamName":"k","Record":{"Data":"YQ=="}}`),
+		"InvalidArgumentException", "This operation is not permitted on KinesisStreamAsSource delivery stream type.")
+	assert call(g, "DeleteDeliveryStream", `{"DeliveryStreamName":"k"}`).status == 200
+	assert has(call(g, "ListDeliveryStreams", "{}"), `"DeliveryStreamNames":["s"]`)
+	g.close()
+}
+
+test "an HTTP endpoint destination is stored, updated and described as AWS shapes it, its access key left out" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"h","HttpEndpointDestinationConfiguration":{`
+		+ `"EndpointConfiguration":{"Url":"https://example.com/","AccessKey":"secret"},`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r","S3Configuration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r"}}}`).status == 200
+	assert call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"h","CurrentDeliveryStreamVersionId":"1",`
+		+ `"DestinationId":"destinationId-000000000001","HttpEndpointDestinationUpdate":{"S3Update":{"Prefix":"u/"}}}`).status
+		== 200
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"h"}`)
+	assert has(d, `"HttpEndpointDestinationDescription":{`) && has(d, `"Url":"https://example.com/"`)
+		&& !has(d, "secret") && has(d, `"BucketARN":"arn:aws:s3:::b"`) && has(d, `"Prefix":"u/"`)
+	g.close()
+}
+
+test "a prefix's expressions need an error output prefix with the error output's type" {
+	const g = gateway()
+	const create = (prefixes: string) => call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"p",` + `"ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r",${prefixes}}}`)
+	assert fails(create(`"Prefix":"!{timestamp:yyyy}/"`), "InvalidArgumentException",
+		"ErrorOutputPrefix cannot be null when expressions are used in Prefix.")
+	assert fails(create(`"Prefix":"!{nope}/","ErrorOutputPrefix":"e/"`), "InvalidArgumentException",
+		"The expression '!{nope}' is not valid.")
+	assert fails(create(`"Prefix":"!{timestamp:yyyy}/","ErrorOutputPrefix":"!{timestamp:yyyy}/"`),
+		"InvalidArgumentException",
+		"ErrorOutputPrefix must contain the '!{firehose:error-output-type}' expression when expressions are used.")
+	assert create(`"Prefix":"!{timestamp:yyyy}/","ErrorOutputPrefix":"!{firehose:error-output-type}/"`).status == 200
+	g.close()
+}
