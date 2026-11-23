@@ -40,6 +40,63 @@ export class Group {
 	created: i64 = 0
 }
 
+/// An instance profile, the container of a role that EC2 passes to an instance.
+export class Profile {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	/// The name of its role, "" if none; it holds one at most.
+	role = ""
+	/// In the order of their keys, which, unlike a user's, differ by case alone.
+	tags: [string, string][] = []
+}
+
+/// An OpenID Connect identity provider, which the roles that trust it let its users assume.
+export class Oidc {
+	/// Its URL, without https://, which its ARN ends with.
+	url = ""
+	/// In the order given, sorted, then those added.
+	clients: string[] = []
+	/// Lower-cased.
+	thumbprints: string[] = []
+	/// To the millisecond.
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+/// A SAML identity provider.
+export class Saml {
+	name = ""
+	id = ""
+	metadata = ""
+	/// To the millisecond.
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+/// What an account has of its own: its alias, and the policy its users' passwords keep to.
+export class Account {
+	/// "" if none.
+	alias = ""
+	passwords: Passwords | null = null
+}
+
+/// A password policy.
+export class Passwords {
+	length: i32 = 6
+	symbols = false
+	numbers = false
+	upper = false
+	lower = false
+	change = false
+	/// In days; null if passwords do not expire.
+	age: i32 | null = null
+	/// Of the passwords last used, how many a new one may not repeat; null for none.
+	reuse: i32 | null = null
+	hardExpiry: bool | null = null
+}
+
 /// A user's membership of a group.
 export class Member {
 	/// The user's name, and the group's.
@@ -126,6 +183,12 @@ export class Tables {
 	members: Table[Member]
 	groupAttached: Table[Attachment]
 	groupInline: Table[Inline]
+	profiles: Table[Profile]
+	/// By the URL, as its ARN names it.
+	oidc: Table[Oidc]
+	saml: Table[Saml]
+	/// By "".
+	account: Table[Account]
 	/// By "".
 	serial: Table[Serial]
 
@@ -144,6 +207,10 @@ export class Tables {
 		this.members = new Table[Member](s, "iam/members")
 		this.groupAttached = new Table[Attachment](s, "iam/group-attached")
 		this.groupInline = new Table[Inline](s, "iam/group-inline")
+		this.profiles = new Table[Profile](s, "iam/profiles")
+		this.oidc = new Table[Oidc](s, "iam/oidc")
+		this.saml = new Table[Saml](s, "iam/saml")
+		this.account = new Table[Account](s, "iam/account")
 		this.serial = new Table[Serial](s, "iam/serial")
 	}
 

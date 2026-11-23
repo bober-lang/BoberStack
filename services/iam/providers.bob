@@ -1,0 +1,307 @@
+//! IAM's identity providers, of OpenID Connect and of SAML, whose users assume the roles that trust them. The
+//! operations of the Handler of ./iam that it mixes in.
+
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { keys, named, sorted, tagging, tagPage, tagsOf } from "./common"
+import { arn, key, Oidc, Saml, save, Tables } from "./records"
+import { indexOf, lastIndexOf, sort, startsWith } from "std/algo"
+import { isAlphanumeric } from "std/ascii"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import * as xml from "std/encoding/xml"
+import { lower, ParseError } from "std/string"
+import { millisecond } from "std/time"
+
+/// The operations on identity providers.
+export class Providers {
+	createOpenIDConnectProvider(caller: Caller,
+		input: api.CreateOpenIDConnectProviderRequest): api.CreateOpenIDConnectProviderResponse throws Fault {
+		tagging(caller, input.Tags)
+		keys(input.Tags)
+		if (!startsWith(input.Url, "https://") || input.Url.length == 8) {
+			throw new Fault(400, "InvalidInput", "")
+		}
+		const url = input.Url.slice(8, input.Url.length)
+		const a = arn(caller.account, "oidc-provider", "/", url)
+		caller.allow(a)
+		const db = new Tables(caller.store())
+		if (db.oidc.get(url) != null) {
+			throw api.entityAlreadyExistsException(`An OIDC provider with the URL ${input.Url} already exists. Review the `
+				+ "existing providers and resolve the duplicate before trying again.")
+		}
+		const p = new Oidc()
+		p.url = url
+		p.clients = clients([], input.ClientIDList ?? [])
+		sort(p.clients)
+		p.thumbprints = thumbprints(input.ThumbprintList ?? [])
+		p.created = instant()
+		p.tags = sorted([], input.Tags ?? [], "OpenIDConnectProvider")
+		save(db.oidc, url, p)
+		const r = new api.CreateOpenIDConnectProviderResponse()
+		r.OpenIDConnectProviderArn = a
+		r.Tags = tagsOf(p.tags)
+		return r
+	}
+
+	getOpenIDConnectProvider(caller: Caller,
+		input: api.GetOpenIDConnectProviderRequest): api.GetOpenIDConnectProviderResponse throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn)
+		const r = new api.GetOpenIDConnectProviderResponse()
+		r.Url = p.url
+		r.ClientIDList = p.clients
+		r.ThumbprintList = p.thumbprints
+		r.CreateDate = p.created
+		r.Tags = p.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return r
+	}
+
+	/// In the order of their URLs.
+	listOpenIDConnectProviders(caller: Caller,
+		input: api.ListOpenIDConnectProvidersRequest): api.ListOpenIDConnectProvidersResponse throws Fault {
+		caller.allow("*")
+		const r = new api.ListOpenIDConnectProvidersResponse()
+		r.OpenIDConnectProviderList = new Tables(caller.store()).oidc.scan(null, 2147483647).map(e => ({ ...new api.OpenIDConnectProviderListEntry(),
+			Arn: arn(caller.account, "oidc-provider", "/", e[1].url) }))
+		return r
+	}
+
+	deleteOpenIDConnectProvider(caller: Caller, input: api.DeleteOpenIDConnectProviderRequest): Unit throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn)
+		new Tables(caller.store()).oidc.delete(p.url)
+		return new Unit()
+	}
+
+	/// Of a client id it has, nothing.
+	addClientIDToOpenIDConnectProvider(caller: Caller,
+		input: api.AddClientIDToOpenIDConnectProviderRequest): Unit throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn)
+		p.clients = clients(p.clients, [input.ClientID])
+		save(new Tables(caller.store()).oidc, p.url, p)
+		return new Unit()
+	}
+
+	/// Of a client id it does not have, nothing.
+	removeClientIDFromOpenIDConnectProvider(caller: Caller,
+		input: api.RemoveClientIDFromOpenIDConnectProviderRequest): Unit throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn)
+		p.clients = p.clients.filter(c => c != input.ClientID)
+		save(new Tables(caller.store()).oidc, p.url, p)
+		return new Unit()
+	}
+
+	updateOpenIDConnectProviderThumbprint(caller: Caller,
+		input: api.UpdateOpenIDConnectProviderThumbprintRequest): Unit throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn)
+		p.thumbprints = thumbprints(input.ThumbprintList)
+		save(new Tables(caller.store()).oidc, p.url, p)
+		return new Unit()
+	}
+
+	tagOpenIDConnectProvider(caller: Caller, input: api.TagOpenIDConnectProviderRequest): Unit throws Fault {
+		keys(input.Tags)
+		const p = oidc(caller, input.OpenIDConnectProviderArn, tagged)
+		p.tags = sorted(p.tags, input.Tags, "OpenIDConnectProvider")
+		save(new Tables(caller.store()).oidc, p.url, p)
+		return new Unit()
+	}
+
+	untagOpenIDConnectProvider(caller: Caller, input: api.UntagOpenIDConnectProviderRequest): Unit throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn, tagged)
+		p.tags = p.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(new Tables(caller.store()).oidc, p.url, p)
+		return new Unit()
+	}
+
+	listOpenIDConnectProviderTags(caller: Caller,
+		input: api.ListOpenIDConnectProviderTagsRequest): api.ListOpenIDConnectProviderTagsResponse throws Fault {
+		const p = oidc(caller, input.OpenIDConnectProviderArn, tagged)
+		const [tags, next] = tagPage(p.tags, input.Marker, input.MaxItems)
+		const r = new api.ListOpenIDConnectProviderTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	createSAMLProvider(caller: Caller,
+		input: api.CreateSAMLProviderRequest): api.CreateSAMLProviderResponse throws Fault {
+		tagging(caller, input.Tags)
+		keys(input.Tags)
+		const name = samlName(input.Name)
+		const a = arn(caller.account, "saml-provider", "/", name)
+		caller.allow(a)
+		const db = new Tables(caller.store())
+		if (db.saml.get(key(name)) != null) {
+			throw api.entityAlreadyExistsException(`SAMLProvider ${name} already exists.`)
+		}
+		const p = new Saml()
+		p.name = name
+		p.id = uuid()
+		p.metadata = metadata(input.SAMLMetadataDocument)
+		p.created = instant()
+		p.tags = sorted([], input.Tags ?? [], "SAMLProvider")
+		save(db.saml, key(name), p)
+		const r = new api.CreateSAMLProviderResponse()
+		r.SAMLProviderArn = a
+		r.Tags = tagsOf(p.tags)
+		return r
+	}
+
+	getSAMLProvider(caller: Caller, input: api.GetSAMLProviderRequest): api.GetSAMLProviderResponse throws Fault {
+		const p = saml(caller, input.SAMLProviderArn)
+		const r = new api.GetSAMLProviderResponse()
+		r.SAMLProviderUUID = p.id
+		r.SAMLMetadataDocument = p.metadata
+		r.CreateDate = p.created
+		r.Tags = tagsOf(p.tags)
+		return r
+	}
+
+	/// In the order of their names.
+	listSAMLProviders(caller: Caller, input: api.ListSAMLProvidersRequest): api.ListSAMLProvidersResponse throws Fault {
+		caller.allow("*")
+		const r = new api.ListSAMLProvidersResponse()
+		r.SAMLProviderList = new Tables(caller.store()).saml.scan(null, 2147483647).map(e => ({ ...new api.SAMLProviderListEntry(),
+			Arn: arn(caller.account, "saml-provider", "/", e[1].name), CreateDate: e[1].created }))
+		return r
+	}
+
+	updateSAMLProvider(caller: Caller,
+		input: api.UpdateSAMLProviderRequest): api.UpdateSAMLProviderResponse throws Fault {
+		const p = saml(caller, input.SAMLProviderArn)
+		if (input.SAMLMetadataDocument != null) {
+			p.metadata = metadata(input.SAMLMetadataDocument!)
+		}
+		save(new Tables(caller.store()).saml, key(p.name), p)
+		const r = new api.UpdateSAMLProviderResponse()
+		r.SAMLProviderArn = input.SAMLProviderArn
+		return r
+	}
+
+	deleteSAMLProvider(caller: Caller, input: api.DeleteSAMLProviderRequest): Unit throws Fault {
+		const p = saml(caller, input.SAMLProviderArn)
+		new Tables(caller.store()).saml.delete(key(p.name))
+		return new Unit()
+	}
+
+	tagSAMLProvider(caller: Caller, input: api.TagSAMLProviderRequest): Unit throws Fault {
+		keys(input.Tags)
+		const p = saml(caller, input.SAMLProviderArn)
+		p.tags = sorted(p.tags, input.Tags, "SAMLProvider")
+		save(new Tables(caller.store()).saml, key(p.name), p)
+		return new Unit()
+	}
+
+	untagSAMLProvider(caller: Caller, input: api.UntagSAMLProviderRequest): Unit throws Fault {
+		const p = saml(caller, input.SAMLProviderArn)
+		p.tags = p.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(new Tables(caller.store()).saml, key(p.name), p)
+		return new Unit()
+	}
+
+	listSAMLProviderTags(caller: Caller,
+		input: api.ListSAMLProviderTagsRequest): api.ListSAMLProviderTagsResponse throws Fault {
+		const [tags, next] = tagPage(saml(caller, input.SAMLProviderArn).tags, input.Marker, input.MaxItems)
+		const r = new api.ListSAMLProviderTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+}
+
+/// How IAM words an OpenID Connect provider of ARN a that does not exist: most operations so.
+function missing(a: string): Fault { return api.noSuchEntityException(`OpenIDConnect Provider not found for arn ${a}`) }
+/// And those of its tags so.
+function tagged(a: string): Fault { return api.noSuchEntityException(`OpenId connect Provider ${a} cannot be found.`) }
+
+/// The OpenID Connect provider of ARN a, of the caller's account, once the caller may perform the operation on it; if
+/// there is none, the fault absent makes of a.
+function oidc(caller: Caller, a: string, absent: (a: string) => Fault = missing): Oidc throws Fault {
+	caller.allow(a)
+	const at = arn(caller.account, "oidc-provider", "/", "")
+	const p = if (startsWith(a, at)) new Tables(caller.store()).oidc.get(a.slice(at.length, a.length)) else null
+	if (p == null) {
+		throw absent(a)
+	}
+	return p
+}
+
+/// The SAML provider of ARN a, of the caller's account, once the caller may perform the operation on it.
+function saml(caller: Caller, a: string): Saml throws Fault {
+	caller.allow(a)
+	const at = arn(caller.account, "saml-provider", "/", "")
+	const p = if (startsWith(a, at)) new Tables(caller.store()).saml.get(key(a.slice(at.length, a.length))) else null
+	if (p == null) {
+		throw api.noSuchEntityException(`SAMLProvider ${a} does not exist.`)
+	}
+	return p
+}
+
+/// have with each of given it does not have after them.
+function clients(have: string[], given: string[]): string[] {
+	const out = have.slice(0, have.length)
+	for (const c of given) {
+		if (!out.includes(c)) {
+			out.push(c)
+		}
+	}
+	return out
+}
+
+/// given, lower-cased, if each is a thumbprint: of 40 characters, which IAM does not check are hex digits.
+function thumbprints(given: string[]): string[] throws Fault {
+	if (given.some(t => t.length != 40)) {
+		throw new Fault(400, api.validation.code,
+			"1 validation error detected: Value at 'thumbprintList' failed to "
+			+ "satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 40, "
+			+ "Member must have length greater than or equal to 40]")
+	}
+	return given.map(lower)
+}
+
+/// The time now, to the millisecond, as the dates of identity providers are.
+function instant(): i64 {
+	const t = now()
+	return t - t % millisecond
+}
+
+/// name, if it is the name of a SAML provider, as IAM checks one.
+function samlName(name: string): string throws Fault {
+	if (name.length < 1 || !name.every(c => isAlphanumeric(c) || indexOf("._-", chr(c)) >= 0)) {
+		throw new Fault(400, api.validation.code,
+			"1 validation error detected: Value at 'name' failed to satisfy "
+			+ "constraint: Member must satisfy regular expression pattern: [\\w._-]+")
+	}
+	return named(name, "name", 128)
+}
+
+/// d, if it is a SAML metadata document: XML, of an EntityDescriptor that describes an identity provider.
+function metadata(d: string): string throws Fault {
+	let root: xml.Node | null = null
+	try {
+		root = xml.parse(d)
+	} catch (e: ParseError) {}
+	const top = root?.children?.find(n => n.kind == "element")
+	if (top == null || local(top!.name) != "EntityDescriptor"
+		|| top!.elements().every(e => local(e.name) != "IDPSSODescriptor")) {
+		throw api.invalidInputException("Could not parse metadata")
+	}
+	return d
+}
+
+/// The name of an element, as written, without its prefix.
+function local(name: string): string { return name.slice(lastIndexOf(name, ":") + 1, name.length) }
+
+/// A random UUID, as a SAML provider's.
+function uuid(): string throws Fault {
+	let h = ""
+	try {
+		h = hex.encode(bytes(16))
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}

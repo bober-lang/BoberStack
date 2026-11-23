@@ -1,0 +1,847 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"RoleId",
+		"InstanceProfileId"
+	],
+	"steps": [
+		{
+			"name": "create a profile of a bad name",
+			"service": "iam",
+			"query": {
+				"Action": "CreateInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "bad name"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'instanceProfileName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]+</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create a profile of a bad path",
+			"service": "iam",
+			"query": {
+				"Action": "CreateInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-x",
+				"Path": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>The specified value for path is invalid. It must begin and end with / and contain only alphanumeric characters and/or / characters.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get a missing profile",
+			"service": "iam",
+			"query": {
+				"Action": "GetInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete a missing profile",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create",
+			"service": "iam",
+			"query": {
+				"Action": "CreateInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"Path": "/${prefix}/",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateInstanceProfileResult>\n    <InstanceProfile>\n      <Path>/boberstack-ab-00000000/</Path>\n      <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n      <Roles/>\n      <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n      <InstanceProfileId>x</InstanceProfileId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </InstanceProfile>\n  </CreateInstanceProfileResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "create it again",
+			"service": "iam",
+			"query": {
+				"Action": "CreateInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-P"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>Instance Profile boberstack-ab-00000000-P already exists.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create a second",
+			"service": "iam",
+			"query": {
+				"Action": "CreateInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q",
+				"Path": "/${prefix}/"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateInstanceProfileResult>\n    <InstanceProfile>\n      <Path>/boberstack-ab-00000000/</Path>\n      <InstanceProfileName>boberstack-ab-00000000-q</InstanceProfileName>\n      <Roles/>\n      <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-q</Arn>\n      <InstanceProfileId>x</InstanceProfileId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </InstanceProfile>\n  </CreateInstanceProfileResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "get",
+			"service": "iam",
+			"query": {
+				"Action": "GetInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-P"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetInstanceProfileResult>\n    <InstanceProfile>\n      <Path>/boberstack-ab-00000000/</Path>\n      <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n      <Roles/>\n      <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n      <InstanceProfileId>x</InstanceProfileId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </InstanceProfile>\n  </GetInstanceProfileResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "list the path's",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfiles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n        <Roles/>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-q</InstanceProfileName>\n        <Roles/>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-q</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </InstanceProfiles>\n  </ListInstanceProfilesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesResponse>\n"
+			}
+		},
+		{
+			"name": "list a page of the path's",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfiles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"marker": "Marker"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesResult>\n    <IsTruncated>true</IsTruncated>\n    <Marker>${marker}</Marker>\n    <InstanceProfiles>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n        <Roles/>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </InstanceProfiles>\n  </ListInstanceProfilesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesResponse>\n"
+			}
+		},
+		{
+			"name": "list the next page",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfiles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1",
+				"Marker": "${marker}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-q</InstanceProfileName>\n        <Roles/>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-q</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </InstanceProfiles>\n  </ListInstanceProfilesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesResponse>\n"
+			}
+		},
+		{
+			"name": "create a role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"Path": "/${prefix}/",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/boberstack-ab-00000000/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "create a second role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-role2</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role2</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "add a role to a missing profile",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "add a missing role",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list a role's before",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfilesForRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesForRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesForRoleResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles/>\n  </ListInstanceProfilesForRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesForRoleResponse>\n"
+			}
+		},
+		{
+			"name": "add the role",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-ROLE"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AddRoleToInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AddRoleToInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "add it again",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>LimitExceeded</Code>\n    <Message>Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "add a second role",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>LimitExceeded</Code>\n    <Message>Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "add the role to the second",
+			"service": "iam",
+			"query": {
+				"Action": "AddRoleToInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AddRoleToInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AddRoleToInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "get it with its role",
+			"service": "iam",
+			"query": {
+				"Action": "GetInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetInstanceProfileResult>\n    <InstanceProfile>\n      <Path>/boberstack-ab-00000000/</Path>\n      <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n      <Roles>\n        <member>\n          <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n          <RoleId>x</RoleId>\n          <Path>/boberstack-ab-00000000/</Path>\n          <RoleName>boberstack-ab-00000000-role</RoleName>\n          <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n          <CreateDate>x-x-x:x:x</CreateDate>\n        </member>\n      </Roles>\n      <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n      <InstanceProfileId>x</InstanceProfileId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </InstanceProfile>\n  </GetInstanceProfileResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "list the path's with roles",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfiles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n        <Roles>\n          <member>\n            <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n            <RoleId>x</RoleId>\n            <Path>/boberstack-ab-00000000/</Path>\n            <RoleName>boberstack-ab-00000000-role</RoleName>\n            <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n            <CreateDate>x-x-x:x:x</CreateDate>\n          </member>\n        </Roles>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-q</InstanceProfileName>\n        <Roles>\n          <member>\n            <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n            <RoleId>x</RoleId>\n            <Path>/boberstack-ab-00000000/</Path>\n            <RoleName>boberstack-ab-00000000-role</RoleName>\n            <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n            <CreateDate>x-x-x:x:x</CreateDate>\n          </member>\n        </Roles>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-q</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </InstanceProfiles>\n  </ListInstanceProfilesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesResponse>\n"
+			}
+		},
+		{
+			"name": "list the role's",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfilesForRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-Role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesForRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesForRoleResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-p</InstanceProfileName>\n        <Roles>\n          <member>\n            <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n            <RoleId>x</RoleId>\n            <Path>/boberstack-ab-00000000/</Path>\n            <RoleName>boberstack-ab-00000000-role</RoleName>\n            <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n            <CreateDate>x-x-x:x:x</CreateDate>\n          </member>\n        </Roles>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-p</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <InstanceProfileName>boberstack-ab-00000000-q</InstanceProfileName>\n        <Roles>\n          <member>\n            <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n            <RoleId>x</RoleId>\n            <Path>/boberstack-ab-00000000/</Path>\n            <RoleName>boberstack-ab-00000000-role</RoleName>\n            <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n            <CreateDate>x-x-x:x:x</CreateDate>\n          </member>\n        </Roles>\n        <Arn>arn:aws:iam::000000000000:instance-profile/boberstack-ab-00000000/boberstack-ab-00000000-q</Arn>\n        <InstanceProfileId>x</InstanceProfileId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </InstanceProfiles>\n  </ListInstanceProfilesForRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesForRoleResponse>\n"
+			}
+		},
+		{
+			"name": "list a missing role's",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfilesForRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get the role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/boberstack-ab-00000000/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role in profiles",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must remove roles from instance profile first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete a profile with a role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must remove roles from instance profile first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "tag",
+			"service": "iam",
+			"query": {
+				"Action": "TagInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"Tags.member.1.Key": "k1",
+				"Tags.member.1.Value": "v1",
+				"Tags.member.2.Key": "K0",
+				"Tags.member.2.Value": "v2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "list the tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfileTags",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfileTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfileTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v2</Value>\n        <Key>K0</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>k1</Key>\n      </member>\n    </Tags>\n  </ListInstanceProfileTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfileTagsResponse>\n"
+			}
+		},
+		{
+			"name": "untag",
+			"service": "iam",
+			"query": {
+				"Action": "UntagInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"TagKeys.member.1": "k0",
+				"TagKeys.member.2": "none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "list the tags left",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfileTags",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfileTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfileTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v2</Value>\n        <Key>K0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>k1</Key>\n      </member>\n    </Tags>\n  </ListInstanceProfileTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfileTagsResponse>\n"
+			}
+		},
+		{
+			"name": "tag a missing profile",
+			"service": "iam",
+			"query": {
+				"Action": "TagInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none",
+				"Tags.member.1.Key": "k1",
+				"Tags.member.1.Value": "v1"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list a missing profile's tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfileTags",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "remove a role not in it",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Role boberstack-ab-00000000-role2 in Instance Profile boberstack-ab-00000000-p cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "remove a missing role",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "remove from a missing profile",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-none",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "remove the role",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-P",
+				"RoleName": "${prefix}-Role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<RemoveRoleFromInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</RemoveRoleFromInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "remove it from the second",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<RemoveRoleFromInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</RemoveRoleFromInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "list the role's after",
+			"service": "iam",
+			"query": {
+				"Action": "ListInstanceProfilesForRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListInstanceProfilesForRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListInstanceProfilesForRoleResult>\n    <IsTruncated>false</IsTruncated>\n    <InstanceProfiles/>\n  </ListInstanceProfilesForRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListInstanceProfilesForRoleResponse>\n"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-P"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "get the deleted",
+			"service": "iam",
+			"query": {
+				"Action": "GetInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-p cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the second",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteInstanceProfileResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteInstanceProfileResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "delete the second role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the role in the profile",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role in the second",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveRoleFromInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the profile",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-p"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-p cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the second",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteInstanceProfile",
+				"Version": "2010-05-08",
+				"InstanceProfileName": "${prefix}-q"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Instance Profile boberstack-ab-00000000-q cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the second role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role2 cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	]
+}

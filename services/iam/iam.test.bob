@@ -9,7 +9,7 @@ import { Handler } from "./iam"
 import { identify } from "./identities"
 import { indexOf } from "std/algo"
 import { Response } from "std/http"
-import { ParseError } from "std/string"
+import { ParseError, replace } from "std/string"
 import { escape } from "std/url"
 import { malloc } from "stdlib.h"
 import { memcpy } from "string.h"
@@ -304,6 +304,64 @@ test "groups: their members take their policies, and neither goes while the othe
 	call(g, "DeleteGroupPolicy", [["GroupName", "builders"], ["PolicyName", "own"]])
 	assert call(g, "DeleteGroup", [["GroupName", "builders"]]).status == 200
 	assert texts(call(g, "ListGroups"), "GroupName") == []
+	g.close()
+}
+
+test "the account: its summary counted from its state, its one alias" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "CreateInstanceProfile", [["InstanceProfileName", "p"]])
+	const summary = call(g, "GetAccountSummary")
+	const names = texts(summary, "key")
+	const values = texts(summary, "value")
+	assert names.length == 34 && values.length == 34
+	assert values[names.indexOf("Users")] == "1" && values[names.indexOf("Roles")] == "1"
+	assert values[names.indexOf("InstanceProfiles")] == "1" && values[names.indexOf("RolesQuota")] == "1000"
+	assert texts(call(g, "ListAccountAliases"), "member") == []
+	call(g, "CreateAccountAlias", [["AccountAlias", "first"]])
+	call(g, "CreateAccountAlias", [["AccountAlias", "second"]])
+	assert texts(call(g, "ListAccountAliases"), "member") == ["second"]
+	assert fails(call(g, "DeleteAccountAlias", [["AccountAlias", "first"]]), 404, "NoSuchEntity")
+	call(g, "DeleteAccountAlias", [["AccountAlias", "second"]])
+	assert texts(call(g, "ListAccountAliases"), "member") == []
+	g.close()
+}
+
+test "SAML providers: stored of a metadata document of an identity provider" {
+	const g = gateway()
+	const idp = `<?xml version="1.0"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" `
+		+ `entityID="https://idp.example.com/saml"><md:IDPSSODescriptor protocolSupportEnumeration="`
+		+ `urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="`
+		+ `urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/sso"/>`
+		+ `</md:IDPSSODescriptor></md:EntityDescriptor>`
+	let metadata = idp
+	while (metadata.length < 1000) {
+		metadata += " "
+	}
+	const sp = replace(metadata, "IDPSSODescriptor", "SPSSODescriptor") + "    "
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "bad name"], ["SAMLMetadataDocument", metadata]]), 400,
+		"ValidationError",
+		"1 validation error detected: Value at 'name' failed to satisfy constraint: Member must "
+		+ "satisfy regular expression pattern: [\\w._-]+")
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "idp"], ["SAMLMetadataDocument", sp]]), 400, "InvalidInput",
+		"Could not parse metadata")
+	const a = "arn:aws:iam::000000000000:saml-provider/idp"
+	assert text(call(g, "CreateSAMLProvider", [["Name", "idp"], ["SAMLMetadataDocument", metadata]]), "SAMLProviderArn")
+		== a
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "IDP"], ["SAMLMetadataDocument", metadata]]), 409,
+		"EntityAlreadyExists")
+	assert text(call(g, "GetSAMLProvider", [["SAMLProviderArn", a]]), "SAMLMetadataDocument") == metadata
+	assert texts(call(g, "ListSAMLProviders"), "Arn") == [a]
+	const tagging: [string, string][] = [["SAMLProviderArn", a]]
+	tagging.append(tags(2))
+	call(g, "TagSAMLProvider", tagging)
+	assert texts(call(g, "ListSAMLProviderTags", [["SAMLProviderArn", a]]), "Key") == ["k0", "k1"]
+	assert fails(call(g, "UpdateSAMLProvider", [["SAMLProviderArn", a], ["SAMLMetadataDocument", sp]]), 400,
+		"InvalidInput")
+	call(g, "DeleteSAMLProvider", [["SAMLProviderArn", a]])
+	assert fails(call(g, "GetSAMLProvider", [["SAMLProviderArn", a]]), 404, "NoSuchEntity",
+		`SAMLProvider ${a} does not exist.`)
 	g.close()
 }
 
@@ -685,7 +743,7 @@ test "a handler that fails after writing leaves no trace" {
 
 test "an operation not implemented" {
 	const g = gateway()
-	const res = call(g, "CreateInstanceProfile", [["InstanceProfileName", "p"]])
-	assert fails(res, 501, "NotImplemented", "The operation CreateInstanceProfile is not implemented")
+	const res = call(g, "CreateVirtualMFADevice", [["VirtualMFADeviceName", "m"]])
+	assert fails(res, 501, "NotImplemented", "The operation CreateVirtualMFADevice is not implemented")
 	g.close()
 }

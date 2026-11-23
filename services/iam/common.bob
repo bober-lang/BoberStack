@@ -420,7 +420,21 @@ export function tagged(tags: [string, string][], given: api.Tag[], kind: string)
 	return out
 }
 
-/// Throws unless the key of each of tags is one: of a letter, digit, space or _.:/=+-@ or more, as IAM checks them.
+/// tags with given set over them by key, of its case, of a resource of a kind, as InstanceProfile, which IAM lists in
+/// the order of their keys; at most 50.
+export function sorted(tags: [string, string][], given: api.Tag[], kind: string): [string, string][] throws Fault {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	for (const g of given) {
+		out.push([g.Key, g.Value])
+	}
+	if (out.length > 50) {
+		throw api.limitExceededException(`Cannot exceed quota for TagsPer${kind}: 50`)
+	}
+	sortBy(out, (a, b) => a[0] < b[0])
+	return out
+}
+
+/// Throws unless the key of each of tags is one:of a letter, digit, space or _.:/=+-@ or more, as IAM checks them.
 export function keys(tags: api.Tag[] | null) throws Fault {
 	const v = new Violations(api.validation)
 	const given = tags ?? []

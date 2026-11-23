@@ -14,14 +14,21 @@ import { accessKey, attach, attached, aws, bound, detach, document, embed, ident
 	tagPage, unknownVersion, user, userOf, uses, version, versionId, versionOf } from "./common"
 
 import { Groups } from "./groups"
+import { Profiles } from "./profiles"
+import { Providers } from "./providers"
+import { Accounts } from "./account"
 import { AccessKey, arn, key, number, Policy, Role, save, stamp, Tables, User, Version, within } from "./records"
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { lower } from "std/string"
 import { escape } from "std/url"
 
-/// The service, of the operations implemented: those of groups in ./groups.
+/// The service, of the operations implemented: those of groups in ./groups, of instance profiles in ./profiles, of
+/// identity providers in ./providers, of the account in ./account.
 export class Handler {
 	...Groups
+	...Profiles
+	...Providers
+	...Accounts
 	...api.Unimplemented
 
 	constructor(catalog: Catalog) { this.catalog = catalog }
@@ -300,6 +307,9 @@ export class Handler {
 		}
 		if (db.roleInline.scan(null, 1, within(k, "")).length > 0) {
 			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		if (db.profiles.scan(null, 2147483647).some(e => key(e[1].role) == k)) {
+			throw api.deleteConflictException("Cannot delete entity, must remove roles from instance profile first.")
 		}
 		bound(caller, db, this.catalog, db.roles.get(k)!.boundary, "")
 		db.roles.delete(k)
