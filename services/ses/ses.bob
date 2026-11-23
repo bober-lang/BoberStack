@@ -1,0 +1,768 @@
+//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, templates,
+//! configuration sets (classic only, without event destinations) and the messages sent.
+//!
+//! An identity is verified at once, as nobody can follow a verification mail's link: its verification and DKIM status
+//! are Success from its creation on. Nothing is sent anywhere: each message is stored, in its account's regional
+//! state, as LocalStack's /_aws/ses lists it (core/internal). The account has production access, so only the source is
+//! checked, by its address or its domain, never the recipients as AWS checks them in the sandbox. Where AWS differs
+//! further: a list answers every item at once, never a NextToken; a send of a template renders nothing, so a missing
+//! attribute is no rendering failure; TestRenderTemplate answers the subject and the parts, not a whole MIME message;
+//! the send statistics are empty; a request to v2 that fails before it is routed, as one badly signed, is answered
+//! as the classic API answers it.
+
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import * as v2 from "./v2/api"
+import { indexOf, lastIndexOf } from "std/algo"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import { ParseError, replace, split, trim, utf8 } from "std/string"
+import { day, millisecond, rfc3339, second } from "std/time"
+import { Request } from "std/http"
+import { Decodable } from "std/types"
+
+/// The table of the messages sent, in each account's regional tree, which ./internal reads.
+export const messages = "ses.messages"
+
+/// An identity: an address or a domain.
+class Identity {
+	name = ""
+	domain = false
+	created: i64 = 0
+	/// For a domain, its TXT record's value; and its DKIM tokens, none before DKIM is asked for by v1.
+	token = ""
+	dkim: string[] = []
+	tags: [string, string][] = []
+}
+
+class Template {
+	name = ""
+	subject: string | null = null
+	text: string | null = null
+	html: string | null = null
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+class ConfigurationSet {
+	name = ""
+	created: i64 = 0
+}
+
+/// A message's recipients, as given.
+class Recipients {
+	ToAddresses: string[] | null @json.OmitEmpty = null
+	CcAddresses: string[] | null @json.OmitEmpty = null
+	BccAddresses: string[] | null @json.OmitEmpty = null
+}
+
+class Parts {
+	text_part: string | null = null
+	html_part: string | null = null
+}
+
+/// A message sent, as LocalStack keeps one.
+class Sent {
+	Id = ""
+	Region = ""
+	Destination: Recipients | null @json.OmitEmpty = null
+	Source = ""
+	Subject: string | null @json.OmitEmpty = null
+	Body: Parts | null @json.OmitEmpty = null
+	RawData: string | null @json.OmitEmpty = null
+	Template: string | null @json.OmitEmpty = null
+	TemplateData: string | null @json.OmitEmpty = null
+	Timestamp = ""
+}
+
+/// SES's state in an account's regional tree.
+class Tables {
+	identities: Table[Identity]
+	templates: Table[Template]
+	sets: Table[ConfigurationSet]
+	sent: Table[Sent]
+
+	constructor(s: Store) {
+		this.identities = new Table[Identity](s, "ses.identities")
+		this.templates = new Table[Template](s, "ses.templates")
+		this.sets = new Table[ConfigurationSet](s, "ses.sets")
+		this.sent = new Table[Sent](s, messages)
+	}
+}
+
+/// The classic API, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	verifyEmailIdentity(caller: Caller,
+		input: api.VerifyEmailIdentityRequest): api.VerifyEmailIdentityResponse throws Fault {
+		verify(caller, input.EmailAddress, false)
+		return new api.VerifyEmailIdentityResponse()
+	}
+
+	verifyEmailAddress(caller: Caller, input: api.VerifyEmailAddressRequest): Unit throws Fault {
+		verify(caller, input.EmailAddress, false)
+		return new Unit()
+	}
+
+	verifyDomainIdentity(caller: Caller,
+		input: api.VerifyDomainIdentityRequest): api.VerifyDomainIdentityResponse throws Fault {
+		const r = new api.VerifyDomainIdentityResponse()
+		r.VerificationToken = verify(caller, input.Domain, true).token
+		return r
+	}
+
+	verifyDomainDkim(caller: Caller, input: api.VerifyDomainDkimRequest): api.VerifyDomainDkimResponse throws Fault {
+		const i = verify(caller, input.Domain, true)
+		if (i.dkim.length == 0) {
+			i.dkim = [token(16), token(16), token(16)]
+			save(new Tables(caller.regional()).identities, i.name, i)
+		}
+		const r = new api.VerifyDomainDkimResponse()
+		r.DkimTokens = i.dkim
+		return r
+	}
+
+	listIdentities(caller: Caller, input: api.ListIdentitiesRequest): api.ListIdentitiesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const domain = input.IdentityType == "Domain"
+		const r = new api.ListIdentitiesResponse()
+		r.Identities = identities(caller).filter(i => input.IdentityType == null || i.domain == domain).map(i => i.name)
+		return r
+	}
+
+	listVerifiedEmailAddresses(caller: Caller, input: Unit): api.ListVerifiedEmailAddressesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const r = new api.ListVerifiedEmailAddressesResponse()
+		r.VerifiedEmailAddresses = identities(caller).filter(i => !i.domain).map(i => i.name)
+		return r
+	}
+
+	getIdentityVerificationAttributes(caller: Caller, input: api.GetIdentityVerificationAttributesRequest): api.GetIdentityVerificationAttributesResponse throws Fault {
+		const r = new api.GetIdentityVerificationAttributesResponse()
+		const t = new Tables(caller.regional()).identities
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = t.get(n)
+			if (i != null) {
+				const a = new api.IdentityVerificationAttributes()
+				a.VerificationStatus = "Success"
+				a.VerificationToken = if (i.domain) i.token else null
+				r.VerificationAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	getIdentityDkimAttributes(caller: Caller,
+		input: api.GetIdentityDkimAttributesRequest): api.GetIdentityDkimAttributesResponse throws Fault {
+		const r = new api.GetIdentityDkimAttributesResponse()
+		const t = new Tables(caller.regional()).identities
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = t.get(n)
+			if (i != null) {
+				const a = new api.IdentityDkimAttributes()
+				a.DkimEnabled = i.dkim.length > 0
+				a.DkimVerificationStatus = if (i.dkim.length > 0) "Success" else "NotStarted"
+				a.DkimTokens = if (i.dkim.length > 0) i.dkim else null
+				r.DkimAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	deleteIdentity(caller: Caller, input: api.DeleteIdentityRequest): api.DeleteIdentityResponse throws Fault {
+		caller.allow(identityArn(caller, input.Identity))
+		new Tables(caller.regional()).identities.delete(input.Identity)
+		return new api.DeleteIdentityResponse()
+	}
+
+	sendEmail(caller: Caller, input: api.SendEmailRequest): api.SendEmailResponse throws Fault {
+		const s = sent(caller, input.Source, v1Recipients(input.Destination))
+		s.Subject = input.Message.Subject.Data
+		s.Body = parts(input.Message.Body.Text?.Data, input.Message.Body.Html?.Data)
+		const r = new api.SendEmailResponse()
+		r.MessageId = store(caller, s)
+		return r
+	}
+
+	sendRawEmail(caller: Caller, input: api.SendRawEmailRequest): api.SendRawEmailResponse throws Fault {
+		const data = input.RawMessage.Data
+		const source = input.Source ?? header(data, "From")
+		if (source == null) {
+			throw new Fault(400, "InvalidParameterValue", "Missing required header 'From'.")
+		}
+		const s = sent(caller, source!, null)
+		s.RawData = data
+		const r = new api.SendRawEmailResponse()
+		r.MessageId = store(caller, s)
+		return r
+	}
+
+	sendTemplatedEmail(caller: Caller,
+		input: api.SendTemplatedEmailRequest): api.SendTemplatedEmailResponse throws Fault {
+		templated(caller, input.Template)
+		const s = sent(caller, input.Source, v1Recipients(input.Destination))
+		s.Template = input.Template
+		s.TemplateData = input.TemplateData
+		const r = new api.SendTemplatedEmailResponse()
+		r.MessageId = store(caller, s)
+		return r
+	}
+
+	sendBulkTemplatedEmail(caller: Caller,
+		input: api.SendBulkTemplatedEmailRequest): api.SendBulkTemplatedEmailResponse throws Fault {
+		templated(caller, input.Template)
+		const r = new api.SendBulkTemplatedEmailResponse()
+		for (const d of input.Destinations) {
+			const s = sent(caller, input.Source, v1Recipients(d.Destination))
+			s.Template = input.Template
+			s.TemplateData = d.ReplacementTemplateData ?? input.DefaultTemplateData
+			const status = new api.BulkEmailDestinationStatus()
+			status.Status = "Success"
+			status.MessageId = store(caller, s)
+			r.Status.push(status)
+		}
+		return r
+	}
+
+	createTemplate(caller: Caller, input: api.CreateTemplateRequest): api.CreateTemplateResponse throws Fault {
+		const n = input.Template.TemplateName
+		caller.allow(templateArn(caller, n))
+		const t = new Tables(caller.regional()).templates
+		if (t.get(n) != null) {
+			throw api.alreadyExistsException(`Template ${n} already exists for account id ${caller.account}`)
+		}
+		save(t, n, fromV1(input.Template, now()))
+		return new api.CreateTemplateResponse()
+	}
+
+	updateTemplate(caller: Caller, input: api.UpdateTemplateRequest): api.UpdateTemplateResponse throws Fault {
+		const t = template(caller, input.Template.TemplateName)
+		save(new Tables(caller.regional()).templates, t.name, fromV1(input.Template, t.created))
+		return new api.UpdateTemplateResponse()
+	}
+
+	getTemplate(caller: Caller, input: api.GetTemplateRequest): api.GetTemplateResponse throws Fault {
+		const t = template(caller, input.TemplateName)
+		const r = new api.GetTemplateResponse()
+		r.Template = { ...new api.Template(), TemplateName: t.name, SubjectPart: t.subject, TextPart: t.text,
+			HtmlPart: t.html }
+		return r
+	}
+
+	deleteTemplate(caller: Caller, input: api.DeleteTemplateRequest): api.DeleteTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		new Tables(caller.regional()).templates.delete(input.TemplateName)
+		return new api.DeleteTemplateResponse()
+	}
+
+	listTemplates(caller: Caller, input: api.ListTemplatesRequest): api.ListTemplatesResponse throws Fault {
+		caller.allow(templateArn(caller, "*"))
+		const r = new api.ListTemplatesResponse()
+		r.TemplatesMetadata = new Tables(caller.regional()).templates.scan().map(e => {
+			return { ...new api.TemplateMetadata(), Name: e[1].name, CreatedTimestamp: e[1].created }
+		})
+		return r
+	}
+
+	testRenderTemplate(caller: Caller,
+		input: api.TestRenderTemplateRequest): api.TestRenderTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		const t = new Tables(caller.regional()).templates.get(input.TemplateName)
+		if (t == null) {
+			throw api.templateDoesNotExistException(`Unable to find <${input.TemplateName}> for <${caller.account}>`)
+		}
+		let data: json.Unknown[] = []
+		try {
+			data = json.decode[json.Keys](input.TemplateData).all
+		} catch (e: ParseError) {
+			throw api.invalidRenderingParameterException("Template rendering data is invalid")
+		}
+		const lines: string[] = []
+		if (t.subject != null) {
+			lines.push(`Subject: ${render(t.subject!, data)}`)
+		}
+		for (const p of [t.text, t.html]) {
+			if (p != null) {
+				lines.push("")
+				lines.push(render(p!, data))
+			}
+		}
+		const r = new api.TestRenderTemplateResponse()
+		r.RenderedTemplate = lines.join("\r\n")
+		return r
+	}
+
+	createConfigurationSet(caller: Caller,
+		input: api.CreateConfigurationSetRequest): api.CreateConfigurationSetResponse throws Fault {
+		const n = input.ConfigurationSet.Name
+		caller.allow(setArn(caller, n))
+		const t = new Tables(caller.regional()).sets
+		if (t.get(n) != null) {
+			throw api.configurationSetAlreadyExistsException(`Configuration set <${n}> already exists.`)
+		}
+		save(t, n, { ...new ConfigurationSet(), name: n, created: now() })
+		return new api.CreateConfigurationSetResponse()
+	}
+
+	describeConfigurationSet(caller: Caller,
+		input: api.DescribeConfigurationSetRequest): api.DescribeConfigurationSetResponse throws Fault {
+		const n = input.ConfigurationSetName
+		caller.allow(setArn(caller, n))
+		if (new Tables(caller.regional()).sets.get(n) == null) {
+			throw api.configurationSetDoesNotExistException(`Configuration set <${n}> does not exist.`)
+		}
+		const r = new api.DescribeConfigurationSetResponse()
+		r.ConfigurationSet = { ...new api.ConfigurationSet(), Name: n }
+		return r
+	}
+
+	listConfigurationSets(caller: Caller,
+		input: api.ListConfigurationSetsRequest): api.ListConfigurationSetsResponse throws Fault {
+		caller.allow(setArn(caller, "*"))
+		const r = new api.ListConfigurationSetsResponse()
+		r.ConfigurationSets = new Tables(caller.regional()).sets.scan().map(e => {
+			return { ...new api.ConfigurationSet(), Name: e[1].name }
+		})
+		return r
+	}
+
+	deleteConfigurationSet(caller: Caller,
+		input: api.DeleteConfigurationSetRequest): api.DeleteConfigurationSetResponse throws Fault {
+		const n = input.ConfigurationSetName
+		caller.allow(setArn(caller, n))
+		if (!new Tables(caller.regional()).sets.delete(n)) {
+			throw api.configurationSetDoesNotExistException(`Configuration set <${n}> does not exist.`)
+		}
+		return new api.DeleteConfigurationSetResponse()
+	}
+
+	getSendQuota(caller: Caller, input: Unit): api.GetSendQuotaResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetSendQuotaResponse()
+		r.Max24HourSend = 200.0
+		r.MaxSendRate = 1.0
+		r.SentLast24Hours = lastDay(caller)
+		return r
+	}
+
+	getSendStatistics(caller: Caller, input: Unit): api.GetSendStatisticsResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetSendStatisticsResponse()
+		r.SendDataPoints = []
+		return r
+	}
+
+	getAccountSendingEnabled(caller: Caller, input: Unit): api.GetAccountSendingEnabledResponse throws Fault {
+		caller.allow("*")
+		const r = new api.GetAccountSendingEnabledResponse()
+		r.Enabled = true
+		return r
+	}
+}
+
+/// The v2 API, of the operations implemented.
+export class V2 {
+	...v2.Unimplemented
+
+	createEmailIdentity(caller: Caller,
+		input: v2.CreateEmailIdentityRequest): v2.CreateEmailIdentityResponse throws Fault {
+		const n = input.EmailIdentity
+		caller.allow(identityArn(caller, n))
+		const t = new Tables(caller.regional()).identities
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`Email identity ${n} already exist.`)
+		}
+		const i = verify(caller, n, indexOf(n, "@") < 0)
+		if (i.domain) {
+			i.dkim = [token(16), token(16), token(16)]
+		}
+		i.tags = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		save(t, n, i)
+		const r = new v2.CreateEmailIdentityResponse()
+		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+		r.VerifiedForSendingStatus = true
+		r.DkimAttributes = dkim(i)
+		return r
+	}
+
+	getEmailIdentity(caller: Caller, input: v2.GetEmailIdentityRequest): v2.GetEmailIdentityResponse throws Fault {
+		const i = emailIdentity(caller, input.EmailIdentity, `<${input.EmailIdentity}>`)
+		const r = new v2.GetEmailIdentityResponse()
+		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+		r.FeedbackForwardingStatus = true
+		r.VerifiedForSendingStatus = true
+		r.DkimAttributes = dkim(i)
+		r.Policies = []
+		r.Tags = i.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		r.VerificationStatus = "SUCCESS"
+		return r
+	}
+
+	listEmailIdentities(caller: Caller,
+		input: v2.ListEmailIdentitiesRequest): v2.ListEmailIdentitiesResponse throws Fault {
+		caller.allow(identityArn(caller, "*"))
+		const r = new v2.ListEmailIdentitiesResponse()
+		r.EmailIdentities = identities(caller).map(i => {
+			const o = new v2.IdentityInfo()
+			o.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
+			o.IdentityName = i.name
+			o.SendingEnabled = true
+			o.VerificationStatus = "SUCCESS"
+			return o
+		})
+		return r
+	}
+
+	deleteEmailIdentity(caller: Caller,
+		input: v2.DeleteEmailIdentityRequest): v2.DeleteEmailIdentityResponse throws Fault {
+		const i = emailIdentity(caller, input.EmailIdentity, input.EmailIdentity)
+		new Tables(caller.regional()).identities.delete(i.name)
+		return new v2.DeleteEmailIdentityResponse()
+	}
+
+	sendEmail(caller: Caller, input: v2.SendEmailRequest): v2.SendEmailResponse throws Fault {
+		const c = input.Content
+		const raw = c.Raw
+		const from = input.FromEmailAddress ?? (if (raw == null) null else header(raw!.Data, "From"))
+		if (from == null) {
+			throw v2.badRequestException("Missing required parameter: FromEmailAddress")
+		}
+		const t = c.Template
+		if (t != null && t!.TemplateName != null) {
+			templated(caller, t!.TemplateName!)
+		}
+		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!))
+		const simple = c.Simple
+		if (simple != null) {
+			s.Subject = simple!.Subject.Data
+			s.Body = parts(simple!.Body.Text?.Data, simple!.Body.Html?.Data)
+		} else if (raw != null) {
+			s.RawData = raw!.Data
+		} else if (t != null) {
+			s.Template = t!.TemplateName
+			s.TemplateData = t!.TemplateData
+		} else {
+			throw v2.badRequestException("Missing required parameter: Content")
+		}
+		const r = new v2.SendEmailResponse()
+		r.MessageId = store(caller, s)
+		return r
+	}
+
+	sendBulkEmail(caller: Caller, input: v2.SendBulkEmailRequest): v2.SendBulkEmailResponse throws Fault {
+		const t = input.DefaultContent.Template
+		if (t == null || input.FromEmailAddress == null) {
+			throw v2.badRequestException(if (t == null) "Missing required parameter: DefaultContent.Template"
+				else "Missing required parameter: FromEmailAddress")
+		}
+		if (t!.TemplateName != null) {
+			templated(caller, t!.TemplateName!)
+		}
+		const r = new v2.SendBulkEmailResponse()
+		for (const e of input.BulkEmailEntries) {
+			const s = sent(caller, input.FromEmailAddress!, v2Recipients(e.Destination))
+			s.Template = t!.TemplateName
+			s.TemplateData = e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? t!.TemplateData
+			const o = new v2.BulkEmailEntryResult()
+			o.Status = "SUCCESS"
+			o.MessageId = store(caller, s)
+			r.BulkEmailEntryResults.push(o)
+		}
+		return r
+	}
+
+	createEmailTemplate(caller: Caller,
+		input: v2.CreateEmailTemplateRequest): v2.CreateEmailTemplateResponse throws Fault {
+		const n = input.TemplateName
+		caller.allow(templateArn(caller, n))
+		const t = new Tables(caller.regional()).templates
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`Template ${n} already exists.`)
+		}
+		const c = input.TemplateContent
+		save(t, n,
+			{ ...new Template(), name: n, subject: c.Subject, text: c.Text, html: c.Html, created: now(),
+			tags: (input.Tags ?? []).map(t => [t.Key, t.Value]) })
+		return new v2.CreateEmailTemplateResponse()
+	}
+
+	getEmailTemplate(caller: Caller, input: v2.GetEmailTemplateRequest): v2.GetEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		const r = new v2.GetEmailTemplateResponse()
+		r.TemplateName = t.name
+		r.TemplateContent = { ...new v2.EmailTemplateContent(), Subject: t.subject, Text: t.text, Html: t.html }
+		r.Tags = t.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		return r
+	}
+
+	updateEmailTemplate(caller: Caller,
+		input: v2.UpdateEmailTemplateRequest): v2.UpdateEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		const c = input.TemplateContent
+		t.subject = c.Subject
+		t.text = c.Text
+		t.html = c.Html
+		save(new Tables(caller.regional()).templates, t.name, t)
+		return new v2.UpdateEmailTemplateResponse()
+	}
+
+	deleteEmailTemplate(caller: Caller,
+		input: v2.DeleteEmailTemplateRequest): v2.DeleteEmailTemplateResponse throws Fault {
+		const t = emailTemplate(caller, input.TemplateName)
+		new Tables(caller.regional()).templates.delete(t.name)
+		return new v2.DeleteEmailTemplateResponse()
+	}
+
+	getAccount(caller: Caller, input: v2.GetAccountRequest): v2.GetAccountResponse throws Fault {
+		caller.allow("*")
+		const r = new v2.GetAccountResponse()
+		r.DedicatedIpAutoWarmupEnabled = true
+		r.EnforcementStatus = "HEALTHY"
+		r.ProductionAccessEnabled = true
+		r.SendingEnabled = true
+		r.SendQuota = { ...new v2.SendQuota(), Max24HourSend: 200.0, MaxSendRate: 1.0,
+			SentLast24Hours: lastDay(caller) }
+		return r
+	}
+}
+
+/// req to v2, as its model routes it: ListEmailIdentities is POST /v2/email/list-identities there, but SDKs of
+/// earlier models GET /v2/email/identities, which AWS still serves, its paging then ignored.
+export function routed(req: Request): Request {
+	if (req.method == "GET" && (req.url.path == "/v2/email/identities" || req.url.path == "/v2/email/identities/")) {
+		req.method = "POST"
+		req.url.path = "/v2/email/list-identities"
+	}
+	return req
+}
+
+function identityArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:identity/${name}`
+}
+
+function templateArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:template/${name}`
+}
+
+function setArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:configuration-set/${name}`
+}
+
+/// The identity of name, a domain or not, verified: made if there is none.
+function verify(caller: Caller, name: string, domain: bool): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const t = new Tables(caller.regional()).identities
+	const found = t.get(name)
+	if (found != null) {
+		return found!
+	}
+	const i = { ...new Identity(), name: name, domain: domain, created: now() }
+	if (domain) {
+		i.token = base64.encode(random(32))
+	}
+	save(t, name, i)
+	return i
+}
+
+function identities(caller: Caller): Identity[] throws Fault {
+	return new Tables(caller.regional()).identities.scan().map(e => e[1])
+}
+
+/// The identity of name, by v2, which words its absence by shown.
+function emailIdentity(caller: Caller, name: string, shown: string): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const i = new Tables(caller.regional()).identities.get(name)
+	if (i == null) {
+		throw v2.notFoundException(`Email identity ${shown} does not exist.`)
+	}
+	return i!
+}
+
+function dkim(i: Identity): v2.DkimAttributes {
+	const d = new v2.DkimAttributes()
+	d.SigningEnabled = i.dkim.length > 0
+	d.Status = if (i.dkim.length > 0) "SUCCESS" else "NOT_STARTED"
+	d.Tokens = if (i.dkim.length > 0) i.dkim else null
+	d.SigningAttributesOrigin = "AWS_SES"
+	return d
+}
+
+function template(caller: Caller, name: string): Template throws Fault {
+	caller.allow(templateArn(caller, name))
+	const t = new Tables(caller.regional()).templates.get(name)
+	if (t == null) {
+		throw api.templateDoesNotExistException(`Template ${name} does not exist.`)
+	}
+	return t!
+}
+
+function emailTemplate(caller: Caller, name: string): Template throws Fault {
+	caller.allow(templateArn(caller, name))
+	const t = new Tables(caller.regional()).templates.get(name)
+	if (t == null) {
+		throw v2.notFoundException(`Template ${name} does not exist.`)
+	}
+	return t!
+}
+
+/// Checks that the template of name, which a send uses, exists.
+function templated(caller: Caller, name: string) throws Fault {
+	caller.allow(templateArn(caller, name))
+	if (new Tables(caller.regional()).templates.get(name) == null) {
+		throw api.templateDoesNotExistException(`Template ${name} does not exist.`)
+	}
+}
+
+function fromV1(t: api.Template, created: i64): Template {
+	return { ...new Template(), name: t.TemplateName, subject: t.SubjectPart, text: t.TextPart, html: t.HtmlPart,
+		created: created }
+}
+
+/// s with each {{name}} replaced by the value of name in data, a string's text unquoted.
+function render(s: string, data: json.Unknown[]): string throws Fault {
+	let out = ""
+	let at = 0
+	while (true) {
+		const open = indexOf(s, "{{", at)
+		if (open < 0) {
+			return out + s.slice(at, s.length)
+		}
+		const close = indexOf(s, "}}", open)
+		if (close < 0) {
+			return out + s.slice(at, s.length)
+		}
+		const name = trim(s.slice(open + 2, close))
+		const v = data.find(d => d[0] == name)
+		if (v == null) {
+			throw api.missingRenderingAttributeException(`Attribute '${name}' is not present in the rendering data.`)
+		}
+		out += s.slice(at, open) + unquoted(v![1])
+		at = close + 2
+	}
+}
+
+/// The JSON text s, a string's unquoted.
+function unquoted(s: string): string {
+	try {
+		return json.decode[string](s)
+	} catch (e: ParseError) {
+		return s
+	}
+}
+
+function v1Recipients(d: api.Destination): Recipients {
+	return { ...new Recipients(), ToAddresses: d.ToAddresses, CcAddresses: d.CcAddresses, BccAddresses: d.BccAddresses }
+}
+
+function v2Recipients(d: v2.Destination): Recipients {
+	return { ...new Recipients(), ToAddresses: d.ToAddresses, CcAddresses: d.CcAddresses, BccAddresses: d.BccAddresses }
+}
+
+function parts(text: string | null, html: string | null): Parts {
+	return { ...new Parts(), text_part: text, html_part: html }
+}
+
+/// A message from source to recipients, once source's address or its domain is a verified identity, as AWS checks it.
+function sent(caller: Caller, source: string, recipients: Recipients | null): Sent throws Fault {
+	const address = addressOf(source)
+	caller.allow(identityArn(caller, address))
+	const t = new Tables(caller.regional()).identities
+	const at = lastIndexOf(address, "@")
+	if (t.get(address) == null && (at < 0 || t.get(address.slice(at + 1, address.length)) == null)) {
+		throw api.messageRejected("Email address is not verified. The following identities failed the check in region "
+			+ `${upper(caller.region)}: ${address}`)
+	}
+	const s = new Sent()
+	s.Region = caller.region
+	s.Source = source
+	s.Destination = recipients
+	return s
+}
+
+/// The address of a mailbox, written bare or as Name <address>.
+function addressOf(mailbox: string): string {
+	const open = lastIndexOf(mailbox, "<")
+	const close = lastIndexOf(mailbox, ">")
+	return if (open >= 0 && close > open) mailbox.slice(open + 1, close) else trim(mailbox)
+}
+
+/// The value of the header of name in the raw message data, null if it has none.
+function header(data: string, name: string): string | null {
+	const lower = name + ":"
+	for (const line of split(replace(data, "\r\n", "\n"), "\n")) {
+		if (line == "") {
+			return null
+		}
+		if (line.length > lower.length && line.slice(0, lower.length) == lower) {
+			return trim(line.slice(lower.length, line.length))
+		}
+	}
+	return null
+}
+
+/// Stores s, of a new id as AWS shapes one, and answers that id.
+function store(caller: Caller, s: Sent): string throws Fault {
+	const t = now()
+	const h = token(16)
+	const uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+	s.Id = `0100${hex12(t / millisecond)}-${uuid}-000000`
+	s.Timestamp = rfc3339(t - t % second).slice(0, 19)
+	save(new Tables(caller.regional()).sent, s.Id, s)
+	return s.Id
+}
+
+/// How many messages were sent in the last day, as their ids begin with the millisecond they were sent at.
+function lastDay(caller: Caller): f64 throws Fault {
+	const since = `0100${hex12((now() - day) / millisecond)}`
+	return new Tables(caller.regional()).sent.scan(since, 1000000).length as f64
+}
+
+/// s, of ASCII, in upper case.
+function upper(s: string): string {
+	let out = ""
+	for (const c of s) {
+		out += utf8(if (c >= 0x61 && c <= 0x7a) c - 0x20 else c)
+	}
+	return out
+}
+
+/// v in 12 hex digits.
+function hex12(v: i64): string {
+	const digits = "0123456789abcdef"
+	let s = ""
+	for (let i = 11; i >= 0; i--) {
+		const d = ((v >> (i * 4)) & 15) as i32
+		s += digits.slice(d, d + 1)
+	}
+	return s
+}
+
+/// n random bytes, in hex.
+function token(n: i32): string throws Fault { return hex.encode(random(n)) }
+
+function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}
+
+function save[V extends Decodable](t: Table[V], k: string, v: V) throws Fault {
+	try {
+		t.put(k, v)
+	} catch (e: json.EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

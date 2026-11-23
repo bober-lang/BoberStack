@@ -33,6 +33,9 @@ import * as route53Api from "./services/route53/api"
 import * as route53 from "./services/route53/route53"
 import * as secretsmanagerApi from "./services/secretsmanager/api"
 import * as secretsmanager from "./services/secretsmanager/secretsmanager"
+import * as sesApi from "./services/ses/api"
+import * as ses from "./services/ses/ses"
+import * as sesv2Api from "./services/ses/v2/api"
 import * as snsApi from "./services/sns/api"
 import * as sns from "./services/sns/sns"
 import * as sqsApi from "./services/sqs/api"
@@ -106,6 +109,13 @@ export function stack(catalog: Catalog): Gateway {
 	g.services.set(s3Api.signingName, (caller, req) => s3.serve(o, caller, req))
 	g.faults.set(s3Api.signingName, (f, id) => restxml.error(s3Api.service, f, id))
 	g.services.set(route53Api.signingName, (caller, req) => route53.serve(z, caller, req))
+	// SES serves its classic API by awsQuery and v2, under /v2/, by restJson1.
+	const v = new ses.Handler()
+	const v2 = new ses.V2()
+	g.services.set(sesApi.signingName, (caller, req) => {
+		const json = startsWith(req.url.path, "/v2/")
+		return if (json) sesv2Api.handle(v2, caller, ses.routed(req)) else sesApi.handle(v, caller, req)
+	})
 	g.faults.set(route53Api.signingName, (f, id) => route53.error(f, id))
 	const c = new acm.Handler()
 	g.services.set(acmApi.signingName, (caller, req) => acmApi.handle(c, caller, req))

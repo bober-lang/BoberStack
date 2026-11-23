@@ -1,13 +1,14 @@
 //! The endpoints that are not AWS's, unsigned, under /_localstack/ as LocalStack's tools probe them and under
 //! /_boberstack/: health and readiness, a reset of the state, and snapshots of it kept in memory under names, which a
-//! restore makes the state again.
+//! restore makes the state again; and LocalStack's /_aws/ses, the messages SES has stored instead of sending them.
 
 import { Fault } from "./fault"
 import { Store } from "./state/store"
 import { startsWith } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
+import { decode, Rest, Unknown } from "std/encoding/json"
 import { json, Request, Response } from "std/http"
-import { lower, split } from "std/string"
+import { lower, ParseError, split } from "std/string"
 import { rfc3339, second } from "std/time"
 
 /// BoberStack's version, which health and info answer in place of LocalStack's.
@@ -25,6 +26,8 @@ const names: [string, string][] = [["acm", "acm"], ["apigateway", "apigateway"],
 	["secretsmanager", "secretsmanager"], ["ses", "ses"], ["sns", "sns"], ["sqs", "sqs"], ["ssm", "ssm"],
 	["stepfunctions", "states"], ["sts", "sts"], ["support", "support"], ["swf", "swf"], ["transcribe", "transcribe"]]
 
+/// The prefix of the keys of the messages SES stores, of services/ses's table.
+const sent = "ses.messages\x00"
 /// The stages of LocalStack's init scripts, of which there are none here, and whether each has completed: all but
 /// SHUTDOWN, once serving.
 const stages: [string, bool][] = [["BOOT", true], ["START", true], ["READY", true], ["SHUTDOWN", false]]
@@ -80,6 +83,17 @@ export class Internal {
 		const m = req.method
 		const ours = path[0] == "_boberstack"
 		const at = path.slice(1, path.length).join("/")
+		if (path[0] == "_aws") {
+			if (m != "GET" && m != "DELETE") {
+				return refused(m)
+			}
+			const q = req.url.query
+			try {
+				return mails(m, q.get("id") ?? "", if (m == "GET") q.get("email") ?? "" else "", state)
+			} catch (f: Fault) {
+				return text(f.status, `{"error": "${f.message}"}`)
+			}
+		}
 		if (at == "health") {
 			return if (m == "GET" || m == "HEAD") this.health(serves) else refused(m)
 		}
@@ -185,9 +199,47 @@ export class Internal {
 	}
 }
 
-/// Whether path is one of the endpoints': under /_localstack/ or /_boberstack/.
+/// Whether path is one of the endpoints': under /_localstack/ or /_boberstack/, or /_aws/ses.
 export function addressed(path: string): bool {
-	return startsWith(path, "/_localstack/") || startsWith(path, "/_boberstack/")
+	return startsWith(path, "/_localstack/") || startsWith(path, "/_boberstack/") || path == "/_aws/ses"
+}
+
+/// A message SES stored, of which the endpoint reads what it filters by.
+class Mail {
+	Id = ""
+	Source = ""
+	rest: Unknown[] @Rest = []
+}
+
+/// The messages SES stored, in each tree of state, as LocalStack's /_aws/ses lists them, of the id and source email
+/// unless "", or deletes them, those of the id unless "".
+function mails(method: string, id: string, email: string, state: State): Response throws Fault {
+	const found: string[] = []
+	for (const n of state.named) {
+		const t = state.trees.get(n)!
+		let after: string | null = null
+		while (true) {
+			const page = t.scan(sent, after)
+			if (page.length == 0) {
+				break
+			}
+			for (const [k, v] of page) {
+				let m = new Mail()
+				try {
+					m = decode[Mail](v)
+				} catch (e: ParseError) {}
+				if ((id == "" || m.Id == id) && (email == "" || m.Source == email)) {
+					if (method == "DELETE") {
+						t.delete(k)
+					} else {
+						found.push(v)
+					}
+				}
+			}
+			after = page[page.length - 1][0]
+		}
+	}
+	return if (method == "DELETE") new Response(204) else text(200, `{"messages": [${found.join(", ")}]}`)
 }
 
 /// Drops the state of state: every tree closed.

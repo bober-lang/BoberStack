@@ -1,0 +1,107 @@
+import { request, sign, text } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import { stack } from "../../stack"
+import { Catalog } from "../iam/catalog"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+/// The answer of g to action with params by the classic API, from the root of 000000000000.
+function call(g: Gateway, action: string, params: [string, string][] = []): Response {
+	const query = params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	return g.handle(request("ses", "test", "test", `Action=${action}&Version=2010-12-01${query}`))
+}
+
+/// The answer of g to a request of method to path by v2, of the JSON body.
+function callV2(g: Gateway, method: string, path: string, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	if (body != "") {
+		req.headers.set("content-type", "application/json")
+	}
+	sign(req, body, "ses", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function internal(g: Gateway, method: string, path: string): Response {
+	return g.handle(new Request(method, `http://localhost:4566${path}`))
+}
+
+function has(res: Response, s: string): bool { return indexOf(res.body.whole ?? "", s) >= 0 }
+
+test "an identity verified by one API is the other's, verified at once" {
+	const g = stack(new Catalog(0, 0))
+	assert call(g, "VerifyEmailIdentity", [["EmailAddress", "a@example.com"]]).status == 200
+	assert callV2(g, "POST", "/v2/email/identities", `{"EmailIdentity": "example.org"}`).status == 200
+	const listed = callV2(g, "POST", "/v2/email/list-identities", "{}")
+	assert has(listed, `"IdentityName":"a@example.com"`) && has(listed, `"IdentityName":"example.org"`)
+	assert has(callV2(g, "GET", "/v2/email/identities"), `"IdentityName":"example.org"`)
+	const got = call(g, "GetIdentityVerificationAttributes", [["Identities.member.1", "a@example.com"]])
+	assert text(got, "VerificationStatus") == "Success"
+	assert call(g, "ListIdentities", [["IdentityType", "Domain"]]).body.whole!.length > 0
+	assert text(call(g, "ListIdentities", [["IdentityType", "Domain"]]), "member") == "example.org"
+	const missing = callV2(g, "GET", "/v2/email/identities/nope.example")
+	assert missing.status == 404 && has(missing, "Email identity <nope.example> does not exist.")
+	assert callV2(g, "DELETE", "/v2/email/identities/example.org").status == 200
+	assert callV2(g, "GET", "/v2/email/identities/example.org").status == 404
+}
+
+test "a message is stored, not sent, only from a verified source, and /_aws/ses lists and clears it" {
+	const g = stack(new Catalog(0, 0))
+	const send: [string, string][] = [["Source", "a@example.com"],
+		["Destination.ToAddresses.member.1", "b@example.net"], ["Message.Subject.Data", "Hi"],
+		["Message.Body.Text.Data", "Hello"]]
+	const rejected = call(g, "SendEmail", send)
+	assert rejected.status == 400 && text(rejected, "Code") == "MessageRejected"
+	assert text(rejected, "Message")
+		== "Email address is not verified. The following identities failed the check in region US-EAST-1: a@example.com"
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	const sent = call(g, "SendEmail", send)
+	assert sent.status == 200
+	const id = text(sent, "MessageId")!
+	assert id.length == 60 && id.slice(0, 4) == "0100" && id.slice(53, 60) == "-000000"
+	const v2 = callV2(g, "POST", "/v2/email/outbound-emails",
+		`{"FromEmailAddress": "c@example.com", "Destination": {"ToAddresses": ["d@example.net"]}, `
+		+ `"Content": {"Raw": {"Data": "RnJvbTogY0BleGFtcGxlLmNvbQ0KDQpCb2R5"}}}`)
+	assert v2.status == 200 && has(v2, `"MessageId":"0100`)
+	const all = internal(g, "GET", "/_aws/ses")
+	assert all.status == 200 && has(all, `"Id":"${id}"`) && has(all, `"Subject":"Hi"`)
+	assert has(all, `"Body":{"text_part":"Hello","html_part":null}`) && has(all, `"RawData":"From: c@example.com`)
+	assert has(all, `"Destination":{"ToAddresses":["b@example.net"]}`) && has(all, `"Region":"us-east-1"`)
+	const mine = internal(g, "GET", "/_aws/ses?email=c@example.com")
+	assert has(mine, `"Source":"c@example.com"`) && !has(mine, id)
+	assert internal(g, "DELETE", `/_aws/ses?id=${id}`).status == 204
+	assert !has(internal(g, "GET", "/_aws/ses"), id)
+	assert internal(g, "DELETE", "/_aws/ses").status == 204
+	assert internal(g, "GET", "/_aws/ses").body.whole == `{"messages": []}`
+}
+
+test "templates render their {{names}}, and a send of one names it" {
+	const g = stack(new Catalog(0, 0))
+	assert call(g, "CreateTemplate",
+		[["Template.TemplateName", "t"], ["Template.SubjectPart", "Hi {{name}}"],
+		["Template.TextPart", "Dear {{ name }}, {{n}}"]]).status == 200
+	assert text(call(g, "CreateTemplate", [["Template.TemplateName", "t"]]), "Code") == "AlreadyExists"
+	const r = call(g, "TestRenderTemplate", [["TemplateName", "t"], ["TemplateData", `{"name": "Ana", "n": 3}`]])
+	assert text(r, "RenderedTemplate") == "Subject: Hi Ana\r\n\r\nDear Ana, 3"
+	const lacking = call(g, "TestRenderTemplate", [["TemplateName", "t"], ["TemplateData", "{}"]])
+	assert text(lacking, "Code") == "MissingRenderingAttribute"
+	const got = callV2(g, "GET", "/v2/email/templates/t")
+	assert got.status == 200 && has(got, `"Subject":"Hi {{name}}"`)
+	assert text(call(g, "GetTemplate", [["TemplateName", "u"]]), "Message") == "Template u does not exist."
+	call(g, "VerifyEmailIdentity", [["EmailAddress", "a@example.com"]])
+	assert call(g, "SendTemplatedEmail",
+		[["Source", "a@example.com"], ["Destination.ToAddresses.member.1", "b@x.net"], ["Template", "t"],
+		["TemplateData", `{"name": "Ana"}`]]).status == 200
+	assert has(internal(g, "GET", "/_aws/ses"), `"Template":"t","TemplateData":"{\\"name\\": \\"Ana\\"}"`)
+	assert text(call(g, "GetSendQuota"), "SentLast24Hours") == "1"
+}
+
+test "configuration sets: create, describe, list, delete" {
+	const g = stack(new Catalog(0, 0))
+	assert call(g, "CreateConfigurationSet", [["ConfigurationSet.Name", "c"]]).status == 200
+	assert text(call(g, "DescribeConfigurationSet", [["ConfigurationSetName", "c"]]), "Name") == "c"
+	assert text(call(g, "ListConfigurationSets"), "Name") == "c"
+	assert call(g, "DeleteConfigurationSet", [["ConfigurationSetName", "c"]]).status == 200
+	assert text(call(g, "DescribeConfigurationSet", [["ConfigurationSetName", "c"]]), "Message")
+		== "Configuration set <c> does not exist."
+}
