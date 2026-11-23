@@ -1,8 +1,10 @@
 //! Amazon Simple Queue Service: standard and FIFO queues, their messages, dead-letter queues, tags and permissions.
 //!
 //! Nothing runs between requests: delays, visibility, retention, FIFO deduplication and dead-lettering are evaluated
-//! at the instant of the request that looks. A receive does not wait. A message move task completes within its
-//! request, ignoring its rate.
+//! at the instant of the request that looks. A receive with nothing to take waits for WaitTimeSeconds, else the
+//! queue's ReceiveMessageWaitTimeSeconds, as the gateway holds it; one is answered after the request that sends, and a
+//! message whose delay or visibility timeout ends meanwhile is taken at the gateway's next tick, about a second late.
+//! A message move task completes within its request, ignoring its rate.
 //!
 //! Where AWS differs on SSE-KMS: the key is used on every send and receive, not once per data key reuse period, and a
 //! receive decrypts the queue's latest data key, not the one each message was sent under.
@@ -1137,7 +1139,8 @@ function digest(h: (s: string) => string throws CryptoError, s: string): string 
 }
 
 /// A message received as often as its queue's RedrivePolicy allows is moved to its dead-letter queue instead. A FIFO
-/// receive retried with its ReceiveRequestAttemptId takes the same messages again, under the same receipts.
+/// receive retried with its ReceiveRequestAttemptId takes the same messages again, under the same receipts. One that
+/// takes nothing holds its caller until its wait from the caller's arrival is up.
 export function receive(caller: Caller, input: api.ReceiveMessageRequest,
 	now: i64): api.ReceiveMessageResult throws Fault {
 	const f = found(caller, input.QueueUrl)
@@ -1214,6 +1217,10 @@ export function receive(caller: Caller, input: api.ReceiveMessageRequest,
 	if (attempt != null) {
 		f.db.attempts.put(within(q.name, attempt!),
 			{ ...new Attempt(), at: now, ids: taken.map(m => m.id), receipts: taken.map(m => m.receipt), until: until })
+	}
+	const waited = ((wait ?? q.wait) as i64) * second
+	if (out.length == 0 && waited > 0 && now < caller.arrived + waited) {
+		caller.hold(caller.arrived + waited)
 	}
 	const r = new api.ReceiveMessageResult()
 	r.Messages = if (out.length == 0) null else out

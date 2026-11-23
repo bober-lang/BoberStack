@@ -36,6 +36,10 @@ export class Caller {
 	userAgent = ""
 	/// How IAM sees the caller; null where there is no IAM, which then allows only the root.
 	identify: Identify | null = null
+	/// When the request came: the same each time the gateway runs it again.
+	arrived = now()
+	/// The instant hold was given, if it was.
+	held: i64 | null = null
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
@@ -65,6 +69,10 @@ export class Caller {
 		this.opened.push([account, s])
 		return s
 	}
+
+	/// Tells the gateway that the request has nothing to answer before instant until: it drops what the request did
+	/// and runs it again from its start, after the next request that commits or the next tick. Its answer is not sent.
+	hold(until: i64) { this.held = until }
 
 	/// Throws the service's access denied unless IAM's evaluation lets the caller perform each of the operation's actions
 	/// on resource, given the resource's own policy (sts:AssumeRole's is the role's trust policy). The resource is of the
@@ -126,6 +134,7 @@ export class Caller {
 		c.actions = actions
 		c.endpoint = this.endpoint
 		c.identify = this.identify
+		c.arrived = this.arrived
 		c.opened = this.opened
 		return c
 	}

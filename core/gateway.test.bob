@@ -1,11 +1,11 @@
-import { request, text } from "./client.test"
+import { request, text, ticks } from "./client.test"
 import { Fault } from "./fault"
 import { Gateway } from "./gateway"
 import { Caller } from "./service"
 import { Blob, live } from "./state/store"
 import { Request, Response } from "std/http"
 import { ParseError, parseInt } from "std/string"
-import { millisecond, sleep } from "std/time"
+import { millisecond, second, sleep } from "std/time"
 
 /// Waits 10 ms of logical time between reading the count of requests and writing it one more, so that overlapping
 /// requests would race; fails as the body asks.
@@ -90,6 +90,89 @@ test "a service called for a request writes into the request's trees" {
 	assert g.trees.get("000000000000/us-east-1")?.get("k") == "sns.amazonaws.com arn:aws:sns http://localhost:4566 null"
 	g.close()
 	assert live() == before
+}
+
+/// A long poll of what other requests write, which needs a queue made first: "poll" holds for 5 seconds from its
+/// arrival unless there is a value, and marks each of its runs, a mark dropped while it is held.
+function polled(log: string[]): Gateway {
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => {
+		const body = req.body.text()
+		try {
+			const s = caller.store()
+			if (body != "poll") {
+				s.put(body, body)
+				return new Response(200, "")
+			}
+			log.push("run")
+			s.put("polled", (s.get("polled") ?? "") + "x")
+			if (s.get("queue") == null) {
+				return new Response(400, "no queue")
+			}
+			const v = s.get("value")
+			if (v == null && now() < caller.arrived + 5 * second) {
+				caller.hold(caller.arrived + 5 * second)
+			}
+			return new Response(200, v ?? "none")
+		} catch (f: Fault) {
+			return new Response(f.status, f.message)
+		}
+	})
+	return g
+}
+
+test "a held request waits without the lock and is answered once a request commits what it waits for" {
+	const log: string[] = []
+	const g = polled(log)
+	assert g.handle(request("test", "test", "test", "queue")).status == 200
+	const t = now()
+	const p = async g.handle(request("test", "test", "test", "poll"))
+	assert g.handle(request("test", "test", "test", "other")).status == 200
+	sleep(millisecond)
+	assert g.handle(request("test", "test", "test", "value")).status == 200
+	const res = await p
+	assert res.status == 200 && res.body.whole == "value" && now() - t < second
+	assert log == ["run", "run", "run"]
+	g.close()
+}
+
+test "a held request answers empty at the first tick after its time is up, its held runs leaving no trace" {
+	const log: string[] = []
+	const g = polled(log)
+	assert g.handle(request("test", "test", "test", "queue")).status == 200
+	const t = now()
+	const p = async g.handle(request("test", "test", "test", "poll"))
+	const ticking = async ticks(g, 6)
+	const res = await p
+	assert res.status == 200 && res.body.whole == "none"
+	assert now() - t >= 5 * second && now() - t < 6 * second
+	const marks = held(g, "polled")[0]
+	assert marks == "x" && log.length == 6
+	await ticking
+	g.close()
+}
+
+test "many held requests are all answered by one commit" {
+	const g = polled([])
+	assert g.handle(request("test", "test", "test", "queue")).status == 200
+	const a = async g.handle(request("test", "test", "test", "poll"))
+	const b = async g.handle(request("test", "test", "test", "poll"))
+	const c = async g.handle(request("test", "test", "test", "poll"))
+	assert g.handle(request("test", "test", "test", "value")).status == 200
+	for (const p of [a, b, c]) {
+		assert (await p).body.whole == "value"
+	}
+	g.close()
+}
+
+test "a reset runs a held request again, against the state it left" {
+	const g = polled([])
+	assert g.handle(request("test", "test", "test", "queue")).status == 200
+	const p = async g.handle(request("test", "test", "test", "poll"))
+	assert g.handle(new Request("POST", "http://localhost:4566/_boberstack/state/reset", "")).status == 200
+	const res = await p
+	assert res.status == 400 && res.body.whole == "no queue"
+	g.close()
 }
 
 function blobs(): Gateway {

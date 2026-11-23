@@ -1,4 +1,5 @@
 import { sign } from "../../core/auth/sigv4"
+import { ticks } from "../../core/client.test"
 import { Fault } from "../../core/fault"
 import { Gateway } from "../../core/gateway"
 import * as protocol from "../../core/protocol/json"
@@ -9,7 +10,7 @@ import { changeVisibility, counts, create, found, Handler, purge, receive, send 
 import { startsWith } from "std/algo"
 import { Decodable } from "std/types"
 import { Request, Response } from "std/http"
-import { minute, second } from "std/time"
+import { minute, second, sleep } from "std/time"
 
 const account = "000000000000"
 const base = "http://localhost:4566/000000000000/"
@@ -207,6 +208,37 @@ test "messages: send, receive, delete, with AWS's MD5s" {
 	assert fails(call(g, "SendMessage",
 		`{"QueueUrl":"${base}q","MessageBody":"x","MessageAttributes":{"n":{"DataType":"Number","StringValue":"x"}}}`),
 		400, "InvalidParameterValue")
+	g.close()
+}
+
+test "a receive with nothing to take waits, answered by a send from another request or empty once its wait is up" {
+	const g = gateway()
+	assert call(g, "CreateQueue", `{"QueueName":"q"}`).status == 200
+	let t = now()
+	const r = async call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","WaitTimeSeconds":20}`)
+	sleep(3 * second)
+	assert call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":"hi"}`).status == 200
+	const got = out[api.ReceiveMessageResult](await r).Messages!
+	assert got.length == 1 && got[0].Body == "hi" && now() - t == 3 * second
+	// The queue's wait, when the receive gives none; the message taken is not visible.
+	assert call(g, "SetQueueAttributes",
+		`{"QueueUrl":"${base}q","Attributes":{"ReceiveMessageWaitTimeSeconds":"2"}}`).status == 200
+	t = now()
+	let ticking = async ticks(g, 3)
+	assert out[api.ReceiveMessageResult](call(g, "ReceiveMessage", `{"QueueUrl":"${base}q"}`)).Messages == null
+	assert now() - t >= 2 * second && now() - t < 3 * second
+	await ticking
+	t = now()
+	assert out[api.ReceiveMessageResult](call(g, "ReceiveMessage",
+		`{"QueueUrl":"${base}q","WaitTimeSeconds":0}`)).Messages == null && now() == t
+	// A message whose delay ends while a receive waits is taken at the tick after.
+	assert call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":"later","DelaySeconds":2}`).status == 200
+	t = now()
+	ticking = async ticks(g, 4)
+	const later = out[api.ReceiveMessageResult](call(g, "ReceiveMessage",
+		`{"QueueUrl":"${base}q","WaitTimeSeconds":10}`)).Messages!
+	assert later[0].Body == "later" && now() - t >= 2 * second && now() - t < 4 * second
+	await ticking
 	g.close()
 }
 

@@ -1,5 +1,7 @@
 //! The HTTP handler in front of every service: it authenticates a request (SigV4, or a SigV2 presigned URL), decodes an
-//! aws-chunked body, and hands it to the service its credential scope names, in a transaction over the state.
+//! aws-chunked body, and hands it to the service its credential scope names, in a transaction over the state. A
+//! request whose handler holds it, as a long poll with nothing to answer yet, waits without the lock and is run again
+//! whole after each request that commits and each tick. tick does, between requests, what services have due.
 
 import * as chunked from "./auth/chunked"
 import { accountOf, authenticate, credentials, use } from "./auth/credentials"
@@ -12,6 +14,7 @@ import * as query from "./protocol/query"
 import { Caller, Identify } from "./service"
 import { Store } from "./state/store"
 import { Signal } from "builtin/fiber"
+import { indexOf } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
 import { CryptoError } from "std/crypto/error"
 import { Body, Request, Response } from "std/http"
@@ -21,6 +24,9 @@ import { ParseError } from "std/string"
 export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
 /// A service's answer, in its protocol, to a fault the gateway finds.
 export type Faulted = (f: Fault, requestId: string, req: Request | null) => Response
+/// A service's work between requests: what is due by instant t in the state that caller, an account's root in one of
+/// its regions, sees.
+export type Timed = (caller: Caller, t: i64) => void throws Fault
 
 /// One request at a time reads and writes the state: each in a transaction of the trees it opens, which commit together
 /// if it answers 2xx and are dropped if not, so that a request that fails leaves no trace.
@@ -29,6 +35,8 @@ export class Gateway {
 	services = new HashMap[string, Service]()
 	/// How a service answers the faults the gateway finds, by signing name; awsQuery's XML for one not here.
 	faults = new HashMap[string, Faulted]()
+	/// What tick runs, in order.
+	timed: Timed[] = []
 	/// The signing name of the service that unauthenticated requests go to, as S3 serves public objects; null answers
 	/// them MissingAuthenticationToken.
 	anonymous: string | null = null
@@ -44,10 +52,16 @@ export class Gateway {
 	identify: Identify | null = null
 	private busy = false
 	private freed = new Signal()
+	/// Woken by each commit, tick, reset and restore, for the requests held.
+	private changed = new Signal()
 
 	handle(req: Request): Response throws IoError | ParseError {
 		if (addressed(req.url.path)) {
-			return this.locked(() => this.internal.handle(req))
+			try {
+				return this.locked(() => this.internal.handle(req))!
+			} finally {
+				this.changed.wake()
+			}
 		}
 		let id = ""
 		let auth: sigv4.Authorization | null = null
@@ -71,8 +85,46 @@ export class Gateway {
 			return this.oversized(name!, req.body.length!, limit, id)
 		}
 		const body = req.body.text(limit)
-		req.body = new Body(body)
-		return this.locked(() => this.serve(name!, service!, req, body, auth, id))
+		const arrived = now()
+		while (true) {
+			const res = this.locked(() => {
+				req.body = new Body(body)
+				return this.serve(name!, service!, req, body, auth, id, arrived)
+			})
+			if (res != null) {
+				return res!
+			}
+			this.changed.wait()
+		}
+	}
+
+	/// Runs what each service has due by instant t in every account's regions, in one transaction of the trees it opens,
+	/// which commit together unless it throws; then wakes the requests held.
+	tick(t: i64) throws Fault {
+		this.acquire()
+		const opened: [string, Store][] = []
+		let done = false
+		try {
+			for (const n of this.named.slice(0, this.named.length)) {
+				const slash = indexOf(n, "/")
+				if (slash < 0) {
+					continue
+				}
+				const account = n.slice(0, slash)
+				for (const timed of this.timed) {
+					const c = new Caller(account, n.slice(slash + 1, n.length), `arn:aws:iam::${account}:root`, uuid(),
+						account, this.trees)
+					c.identify = this.identify
+					c.opened = opened
+					timed(c, t)
+				}
+			}
+			done = true
+		} finally {
+			this.commit(opened, done)
+			this.release()
+			this.changed.wake()
+		}
 	}
 
 	close() {
@@ -101,21 +153,48 @@ export class Gateway {
 		return new Response(if (name == "logs") 400 else 413, if (name == "logs") "<InternalFailure/>" else "")
 	}
 
-	private locked(f: () => Response throws IoError | ParseError): Response throws IoError | ParseError {
+	private locked(f: () => Response | null throws IoError | ParseError): Response | null throws IoError | ParseError {
+		this.acquire()
+		try {
+			return f()
+		} finally {
+			this.release()
+		}
+	}
+
+	private acquire() {
 		while (this.busy) {
 			this.freed.wait()
 		}
 		this.busy = true
-		try {
-			return f()
-		} finally {
-			this.busy = false
-			this.freed.wake()
+	}
+
+	private release() {
+		this.busy = false
+		this.freed.wake()
+	}
+
+	/// Replaces the committed trees by those opened if commit, else closes them; wakes the requests held if any was.
+	private commit(opened: [string, Store][], commit: bool) {
+		for (const [account, tree] of opened) {
+			if (commit) {
+				if (!this.trees.has(account)) {
+					this.named.push(account)
+				}
+				this.trees.get(account)?.close()
+				this.trees.set(account, tree)
+			} else {
+				tree.close()
+			}
+		}
+		if (commit && opened.length > 0) {
+			this.changed.wake()
 		}
 	}
 
+	/// null if the service held the request.
 	private serve(name: string, service: Service, req: Request, body: string, auth: sigv4.Authorization | null,
-		id: string): Response throws IoError | ParseError {
+		id: string, arrived: i64): Response | null throws IoError | ParseError {
 		const global = this.trees.get("")
 		const known = if (global == null || auth == null) null else credentials(global).get(auth.accessKey)
 		let why: Fault | null = null
@@ -146,24 +225,16 @@ export class Gateway {
 		caller.credential = known
 		caller.userAgent = req.headers.get("user-agent") ?? ""
 		caller.identify = this.identify
+		caller.arrived = arrived
 		let res: Response | null = null
+		let held = false
 		try {
 			res = service(caller, req)
+			held = caller.held != null && now() < caller.held!
 		} finally {
-			const commit = res != null && res!.status < 300
-			for (const [account, tree] of caller.opened) {
-				if (commit) {
-					if (!this.trees.has(account)) {
-						this.named.push(account)
-					}
-					this.trees.get(account)?.close()
-					this.trees.set(account, tree)
-				} else {
-					tree.close()
-				}
-			}
+			this.commit(caller.opened, res != null && res!.status < 300 && !held)
 		}
-		return res!
+		return if (held) null else res!
 	}
 }
 

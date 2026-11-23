@@ -1,4 +1,5 @@
 import { sign } from "../../core/auth/sigv4"
+import { ticks } from "../../core/client.test"
 import { Gateway } from "../../core/gateway"
 import { Catalog } from "../iam/catalog"
 import { stack } from "../../stack"
@@ -6,6 +7,7 @@ import { indexOf } from "std/algo"
 import * as json from "std/encoding/json"
 import { Request, Response } from "std/http"
 import { escape } from "std/url"
+import { second } from "std/time"
 
 const machine = "arn:aws:states:us-east-1:000000000000:stateMachine:m"
 const role = "arn:aws:iam::000000000000:role/r"
@@ -183,7 +185,12 @@ test "an execution waits at an activity's task until a worker answers it" {
 	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"x","input":"{\\"n\\":1}"}`))
 	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${e}"}`), `"status":"RUNNING"`)
 	const first = token(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`))
+	// A poll with no task waits 60 seconds, then answers none.
+	const t = now()
+	const ticking = async ticks(g, 61)
 	assert ok(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`), "{}")
+	assert now() - t >= 60 * second && now() - t < 61 * second
+	await ticking
 	assert fails(sfn(g, "SendTaskSuccess", `{"taskToken":"x","output":"{}"}`), "InvalidToken", "Invalid Token")
 	assert ok(sfn(g, "SendTaskHeartbeat", `{"taskToken":"${first}"}`))
 	assert ok(sfn(g, "SendTaskSuccess", `{"taskToken":"${first}","output":"7"}`))
@@ -202,7 +209,10 @@ test "an execution waits at an activity's task until a worker answers it" {
 	assert ok(sfn(g, "StopExecution", `{"executionArn":"${y}","error":"Stop"}`))
 	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${y}"}`), `"status":"ABORTED"`, `"error":"Stop"`)
 	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${y}","reverseOrder":true}`), `"type":"ExecutionAborted"`)
-	assert ok(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`), "{}")
+	// A poll held is answered by the execution that reaches the activity.
+	const polled = async sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`)
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"z","input":"{\\"n\\":2}"}`))
+	assert ok(await polled, `\\"n\\":2`)
 }
 
 test "versions, aliases and TestState" {

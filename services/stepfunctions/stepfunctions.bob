@@ -1,11 +1,12 @@
 //! AWS Step Functions: state machines, STANDARD and EXPRESS, of the States Language of JSONPath (./asl), their
-//! executions, and activities. BoberStack has no timers and runs nothing between requests, so an execution advances
+//! executions, and activities. Step Functions has no timers and does nothing between requests, so an execution advances
 //! only inside a request: StartExecution interprets the machine to its end, or to a task that waits for a token, before
 //! it answers. A Task calls the handler of its service directly, as a session of the machine's role.
 //!
 //! A paused execution's task token is the execution's ARN, the task's number in the run and a random secret, so
 //! SendTaskSuccess and SendTaskFailure find it and continue it within their request: they run the machine again from
-//! its start, replaying each task's outcome, UUID and random number the execution recorded. There is no long poll.
+//! its start, replaying each task's outcome, UUID and random number the execution recorded. GetActivityTask with no
+//! task waits up to 60 seconds, as the gateway holds it, for an execution to reach the activity.
 //!
 //! Where AWS differs:
 //!
@@ -809,6 +810,10 @@ export class Handler {
 			}
 		}
 		if (oldest == null) {
+			// AWS holds a poll for up to 60 seconds, then answers no token.
+			if (now() < caller.arrived + 60 * second) {
+				caller.hold(caller.arrived + 60 * second)
+			}
 			return out
 		}
 		const [k, e] = oldest!

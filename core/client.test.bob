@@ -2,10 +2,13 @@
 //! to a gateway, not sent: its URL only names the host that is signed.
 
 import { sign } from "./auth/sigv4"
+import { Fault } from "./fault"
+import { Gateway } from "./gateway"
 import { CryptoError } from "std/crypto/error"
 import { parse } from "std/encoding/xml"
 import { Request, Response } from "std/http"
 import { ParseError } from "std/string"
+import { second, sleep } from "std/time"
 
 /// A query of body to service from accessKey, signed by secret, dated as tests see now.
 export function request(service: string, accessKey: string, secret: string, body: string,
@@ -21,3 +24,15 @@ export function texts(res: Response, name: string): string[] throws ParseError {
 }
 
 export function text(res: Response, name: string): string | null throws ParseError { return texts(res, name).at(0) }
+
+/// Ticks g once a second of logical time, n times, as main's fiber does.
+export function ticks(g: Gateway, n: i32) {
+	for (let i = 0; i < n; i++) {
+		sleep(second)
+		try {
+			g.tick(now())
+		} catch (f: Fault) {
+			assert f.message == ""
+		}
+	}
+}
