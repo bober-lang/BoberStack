@@ -1,0 +1,91 @@
+//! KMS's state in an account's regional tree: its keys by id, each with its key material and grants, and its aliases
+//! by name.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+
+/// A version of a key's secret: the first is made with the key, each rotation adds one.
+export class Material {
+	/// 64 hex digits, as KMS's KeyMaterialId.
+	id = ""
+	/// The secret's bytes, in base64.
+	secret = ""
+	created: i64 = 0
+	/// How it came to be: "" for the first, else AUTOMATIC or ON_DEMAND.
+	rotation = ""
+}
+
+/// Permission to use a key that its policy need not give: the operations, to whom, and on what condition.
+export class Grant {
+	id = ""
+	token = ""
+	name: string | null = null
+	created: i64 = 0
+	/// The grantee and retiring principals, an ARN or a service principal, null if none.
+	grantee: string | null = null
+	retiring: string | null = null
+	/// The account that made it.
+	issuer = ""
+	operations: string[] = []
+	/// EncryptionContextSubset and EncryptionContextEquals, null if not given.
+	subset: [string, string][] | null = null
+	equals: [string, string][] | null = null
+}
+
+export class Key {
+	id = ""
+	arn = ""
+	account = ""
+	created: i64 = 0
+	description = ""
+	/// KeyUsage and KeySpec, as KMS names them.
+	usage = ""
+	spec = ""
+	multiRegion = false
+	/// Enabled, Disabled or PendingDeletion.
+	state = "Enabled"
+	/// When it is scheduled to be deleted and the window given, null if it is not.
+	deleting: i64 | null = null
+	window: i32 | null = null
+	policy = ""
+	tags: [string, string][] = []
+	/// Whether it rotates automatically, every period days, from when it was enabled.
+	rotates = false
+	period: i32 | null = null
+	since: i64 | null = null
+	/// Oldest first; the last is current.
+	materials: Material[] = []
+	grants: Grant[] = []
+}
+
+/// An alias: its name, alias/…, and the id of the key it names.
+export class Alias {
+	name = ""
+	target = ""
+	created: i64 = 0
+	updated: i64 = 0
+}
+
+/// The keys of an account's regional tree, by id.
+export function keys(s: Store): Table[Key] { return new Table[Key](s, "kms/keys") }
+/// The aliases of an account's regional tree, by name.
+export function aliases(s: Store): Table[Alias] { return new Table[Alias](s, "kms/aliases") }
+
+/// Puts k in t; a record holds no float, the one thing JSON cannot encode.
+export function save(t: Table[Key], k: Key) throws Fault {
+	try {
+		t.put(k.id, k)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}
+
+/// Puts a in t.
+export function saveAlias(t: Table[Alias], a: Alias) throws Fault {
+	try {
+		t.put(a.name, a)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

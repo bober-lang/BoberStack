@@ -7,7 +7,8 @@ for model in sts/service/2011-06-15/sts-2011-06-15.json iam/service/2010-05-08/i
 	sqs/service/2012-11-05/sqs-2012-11-05.json dynamodb/service/2012-08-10/dynamodb-2012-08-10.json \
 	sns/service/2010-03-31/sns-2010-03-31.json eventbridge/service/2015-10-07/eventbridge-2015-10-07.json \
 	s3/service/2006-03-01/s3-2006-03-01.json secrets-manager/service/2017-10-17/secrets-manager-2017-10-17.json \
-	ssm/service/2014-11-06/ssm-2014-11-06.json cloudwatch-logs/service/2014-03-28/cloudwatch-logs-2014-03-28.json; do
+	ssm/service/2014-11-06/ssm-2014-11-06.json cloudwatch-logs/service/2014-03-28/cloudwatch-logs-2014-03-28.json \
+	kms/service/2014-11-01/kms-2014-11-01.json; do
 	name=${model%%/*}
 	curl -fsS -A curl -o "$(echo "$name" | tr -d -).json" "https://raw.githubusercontent.com/aws/api-models-aws/$commit/models/$model"
 done

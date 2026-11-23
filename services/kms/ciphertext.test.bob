@@ -1,0 +1,43 @@
+import { mac, open, parse, seal } from "./ciphertext"
+import * as aead from "std/crypto/aead"
+import * as hex from "std/encoding/hex"
+
+test "XChaCha20-Poly1305: draft-irtf-cfrg-xchacha's vector A.3.1" {
+	const plain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, "
+		+ "sunscreen would be it."
+	const key = hex.decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+	const nonce = hex.decode("404142434445464748494a4b4c4d4e4f5051525354555657")
+	const ad = hex.decode("50515253c0c1c2c3c4c5c6c7")
+	const sealed = aead.seal(key, nonce, plain, ad)
+	assert hex.encode(sealed)
+		== "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a"
+		+ "82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9"
+		+ "664c97637da9768812f615c68b13b52e" + "c0875924c1c7987947deafd8780acf49"
+	assert aead.open(key, nonce, sealed, ad) == plain && aead.open(key, nonce, sealed, "") == null
+}
+
+test "HMAC-SHA-256 and HMAC-SHA-512: RFC 4231's test case 2" {
+	assert hex.encode(mac("HMAC_SHA_256", "Jefe", "what do ya want for nothing?"))
+		== "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+	assert hex.encode(mac("HMAC_SHA_512", "Jefe", "what do ya want for nothing?"))
+		== "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fd"
+		+ "caeab1a34d4a6b4b636e070a38bce737"
+}
+
+test "a blob names its key and material, and opens only under both and its context" {
+	const secret = hex.decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	const material = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	const id = "1234abcd-12ab-34cd-56ef-1234567890ab"
+	const b = seal("000000000000", "us-east-1", id, material, secret, "hello", [["b", "2"], ["a", "1"]])
+	const p = parse(b)!
+	assert p.account == "000000000000" && p.region == "us-east-1" && p.key == id && p.material == material
+	// The context's order does not matter; its pairs do.
+	assert open(p, secret, [["a", "1"], ["b", "2"]]) == "hello"
+	assert open(p, secret, [["a", "1"]]) == null && open(p, secret, []) == null
+	assert open(p, secret, [["a", "1"], ["b", "3"]]) == null
+	assert open(p, hex.decode(material), [["a", "1"], ["b", "2"]]) == null
+	// A blob altered anywhere does not open.
+	const forged = parse(b.slice(0, 10) + "x" + b.slice(11, b.length))
+	assert forged == null || open(forged!, secret, [["a", "1"], ["b", "2"]]) == null
+	assert parse("hi") == null && parse("bsk1") == null
+}

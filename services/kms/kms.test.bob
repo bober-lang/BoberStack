@@ -1,0 +1,291 @@
+import { sign, text } from "../../core/client"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import * as protocol from "../../core/protocol/json"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import * as api from "./api"
+import { decryptAs, encryptAs, Handler, keyArn } from "./kms"
+import { indexOf, startsWith } from "std/algo"
+import { replace } from "std/string"
+import * as base64 from "std/encoding/base64"
+import { Request, Response } from "std/http"
+import { Decodable } from "std/types"
+import { escape } from "std/url"
+
+const arn = "arn:aws:kms:us-east-1:000000000000"
+
+/// Who signs a request: an access key and its secret; an unknown key is its account's root.
+class Key {
+	id = "test"
+	secret = "test"
+}
+
+/// The answer of g to the KMS operation op with the JSON input body, signed by k.
+function call(g: Gateway, op: string, body: string, k = new Key()): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `TrentService.${op}`)
+	sign(req, body, "kms", "us-east-1", k.id, k.secret, "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// The answer of g's IAM to the action of params, from the root of 000000000000.
+function iam(g: Gateway, params: [string, string][]): Response {
+	const body = "Version=2010-05-08" + params.map(p => `&${p[0]}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, "iam", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// The user name, with the inline policy document if not "", and its access key.
+function user(g: Gateway, name: string, document = ""): Key {
+	assert iam(g, [["Action", "CreateUser"], ["UserName", name]]).status == 200
+	if (document != "") {
+		assert iam(g,
+			[["Action", "PutUserPolicy"], ["UserName", name], ["PolicyName", "p"], ["PolicyDocument", document]]).status
+			== 200
+	}
+	const res = iam(g, [["Action", "CreateAccessKey"], ["UserName", name]])
+	return { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")! }
+}
+
+/// The T that res holds.
+function out[T extends Decodable](res: Response): T {
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+/// Whether res is the error code, of the message why if given.
+function fails(res: Response, code: string, why = ""): bool {
+	const body = res.body.whole ?? ""
+	return res.status >= 400 && indexOf(body, `"__type":"${code}"`) >= 0 && indexOf(body, why) >= 0
+}
+
+/// A new key of the CreateKey input body; its metadata.
+function key(g: Gateway, body = "{}"): api.KeyMetadata {
+	return out[api.CreateKeyResponse](call(g, "CreateKey", body)).KeyMetadata!
+}
+
+/// The base64 of s.
+function b64(s: string): string { return base64.encode(s) }
+
+test "keys: create, describe, list, enable and disable, describe, tag, schedule and cancel deletion" {
+	const g = stack(new Catalog(0, 0))
+	const m = key(g, `{"Description":"one","Tags":[{"TagKey":"env","TagValue":"dev"}]}`)
+	assert m.KeyId.length == 36 && m.Arn == `${arn}:key/${m.KeyId}` && m.Enabled && m.KeyState == "Enabled"
+	assert m.KeySpec == "SYMMETRIC_DEFAULT" && m.KeyUsage == "ENCRYPT_DECRYPT" && m.Description == "one"
+	assert m.EncryptionAlgorithms! == ["SYMMETRIC_DEFAULT"] && m.KeyManager == "CUSTOMER" && m.Origin == "AWS_KMS"
+	const h = key(g, `{"KeySpec":"HMAC_256","KeyUsage":"GENERATE_VERIFY_MAC","MultiRegion":true}`)
+	assert startsWith(h.KeyId, "mrk-") && h.MacAlgorithms! == ["HMAC_SHA_256"] && h.MultiRegion == true
+	assert fails(call(g, "CreateKey", `{"KeySpec":"SYMMETRIC_DEFAULT","KeyUsage":"SIGN_VERIFY"}`),
+		"ValidationException",
+		"The operation failed because the KeyUsage value of the CMK is SIGN_VERIFY. To perform this operation, the "
+		+ "KeyUsage value must be ENCRYPT_DECRYPT.")
+	assert call(g, "CreateKey", `{"KeySpec":"RSA_2048","KeyUsage":"SIGN_VERIFY"}`).status == 501
+	assert call(g, "CreateKey", `{"Origin":"EXTERNAL"}`).status == 501
+	assert fails(call(g, "CreateKey", `{"Tags":[{"TagKey":"aws:x","TagValue":"y"}]}`), "TagException")
+	const listed = out[api.ListKeysResponse](call(g, "ListKeys", `{"Limit":1}`))
+	assert listed.Keys!.length == 1 && listed.Truncated == true
+	assert out[api.ListKeysResponse](call(g, "ListKeys", `{"Marker":"${listed.NextMarker!}"}`)).Keys!.length == 1
+	// A key is named by its id or ARN; anything else is not found, as AWS words it.
+	assert out[api.DescribeKeyResponse](call(g, "DescribeKey", `{"KeyId":"${m.Arn}"}`)).KeyMetadata!.KeyId == m.KeyId
+	assert fails(call(g, "DescribeKey", `{"KeyId":"1234"}`), "NotFoundException", "Invalid keyId '1234'")
+	const none = "11111111-2222-4333-8444-555555555555"
+	assert fails(call(g, "DescribeKey", `{"KeyId":"${none}"}`), "NotFoundException",
+		`Key '${arn}:key/${none}' does not exist`)
+	assert fails(call(g, "DescribeKey", `{"KeyId":"arn:aws:kms:us-west-2:000000000000:key/${none}"}`),
+		"NotFoundException", "Invalid arn us-west-2")
+	assert call(g, "DisableKey", `{"KeyId":"${m.KeyId}"}`).status == 200
+	assert fails(call(g, "Encrypt", `{"KeyId":"${m.KeyId}","Plaintext":"${b64("x")}"}`), "DisabledException",
+		`${m.Arn} is disabled.`)
+	assert call(g, "EnableKey", `{"KeyId":"${m.KeyId}"}`).status == 200
+	assert call(g, "UpdateKeyDescription", `{"KeyId":"${m.KeyId}","Description":"two"}`).status == 200
+	assert call(g, "TagResource", `{"KeyId":"${m.KeyId}","Tags":[{"TagKey":"team","TagValue":"a"}]}`).status == 200
+	assert call(g, "UntagResource", `{"KeyId":"${m.KeyId}","TagKeys":["env"]}`).status == 200
+	const tags = out[api.ListResourceTagsResponse](call(g, "ListResourceTags", `{"KeyId":"${m.KeyId}"}`)).Tags!
+	assert tags.length == 1 && tags[0].TagKey == "team"
+	assert fails(call(g, "ScheduleKeyDeletion", `{"KeyId":"${m.KeyId}","PendingWindowInDays":3}`),
+		"ValidationException", "PendingWindowInDays must be between 7 and 30")
+	const s = out[api.ScheduleKeyDeletionResponse](call(g, "ScheduleKeyDeletion",
+		`{"KeyId":"${m.KeyId}","PendingWindowInDays":7}`))
+	assert s.KeyState == "PendingDeletion" && s.KeyId == m.Arn && s.PendingWindowInDays == 7
+	assert fails(call(g, "Encrypt", `{"KeyId":"${m.KeyId}","Plaintext":"${b64("x")}"}`), "KMSInvalidStateException",
+		`${m.Arn} is pending deletion.`)
+	assert out[api.CancelKeyDeletionResponse](call(g, "CancelKeyDeletion", `{"KeyId":"${m.KeyId}"}`)).KeyId == m.Arn
+	const d = out[api.DescribeKeyResponse](call(g, "DescribeKey", `{"KeyId":"${m.KeyId}"}`)).KeyMetadata!
+	assert d.KeyState == "Disabled" && d.Description == "two" && d.DeletionDate == null
+}
+
+test "aliases name keys wherever AWS takes them, and only there" {
+	const g = stack(new Catalog(0, 0))
+	const a = key(g)
+	const b = key(g)
+	assert call(g, "CreateAlias", `{"AliasName":"alias/app","TargetKeyId":"${a.KeyId}"}`).status == 200
+	assert fails(call(g, "CreateAlias", `{"AliasName":"app","TargetKeyId":"${a.KeyId}"}`), "ValidationException",
+		"Alias must start with the prefix \\\"alias/\\\".")
+	assert fails(call(g, "CreateAlias", `{"AliasName":"alias/app","TargetKeyId":"${b.KeyId}"}`),
+		"AlreadyExistsException", `An alias with the name ${arn}:alias/app already exists`)
+	assert fails(call(g, "CreateAlias", `{"AliasName":"alias/two","TargetKeyId":"alias/app"}`), "ValidationException",
+		"Aliases must refer to keys. Not aliases")
+	assert fails(call(g, "CreateAlias", `{"AliasName":"alias/aws/x","TargetKeyId":"${a.KeyId}"}`),
+		"InvalidAliasNameException")
+	for (const name of ["alias/app", `${arn}:alias/app`]) {
+		assert out[api.DescribeKeyResponse](call(g, "DescribeKey", `{"KeyId":"${name}"}`)).KeyMetadata!.KeyId == a.KeyId
+		assert fails(call(g, "EnableKey", `{"KeyId":"${name}"}`), "InvalidArnException",
+			"Key Aliases are not supported for this operation.")
+	}
+	assert fails(call(g, "DescribeKey", `{"KeyId":"alias/none"}`), "NotFoundException",
+		`Alias ${arn}:alias/none is not found.`)
+	assert call(g, "UpdateAlias", `{"AliasName":"alias/app","TargetKeyId":"${b.Arn}"}`).status == 200
+	const of = out[api.ListAliasesResponse](call(g, "ListAliases", `{"KeyId":"${b.KeyId}"}`)).Aliases!
+	assert of.length == 1 && of[0].AliasArn == `${arn}:alias/app` && of[0].TargetKeyId == b.KeyId
+	assert out[api.ListAliasesResponse](call(g, "ListAliases", `{"KeyId":"${a.KeyId}"}`)).Aliases!.length == 0
+	assert call(g, "DeleteAlias", `{"AliasName":"alias/app"}`).status == 200
+	assert fails(call(g, "DeleteAlias", `{"AliasName":"alias/app"}`), "NotFoundException")
+}
+
+test "encrypt, decrypt and re-encrypt under the encryption context, across rotations" {
+	const g = stack(new Catalog(0, 0))
+	const a = key(g)
+	const b = key(g)
+	assert call(g, "CreateAlias", `{"AliasName":"alias/a","TargetKeyId":"${a.KeyId}"}`).status == 200
+	const e = out[api.EncryptResponse](call(g, "Encrypt",
+		`{"KeyId":"alias/a","Plaintext":"${b64("secret")}","EncryptionContext":{"app":"x","v":"1"}}`))
+	assert e.KeyId == a.Arn && e.EncryptionAlgorithm == "SYMMETRIC_DEFAULT"
+	const blob = b64(e.CiphertextBlob!)
+	// Decrypt finds the key from the blob; the context must be the same, in any order.
+	const d = out[api.DecryptResponse](call(g, "Decrypt",
+		`{"CiphertextBlob":"${blob}","EncryptionContext":{"v":"1","app":"x"}}`))
+	assert d.Plaintext == "secret" && d.KeyId == a.Arn
+	assert fails(call(g, "Decrypt", `{"CiphertextBlob":"${blob}","EncryptionContext":{"app":"x"}}`),
+		"InvalidCiphertextException")
+	assert fails(call(g, "Decrypt", `{"CiphertextBlob":"${blob}"}`), "InvalidCiphertextException")
+	assert fails(call(g, "Decrypt", `{"CiphertextBlob":"${b64("garbage")}"}`), "InvalidCiphertextException")
+	assert fails(call(g, "Decrypt",
+		`{"CiphertextBlob":"${blob}","KeyId":"${b.KeyId}","EncryptionContext":{"app":"x","v":"1"}}`),
+		"IncorrectKeyException")
+	let big = ""
+	for (let i = 0; i < 4097; i++) {
+		big += "a"
+	}
+	assert fails(call(g, "Encrypt", `{"KeyId":"${a.KeyId}","Plaintext":"${b64(big)}"}`), "ValidationException",
+		"failed to satisfy constraint: Member must have length less than or equal to 4096")
+	// Old material still decrypts after a rotation; new blobs are sealed under the new.
+	assert call(g, "EnableKeyRotation", `{"KeyId":"${a.KeyId}","RotationPeriodInDays":90}`).status == 200
+	const status = out[api.GetKeyRotationStatusResponse](call(g, "GetKeyRotationStatus", `{"KeyId":"${a.KeyId}"}`))
+	assert status.KeyRotationEnabled && status.RotationPeriodInDays == 90
+	assert call(g, "RotateKeyOnDemand", `{"KeyId":"${a.KeyId}"}`).status == 200
+	const rotations = out[api.ListKeyRotationsResponse](call(g, "ListKeyRotations", `{"KeyId":"${a.KeyId}"}`))
+	assert rotations.Rotations!.length == 1 && rotations.Rotations![0].RotationType == "ON_DEMAND"
+	const again = out[api.DecryptResponse](call(g, "Decrypt",
+		`{"CiphertextBlob":"${blob}","EncryptionContext":{"app":"x","v":"1"}}`))
+	assert again.Plaintext == "secret" && again.KeyMaterialId == d.KeyMaterialId
+	const r = out[api.ReEncryptResponse](call(g, "ReEncrypt",
+		`{"CiphertextBlob":"${blob}",`
+		+ `"SourceEncryptionContext":{"app":"x","v":"1"},"DestinationKeyId":"${b.KeyId}"}`))
+	assert r.SourceKeyId == a.Arn && r.KeyId == b.Arn
+	assert out[api.DecryptResponse](call(g, "Decrypt", `{"CiphertextBlob":"${b64(r.CiphertextBlob!)}"}`)).Plaintext
+		== "secret"
+	// A data key decrypts to its plaintext.
+	assert fails(call(g, "GenerateDataKey", `{"KeyId":"${a.KeyId}"}`), "ValidationException",
+		"Please specify either number of bytes or key spec.")
+	const k = out[api.GenerateDataKeyResponse](call(g, "GenerateDataKey", `{"KeyId":"${a.KeyId}","KeySpec":"AES_128"}`))
+	assert k.Plaintext!.length == 16
+	assert out[api.DecryptResponse](call(g, "Decrypt", `{"CiphertextBlob":"${b64(k.CiphertextBlob!)}"}`)).Plaintext
+		== k.Plaintext
+	const w = out[api.GenerateDataKeyWithoutPlaintextResponse](call(g, "GenerateDataKeyWithoutPlaintext",
+		`{"KeyId":"${a.KeyId}","NumberOfBytes":64}`))
+	assert out[api.DecryptResponse](call(g, "Decrypt",
+		`{"CiphertextBlob":"${b64(w.CiphertextBlob!)}"}`)).Plaintext!.length == 64
+	assert out[api.GenerateRandomResponse](call(g, "GenerateRandom", `{"NumberOfBytes":10}`)).Plaintext!.length == 10
+}
+
+test "HMAC keys generate and verify MACs, and are refused for encryption" {
+	const g = stack(new Catalog(0, 0))
+	const h = key(g, `{"KeySpec":"HMAC_512","KeyUsage":"GENERATE_VERIFY_MAC"}`)
+	const m = out[api.GenerateMacResponse](call(g, "GenerateMac",
+		`{"KeyId":"${h.KeyId}","Message":"${b64("hi")}","MacAlgorithm":"HMAC_SHA_512"}`)).Mac!
+	assert m.length == 64
+	assert out[api.VerifyMacResponse](call(g, "VerifyMac",
+		`{"KeyId":"${h.KeyId}","Message":"${b64("hi")}","MacAlgorithm":"HMAC_SHA_512","Mac":"${b64(m)}"}`)).MacValid
+	assert fails(call(g, "VerifyMac",
+		`{"KeyId":"${h.KeyId}","Message":"${b64("ho")}","MacAlgorithm":"HMAC_SHA_512","Mac":"${b64(m)}"}`),
+		"KMSInvalidMacException")
+	assert fails(call(g, "GenerateMac",
+		`{"KeyId":"${h.KeyId}","Message":"${b64("hi")}","MacAlgorithm":"HMAC_SHA_256"}`), "InvalidKeyUsageException")
+	assert fails(call(g, "Encrypt", `{"KeyId":"${h.KeyId}","Plaintext":"${b64("x")}"}`), "InvalidKeyUsageException")
+	assert fails(call(g, "EnableKeyRotation", `{"KeyId":"${h.KeyId}"}`), "UnsupportedOperationException")
+}
+
+test "key policies and grants decide who may use a key, of its condition keys" {
+	const g = stack(new Catalog(0, 0))
+	const alice = user(g, "alice")
+	const bob = user(g, "bob")
+	const k = key(g)
+	const enc = `{"KeyId":"${k.KeyId}","Plaintext":"${b64("x")}","EncryptionContext":{"app":"x"}}`
+	// The default key policy gives the account to IAM, and alice has no policy.
+	const policy = out[api.GetKeyPolicyResponse](call(g, "GetKeyPolicy", `{"KeyId":"${k.KeyId}"}`)).Policy!
+	assert indexOf(policy, `"AWS" : "arn:aws:iam::000000000000:root"`) >= 0
+	assert fails(call(g, "Encrypt", enc, alice), "AccessDeniedException",
+		"User: arn:aws:iam::000000000000:user/alice is not authorized to perform: kms:Encrypt")
+	// A key policy that names alice, on a condition of the encryption context.
+	const named = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},`
+		+ `"Action":"kms:*","Resource":"*"},{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/alice"},`
+		+ `"Action":"kms:Encrypt","Resource":"*","Condition":{"StringEquals":{"kms:EncryptionContext:app":"x"}}}]}`
+	assert call(g, "PutKeyPolicy", `{"KeyId":"${k.KeyId}","PolicyName":"default","Policy":${escaped(named)}}`).status
+		== 200
+	assert call(g, "Encrypt", enc, alice).status == 200
+	assert fails(call(g, "Encrypt", `{"KeyId":"${k.KeyId}","Plaintext":"${b64("x")}","EncryptionContext":{"app":"y"}}`,
+		alice), "AccessDeniedException")
+	// The lockout safety check refuses a policy that would leave no one to put the next.
+	const locked = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"kms:PutKeyPolicy",`
+		+ `"Resource":"*"}]}`
+	assert fails(call(g, "PutKeyPolicy", `{"KeyId":"${k.KeyId}","Policy":${escaped(locked)}}`),
+		"MalformedPolicyDocumentException",
+		"The new key policy will not allow you to update the key policy in the future.")
+	// A grant lets bob decrypt with the context it requires, and is retired by him.
+	const blob = b64(out[api.EncryptResponse](call(g, "Encrypt", enc)).CiphertextBlob!)
+	const dec = `{"CiphertextBlob":"${blob}","EncryptionContext":{"app":"x"}}`
+	assert fails(call(g, "Decrypt", dec, bob), "AccessDeniedException")
+	const grant = out[api.CreateGrantResponse](call(g, "CreateGrant",
+		`{"KeyId":"${k.KeyId}",`
+		+ `"GranteePrincipal":"arn:aws:iam::000000000000:user/bob","Operations":["Decrypt","RetireGrant"],`
+		+ `"Constraints":{"EncryptionContextSubset":{"app":"x"}}}`))
+	assert out[api.DecryptResponse](call(g, "Decrypt", dec, bob)).Plaintext == "x"
+	assert fails(call(g, "Encrypt", enc, bob), "AccessDeniedException")
+	const grants = out[api.ListGrantsResponse](call(g, "ListGrants", `{"KeyId":"${k.KeyId}"}`)).Grants!
+	assert grants.length == 1 && grants[0].GrantId == grant.GrantId
+	assert call(g, "RetireGrant", `{"GrantToken":"${grant.GrantToken!}"}`, bob).status == 200
+	assert fails(call(g, "Decrypt", dec, bob), "AccessDeniedException")
+	assert fails(call(g, "RevokeGrant", `{"KeyId":"${k.KeyId}","GrantId":"${grant.GrantId!}"}`), "NotFoundException")
+}
+
+test "a service encrypts and decrypts for its caller, by a key's alias, of kms:ViaService" {
+	const h = new Handler()
+	const c = new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "r")
+	c.actions = ["kms:CreateKey"]
+	const k = h.createKey(c, new api.CreateKeyRequest()).KeyMetadata!
+	c.actions = ["kms:CreateAlias"]
+	h.createAlias(c, { ...new api.CreateAliasRequest(), AliasName: "alias/s", TargetKeyId: k.KeyId })
+	c.actions = ["s3:PutObject"]
+	assert keyArn(c, "s3", "alias/s") == k.Arn
+	const blob = encryptAs(c, "s3", "alias/s", "hello", [["bucket", "b"]])
+	assert decryptAs(c, "s3", blob, [["bucket", "b"]]) == ["hello", k.Arn!] && c.actions == ["s3:PutObject"]
+	let refused = false
+	try {
+		decryptAs(c, "s3", blob, [])
+	} catch (f: Fault) {
+		refused = f.code == "InvalidCiphertextException"
+	}
+	assert refused
+}
+
+/// s as a JSON string.
+function escaped(s: string): string { return `"${replace(s, "\"", "\\\"")}"` }

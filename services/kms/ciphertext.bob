@@ -1,0 +1,118 @@
+//! KMS's cryptography: a ciphertext blob of BoberStack's own format, sealed by XChaCha20-Poly1305 under a version of a
+//! key's material, and the MACs of HMAC keys.
+//!
+//! A blob is "bsk1", the key's account (12 digits), its region and its id, each after a byte of its length, the
+//! material's id (32 bytes), a random nonce (24 bytes), then the plaintext sealed with a tag over all before the nonce
+//! and the encryption context: so a blob names its key and the material it was sealed under, and opens only under
+//! both and the context it was sealed with.
+
+import { Fault } from "../../core/fault"
+import * as aead from "std/crypto/aead"
+import { CryptoError } from "std/crypto/error"
+import { hmacSha256, hmacSha512 } from "std/crypto/hash"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import { sortBy } from "std/algo"
+import { ParseError } from "std/string"
+
+const magic = "bsk1"
+
+/// What a blob says of itself: the key it was sealed under, by account, region and id, the material's id in hex,
+/// and the rest, to open.
+export class Blob {
+	account = ""
+	region = ""
+	key = ""
+	material = ""
+	head = ""
+	nonce = ""
+	sealed = ""
+}
+
+/// plain sealed under secret, the bytes of the material whose id is material, of the key id of account and region,
+/// with the encryption context.
+export function seal(account: string, region: string, key: string, material: string, secret: string, plain: string,
+	context: [string, string][]): string throws Fault {
+	let id = ""
+	try {
+		id = hex.decode(material)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A key material's id is not hex")
+	}
+	const head = magic + sized(account) + sized(region) + sized(key) + id
+	const nonce = random(24)
+	try {
+		return head + nonce + aead.seal(secret, nonce, plain, head + canonical(context))
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", `A key's material does not seal: ${e.what}`)
+	}
+}
+
+/// The blob b is, null if it is none of this format.
+export function parse(b: string): Blob | null {
+	if (b.length < magic.length || b.slice(0, magic.length) != magic) {
+		return null
+	}
+	const out = new Blob()
+	let at = magic.length
+	const parts: string[] = []
+	for (let i = 0; i < 3; i++) {
+		if (at >= b.length) {
+			return null
+		}
+		const n = b[at] as i32
+		if (at + 1 + n > b.length) {
+			return null
+		}
+		parts.push(b.slice(at + 1, at + 1 + n))
+		at += 1 + n
+	}
+	if (at + 32 + 24 + 16 > b.length) {
+		return null
+	}
+	out.account = parts[0]
+	out.region = parts[1]
+	out.key = parts[2]
+	out.material = hex.encode(b.slice(at, at + 32))
+	out.head = b.slice(0, at + 32)
+	out.nonce = b.slice(at + 32, at + 56)
+	out.sealed = b.slice(at + 56, b.length)
+	return out
+}
+
+/// The plaintext of b under secret, its material's bytes, with the encryption context; null if b was not sealed so.
+export function open(b: Blob, secret: string, context: [string, string][]): string | null {
+	try {
+		return aead.open(secret, b.nonce, b.sealed, b.head + canonical(context))
+	} catch (e: CryptoError) {
+		return null
+	}
+}
+
+/// The MAC of message under secret by the algorithm, of HMAC_SHA_256 or HMAC_SHA_512.
+export function mac(algorithm: string, secret: string, message: string): string throws Fault {
+	try {
+		return if (algorithm == "HMAC_SHA_512") hmacSha512(secret, message) else hmacSha256(secret, message)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", `A key's material does not MAC: ${e.what}`)
+	}
+}
+
+/// n random bytes.
+export function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}
+
+/// The encryption context as the tag covers it: its pairs by key, each part after its length.
+function canonical(context: [string, string][]): string {
+	const pairs = context.slice(0, context.length)
+	sortBy(pairs, (a, b) => a[0] < b[0])
+	return pairs.map(p => `${p[0].length}:${p[0]}${p[1].length}:${p[1]}`).join("")
+}
+
+/// s after a byte of its length, which is less than 256.
+function sized(s: string): string { return fromBytes([s.length as u8]) + s }
