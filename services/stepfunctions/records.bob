@@ -1,5 +1,5 @@
-//! Step Functions' state in an account's regional tree: its state machines by name, and their executions by the
-//! machine's name, a NUL and the execution's.
+//! Step Functions' state in an account's regional tree: its state machines by name, their executions by the machine's
+//! name, a NUL and the execution's, and its activities by name.
 
 import { Store, Table } from "../../core/state/store"
 
@@ -31,15 +31,32 @@ export class Execution {
 	role = ""
 	/// Its history, each event the JSON of the wire's HistoryEvent.
 	events: string[] = []
+	/// The outcome of each call its runs made of their host, in order, as JSON: a task's {"Output"} or {"Error",
+	/// "Cause"}, a UUID's string or a random number; what a continuation replays.
+	steps: string[] = []
+	/// The number of the task, counted from 0 in the run's order, a RUNNING execution waits on for its token.
+	waiting: i32 = -1
+	/// The ARN of the activity that task is of, "" if it is a callback; its input, and whether a worker has it.
+	activity = ""
+	work = ""
+	handed = false
+}
+
+export class Activity {
+	name = ""
+	created: i64 = 0
+	tags: [string, string][] = []
 }
 
 /// The tables of a regional tree.
 export class Tables {
 	machines: Table[Machine]
 	executions: Table[Execution]
+	activities: Table[Activity]
 
 	constructor(s: Store) {
 		this.machines = new Table[Machine](s, "states/machines")
 		this.executions = new Table[Execution](s, "states/executions")
+		this.activities = new Table[Activity](s, "states/activities")
 	}
 }

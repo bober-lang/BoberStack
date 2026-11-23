@@ -35,6 +35,8 @@ export interface Host {
 	task(resource: string, parameters: Json): Json throws Failure
 	/// Records an event of the history of the type kind, its details under the member field, none if "".
 	event(kind: string, field: string, details: Json)
+	/// The token of the next task, as $$.Task.Token has it.
+	token(): string
 	/// A random UUID, and a random number from 0 up to 1.
 	uuid(): string
 	random(): f64
@@ -234,6 +236,9 @@ export class Execution {
 		let retries = 0
 		while (true) {
 			try {
+				if (t == "Task" && endsWith(s.str("Resource") ?? "", ".waitForTaskToken")) {
+					this.context.set("Task", obj([["Token", str(this.host.token())]]))
+				}
 				const eff = this.parameters(s, if (t == "Map") "" else "Parameters", this.inputPath(s, value))
 				let result = new Json()
 				if (t == "Task") {

@@ -125,7 +125,7 @@ test "a task its role may not perform fails the execution" {
 	assert ok(sfn(g, "CreateStateMachine", create(d)))
 	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"x"}`))
 	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:m:x"}`),
-		`"status":"FAILED"`, `"error":"DynamoDB.AccessDenied"`,
+		`"status":"FAILED"`, `"error":"DynamoDB.AccessDeniedException"`,
 		"assumed-role/r/x is not authorized to perform: dynamodb:GetItem")
 }
 
@@ -152,4 +152,46 @@ test "state machines" {
 		`"revisionId"`)
 	assert ok(sfn(g, "DeleteStateMachine", `{"stateMachineArn":"${machine}"}`))
 	assert ok(sfn(g, "ListStateMachines", "{}"), `"stateMachines":[]`)
+}
+
+test "an execution waits at an activity's task until a worker answers it" {
+	const g = world()
+	const activity = "arn:aws:states:us-east-1:000000000000:activity:a"
+	assert ok(sfn(g, "CreateActivity", `{"name":"a"}`), `"activityArn":"${activity}"`)
+	const d = `{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"${activity}","ResultPath":"$.r","Next":"B"},`
+		+ `"B":{"Type":"Pass","Parameters":{"id.$":"States.UUID()","r.$":"$.r"},"Next":"C"},`
+		+ `"C":{"Type":"Task","Resource":"${activity}","End":true}}}`
+	assert ok(sfn(g, "CreateStateMachine", create(d)))
+	const e = "arn:aws:states:us-east-1:000000000000:execution:m:x"
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"x","input":"{\\"n\\":1}"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${e}"}`), `"status":"RUNNING"`)
+	const first = token(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`))
+	assert ok(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`), "{}")
+	assert fails(sfn(g, "SendTaskSuccess", `{"taskToken":"x","output":"{}"}`), "InvalidToken", "Invalid Token")
+	assert ok(sfn(g, "SendTaskHeartbeat", `{"taskToken":"${first}"}`))
+	assert ok(sfn(g, "SendTaskSuccess", `{"taskToken":"${first}","output":"7"}`))
+	assert fails(sfn(g, "SendTaskSuccess", `{"taskToken":"${first}","output":"7"}`), "TaskDoesNotExist", "Task")
+	const res = sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`)
+	assert ok(res, `\\"r\\":7`)
+	const b = res.body.whole ?? ""
+	const at = indexOf(b, `\\"id\\":\\"`) + 9
+	const id = b.slice(at, at + 36)
+	assert ok(sfn(g, "SendTaskFailure", `{"taskToken":"${token(res)}","error":"E","cause":"C"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${e}"}`), `"status":"FAILED"`, `"error":"E"`)
+	// The continuation replayed the first answer and the UUID as they were, and kept the history it had.
+	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${e}"}`), id, `"id":1,`, `"type":"ExecutionFailed"`)
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"y"}`))
+	const y = "arn:aws:states:us-east-1:000000000000:execution:m:y"
+	assert ok(sfn(g, "StopExecution", `{"executionArn":"${y}","error":"Stop"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${y}"}`), `"status":"ABORTED"`, `"error":"Stop"`)
+	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${y}","reverseOrder":true}`), `"type":"ExecutionAborted"`)
+	assert ok(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`), "{}")
+}
+
+/// The task token of the answer res of GetActivityTask.
+function token(res: Response): string {
+	const b = res.body.whole ?? ""
+	const from = indexOf(b, `"taskToken":"`) + 13
+	const rest = b.slice(from, b.length)
+	return rest.slice(0, indexOf(rest, `"`))
 }

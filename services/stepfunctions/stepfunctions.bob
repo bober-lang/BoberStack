@@ -1,38 +1,51 @@
-//! AWS Step Functions: state machines, STANDARD and EXPRESS, of the States Language of JSONPath (./asl), and their
-//! executions. BoberStack has no timers and runs nothing between requests, so an execution runs to its end inside the
-//! request that starts it: StartExecution interprets the machine to success or failure before it answers, and what the
-//! execution's tasks write commits with that request; a Wait state waits for nothing, and every time an execution
-//! records is the request's. StartSyncExecution gives the same result in its answer. A Task calls the handler of its
-//! service directly, as the machine's role: as a session of that role, whose policies IAM evaluates. Where AWS
-//! differs:
+//! AWS Step Functions: state machines, STANDARD and EXPRESS, of the States Language of JSONPath (./asl), their
+//! executions, and activities. BoberStack has no timers and runs nothing between requests, so an execution advances
+//! only inside a request: StartExecution interprets the machine to its end, or to a task that waits for a token, before
+//! it answers, and what the execution's tasks write commits with that request; a Wait state waits for nothing.
+//! StartSyncExecution gives the same result in its answer. A Task calls the handler of its service directly, as a
+//! session of the machine's role, whose policies IAM evaluates.
+//!
+//! An execution that reaches a task of .waitForTaskToken, after its call, or of an activity stays RUNNING. Its task
+//! token is the execution's ARN and the task's number in the run, so SendTaskSuccess and SendTaskFailure find it, and
+//! continue the execution within their request: they record the outcome and run the machine again from its start,
+//! replaying each task's outcome, UUID and random number the execution recorded instead of making it again and making
+//! again the events it has, to its next pause or its end. GetActivityTask hands a task of the activity no worker has, the
+//! first by the execution's machine and name, at once, or answers with none at once: there is no long poll. Where AWS differs:
 //!
 //! - Tasks are the optimized integrations sqs:sendMessage, sns:publish, dynamodb:getItem, putItem, updateItem and
-//!   deleteItem, and events:putEvents, their results the service's output without AWS's SdkHttpMetadata and
-//!   SdkResponseMetadata; their errors are named by the service's fault code, as DynamoDB.AccessDenied, where AWS
-//!   names the SDK's exception, as DynamoDB.ConditionalCheckFailedException. A Lambda task fails with
-//!   States.TaskFailed, as BoberStack has no Lambda; any other resource the same way. The role's trust policy is not
-//!   checked.
-//! - Callbacks (.waitForTaskToken), .sync, activities, the aws-sdk integrations, versions, aliases, redrives, map runs
-//!   and TestState are not implemented; nor is JSONata, which CreateStateMachine refuses.
-//! - Branches of a Parallel and iterations of a Map run one after the other; an execution is never RUNNING, so
-//!   StopExecution finds none to stop. Timeouts never pass, and an EXPRESS machine's executions are kept and described
-//!   as a STANDARD one's.
+//!   deleteItem, events:putEvents, and states:startExecution, also with .sync and .sync:2, any of them with
+//!   .waitForTaskToken; and the aws-sdk integration kinesis:putRecord. Their results are the service's output without
+//!   AWS's SdkHttpMetadata and SdkResponseMetadata. A failed call is named of the service and the fault's code with
+//!   Exception after it, as SQS.QueueDoesNotExistException, which is the SDK's name where the code is its exception's
+//!   name less Exception. A Lambda task fails with States.TaskFailed; any other resource the same way. The role's trust
+//!   policy is not checked.
+//! - A nested .sync execution runs to its end within its parent's request; one that pauses fails the parent's task
+//!   with States.TaskFailed, as nothing could continue the parent when it ends. Its dates are milliseconds since the
+//!   epoch.
+//! - An activity's task is recorded as Task events, not Activity ones; GetActivityTask's workerName is not recorded.
+//!   Heartbeats are accepted and change nothing; no task times out, so TaskTimedOut is never raised.
+//! - The other aws-sdk integrations, versions, aliases, redrives, map runs and TestState are not implemented; nor is
+//!   JSONata, which CreateStateMachine refuses.
+//! - Branches of a Parallel and iterations of a Map run one after the other, and a pause in one stops the others.
+//!   Timeouts never pass, and an EXPRESS machine's executions are kept and described as a STANDARD one's.
 //! - A history's previousEventId is the event before it, whatever branch or iteration it is of.
 
 import * as api from "./api"
 import * as asl from "./asl"
-import { Execution, Machine, Tables } from "./records"
-import { Json, JsonError, nul, num, obj, parse, str, write } from "./value"
+import { Activity, Execution, Machine, Tables } from "./records"
+import { boolean, Json, JsonError, nul, num, obj, parse, str, write } from "./value"
 import * as dynamodbApi from "../dynamodb/api"
 import * as eventsApi from "../events/api"
+import * as kinesisApi from "../kinesis/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import { Fault } from "../../core/fault"
 import * as json from "../../core/protocol/json"
 import { Caller, requestTags, resourceTags } from "../../core/service"
 import { Table } from "../../core/state/store"
-import { startsWith } from "std/algo"
+import { endsWith, lastIndexOf, startsWith } from "std/algo"
 import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
 import { EncodeError } from "std/encoding/json"
 import * as hex from "std/encoding/hex"
 import { ParseError, parseInt, split } from "std/string"
@@ -51,6 +64,7 @@ export class Handler {
 	sns: snsApi.SNS
 	dynamodb: dynamodbApi.DynamoDB
 	events: eventsApi.EventBridge
+	kinesis: kinesisApi.Kinesis | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, dynamodb: dynamodbApi.DynamoDB, events: eventsApi.EventBridge) {
 		this.sqs = sqs
@@ -302,9 +316,121 @@ export class Handler {
 
 	stopExecution(caller: Caller, input: api.StopExecutionInput): api.StopExecutionOutput throws Fault {
 		const e = execution(caller, input.executionArn)
+		if (e.status == "RUNNING") {
+			e.status = "ABORTED"
+			e.error = input.error
+			e.cause = input.cause
+			e.stopped = now()
+			e.waiting = -1
+			e.activity = ""
+			e.work = ""
+			const details: [string, Json][] = []
+			if (input.error != null) {
+				details.push(["error", str(input.error!)])
+			}
+			if (input.cause != null) {
+				details.push(["cause", str(input.cause!)])
+			}
+			const host = new Host(this, caller, e, machineArn(caller, e.machine))
+			host.made = host.kept
+			host.event("ExecutionAborted", "executionAbortedEventDetails", obj(details))
+			save(new Tables(caller.regional()).executions, nameOf(input.executionArn, "execution"), e)
+		}
 		const out = new api.StopExecutionOutput()
 		out.stopDate = e.stopped ?? now()
 		return out
+	}
+
+	createActivity(caller: Caller, input: api.CreateActivityInput): api.CreateActivityOutput throws Fault {
+		const arn = activityArn(caller, input.name)
+		const tags = pairs(input.tags ?? [])
+		caller.actions = if (tags.length == 0) ["states:CreateActivity"]
+			else ["states:CreateActivity", "states:TagResource"]
+		caller.allow(arn, null, requestTags(tags))
+		named(input.name)
+		const db = new Tables(caller.regional())
+		let a = db.activities.get(input.name)
+		if (a == null) {
+			a = new Activity()
+			a.name = input.name
+			a.created = now()
+			a.tags = tags
+			save(db.activities, a.name, a!)
+		}
+		const out = new api.CreateActivityOutput()
+		out.activityArn = arn
+		out.creationDate = a.created
+		return out
+	}
+
+	describeActivity(caller: Caller, input: api.DescribeActivityInput): api.DescribeActivityOutput throws Fault {
+		const a = activity(caller, input.activityArn)
+		const out = new api.DescribeActivityOutput()
+		out.activityArn = input.activityArn
+		out.name = a.name
+		out.creationDate = a.created
+		return out
+	}
+
+	listActivities(caller: Caller, input: api.ListActivitiesInput): api.ListActivitiesOutput throws Fault {
+		caller.allow(activityArn(caller, "*"))
+		const all = new Tables(caller.regional()).activities.scan(null, 2147483647).map(e => e[1])
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListActivitiesOutput()
+		out.activities = page.map(a => {
+			const w = new api.ActivityListItem()
+			w.activityArn = activityArn(caller, a.name)
+			w.name = a.name
+			w.creationDate = a.created
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	deleteActivity(caller: Caller, input: api.DeleteActivityInput): api.DeleteActivityOutput throws Fault {
+		const name = nameOf(input.activityArn, "activity")
+		caller.allow(input.activityArn)
+		new Tables(caller.regional()).activities.delete(name)
+		return new api.DeleteActivityOutput()
+	}
+
+	getActivityTask(caller: Caller, input: api.GetActivityTaskInput): api.GetActivityTaskOutput throws Fault {
+		activity(caller, input.activityArn)
+		const db = new Tables(caller.regional())
+		const out = new api.GetActivityTaskOutput()
+		for (const [k, e] of db.executions.scan(null, 2147483647)) {
+			if (e.status == "RUNNING" && e.activity == input.activityArn && !e.handed) {
+				e.handed = true
+				save(db.executions, k, e)
+				out.taskToken = token(executionArn(caller, e), e.waiting)
+				out.input = e.work
+				return out
+			}
+		}
+		return out
+	}
+
+	sendTaskSuccess(caller: Caller, input: api.SendTaskSuccessInput): api.SendTaskSuccessOutput throws Fault {
+		let output = new Json()
+		try {
+			output = parse(input.output)
+		} catch (j: JsonError) {
+			throw api.invalidOutput(`Invalid Output: '${j.message}'`)
+		}
+		this.resume(caller, input.taskToken, obj([["Output", output]]))
+		return new api.SendTaskSuccessOutput()
+	}
+
+	sendTaskFailure(caller: Caller, input: api.SendTaskFailureInput): api.SendTaskFailureOutput throws Fault {
+		this.resume(caller, input.taskToken,
+			obj([["Error", str(input.error ?? "")], ["Cause", str(input.cause ?? "")]]))
+		return new api.SendTaskFailureOutput()
+	}
+
+	sendTaskHeartbeat(caller: Caller, input: api.SendTaskHeartbeatInput): api.SendTaskHeartbeatOutput throws Fault {
+		this.resume(caller, input.taskToken, nul())
+		return new api.SendTaskHeartbeatOutput()
 	}
 
 	getExecutionHistory(caller: Caller,
@@ -388,20 +514,68 @@ export class Handler {
 			host.event("ExecutionSucceeded", "executionSucceededEventDetails",
 				obj([["output", str(out)], ["outputDetails", truncated()]]))
 		} catch (f: asl.Failure) {
-			e.status = "FAILED"
-			e.error = f.error
-			e.cause = f.cause
-			host.event("ExecutionFailed", "executionFailedEventDetails",
-				obj([["error", str(f.error)], ["cause", str(f.cause)]]))
+			if (!host.paused) {
+				e.status = "FAILED"
+				e.error = f.error
+				e.cause = f.cause
+				host.event("ExecutionFailed", "executionFailedEventDetails",
+					obj([["error", str(f.error)], ["cause", str(f.cause)]]))
+			}
 		}
-		e.stopped = e.started
+		e.stopped = if (host.paused) null else now()
 		if (host.fault != null) {
 			throw host.fault!
 		}
 	}
 
+	/// Continues the execution waiting on the task of the token, of the task's outcome, to its next pause or its end.
+	private resume(caller: Caller, token: string, outcome: Json) throws Fault {
+		caller.allow("*")
+		let arn = ""
+		let n = -1
+		try {
+			const t = base64.decode(token, "url", "raw")
+			const at = lastIndexOf(t, "#")
+			arn = t.slice(0, if (at < 0) 0 else at)
+			n = parseInt(t.slice(at + 1, t.length))
+		} catch (p: ParseError) {}
+		if (n < 0 || !startsWith(arn, "arn:aws:states:")) {
+			throw api.invalidToken("Invalid Token: 'Invalid token'")
+		}
+		let k = ""
+		try {
+			k = nameOf(arn, "execution")
+		} catch (f: Fault) {
+			throw api.invalidToken("Invalid Token: 'Invalid token'")
+		}
+		const db = new Tables(caller.regional())
+		const e = db.executions.get(k)
+		if (e == null || e.status != "RUNNING" || e.waiting != n) {
+			throw api.taskDoesNotExist("Task Does Not Exist")
+		}
+		if (outcome.kind == "null") {
+			return
+		}
+		e.steps.push(write(outcome))
+		e.waiting = -1
+		e.activity = ""
+		e.work = ""
+		let input = new Json()
+		try {
+			input = parse(e.input)
+		} catch (j: JsonError) {} // validated when started
+		this.run(caller, e!, machineArn(caller, e.machine), input)
+		save(db.executions, k, e!)
+	}
+
 	/// The result of the Task resource of parameters, called as the session c of the machine's role.
 	task(c: Caller, resource: string, parameters: Json): Json throws asl.Failure {
+		for (const k of ["MessageBody", "Message"]) {
+			const v = parameters.get(k)
+			if (v != null && v.kind != "string") {
+				parameters.set(k, str(write(v!)))
+			}
+		}
 		const p = write(parameters)
 		const prefix = "arn:aws:states:::"
 		const op = if (startsWith(resource, prefix)) resource.slice(prefix.length, resource.length) else ""
@@ -434,19 +608,91 @@ export class Handler {
 					return result(json.result(this.events.putEvents(c,
 						json.decode[eventsApi.PutEventsRequest](p, eventsApi.validation))))
 			}
+			if (op == "aws-sdk:kinesis:putRecord" && this.kinesis != null) {
+				c.actions = ["kinesis:PutRecord"]
+				return result(json.result(this.kinesis!.putRecord(c,
+					json.decode[kinesisApi.PutRecordInput](p, kinesisApi.validation))))
+			}
+			if (op == "states:startExecution" || op == "states:startExecution.sync"
+				|| op == "states:startExecution.sync:2") {
+				return this.child(c, op, parameters)
+			}
 		} catch (f: Fault) {
-			const service = split(op, ":")[0]
+			const service = split(op, ":")[if (startsWith(op, "aws-sdk:")) 1 else 0]
 			const named = if (service == "dynamodb") "DynamoDB"
+				else if (service == "kinesis") "Kinesis"
 				else if (service == "events") "EventBridge"
 				else if (service == "sns") "SNS"
+				else if (service == "states") "StepFunctions"
 				else "SQS"
-			throw new asl.Failure(`${named}.${f.code}`, f.message)
+			const code = split(f.code, ".")
+			const name = code[code.length - 1]
+			throw new asl.Failure(`${named}.${name}${if (endsWith(name, "Exception")) "" else "Exception"}`, f.message)
+		}
+		if (startsWith(op, "states:")) {
+			throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
 		}
 		if (startsWith(op, "lambda:") || isLambda(resource)) {
 			throw new asl.Failure("States.TaskFailed", "BoberStack has no Lambda to invoke")
 		}
 		throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
 	}
+
+	/// The result of the nested execution the Task op, states:startExecution with or without .sync or .sync:2, starts of
+	/// parameters as the session c: at once its ARN and start, or as .sync, its description once it has run.
+	private child(c: Caller, op: string, parameters: Json): Json throws Fault | asl.Failure {
+		c.actions = ["states:StartExecution"]
+		const given = parameters.get("Input")
+		const e = this.start(c, parameters.str("StateMachineArn") ?? "", parameters.str("Name"),
+			if (given == null) null else if (given.kind == "string") given.text else write(given!), false)
+		const arn = executionArn(c, e)
+		if (op == "states:startExecution") {
+			return obj([["ExecutionArn", str(arn)], ["StartDate", millis(e.started)]])
+		}
+		const sync2 = endsWith(op, ":2")
+		const keys: [string, Json][] = [["ExecutionArn", str(arn)], ["Input", shaped(e.input, sync2)],
+			["InputDetails", obj([["Included", boolean(true)]])], ["Name", str(e.name)]]
+		if (e.output != null) {
+			keys.push(["Output", shaped(e.output, sync2)])
+			keys.push(["OutputDetails", obj([["Included", boolean(true)]])])
+		}
+		keys.push(["RedriveCount", num(0.0)])
+		keys.push(["StartDate", millis(e.started)])
+		keys.push(["StateMachineArn", str(machineArn(c, e.machine))])
+		keys.push(["Status", str(e.status)])
+		if (e.stopped != null) {
+			keys.push(["StopDate", millis(e.stopped!)])
+		}
+		if (e.error != null) {
+			keys.push(["Error", str(e.error!)])
+			keys.push(["Cause", str(e.cause ?? "")])
+		}
+		const out = obj(keys)
+		if (e.status == "RUNNING") {
+			throw new asl.Failure("States.TaskFailed",
+				`The execution ${arn} waits for a task token, which a .sync task cannot await in BoberStack`)
+		}
+		if (e.status != "SUCCEEDED") {
+			throw new asl.Failure("States.TaskFailed", write(out))
+		}
+		return out
+	}
+}
+
+/// The milliseconds since the epoch of the time t, as a nested execution's result has its dates.
+function millis(t: i64): Json { return num((t / 1000000) as f64) }
+
+/// The value s as a nested execution's result has its input or output: the JSON's text, or as sync2, the JSON.
+function shaped(s: string | null, sync2: bool): Json {
+	if (s == null) {
+		return nul()
+	}
+	if (sync2) {
+		try {
+			return parse(s!)
+		} catch (e: JsonError) {} // the JSON an execution keeps
+	}
+	return str(s!)
 }
 
 /// Whether resource is a Lambda function's ARN.
@@ -461,7 +707,8 @@ function result(s: string): Json {
 	}
 }
 
-/// What runs an execution's tasks, as a session of its machine's role, and keeps its history.
+/// What runs an execution's tasks, as a session of its machine's role, and keeps its history. A run replays the steps
+/// the execution has recorded, and makes again the events it has, before it adds to either.
 class Host {
 	handler: Handler
 	caller: Caller
@@ -469,26 +716,85 @@ class Host {
 	arn: string
 	/// The fault no task can stand for, which fails the request.
 	fault: Fault | null = null
+	/// The steps and tasks of this run so far, and the events it has made.
+	step = 0
+	tasks = 0
+	made = 0
+	/// The number of events the execution had before this run.
+	kept: i32
+	/// Whether the run stopped at a task that waits for its token.
+	paused = false
 
 	constructor(handler: Handler, caller: Caller, e: Execution, arn: string) {
 		this.handler = handler
 		this.caller = caller
 		this.e = e
 		this.arn = arn
+		this.kept = e.events.length
 	}
 
 	task(resource: string, parameters: Json): Json throws asl.Failure {
+		const at = this.step
+		this.step++
+		const n = this.tasks
+		this.tasks++
+		if (at < this.e.steps.length) {
+			const was = this.replayed(at)
+			const output = was.get("Output")
+			if (output == null) {
+				throw new asl.Failure(was.str("Error") ?? "", was.str("Cause") ?? "")
+			}
+			return output!
+		}
+		if (split(resource, ":").length == 7 && split(resource, ":")[5] == "activity") {
+			this.e.waiting = n
+			this.e.activity = resource
+			this.e.work = write(parameters)
+			this.e.handed = false
+			this.paused = true
+			throw new asl.Failure("States.Runtime", "The execution waits for a worker of its activity")
+		}
+		const callback = ".waitForTaskToken"
+		const waits = endsWith(resource, callback)
 		const c = this.caller.internal(principal, this.arn, [])
 		c.source = ""
 		const role = split(this.e.role, "/")
 		c.arn = `arn:aws:sts::${this.caller.account}:assumed-role/${role[role.length - 1]}/${this.e.name}`
 		c.userId = `${role[role.length - 1]}:${this.e.name}`
-		return this.handler.task(c, resource, parameters)
+		try {
+			const out = this.handler.task(c,
+				if (waits) resource.slice(0, resource.length - callback.length) else resource, parameters)
+			if (waits) {
+				this.e.waiting = n
+				this.paused = true
+				throw new asl.Failure("States.Runtime", "The execution waits for its task token")
+			}
+			this.e.steps.push(write(obj([["Output", out]])))
+			return out
+		} catch (f: asl.Failure) {
+			if (!this.paused) {
+				this.e.steps.push(write(obj([["Error", str(f.error)], ["Cause", str(f.cause)]])))
+			}
+			throw f
+		}
+	}
+
+	/// The step at as recorded.
+	private replayed(at: i32): Json {
+		try {
+			return parse(this.e.steps[at])
+		} catch (j: JsonError) {
+			return obj([]) // written by write
+		}
 	}
 
 	event(kind: string, field: string, details: Json) {
-		const id = this.e.events.length + 1
-		const t = this.e.started
+		this.made++
+		if (this.paused || this.made <= this.kept) {
+			return
+		}
+		const id = this.made
+		const t = now()
 		const ms = (t % second) / 1000000
 		const keys: [string, Json][] = [["timestamp", num(((t / second) as f64) + (ms as f64) / 1000.0)],
 			["type", str(kind)], ["id", num(id as f64)], ["previousEventId", num((id - 1) as f64)]]
@@ -498,25 +804,42 @@ class Host {
 		this.e.events.push(write(obj(keys)))
 	}
 
+	token(): string { return token(executionArn(this.caller, this.e), this.tasks) }
+
 	uuid(): string {
+		const at = this.step
+		this.step++
+		if (at < this.e.steps.length) {
+			return this.replayed(at).text
+		}
+		let u = ""
 		try {
-			return uuid()
+			u = uuid()
 		} catch (f: Fault) {
 			this.fault = f
-			return ""
 		}
+		this.e.steps.push(write(str(u)))
+		return u
 	}
 
 	random(): f64 {
+		const at = this.step
+		this.step++
+		if (at < this.e.steps.length) {
+			return this.replayed(at).number()
+		}
+		let x = 0.0
 		try {
 			const b = bytes(4)
-			const n = ((b[0] as i64) << 16) | ((b[1] as i64) << 8) | (b[2] as i64)
-			return (n as f64) / 16777216.0
-		} catch (e: IoError) {
-			return 0.0
-		}
+			x = (((b[0] as i64) << 16 | (b[1] as i64) << 8 | (b[2] as i64)) as f64) / 16777216.0
+		} catch (e: IoError) {}
+		this.e.steps.push(write(num(x)))
+		return x
 	}
 }
+
+/// The task token of the task numbered n of the execution of the ARN arn.
+function token(arn: string, n: i32): string { return base64.encode(`${arn}#${n}`, "url", "raw") }
 
 /// Throws unless role is a role's ARN of the caller's account that the caller may pass to Step Functions, and the
 /// caller may perform actions on resource, of the context keys context.
@@ -570,11 +893,11 @@ function nameOf(arn: string, kind: string): string throws Fault {
 	if (parts.length < 6 || parts[0] != "arn" || parts[2] != "states") {
 		throw api.invalidArn(`Invalid Arn: 'Invalid ARN prefix: ${arn}'`)
 	}
-	const n = if (kind == "stateMachine") 7 else 8
+	const n = if (kind == "execution") 8 else 7
 	if (parts.length != n || parts[5] != kind && !(kind == "execution" && parts[5] == "express")) {
 		throw api.invalidArn(`Invalid Arn: 'Resource path not valid: ${arn}'`)
 	}
-	return if (kind == "stateMachine") parts[6] else `${parts[6]}\x00${parts[7]}`
+	return if (kind == "execution") `${parts[6]}\x00${parts[7]}` else parts[6]
 }
 
 function machineName(arn: string): string throws Fault { return nameOf(arn, "stateMachine") }
@@ -598,6 +921,21 @@ function execution(caller: Caller, arn: string): Execution throws Fault {
 		throw api.executionDoesNotExist(`Execution Does Not Exist: '${arn}'`)
 	}
 	return e!
+}
+
+/// The ARN of the activity named name.
+function activityArn(caller: Caller, name: string): string {
+	return `arn:aws:states:${caller.region}:${caller.account}:activity:${name}`
+}
+
+/// The activity of the ARN arn, which caller is allowed to act on.
+function activity(caller: Caller, arn: string): Activity throws Fault {
+	const a = new Tables(caller.regional()).activities.get(nameOf(arn, "activity"))
+	caller.allow(arn)
+	if (a == null) {
+		throw api.activityDoesNotExist(`Activity Does Not Exist: '${arn}'`)
+	}
+	return a!
 }
 
 function doesNotExist(arn: string): Fault {
@@ -662,7 +1000,7 @@ function details(): api.CloudWatchEventsExecutionDataDetails {
 }
 
 /// An inputDetails or outputDetails of a history event: nothing truncated.
-function truncated(): Json { return obj([["truncated", { ...nul(), kind: "bool", text: "false" }]]) }
+function truncated(): Json { return obj([["truncated", boolean(false)]]) }
 
 /// The time t as the context object has it, to the millisecond, as 2026-11-23T03:04:05.123Z.
 function stamp(t: i64): string {
