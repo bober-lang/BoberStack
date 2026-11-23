@@ -28,7 +28,7 @@ import { decryptAs, encryptAs, sealer } from "../kms/kms"
 import * as api from "./api"
 import { arn, authorize, bucketPolicy, Found, found, member, noSuchBucket, noSuchKey, owner } from "./common"
 
-import { acl, Config, exposed, forget, locking, mfaDelete, preflight, publicPolicy, settings,
+import { acl, Config, exposed, forget, lockable, locking, mfaDelete, preflight, publicPolicy, settings,
 	versioned } from "./config"
 
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
@@ -242,6 +242,7 @@ export class Handler {
 		v.tags = tagging(input.Tagging)
 		v.algorithm = algorithm
 		v.checksum = sum
+		retain(f, v, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 		encrypt(caller, f, v, input)
 		const k = write(caller, f, v, data)
 		this.notify(caller, f, "ObjectCreated:Put", v)
@@ -472,6 +473,7 @@ export class Handler {
 			v.metadata = input.Metadata ?? []
 		}
 		v.redirect = input.WebsiteRedirectLocation ?? (if (replace) null else s.redirect)
+		retain(f, v, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 		encrypt(caller, f, v, input)
 		if (s.parts > 0) {
 			// a copy is one part, its ETag its bytes' MD5
@@ -534,6 +536,7 @@ export class Handler {
 		v.metadata = input.Metadata ?? []
 		v.tags = tagging(input.Tagging)
 		v.algorithm = if (input.ChecksumAlgorithm == null) "" else `${input.ChecksumAlgorithm!}`
+		retain(f, v, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 		encrypt(caller, f, v, input)
 		put(f.db.uploads, `${path(input.Bucket, input.Key)}\x00${`${1000000000000 + u.order}`.slice(1, 13)}`, u)
 		this.typed = ""
@@ -917,6 +920,14 @@ export class Handler {
 		return { ...new api.DeleteObjectTaggingOutput(), VersionId: versionOf(f.bucket, v) }
 	}
 
+	/// Refused, as every object here is STANDARD.
+	restoreObject(caller: Caller, input: api.RestoreObjectRequest): api.RestoreObjectOutput throws Fault {
+		caller.actions = ["s3:RestoreObject"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		object(f, input.Key, input.VersionId)
+		throw new Fault(403, "InvalidObjectState", "Restore is not allowed for the object's current storage class")
+	}
+
 	/// Of the attributes asked, given in one header or several; of the parts only their count, as S3 gives no part's
 	/// size or checksum for an upload that had none.
 	getObjectAttributes(caller: Caller,
@@ -925,11 +936,17 @@ export class Handler {
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const asked: string[] = []
 		for (const h of input.ObjectAttributes) {
-			asked.append(split(h, ",").map(a => trim(a)))
+			asked.append(split(h, ",").map(a => trim(a)).filter(a => a != ""))
+		}
+		if (asked.length == 0) {
+			throw new Fault(400, "InvalidRequest",
+				"The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty")
 		}
 		const known = ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"]
-		if (asked.length == 0 || asked.some(a => !known.includes(a))) {
-			throw new Fault(400, "InvalidArgument", "Invalid attribute name specified.")
+		const unknown = asked.find(a => !known.includes(a))
+		if (unknown != null) {
+			throw new Fault(400, "InvalidArgument", "Invalid attribute name specified.", true,
+				member("ArgumentName", "x-amz-object-attributes") + member("ArgumentValue", unknown!))
 		}
 		const v = object(f, input.Key, input.VersionId)
 		const r = new api.GetObjectAttributesOutput()
@@ -1073,6 +1090,10 @@ export class Handler {
 				"The XML you provided was not well-formed or did not validate against our published schema")
 		}
 		versioned(f, input)
+		if (s != f.bucket.versioning && lockable(f)) {
+			throw new Fault(409, "InvalidBucketState",
+				"An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.")
+		}
 		f.bucket.versioning = s!
 		put(f.db.buckets, input.Bucket, f.bucket)
 		return new Unit()
@@ -1576,6 +1597,33 @@ function bypass(caller: Caller, f: Found, key: string, v: Version, bypassing: bo
 	}
 	caller.actions = ["s3:BypassGovernanceRetention"]
 	authorize(caller, f.bucket, arn(f.bucket.name, key))
+}
+
+/// Sets the retention and legal hold of v, new in the bucket of f, from a request's headers, else the bucket's default
+/// retention from now; throws S3's refusal of headers it does not take.
+function retain(f: Found, v: Version, mode: string | null, until: i64 | null, hold: string | null) throws Fault {
+	const header = "x-amz-object-lock-retain-until-date"
+	if ((mode == null) != (until == null)) {
+		throw new Fault(400, "InvalidArgument", `${header} and x-amz-object-lock-mode must both be supplied`, true,
+			member("ArgumentName", header))
+	}
+	if (until != null && until! <= now()) {
+		throw new Fault(400, "InvalidArgument", "The retain until date must be in the future!", true,
+			member("ArgumentName", header) + member("ArgumentValue", query.stamp(until!, "date-time")))
+	}
+	const locked = lockable(f)
+	if ((mode != null || hold != null) && !locked) {
+		throw new Fault(400, "InvalidRequest", "Bucket is missing ObjectLockConfiguration")
+	}
+	v.hold = hold
+	v.mode = mode
+	v.until = until ?? 0
+	const d = if (locked && mode == null) settings(f).lock?.Rule?.DefaultRetention else null
+	if (d != null) {
+		v.mode = d!.Mode
+		const days = ((d!.Days ?? 0) as i64) + ((d!.Years ?? 0) as i64) * 365
+		v.until = now() + days * 86400 * second
+	}
 }
 
 /// S3's answer for a version of no retention or legal hold.

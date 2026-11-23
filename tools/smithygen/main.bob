@@ -269,6 +269,13 @@ const milliseconds = ["com.amazonaws.s3#AmazonS3", "com.amazonaws.route53#AWSDns
 const interleaved: [string, [string, string, string][]][] = [["com.amazonaws.s3#AmazonS3",
 	[["com.amazonaws.s3#ListObjectVersionsOutput", "Version", "DeleteMarker"]]]]
 
+/// The XML names the services below give structures where AWS names them otherwise than their models, as on
+/// 2026-11-23: by their shape ids, each structure's and its name.
+const xmlNames: [string, [string, string][]][] = [["com.amazonaws.s3#AmazonS3",
+	[["com.amazonaws.s3#ListBucketAnalyticsConfigurationsOutput", "ListBucketAnalyticsConfigurationsResult"],
+	["com.amazonaws.s3#ListBucketIntelligentTieringConfigurationsOutput",
+	"ListIntelligentTieringConfigurationsResult"]]]]
+
 /// The codes the services below answer with besides the errors their models declare, as AWS did on 2026-11-23: by
 /// their shape ids, each code and its __type.
 const undeclared: [string, [string, string][]][] = [["com.amazonaws.sqs#AmazonSQS",
@@ -381,6 +388,8 @@ class Generator {
 	open = false
 	/// The flattened lists written as one, by their structures' ids.
 	interleaved: [string, string, string][] = []
+	/// The XML names AWS gives structures, by their ids, where it differs from the model.
+	xmlNames: [string, string][] = []
 	/// Whether the service serves awsJson 1.0 besides awsQuery.
 	twofold = false
 	/// Whether the member being typed is a restXml payload, which may be a stream; and the operations the API cannot
@@ -439,6 +448,8 @@ class Generator {
 		this.opened = opened.includes(services[0][0])
 		const merged = interleaved.find(i => i[0] == services[0][0])
 		this.interleaved = if (merged == null) [] else merged[1]
+		const sent = xmlNames.find(x => x[0] == services[0][0])
+		this.xmlNames = if (sent == null) [] else sent[1]
 		const fixed = statuses.find(c => c[0] == services[0][0])
 		const answered = if (fixed == null) [] else fixed[1]
 		const ops = [...s.operations.map(r => r.target), ...this.operationsOf(s.resources)]
@@ -783,8 +794,10 @@ class Generator {
 		}
 		const n = this.declare(name(id))
 		let tags = ""
-		if (this.protocol == "restXml" && s.traits.xmlName != null) {
-			tags += ` @restxml.Name[${json.quoted(s.traits.xmlName!)}]`
+		const sent = this.xmlNames.find(x => x[0] == id)
+		const xmlName = if (sent == null) s.traits.xmlName else sent![1]
+		if (this.protocol == "restXml" && xmlName != null) {
+			tags += ` @restxml.Name[${json.quoted(xmlName!)}]`
 		}
 		if (this.protocol == "restXml" && s.traits.xmlNamespace != null) {
 			tags += ` ${namespace(s.traits.xmlNamespace!)}`

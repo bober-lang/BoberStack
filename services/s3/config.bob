@@ -51,9 +51,14 @@ export function settings(f: Found): Settings throws Fault { return table(f).get(
 
 /// Throws S3's refusal of a retention or legal hold unless the bucket of f has Object Lock.
 export function locking(f: Found) throws Fault {
-	if (!f.bucket.locked && settings(f).lock?.ObjectLockEnabled != "Enabled") {
+	if (!lockable(f)) {
 		throw new Fault(400, "InvalidRequest", "Bucket is missing Object Lock Configuration")
 	}
+}
+
+/// Whether the bucket of f has Object Lock.
+export function lockable(f: Found): bool throws Fault {
+	return f.bucket.locked || settings(f).lock?.ObjectLockEnabled == "Enabled"
 }
 
 /// Drops the configuration of the bucket of f, deleted.

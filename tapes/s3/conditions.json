@@ -1,0 +1,956 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"headers": {
+				"content-md5": "ELC5MY6yoOfvAzpPGPEnCA=="
+			},
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-c.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"content-md5": "XrY7u+Ae7tCTyyK7j1rNww=="
+			},
+			"body": "hello world",
+			"capture": {
+				"e": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "${e}",
+					"x-amz-checksum-crc64nvme": "jSnVw/bqjr4=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "if-match",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "${e}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-match other",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "\"0123\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "if-match star",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "*"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-none-match",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "${e}"
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}"
+				}
+			}
+		},
+		{
+			"name": "if-none-match star",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "*"
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}"
+				}
+			}
+		},
+		{
+			"name": "if-modified-since later",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-modified-since earlier",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-modified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-unmodified-since earlier",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Unmodified-Since</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "if-match over if-unmodified-since",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "${e}",
+				"if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-none-match over if-modified-since",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "\"0123\"",
+				"if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "binary/octet-stream",
+					"content-length": "11"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "if-none-match false, if-modified-since true",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "${e}",
+				"if-modified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}"
+				}
+			}
+		},
+		{
+			"name": "head if-match other",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "\"0123\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "head if-none-match",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "${e}"
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}"
+				}
+			}
+		},
+		{
+			"name": "head if-unmodified-since earlier",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "range a-b",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=0-4"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-4/11",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			}
+		},
+		{
+			"name": "range a-",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=6-"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 6-10/11",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"
+			}
+		},
+		{
+			"name": "range -n",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=-3"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 8-10/11",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "85c76dcae2299d2235c793fe3425bd88376f5c4721cfddc1c9a9c452c20c5d33"
+			}
+		},
+		{
+			"name": "range past the end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=5-100"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "6",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 5-10/11",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 6,
+				"sha256": "045f13dd864bafaad0dd977ac971de549b090cb2836f061d0779b26dd9bb8f4b"
+			}
+		},
+		{
+			"name": "range unsatisfiable",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=20-30"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message><RangeRequested>bytes=20-30</RangeRequested><ActualObjectSize>11</ActualObjectSize><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "range several",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=0-1,3-4"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "11",
+					"accept-ranges": "bytes",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "range not bytes",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "lines=0-1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "11",
+					"accept-ranges": "bytes",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "head range",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=0-4"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-4/11",
+					"content-length": "5",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "head range unsatisfiable",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"range": "bytes=20-30"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "part 1 of a simple object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "11",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-10/11",
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 11,
+				"sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+			}
+		},
+		{
+			"name": "head part 1 of a simple object",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:04 GMT",
+					"etag": "${e}",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-10/11",
+					"content-length": "11",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "part 2 of a simple object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "2"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidPartNumber</Code><Message>The requested partnumber is not satisfiable</Message><PartNumberRequested>2</PartNumberRequested><ActualPartCount>1</ActualPartCount><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if-none-match star over it",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-none-match": "*",
+				"content-md5": "eV8yArF8trw9S3cdjGyerw=="
+			},
+			"body": "other",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-None-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if-match other",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "\"0123\"",
+				"content-md5": "eV8yArF8trw9S3cdjGyerw=="
+			},
+			"body": "other",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if-match",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"if-match": "${e}",
+				"content-md5": "XrY7u+Ae7tCTyyK7j1rNww=="
+			},
+			"body": "hello world",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "${e}",
+					"x-amz-checksum-crc64nvme": "jSnVw/bqjr4=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put if-match a missing key",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/missing",
+			"headers": {
+				"if-match": "${e}",
+				"content-md5": "ndTkYSaMgDT1yFZOFVxnpg=="
+			},
+			"body": "x",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>missing</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if-none-match star new",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/n",
+			"headers": {
+				"if-none-match": "*",
+				"content-md5": "e4uWWtS8oOQatR3nsxNjoQ=="
+			},
+			"body": "n",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"7b8b965ad4bca0e41ab51de7b31363a1\"",
+					"x-amz-checksum-crc64nvme": "YuKc2hTAL00=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "copy if-match other",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/c",
+			"headers": {
+				"x-amz-copy-source": "${prefix}-c/k",
+				"x-amz-copy-source-if-match": "\"0123\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if-none-match",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/c",
+			"headers": {
+				"x-amz-copy-source": "${prefix}-c/k",
+				"x-amz-copy-source-if-none-match": "${e}"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-None-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if-unmodified-since earlier",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/c",
+			"headers": {
+				"x-amz-copy-source": "${prefix}-c/k",
+				"x-amz-copy-source-if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-Unmodified-Since</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if-modified-since later",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/c",
+			"headers": {
+				"x-amz-copy-source": "${prefix}-c/k",
+				"x-amz-copy-source-if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2026-11-23T04:12:06.000Z</LastModified><ETag>${e}</ETag><ChecksumCRC64NVME>jSnVw/bqjr4=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "create an upload",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"uploads": ""
+			},
+			"capture": {
+				"upload": "UploadId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-c</Bucket><Key>k</Key><UploadId>${upload}</UploadId></InitiateMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "upload part 1",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "${upload}"
+			},
+			"headers": {
+				"content-md5": "9Mk4XxkC9zNLALm07NFk3g=="
+			},
+			"body": "part",
+			"capture": {
+				"pe": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${pe}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "complete if-none-match star",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"headers": {
+				"if-none-match": "*"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${pe}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-None-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete if-match other",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"headers": {
+				"if-match": "\"0123\""
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${pe}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete if-match",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"headers": {
+				"if-match": "${e}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${pe}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>https://s3.eu-north-1.amazonaws.com/boberstack-ab-00000000-c/k</Location><Bucket>boberstack-ab-00000000-c</Bucket><Key>k</Key><ETag>\"1819d1a8700e59901a48215b8577ac07-1\"</ETag><ChecksumCRC64NVME>v+lYbwd1k6E=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CompleteMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "get part 1 of the upload",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "4",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-3/4",
+					"last-modified": "Mon, 23 Nov 2026 04:12:06 GMT",
+					"etag": "\"1819d1a8700e59901a48215b8577ac07-1\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-mp-parts-count": "1"
+				},
+				"size": 4,
+				"sha256": "37a680133bd09342f934afb8dd2c7d9e1b624da5f35e3a38adb103e37c055ed1"
+			}
+		},
+		{
+			"name": "head part 1 of the upload",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"last-modified": "Mon, 23 Nov 2026 04:12:06 GMT",
+					"etag": "\"1819d1a8700e59901a48215b8577ac07-1\"",
+					"x-amz-mp-parts-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-3/4",
+					"content-length": "4",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "head part 2 of the upload",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"partNumber": "2"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "abort",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete k",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete n",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/n",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete c",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/c",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete missing",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/missing",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}
