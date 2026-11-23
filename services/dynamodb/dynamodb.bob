@@ -32,6 +32,8 @@ import { attribute, Change, Definition, Destination, entries, Index, indexKeyOf,
 import { keyArn } from "../kms/kms"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as b64 from "std/encoding/base64"
+import { crc32 } from "std/hash/crc32"
+import { Request, Response } from "std/http"
 import { ParseError, replace } from "std/string"
 import { millisecond, minute } from "std/time"
 
@@ -1947,6 +1949,13 @@ function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] 
 	return out
 }
 
+/// The answer to req, with the CRC32 of its body in x-amz-crc32, which DynamoDB's SDKs check.
+export function serve(h: Handler, caller: Caller, req: Request): Response throws IoError {
+	const res = api.handle(h, caller, req)
+	res.headers.set("x-amz-crc32", `${crc32(res.body.whole ?? "")}`)
+	return res
+}
+
 function base64(s: string): string { return b64.encode(s) }
 
 function describe(caller: Caller, d: Definition, status: api.TableStatus): api.TableDescription {
@@ -1975,7 +1984,9 @@ function describe(caller: Caller, d: Definition, status: api.TableStatus): api.T
 		else globals.map(x => ({ ...new api.GlobalSecondaryIndexDescription(), IndexName: x.name,
 		KeySchema: keySchema(x.hash, x.range), Projection: projectionOf(x), IndexStatus: "ACTIVE",
 		ProvisionedThroughput: provisioned(x.read, x.write), IndexSizeBytes: x.size, ItemCount: x.count,
-		IndexArn: `${t.TableArn!}/index/${x.name}` }))
+		IndexArn: `${t.TableArn!}/index/${x.name}`,
+		WarmThroughput: { ...new api.GlobalSecondaryIndexWarmThroughputDescription(),
+		ReadUnitsPerSecond: warm(x.read, 12000), WriteUnitsPerSecond: warm(x.write, 4000), Status: "ACTIVE" } }))
 	if (d.stream) {
 		t.StreamSpecification = { ...new api.StreamSpecification(), StreamEnabled: true,
 			StreamViewType: d.streamView as api.StreamViewType }
@@ -1987,6 +1998,8 @@ function describe(caller: Caller, d: Definition, status: api.TableStatus): api.T
 	t.TableClassSummary = if (d.tableClass == "STANDARD") null
 		else ({ ...new api.TableClassSummary(), TableClass: d.tableClass as api.TableClass })
 	t.DeletionProtectionEnabled = d.deletionProtection
+	t.WarmThroughput = { ...new api.TableWarmThroughputDescription(), ReadUnitsPerSecond: warm(d.read, 12000),
+		WriteUnitsPerSecond: warm(d.write, 4000), Status: status }
 	if (d.kmsKey != null) {
 		const e = new api.SSEDescription()
 		e.Status = "ENABLED"
@@ -2018,6 +2031,9 @@ function keySchema(hash: Key, range: Key | null): api.KeySchemaElement[] {
 	}
 	return out
 }
+
+/// A new table's or index's, AWS's start for on-demand, raised to the capacity provisioned above it.
+function warm(provisioned: i64, start: i64): i64 { return if (provisioned > start) provisioned else start }
 
 function provisioned(read: i64, write: i64): api.ProvisionedThroughputDescription {
 	return { ...new api.ProvisionedThroughputDescription(), NumberOfDecreasesToday: 0, ReadCapacityUnits: read,
