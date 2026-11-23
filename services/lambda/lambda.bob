@@ -1,22 +1,30 @@
-//! AWS Lambda's control plane: functions, their versions, aliases, resource policies, tags, reserved concurrency and
-//! event source mappings.
+//! AWS Lambda's control plane: functions, their versions, aliases, resource policies, tags, reserved and provisioned
+//! concurrency, settings of asynchronous invocation, event source mappings and layers.
 //!
-//! Nothing runs a function, and nothing polls an event source mapping's source. Invoke authorizes the call and finds the function and its qualifier as AWS does, then
-//! answers status 200 with X-Amz-Function-Error: Unhandled and a payload whose errorType is NotImplemented, as a
-//! function that failed: SDKs hand that back to the caller as is, where a 5xx would be retried; a DryRun answers 204
-//! as AWS's. There is no background work: a function is Active, and its last update Successful, from the answer that
-//! makes it, and a mapping Enabled from the first read after its creation. Where AWS differs further: GetFunction answers no Code.Location, as this server serves no download of a
-//! function's code; the role must exist and trust lambda.amazonaws.com, but is never assumed; an image's URI is not
-//! checked, and its CodeSha256 is that of the URI. A mapping's source, a queue's or stream's ARN, is not checked to
-//! exist. A function URL is shaped as AWS's and serves nothing. A zip in S3 is read as the caller, as AWS reads it.
-//! Layers, event invoke configs, provisioned concurrency and code signing are not implemented.
+//! Nothing runs a function, and nothing polls an event source mapping's source. Invoke authorizes the call and finds
+//! the function and its qualifier as AWS does, then answers status 200 with X-Amz-Function-Error: Unhandled and a
+//! payload whose errorType is NotImplemented, as a function that failed: SDKs hand that back to the caller as is, where
+//! a 5xx would be retried; a DryRun answers 204 as AWS's. There is no background work: a function is Active, and its
+//! last update Successful, from the answer that makes it, a mapping Enabled from the first read after its creation, and
+//! provisioned concurrency READY, all allocated, as soon as it is put. A function's role is passed as iam:PassRole
+//! checks it and must trust lambda.amazonaws.com; a mapping's queue or stream must exist and its function's role be
+//! allowed to read it, as AWS checks at creation. GetFunction and GetLayerVersion locate a zip at this server's
+//! unsigned /_boberstack/lambda/ endpoint. Where AWS differs further: an image's URI is not checked, and its CodeSha256
+//! is that of the URI; a function URL is shaped as AWS's and serves nothing; a function's layers are of its account
+//! and region; code signing is never configured. A zip in S3 is read as the caller, as AWS reads it.
 
 import { Fault } from "../../core/fault"
-import { Caller, Context, requestTags, Unit } from "../../core/service"
+import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { BlobWriter, Table } from "../../core/state/store"
-import * as iam from "../iam/records"
 import * as s3Api from "../s3/api"
 import * as s3 from "../s3/s3"
+import * as kinesisApi from "../kinesis/api"
+import * as kinesis from "../kinesis/kinesis"
+import * as streamsApi from "../dynamodbstreams/api"
+import * as streams from "../dynamodbstreams/dynamodbstreams"
+import * as sqsApi from "../sqs/api"
+import * as sqs from "../sqs/sqs"
+import { actAs, passRole } from "../sts/sts"
 import * as api from "./api"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
@@ -37,6 +45,7 @@ class Function {
 	published: i32 = 0
 	tags: [string, string][] = []
 	reserved: i32 | null = null
+	recursion: api.RecursiveLoop = "Terminate"
 }
 
 /// A version of a function, $LATEST among them; its code is the blob stored with it.
@@ -56,7 +65,8 @@ class Version {
 	packaged: api.PackageType = "Zip"
 	image: string | null = null
 	environment: [string, string][] | null = null
-	layers: string[] = []
+	/// The ARNs of its layers' versions, each with its size.
+	layers: [string, i64][] = []
 	architectures: api.Architecture[] = ["x86_64"]
 	ephemeral: i32 = 512
 	tracing: api.TracingMode = "PassThrough"
@@ -64,6 +74,8 @@ class Version {
 	vpc: api.VpcConfig | null = null
 	logging: api.LoggingConfig | null = null
 	kms: string | null = null
+	updateRuntime: api.UpdateRuntimeOn = "Auto"
+	runtimeVersion: string | null = null
 }
 
 /// An event source mapping, which nothing polls.
@@ -86,6 +98,41 @@ class Mapping {
 	parallelization: i32 | null = null
 	responses: api.FunctionResponseType[] | null = null
 	tags: [string, string][] = []
+}
+
+/// A version of a layer; its zip is the blob stored with it.
+class LayerVersion {
+	name = ""
+	version: i64 = 0
+	description: string | null = null
+	created = ""
+	runtimes: api.Runtime[] | null = null
+	architectures: api.Architecture[] | null = null
+	license: string | null = null
+	sha = ""
+	size: i64 = 0
+	/// Its policy's statements, by their ids, as JSON, as Policy's.
+	statements: [string, string][] = []
+	revision = ""
+}
+
+/// A layer: the number of its latest version, which a version deleted does not give back.
+class LayerName {
+	published: i64 = 0
+}
+
+/// The provisioned concurrency of a version or alias, READY as soon as put: nothing is allocated.
+class Provisioned {
+	requested: i32 = 0
+	modified = ""
+}
+
+/// The settings of asynchronous invocation of a version or alias, of which there is none.
+class Invoking {
+	retries: i32 | null = null
+	age: i32 | null = null
+	destination: api.DestinationConfig | null = null
+	modified: i64 = 0
 }
 
 /// A function URL, which serves nothing.
@@ -122,6 +169,12 @@ class Tables {
 	/// By UUID.
 	mappings: Table[Mapping]
 	urls: Table[Url]
+	/// By the function's name, a colon and the qualifier, $LATEST for the unqualified function's.
+	provisioned: Table[Provisioned]
+	invoking: Table[Invoking]
+	/// Layers by name; their versions by the layer's name, a colon and the version's key.
+	layers: Table[LayerName]
+	layerVersions: Table[LayerVersion]
 
 	constructor(caller: Caller) throws Fault {
 		const s = caller.regional()
@@ -131,6 +184,10 @@ class Tables {
 		this.policies = new Table[Policy](s, "lambda.policies")
 		this.mappings = new Table[Mapping](s, "lambda.mappings")
 		this.urls = new Table[Url](s, "lambda.urls")
+		this.provisioned = new Table[Provisioned](s, "lambda.provisioned")
+		this.invoking = new Table[Invoking](s, "lambda.invoking")
+		this.layers = new Table[LayerName](s, "lambda.layers")
+		this.layerVersions = new Table[LayerVersion](s, "lambda.layerVersions")
 	}
 }
 
@@ -146,6 +203,10 @@ export class Handler {
 
 	/// S3, which a function's code is read from as the caller.
 	s3: s3.Handler | null = null
+	/// The services whose queues and streams an event source mapping reads.
+	sqs: sqs.Handler | null = null
+	kinesis: kinesis.Handler | null = null
+	streams: streams.Handler | null = null
 
 	createFunction(caller: Caller, input: api.CreateFunctionRequest): api.FunctionConfiguration throws Fault {
 		const t = target(caller, input.FunctionName, null)
@@ -172,7 +233,7 @@ export class Handler {
 		v.timeout = input.Timeout ?? 3
 		v.memory = input.MemorySize ?? 128
 		v.environment = input.Environment?.Variables
-		v.layers = input.Layers ?? []
+		v.layers = layered(db, caller, input.Layers ?? [])
 		v.architectures = input.Architectures ?? ["x86_64"]
 		v.ephemeral = input.EphemeralStorage?.Size ?? 512
 		v.tracing = input.TracingConfig?.Mode ?? "PassThrough"
@@ -205,6 +266,7 @@ export class Handler {
 		r.Code = new api.FunctionCodeLocation()
 		if (v.packaged == "Zip") {
 			r.Code.RepositoryType = "S3"
+			r.Code.Location = located(caller, "versions", t.name, key(v.version))
 		} else {
 			r.Code.RepositoryType = "ECR"
 			r.Code.ImageUri = v.image
@@ -279,7 +341,9 @@ export class Handler {
 		if (input.Environment != null) {
 			v.environment = input.Environment!.Variables
 		}
-		v.layers = input.Layers ?? v.layers
+		if (input.Layers != null) {
+			v.layers = layered(db, caller, input.Layers!)
+		}
 		v.ephemeral = input.EphemeralStorage?.Size ?? v.ephemeral
 		v.tracing = input.TracingConfig?.Mode ?? v.tracing
 		if (input.DeadLetterConfig != null) {
@@ -310,6 +374,8 @@ export class Handler {
 			}
 			db.versions.delete(`${t.name}:${key(v.version)}`)
 			db.policies.delete(`${t.name}:${v.version}`)
+			db.provisioned.delete(`${t.name}:${v.version}`)
+			db.invoking.delete(`${t.name}:${v.version}`)
 			return r
 		}
 		version(caller, db, t)
@@ -325,6 +391,12 @@ export class Handler {
 		}
 		for (const [k, _] of db.urls.scan(null, 100000, `${t.name}:`)) {
 			db.urls.delete(k)
+		}
+		for (const [k, _] of db.provisioned.scan(null, 100000, `${t.name}:`)) {
+			db.provisioned.delete(k)
+		}
+		for (const [k, _] of db.invoking.scan(null, 100000, `${t.name}:`)) {
+			db.invoking.delete(k)
 		}
 		return r
 	}
@@ -359,7 +431,8 @@ export class Handler {
 	createAlias(caller: Caller, input: api.CreateAliasRequest): api.AliasConfiguration throws Fault {
 		const t = unqualified(caller, input.FunctionName)
 		const db = new Tables(caller)
-		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null))
+		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null),
+			resourceTags(db.functions.get(t.name)?.tags ?? []))
 		version(caller, db, t)
 		const k = `${t.name}:${input.Name}`
 		if (db.aliases.get(k) != null) {
@@ -377,14 +450,16 @@ export class Handler {
 	getAlias(caller: Caller, input: api.GetAliasRequest): api.AliasConfiguration throws Fault {
 		const t = unqualified(caller, input.FunctionName)
 		const db = new Tables(caller)
-		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null))
+		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null),
+			resourceTags(db.functions.get(t.name)?.tags ?? []))
 		return aliasOf(caller, t.name, alias(caller, db, t.name, input.Name))
 	}
 
 	updateAlias(caller: Caller, input: api.UpdateAliasRequest): api.AliasConfiguration throws Fault {
 		const t = unqualified(caller, input.FunctionName)
 		const db = new Tables(caller)
-		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null))
+		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null),
+			resourceTags(db.functions.get(t.name)?.tags ?? []))
 		const a = alias(caller, db, t.name, input.Name)
 		revised(input.RevisionId, a.revision)
 		a.description = input.Description ?? a.description
@@ -399,7 +474,8 @@ export class Handler {
 	deleteAlias(caller: Caller, input: api.DeleteAliasRequest): Unit throws Fault {
 		const t = unqualified(caller, input.FunctionName)
 		const db = new Tables(caller)
-		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null))
+		caller.allow(arn(caller, t.name, input.Name), policy(db, t.name, null),
+			resourceTags(db.functions.get(t.name)?.tags ?? []))
 		db.aliases.delete(`${t.name}:${input.Name}`)
 		db.policies.delete(`${t.name}:${input.Name}`)
 		db.urls.delete(`${t.name}:${input.Name}`)
@@ -531,6 +607,306 @@ export class Handler {
 		return new Unit()
 	}
 
+	putProvisionedConcurrencyConfig(caller: Caller,
+		input: api.PutProvisionedConcurrencyConfigRequest): api.PutProvisionedConcurrencyConfigResponse throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		if (version(caller, db, t).version == "$LATEST") {
+			throw invalid("Provisioned Concurrency Configs cannot be applied to unpublished function versions.")
+		}
+		const p = { ...new Provisioned(), requested: input.ProvisionedConcurrentExecutions, modified: stamp() }
+		save(db.provisioned, `${t.name}:${t.qualifier}`, p)
+		const c = provisionedOf(caller, t, p)
+		return { ...new api.PutProvisionedConcurrencyConfigResponse(),
+			RequestedProvisionedConcurrentExecutions: c.RequestedProvisionedConcurrentExecutions,
+			AllocatedProvisionedConcurrentExecutions: c.AllocatedProvisionedConcurrentExecutions,
+			AvailableProvisionedConcurrentExecutions: c.AvailableProvisionedConcurrentExecutions, Status: c.Status,
+			LastModified: c.LastModified }
+	}
+
+	getProvisionedConcurrencyConfig(caller: Caller,
+		input: api.GetProvisionedConcurrencyConfigRequest): api.GetProvisionedConcurrencyConfigResponse throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const c = provisionedOf(caller, t, provisioned(caller, t))
+		return { ...new api.GetProvisionedConcurrencyConfigResponse(),
+			RequestedProvisionedConcurrentExecutions: c.RequestedProvisionedConcurrentExecutions,
+			AllocatedProvisionedConcurrentExecutions: c.AllocatedProvisionedConcurrentExecutions,
+			AvailableProvisionedConcurrentExecutions: c.AvailableProvisionedConcurrentExecutions, Status: c.Status,
+			LastModified: c.LastModified }
+	}
+
+	deleteProvisionedConcurrencyConfig(caller: Caller,
+		input: api.DeleteProvisionedConcurrencyConfigRequest): Unit throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		provisioned(caller, t)
+		new Tables(caller).provisioned.delete(`${t.name}:${t.qualifier}`)
+		return new Unit()
+	}
+
+	listProvisionedConcurrencyConfigs(caller: Caller, input: api.ListProvisionedConcurrencyConfigsRequest): api.ListProvisionedConcurrencyConfigsResponse throws Fault {
+		const t = unqualified(caller, input.FunctionName)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		const found = db.provisioned.scan(input.Marker, 100000, `${t.name}:`)
+		const n = input.MaxItems ?? 50
+		const items: api.ProvisionedConcurrencyConfigListItem[] = []
+		for (let i = 0; i < found.length && i < n; i++) {
+			const [k, p] = found[i]
+			items.push(provisionedOf(caller,
+				{ ...new Target(), name: t.name, qualifier: k.slice(t.name.length + 1, k.length) }, p))
+		}
+		return { ...new api.ListProvisionedConcurrencyConfigsResponse(), ProvisionedConcurrencyConfigs: items,
+			NextMarker: if (found.length > n) found[n - 1][0] else null }
+	}
+
+	putFunctionEventInvokeConfig(caller: Caller,
+		input: api.PutFunctionEventInvokeConfigRequest): api.FunctionEventInvokeConfig throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		const e = { ...new Invoking(), retries: input.MaximumRetryAttempts, age: input.MaximumEventAgeInSeconds,
+			destination: input.DestinationConfig, modified: now() }
+		save(db.invoking, `${t.name}:${t.qualifier ?? "$LATEST"}`, e)
+		return invokingOf(caller, t.name, t.qualifier ?? "$LATEST", e)
+	}
+
+	updateFunctionEventInvokeConfig(caller: Caller,
+		input: api.UpdateFunctionEventInvokeConfigRequest): api.FunctionEventInvokeConfig throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const e = invoking(caller, t)
+		e.retries = input.MaximumRetryAttempts ?? e.retries
+		e.age = input.MaximumEventAgeInSeconds ?? e.age
+		e.destination = input.DestinationConfig ?? e.destination
+		e.modified = now()
+		save(new Tables(caller).invoking, `${t.name}:${t.qualifier ?? "$LATEST"}`, e)
+		return invokingOf(caller, t.name, t.qualifier ?? "$LATEST", e)
+	}
+
+	getFunctionEventInvokeConfig(caller: Caller,
+		input: api.GetFunctionEventInvokeConfigRequest): api.FunctionEventInvokeConfig throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		return invokingOf(caller, t.name, t.qualifier ?? "$LATEST", invoking(caller, t))
+	}
+
+	deleteFunctionEventInvokeConfig(caller: Caller,
+		input: api.DeleteFunctionEventInvokeConfigRequest): Unit throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		invoking(caller, t)
+		new Tables(caller).invoking.delete(`${t.name}:${t.qualifier ?? "$LATEST"}`)
+		return new Unit()
+	}
+
+	listFunctionEventInvokeConfigs(caller: Caller,
+		input: api.ListFunctionEventInvokeConfigsRequest): api.ListFunctionEventInvokeConfigsResponse throws Fault {
+		const t = unqualified(caller, input.FunctionName)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		const found = db.invoking.scan(input.Marker, 100000, `${t.name}:`)
+		const n = input.MaxItems ?? 50
+		const items: api.FunctionEventInvokeConfig[] = []
+		for (let i = 0; i < found.length && i < n; i++) {
+			const [k, e] = found[i]
+			items.push(invokingOf(caller, t.name, k.slice(t.name.length + 1, k.length), e))
+		}
+		return { ...new api.ListFunctionEventInvokeConfigsResponse(), FunctionEventInvokeConfigs: items,
+			NextMarker: if (found.length > n) found[n - 1][0] else null }
+	}
+
+	getFunctionCodeSigningConfig(caller: Caller,
+		input: api.GetFunctionCodeSigningConfigRequest): api.GetFunctionCodeSigningConfigResponse throws Fault {
+		const t = unqualified(caller, input.FunctionName)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		return { ...new api.GetFunctionCodeSigningConfigResponse(), CodeSigningConfigArn: "", FunctionName: t.name }
+	}
+
+	getRuntimeManagementConfig(caller: Caller,
+		input: api.GetRuntimeManagementConfigRequest): api.GetRuntimeManagementConfigResponse throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		const v = version(caller, db, t)
+		return { ...new api.GetRuntimeManagementConfigResponse(), UpdateRuntimeOn: v.updateRuntime,
+			FunctionArn: arn(caller, t.name, t.qualifier), RuntimeVersionArn: v.runtimeVersion }
+	}
+
+	putRuntimeManagementConfig(caller: Caller,
+		input: api.PutRuntimeManagementConfigRequest): api.PutRuntimeManagementConfigResponse throws Fault {
+		const t = target(caller, input.FunctionName, input.Qualifier)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		const v = version(caller, db, t)
+		v.updateRuntime = input.UpdateRuntimeOn
+		v.runtimeVersion = input.RuntimeVersionArn
+		kept(db, v)
+		return { ...new api.PutRuntimeManagementConfigResponse(), UpdateRuntimeOn: v.updateRuntime,
+			FunctionArn: arn(caller, t.name, t.qualifier), RuntimeVersionArn: v.runtimeVersion }
+	}
+
+	getFunctionRecursionConfig(caller: Caller,
+		input: api.GetFunctionRecursionConfigRequest): api.GetFunctionRecursionConfigResponse throws Fault {
+		const t = unqualified(caller, input.FunctionName)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		return { ...new api.GetFunctionRecursionConfigResponse(), RecursiveLoop: db.functions.get(t.name)!.recursion }
+	}
+
+	putFunctionRecursionConfig(caller: Caller,
+		input: api.PutFunctionRecursionConfigRequest): api.PutFunctionRecursionConfigResponse throws Fault {
+		const t = unqualified(caller, input.FunctionName)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		const f = db.functions.get(t.name)!
+		f.recursion = input.RecursiveLoop
+		save(db.functions, f.name, f)
+		return { ...new api.PutFunctionRecursionConfigResponse(), RecursiveLoop: f.recursion }
+	}
+
+	publishLayerVersion(caller: Caller,
+		input: api.PublishLayerVersionRequest): api.PublishLayerVersionResponse throws Fault {
+		const name = layerName(input.LayerName)
+		const db = new Tables(caller)
+		const l = db.layers.get(name) ?? new LayerName()
+		caller.allow(layerArn(caller, name, l.published + 1), null)
+		const c = input.Content
+		const zip = source(this.s3, caller, c.ZipFile, c.S3Bucket, c.S3Key, c.S3ObjectVersion)
+		l.published++
+		save(db.layers, name, l)
+		const v = new LayerVersion()
+		v.name = name
+		v.version = l.published
+		v.description = input.Description
+		v.created = stamp()
+		v.runtimes = input.CompatibleRuntimes
+		v.architectures = input.CompatibleArchitectures
+		v.license = input.LicenseInfo
+		v.sha = digest(zip)
+		v.size = zip.length as i64
+		const w = new BlobWriter()
+		w.write(zip)
+		const b = w.finish()
+		try {
+			db.layerVersions.put(`${name}:${key(`${v.version}`)}`, v, b)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		} finally {
+			b.close()
+		}
+		const r = layerOf(caller, v)
+		return { ...new api.PublishLayerVersionResponse(), Content: r.Content, LayerArn: r.LayerArn,
+			LayerVersionArn: r.LayerVersionArn, Description: r.Description, CreatedDate: r.CreatedDate,
+			Version: r.Version, CompatibleArchitectures: r.CompatibleArchitectures,
+			CompatibleRuntimes: r.CompatibleRuntimes, LicenseInfo: r.LicenseInfo }
+	}
+
+	getLayerVersion(caller: Caller, input: api.GetLayerVersionRequest): api.GetLayerVersionResponse throws Fault {
+		return layerOf(caller, layer(caller, layerName(input.LayerName), input.VersionNumber))
+	}
+
+	getLayerVersionByArn(caller: Caller,
+		input: api.GetLayerVersionByArnRequest): api.GetLayerVersionResponse throws Fault {
+		const parts = split(input.Arn, ":")
+		if (parts.length != 8 || parts[5] != "layer" || !numeric(parts[7])) {
+			throw invalid(`1 validation error detected: Value '${input.Arn}' at 'arn' failed to satisfy constraint: `
+				+ "Member must satisfy regular expression pattern: "
+				+ "(arn:(aws[a-zA-Z-]*)?:lambda:[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:\\d{12}:layer:[a-zA-Z0-9-_]+:[0-9]+)"
+				+ "|(arn:[a-zA-Z0-9-]+:lambda:::awslayer:[a-zA-Z0-9-_]+)")
+		}
+		return layerOf(caller, layer(caller, parts[6], number(parts[7])))
+	}
+
+	listLayers(caller: Caller, input: api.ListLayersRequest): api.ListLayersResponse throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller)
+		const latest: [string, api.LayersListItem][] = []
+		for (const [_, v] of db.layerVersions.scan(null, 100000)) {
+			if (!compatible(v, input.CompatibleRuntime, input.CompatibleArchitecture)) {
+				continue
+			}
+			const item = { ...new api.LayersListItem(), LayerName: v.name,
+				LayerArn: `arn:aws:lambda:${caller.region}:${caller.account}:layer:${v.name}`,
+				LatestMatchingVersion: listedLayer(caller, v) }
+			if (latest.length > 0 && latest[latest.length - 1][0] == v.name) {
+				latest[latest.length - 1] = [v.name, item]
+			} else {
+				latest.push([v.name, item])
+			}
+		}
+		const [page, next] = paged(latest.filter(e => input.Marker == null || e[0] > input.Marker!), input.MaxItems)
+		return { ...new api.ListLayersResponse(), Layers: page, NextMarker: next }
+	}
+
+	listLayerVersions(caller: Caller, input: api.ListLayerVersionsRequest): api.ListLayerVersionsResponse throws Fault {
+		const name = layerName(input.LayerName)
+		caller.allow(`arn:aws:lambda:${caller.region}:${caller.account}:layer:${name}`)
+		const found = new Tables(caller).layerVersions.scan(null, 100000, `${name}:`).reverse().filter(e => compatible(e[1],
+			input.CompatibleRuntime, input.CompatibleArchitecture) && (input.Marker == null || e[0] < input.Marker!))
+		const [page, next] = paged(found, input.MaxItems)
+		return { ...new api.ListLayerVersionsResponse(), LayerVersions: page.map(v => listedLayer(caller, v)),
+			NextMarker: next }
+	}
+
+	deleteLayerVersion(caller: Caller, input: api.DeleteLayerVersionRequest): Unit throws Fault {
+		const name = layerName(input.LayerName)
+		caller.allow(layerArn(caller, name, input.VersionNumber), null)
+		new Tables(caller).layerVersions.delete(`${name}:${key(`${input.VersionNumber}`)}`)
+		return new Unit()
+	}
+
+	addLayerVersionPermission(caller: Caller,
+		input: api.AddLayerVersionPermissionRequest): api.AddLayerVersionPermissionResponse throws Fault {
+		const db = new Tables(caller)
+		const v = layer(caller, layerName(input.LayerName), input.VersionNumber)
+		revised(input.RevisionId, v.revision)
+		for (const [sid, _] of v.statements) {
+			if (sid == input.StatementId) {
+				throw api.resourceConflictException(`The statement id (${input.StatementId}) provided already exists. `
+					+ "Please provide a new statement id, or remove the existing statement.", conflict())
+			}
+		}
+		const principal = if (input.Principal == "*") `"*"` else json.quoted(`arn:aws:iam::${input.Principal}:root`)
+		const s = `{"Sid":${json.quoted(input.StatementId)},"Effect":"Allow","Principal":${principal},`
+			+ `"Action":${json.quoted(input.Action)},"Resource":${json.quoted(layerArn(caller, v.name, v.version))}`
+			+ (if (input.OrganizationId == null) ""
+			else `,"Condition":{"StringEquals":{"aws:PrincipalOrgID":${json.quoted(input.OrganizationId!)}}}`) + "}"
+		v.statements.push([input.StatementId, s])
+		v.revision = uuid()
+		layerKept(db, v)
+		return { ...new api.AddLayerVersionPermissionResponse(), Statement: s, RevisionId: v.revision }
+	}
+
+	removeLayerVersionPermission(caller: Caller, input: api.RemoveLayerVersionPermissionRequest): Unit throws Fault {
+		const db = new Tables(caller)
+		const v = layer(caller, layerName(input.LayerName), input.VersionNumber)
+		const rest = v.statements.filter(e => e[0] != input.StatementId)
+		if (rest.length == v.statements.length) {
+			throw api.resourceNotFoundException(`Statement ${input.StatementId} is not found in resource policy.`,
+				user())
+		}
+		revised(input.RevisionId, v.revision)
+		v.statements = rest
+		v.revision = uuid()
+		layerKept(db, v)
+		return new Unit()
+	}
+
+	getLayerVersionPolicy(caller: Caller,
+		input: api.GetLayerVersionPolicyRequest): api.GetLayerVersionPolicyResponse throws Fault {
+		const v = layer(caller, layerName(input.LayerName), input.VersionNumber)
+		if (v.statements.length == 0) {
+			throw api.resourceNotFoundException("No policy is associated with the given resource.", user())
+		}
+		return { ...new api.GetLayerVersionPolicyResponse(),
+			Policy: document({ ...new Policy(), statements: v.statements }), RevisionId: v.revision }
+	}
+
 	getAccountSettings(caller: Caller,
 		input: api.GetAccountSettingsRequest): api.GetAccountSettingsResponse throws Fault {
 		caller.allow("*")
@@ -637,12 +1013,13 @@ export class Handler {
 		const context = requestTags(input.Tags ?? [])
 		context.push(["lambda:FunctionArn", fn])
 		caller.allow("*", null, context)
-		version(caller, db, t)
+		const v = version(caller, db, t)
 		const source = input.EventSourceArn ?? ""
 		const kind = split(source, ":")
 		if (kind.length < 6 || (kind[2] != "sqs" && kind[2] != "kinesis" && kind[2] != "dynamodb")) {
 			throw invalid(`Unrecognized event source, must be kinesis, dynamodb stream or sqs. Unsupported source arn : ${source}`)
 		}
+		readable(this, caller, source, v.role, fn)
 		for (const [_, m] of db.mappings.scan(null, 100000)) {
 			if (m.source == source && m.function == fn) {
 				throw api.resourceConflictException(`The event source arn (" ${source} ") and function (" ${t.name} ") `
@@ -783,9 +1160,10 @@ function unqualified(caller: Caller, name: string): Target throws Fault {
 	return t
 }
 
-/// Authorizes the request on t, by its function's or qualifier's policy.
+/// Authorizes the request on t, by its function's or qualifier's policy and its function's tags.
 function allowed(caller: Caller, db: Tables, t: Target) throws Fault {
-	caller.allow(arn(caller, t.name, t.qualifier), policy(db, t.name, t.qualifier))
+	const f = db.functions.get(t.name)
+	caller.allow(arn(caller, t.name, t.qualifier), policy(db, t.name, t.qualifier), resourceTags(f?.tags ?? []))
 }
 
 /// The policy of the function name, or of its version or alias qualifier, as JSON; null if it has none.
@@ -902,6 +1280,128 @@ function urlOf(caller: Caller, t: Target, u: Url): api.FunctionUrlConfig {
 	return c
 }
 
+/// The URL of this server's unsigned endpoint that serves the zip stored under k of the table named table.
+function located(caller: Caller, table: string, name: string, k: string): string {
+	return `${caller.endpoint}/_boberstack/lambda/${caller.account}/${caller.region}/${table}/${name}/${k}`
+}
+
+/// The name of a layer that name names, a name or an ARN.
+function layerName(name: string): string {
+	const parts = split(name, ":")
+	return if (parts.length == 7 && parts[5] == "layer") parts[6] else name
+}
+
+function layerArn(caller: Caller, name: string, version: i64): string {
+	return `arn:aws:lambda:${caller.region}:${caller.account}:layer:${name}:${version}`
+}
+
+/// The version of the layer name, authorized by its policy.
+function layer(caller: Caller, name: string, version: i64): LayerVersion throws Fault {
+	const db = new Tables(caller)
+	const v = db.layerVersions.get(`${name}:${key(`${version}`)}`)
+	caller.allow(layerArn(caller, name, version),
+		if (v == null || v!.statements.length == 0) null else document({ ...new Policy(), statements: v!.statements }))
+	if (v == null) {
+		throw api.resourceNotFoundException("The resource you requested does not exist.", user())
+	}
+	return v!
+}
+
+/// Stores v, with the zip it has.
+function layerKept(db: Tables, v: LayerVersion) throws Fault {
+	const k = `${v.name}:${key(`${v.version}`)}`
+	const b = db.layerVersions.blob(k)
+	try {
+		db.layerVersions.put(k, v, b)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	} finally {
+		b?.close()
+	}
+}
+
+function layerOf(caller: Caller, v: LayerVersion): api.GetLayerVersionResponse {
+	const r = new api.GetLayerVersionResponse()
+	r.Content = { ...new api.LayerVersionContentOutput(), CodeSha256: v.sha, CodeSize: v.size,
+		Location: located(caller, "layerVersions", v.name, key(`${v.version}`)) }
+	r.LayerArn = `arn:aws:lambda:${caller.region}:${caller.account}:layer:${v.name}`
+	r.LayerVersionArn = layerArn(caller, v.name, v.version)
+	r.Description = v.description
+	r.CreatedDate = v.created
+	r.Version = v.version
+	r.CompatibleArchitectures = v.architectures
+	r.CompatibleRuntimes = v.runtimes
+	r.LicenseInfo = v.license
+	return r
+}
+
+function listedLayer(caller: Caller, v: LayerVersion): api.LayerVersionsListItem {
+	return { ...new api.LayerVersionsListItem(), LayerVersionArn: layerArn(caller, v.name, v.version),
+		Version: v.version, Description: v.description, CreatedDate: v.created,
+		CompatibleArchitectures: v.architectures, CompatibleRuntimes: v.runtimes, LicenseInfo: v.license }
+}
+
+/// Whether v is compatible with the runtime and architecture given, if any.
+function compatible(v: LayerVersion, runtime: api.Runtime | null, architecture: api.Architecture | null): bool {
+	return (runtime == null || (v.runtimes ?? []).includes(runtime!))
+		&& (architecture == null || (v.architectures ?? []).includes(architecture!))
+}
+
+/// The layers' versions that arns name, each with its size; each must exist, as of this account and region.
+function layered(db: Tables, caller: Caller, arns: string[]): [string, i64][] throws Fault {
+	const out: [string, i64][] = []
+	for (const a of arns) {
+		const parts = split(a, ":")
+		const v = if (parts.length == 8 && parts[5] == "layer" && parts[4] == caller.account
+			&& parts[3] == caller.region && numeric(parts[7])) db.layerVersions.get(`${parts[6]}:${key(parts[7])}`)
+			else null
+		if (v == null) {
+			throw invalid(`Layer version ${a} does not exist.`)
+		}
+		out.push([a, v!.size])
+	}
+	return out
+}
+
+/// The provisioned concurrency of t, a version or alias, authorized.
+function provisioned(caller: Caller, t: Target): Provisioned throws Fault {
+	const db = new Tables(caller)
+	allowed(caller, db, t)
+	version(caller, db, t)
+	const p = db.provisioned.get(`${t.name}:${t.qualifier}`)
+	if (p == null) {
+		throw api.provisionedConcurrencyConfigNotFoundException("No Provisioned Concurrency Config found for this function",
+			{ ...new api.ProvisionedConcurrencyConfigNotFoundException(), Type: "User" })
+	}
+	return p!
+}
+
+/// p as AWS answers it, READY at once.
+function provisionedOf(caller: Caller, t: Target, p: Provisioned): api.ProvisionedConcurrencyConfigListItem {
+	return { ...new api.ProvisionedConcurrencyConfigListItem(), FunctionArn: arn(caller, t.name, t.qualifier),
+		RequestedProvisionedConcurrentExecutions: p.requested, AllocatedProvisionedConcurrentExecutions: p.requested,
+		AvailableProvisionedConcurrentExecutions: p.requested, Status: "READY", LastModified: p.modified }
+}
+
+/// The asynchronous invocation settings of t, authorized; an unqualified function's are those of $LATEST.
+function invoking(caller: Caller, t: Target): Invoking throws Fault {
+	const db = new Tables(caller)
+	allowed(caller, db, t)
+	version(caller, db, t)
+	const e = db.invoking.get(`${t.name}:${t.qualifier ?? "$LATEST"}`)
+	if (e == null) {
+		throw api.resourceNotFoundException(`The function ${arn(caller, t.name, t.qualifier ?? "$LATEST")} doesn't have an EventInvokeConfig`,
+			user())
+	}
+	return e!
+}
+
+function invokingOf(caller: Caller, name: string, qualifier: string, e: Invoking): api.FunctionEventInvokeConfig {
+	return { ...new api.FunctionEventInvokeConfig(), FunctionArn: arn(caller, name, qualifier),
+		MaximumRetryAttempts: e.retries, MaximumEventAgeInSeconds: e.age, DestinationConfig: e.destination,
+		LastModified: e.modified }
+}
+
 /// The event source mapping of id, authorized.
 function mapping(caller: Caller, id: string): [Tables, Mapping] throws Fault {
 	const db = new Tables(caller)
@@ -1003,6 +1503,11 @@ function code(db: Tables, v: Version, zip: string | null, image: string | null) 
 function changed(db: Tables, v: Version) throws Fault {
 	v.modified = stamp()
 	v.revision = uuid()
+	kept(db, v)
+}
+
+/// Stores v, with the code it has.
+function kept(db: Tables, v: Version) throws Fault {
 	const k = `${v.name}:${key(v.version)}`
 	try {
 		db.versions.put(k, v, db.versions.blob(k))
@@ -1100,7 +1605,7 @@ function configuration(caller: Caller, v: Version): api.FunctionConfiguration {
 	c.RevisionId = v.revision
 	if (v.layers.length > 0) {
 		c.Layers = v.layers.map(l => {
-			return { ...new api.Layer(), Arn: l }
+			return { ...new api.Layer(), Arn: l[0], CodeSize: l[1] }
 		})
 	}
 	c.State = "Active"
@@ -1115,20 +1620,49 @@ function configuration(caller: Caller, v: Version): api.FunctionConfiguration {
 
 /// Throws unless role is a role of the account that lambda.amazonaws.com may assume for the function of ARN fn.
 function assumable(caller: Caller, role: string, fn: string) throws Fault {
-	const refused = invalid("The role defined for the function cannot be assumed by Lambda.")
-	const parts = split(role, ":")
-	if (parts.length != 6 || !startsWith(parts[5], "role/")) {
-		throw refused
+	passRole(caller, role, "lambda.amazonaws.com")
+	if (actAs(caller, "lambda.amazonaws.com", role, fn, [], "") == null) {
+		throw invalid("The role defined for the function cannot be assumed by Lambda.")
 	}
-	const r = new iam.Tables(caller.tree(parts[4])).roles.get(iam.key(parts[5].slice(lastIndexOf(parts[5], "/") + 1,
-		parts[5].length)))
-	if (r == null) {
-		throw refused
+}
+
+/// Throws as AWS does unless source, a queue's or stream's ARN, exists, and the function fn's role may read it.
+function readable(h: Handler, caller: Caller, source: string, role: string, fn: string) throws Fault {
+	const parts = split(source, ":")
+	const service = parts[2]
+	const actions = if (service == "sqs") ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+		else if (service
+		== "kinesis") ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:ListShards"]
+		else ["dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:DescribeStream", "dynamodb:ListStreams"]
+	const c = actAs(caller, "lambda.amazonaws.com", role, fn, actions, "")
+	if (c == null) {
+		throw invalid("The role defined for the function cannot be assumed by Lambda.")
 	}
+	const listed = if (service == "kinesis") "ListShards" else "ListStreams"
+	const stream = invalid(`Cannot access stream ${source}. Please ensure the role can perform the GetRecords, `
+		+ `GetShardIterator, DescribeStream, and ${listed} Actions on your stream in IAM.`)
 	try {
-		caller.internal("lambda.amazonaws.com", fn, ["sts:AssumeRole"]).allow(role, r!.trust)
+		if (service == "sqs" && h.sqs != null) {
+			const q = new sqsApi.GetQueueAttributesRequest()
+			q.QueueUrl = `${caller.endpoint}/${parts[4]}/${parts[5]}`
+			h.sqs!.getQueueAttributes(c!, q)
+		} else if (service == "kinesis" && h.kinesis != null) {
+			const k = new kinesisApi.DescribeStreamSummaryInput()
+			k.StreamARN = source
+			h.kinesis!.describeStreamSummary(c!, k)
+		} else if (h.streams != null) {
+			const d = new streamsApi.DescribeStreamInput()
+			d.StreamArn = source
+			h.streams!.describeStream(c!, d)
+		}
 	} catch (f: Fault) {
-		throw refused
+		if (service != "sqs") {
+			throw stream
+		}
+		if (f.status == 403) {
+			throw invalid("The provided execution role does not have permissions to call ReceiveMessage on SQS")
+		}
+		throw invalid(`Error occurred while ReceiveMessage. SQS Error Code: ${f.code}. SQS Error Message: ${f.message}`)
 	}
 }
 
@@ -1201,6 +1735,15 @@ function numeric(s: string): bool {
 		}
 	}
 	return true
+}
+
+/// The number s, of digits only.
+function number(s: string): i64 {
+	let n: i64 = 0
+	for (let i = 0; i < s.length; i++) {
+		n = n * 10 + (indexOf("0123456789", s.slice(i, i + 1)) as i64)
+	}
+	return n
 }
 
 function notFound(caller: Caller, name: string, qualifier: string | null): Fault {

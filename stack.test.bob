@@ -737,10 +737,10 @@ function lambdaCall(g: Gateway, method: string, path: string, body: string, k: K
 
 test "Lambda routes and authenticates a request, and answers NotImplemented in restJson1's error form" {
 	const g = gateway()
-	let res = lambdaGet(g, "/2018-10-31/layers")
+	let res = lambdaGet(g, "/2020-04-22/code-signing-configs")
 	assert res.status == 501 && res.headers.get("x-amzn-errortype") == "NotImplemented"
 	assert res.headers.get("content-type") == "application/json"
-	assert res.body.whole == `{"message":"The operation ListLayers is not implemented"}`
+	assert res.body.whole == `{"message":"The operation ListCodeSigningConfigs is not implemented"}`
 	const forged = user(g, "bob")
 	forged.secret = "wrong"
 	res = lambdaGet(g, "/2015-03-31/functions", forged)
@@ -777,11 +777,29 @@ test "Lambda: a function of a role Lambda may assume, its versions, aliases, pol
 	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}")
 	assert res.status == 201 && member(res, "Version") == "1"
 	assert member(lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}"), "Version") == "1"
+	const located = member(lambdaGet(g, "/2015-03-31/functions/f?Qualifier=1"), "Location")
+	assert located == `http://localhost:4566/_boberstack/lambda/${account}/us-east-1/versions/f/0000000001`
+	res = g.handle(new Request("GET", located, ""))
+	assert res.status == 200 && res.body.whole == "PK\x03\x04 not really"
 	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"live","FunctionVersion":"1"}`).status
 		== 201
 	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"x","FunctionVersion":"7"}`), 404,
 		"ResourceNotFoundException")
 	assert member(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), "Version") == "1"
+	const provisioning = "/2019-09-30/functions/f/provisioned-concurrency?Qualifier="
+	assert refused(lambdaCall(g, "PUT", `${provisioning}$LATEST`, `{"ProvisionedConcurrentExecutions":2}`), 400,
+		"InvalidParameterValueException")
+	assert member(lambdaCall(g, "PUT", `${provisioning}live`, `{"ProvisionedConcurrentExecutions":2}`), "Status")
+		== "READY"
+	assert refused(lambdaGet(g, `${provisioning}1`), 404, "ProvisionedConcurrencyConfigNotFoundException")
+	assert refused(lambdaGet(g, "/2019-09-25/functions/f/event-invoke-config"), 404, "ResourceNotFoundException",
+		`The function arn:aws:lambda:us-east-1:${account}:function:f:$LATEST doesn't have an EventInvokeConfig`)
+	assert lambdaCall(g, "PUT", "/2019-09-25/functions/f/event-invoke-config?Qualifier=live",
+		`{"MaximumRetryAttempts":1,"DestinationConfig":{"OnFailure":{"Destination":"arn:aws:sqs:us-east-1:${account}:q"}}}`).status
+		== 200
+	assert indexOf(lambdaGet(g, "/2019-09-25/functions/f/event-invoke-config/list").body.whole ?? "",
+		`"Destination":"arn:aws:sqs:us-east-1:${account}:q"`) > 0
+	assert member(lambdaGet(g, "/2024-08-31/functions/f/recursion-config"), "RecursiveLoop") == "Terminate"
 	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
 		`{"StatementId":"s3","Action":"lambda:InvokeFunction","Principal":"s3.amazonaws.com","SourceAccount":"${account}"}`)
 	assert res.status == 201
@@ -801,8 +819,18 @@ test "Lambda: a function of a role Lambda may assume, its versions, aliases, pol
 		`{"StatementId":"bob","Action":"lambda:InvokeFunction","Principal":"arn:aws:iam::${account}:user/bob"}`).status
 		== 201
 	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob).status == 200
-	res = lambdaCall(g, "POST", "/2015-03-31/event-source-mappings",
-		`{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`)
+	const mapped = `{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped), 400,
+		"InvalidParameterValueException",
+		"Error occurred while ReceiveMessage. SQS Error Code: QueueDoesNotExist. SQS Error Message: The specified queue does not exist.")
+	queue(g, "q")
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped), 400,
+		"InvalidParameterValueException",
+		"The provided execution role does not have permissions to call ReceiveMessage on SQS")
+	assert query(g, "iam",
+		[["Action", "PutRolePolicy"], ["RoleName", "fn"], ["PolicyName", "p"],
+		["PolicyDocument", policy([statement("Allow", `"sqs:*"`, "*")])]]).status == 200
+	res = lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped)
 	assert res.status == 202 && member(res, "State") == "Creating"
 	const id = member(res, "UUID")
 	assert member(lambdaGet(g, `/2015-03-31/event-source-mappings/${id}`), "State") == "Enabled"
@@ -814,6 +842,37 @@ test "Lambda: a function of a role Lambda may assume, its versions, aliases, pol
 	assert res.status == 201 && indexOf(member(res, "FunctionUrl"), ".lambda-url.us-east-1.on.aws/") == 40
 	assert lambdaCall(g, "DELETE", "/2015-03-31/functions/f", "").status == 204
 	assert refused(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), 404, "ResourceNotFoundException")
+	g.close()
+}
+
+test "Lambda: a layer's versions, served where GetLayerVersion locates them, and a function of one" {
+	const g = gateway()
+	role(g, "fn", "lambda.amazonaws.com")
+	const published = `{"Content":{"ZipFile":"${base64.encode("layer")}"},"CompatibleRuntimes":["python3.12"]}`
+	assert member(lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published), "LayerVersionArn")
+		== `arn:aws:lambda:us-east-1:${account}:layer:l:1`
+	assert lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published).status == 201
+	assert lambdaCall(g, "DELETE", "/2018-10-31/layers/l/versions/2", "").status == 204
+	const layer = `arn:aws:lambda:us-east-1:${account}:layer:l:1`
+	let res = lambdaGet(g, `/2018-10-31/layers?find=LayerVersion&Arn=${escape(layer)}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"CodeSize":5`) > 0
+	assert g.handle(new Request("GET", member(res, "Location"), "")).body.whole == "layer"
+	assert refused(lambdaGet(g, "/2018-10-31/layers/l/versions/2"), 404, "ResourceNotFoundException",
+		"The resource you requested does not exist.")
+	assert indexOf(lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published).body.whole ?? "", `"Version":3`)
+		> 0
+	assert indexOf(lambdaGet(g, "/2018-10-31/layers?CompatibleRuntime=python3.12").body.whole ?? "", `"Version":3`) > 0
+	assert lambdaCall(g, "POST", "/2018-10-31/layers/l/versions/1/policy",
+		`{"StatementId":"all","Action":"lambda:GetLayerVersion","Principal":"*"}`).status == 201
+	res = lambdaGet(g, "/2018-10-31/layers/l/versions/1/policy")
+	assert indexOf(res.body.whole ?? "", `\\"Principal\\":\\"*\\"`) > 0
+	const create = (l: string) => lambdaCall(g, "POST", "/2015-03-31/functions",
+		`{"FunctionName":"f","Runtime":"python3.12","Handler":"h.h","Role":"arn:aws:iam::${account}:role/fn",`
+		+ `"Code":{"ZipFile":"${base64.encode("code")}"},"Layers":["${l}"]}`)
+	assert refused(create(`${layer}0`), 400, "InvalidParameterValueException",
+		`Layer version ${layer}0 does not exist.`)
+	res = create(layer)
+	assert res.status == 201 && indexOf(res.body.whole ?? "", `"CodeSize":5`) > 0
 	g.close()
 }
 
