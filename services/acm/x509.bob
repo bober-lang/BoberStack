@@ -36,8 +36,17 @@ function tlv(tag: i32, content: string): string {
 
 function seq(parts: string[]): string { return tlv(0x30, parts.join("")) }
 function set(parts: string[]): string { return tlv(0x31, parts.join("")) }
-/// The DER of the unsigned integer of the big-endian bytes b.
-function integer(b: string): string { return tlv(0x02, if (b[0] >= 0x80) "\x00" + b else b) }
+
+/// The DER of the unsigned integer of the big-endian bytes b: in the fewest bytes, as DER demands, so without the
+/// leading zeros random bytes may begin with.
+function integer(b: string): string {
+	let i = 0
+	while (i < b.length - 1 && b[i] == 0) {
+		i++
+	}
+	const v = b.slice(i, b.length)
+	return tlv(0x02, if (v[0] >= 0x80) "\x00" + v else v)
+}
 
 /// The UTCTime of t, as YYMMDDHHMMSSZ.
 function time(t: i64): string {
