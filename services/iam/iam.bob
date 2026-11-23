@@ -1,0 +1,865 @@
+//! AWS Identity and Access Management: users, access keys, roles, managed policies and their versions, attached and
+//! embedded policies, and AWS's managed policies, which any account may attach but none change.
+
+import { Credential, credentials, id, secret } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+
+import { accessKey, attach, attached, aws, bound, detach, document, embed, identity, inline, keys, managed, move, named,
+	onPolicy, onRole, onUser, owned, owner, page, part, path, policyOf, role, roleOf, tagged, tagging, taggable,
+	tagPage, unknownVersion, user, userOf, uses, version, versionId, versionOf } from "./common"
+
+import { Groups } from "./groups"
+import { Linked, modifiable } from "./linked"
+import { Logins } from "./logins"
+import { Profiles } from "./profiles"
+import { Providers } from "./providers"
+import { Simulation } from "./simulation"
+import { Accounts } from "./account"
+import { Details, details } from "./details"
+import { AccessKey, arn, key, number, Policy, Role, stamp, Tables, User, Version, within } from "./records"
+import { indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
+import { lower } from "std/string"
+import { escape } from "std/url"
+
+/// The service; groups, linked roles, logins, profiles, providers, simulation, account and details are mixed in.
+export class Handler {
+	...Groups
+	...Linked
+	...Logins
+	...Profiles
+	...Providers
+	...Simulation
+	...Accounts
+	...Details
+	...api.Unimplemented
+
+	constructor(catalog: Catalog) { this.catalog = catalog }
+
+	getAccountAuthorizationDetails(caller: Caller,
+		input: api.GetAccountAuthorizationDetailsRequest): api.GetAccountAuthorizationDetailsResponse throws Fault {
+		return details(caller, this.catalog, input)
+	}
+
+	createUser(caller: Caller, input: api.CreateUserRequest): api.CreateUserResponse throws Fault {
+		tagging(caller, input.Tags)
+		caller.allow(arn(caller.account, "user", input.Path ?? "/", input.UserName))
+		const db = new Tables(caller.store())
+		const k = key(named(input.UserName, "userName", 64))
+		if (db.users.get(k) != null) {
+			throw api.entityAlreadyExistsException(`User with name ${input.UserName} already exists.`)
+		}
+		const u = new User()
+		u.name = input.UserName
+		u.path = path(input.Path, "path")
+		u.id = id("AIDA", 17)
+		u.created = stamp()
+		u.tags = tagged([], input.Tags ?? [], "User")
+		if (input.PermissionsBoundary != null) {
+			u.boundary = bound(caller, db, this.catalog, "", input.PermissionsBoundary!)
+		}
+		db.users.put(k, u)
+		const r = new api.CreateUserResponse()
+		r.User = userOf(caller.account, u, true)
+		return r
+	}
+
+	getUser(caller: Caller, input: api.GetUserRequest): api.GetUserResponse throws Fault {
+		onUser(caller, input.UserName)
+		const r = new api.GetUserResponse()
+		r.User = userOf(caller.account, owner(caller, new Tables(caller.store()), input.UserName), true)
+		return r
+	}
+
+	listUsers(caller: Caller, input: api.ListUsersRequest): api.ListUsersResponse throws Fault {
+		const prefix = input.PathPrefix ?? "/"
+		caller.allow(arn(caller.account, "user", prefix, ""))
+		const [users, next] = page(new Tables(caller.store()).users, "", input.Marker, input.MaxItems,
+			u => startsWith(u.path, prefix))
+		const r = new api.ListUsersResponse()
+		r.Users = users.map(u => userOf(caller.account, u, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateUser(caller: Caller, input: api.UpdateUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const was = key(u.name)
+		const name = named(input.NewUserName ?? u.name, "newUserName", 64)
+		const k = key(name)
+		if (k != was && db.users.get(k) != null) {
+			throw api.entityAlreadyExistsException(`User with name ${name} already exists.`)
+		}
+		u.name = name
+		if (input.NewPath != null) {
+			u.path = path(input.NewPath, "newPath")
+		}
+		db.users.delete(was)
+		db.users.put(k, u)
+		move(db.keys, was, k, a => {
+			a.user = name
+		})
+		move(db.userAttached, was, k, a => {})
+		move(db.userInline, was, k, p => {})
+		const l = db.logins.get(was)
+		if (l != null) {
+			db.logins.delete(was)
+			db.logins.put(k, l!)
+		}
+		for (const [at, m] of db.members.scan(null, 2147483647).filter(e => key(e[1].user) == was)) {
+			db.members.delete(at)
+			m.user = name
+			db.members.put(within(key(m.group), k), m)
+		}
+		const issued = credentials(caller.global())
+		for (const [_, a] of db.keys.scan(null, 2, within(k, ""))) {
+			const c = issued.get(a.id)!
+			c.arn = arn(caller.account, "user", u.path, u.name)
+			issued.put(a.id, c)
+		}
+		return new Unit()
+	}
+
+	deleteUser(caller: Caller, input: api.DeleteUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const k = key(user(db, input.UserName).name)
+		if (db.logins.get(k) != null) {
+			throw api.deleteConflictException("Cannot delete entity, must delete login profile first.")
+		}
+		if (db.keys.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete access keys first.")
+		}
+		if (db.members.scan(null, 2147483647).some(e => key(e[1].user) == k)) {
+			throw api.deleteConflictException("Cannot delete entity, must remove users from group first.")
+		}
+		if (db.userAttached.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
+		}
+		if (db.userInline.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		bound(caller, db, this.catalog, db.users.get(k)!.boundary, "")
+		db.users.delete(k)
+		return new Unit()
+	}
+
+	tagUser(caller: Caller, input: api.TagUserRequest): Unit throws Fault {
+		keys(input.Tags)
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.tags = tagged(u.tags, input.Tags, "User")
+		db.users.put(key(u.name), u)
+		return new Unit()
+	}
+
+	untagUser(caller: Caller, input: api.UntagUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.tags = u.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		db.users.put(key(u.name), u)
+		return new Unit()
+	}
+
+	listUserTags(caller: Caller, input: api.ListUserTagsRequest): api.ListUserTagsResponse throws Fault {
+		onUser(caller, input.UserName)
+		const [tags,
+			next] = tagPage(user(new Tables(caller.store()), input.UserName).tags, input.Marker, input.MaxItems)
+		const r = new api.ListUserTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	createAccessKey(caller: Caller, input: api.CreateAccessKeyRequest): api.CreateAccessKeyResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = owner(caller, db, input.UserName)
+		const k = key(u.name)
+		if (db.keys.scan(null, 2, within(k, "")).length == 2) {
+			throw api.limitExceededException("Cannot exceed quota for AccessKeysPerUser: 2")
+		}
+		const a = new AccessKey()
+		a.user = u.name
+		a.id = id("AKIA", 16)
+		a.created = stamp()
+		a.serial = db.next()
+		db.keys.put(within(k, a.id), a)
+		const c = new Credential()
+		c.secret = secret()
+		c.account = caller.account
+		c.arn = identity(caller.account, u)
+		c.userId = u.id
+		(credentials(caller.global())).put(a.id, c)
+		const r = new api.CreateAccessKeyResponse()
+		r.AccessKey.UserName = u.name
+		r.AccessKey.AccessKeyId = a.id
+		r.AccessKey.Status = "Active"
+		r.AccessKey.SecretAccessKey = c.secret
+		r.AccessKey.CreateDate = a.created
+		return r
+	}
+
+	listAccessKeys(caller: Caller, input: api.ListAccessKeysRequest): api.ListAccessKeysResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = owner(caller, db, input.UserName)
+		const all = db.keys.scan(null, 2147483647, within(key(u.name), "")).map(e => e[1])
+		sortBy(all, (a, b) => a.serial > b.serial)
+		const [keys, next] = part(all, input.Marker, input.MaxItems)
+		const r = new api.ListAccessKeysResponse()
+		r.AccessKeyMetadata = keys.map(a => {
+			const m = new api.AccessKeyMetadata()
+			m.UserName = if (a.user == "") null else a.user // the root's
+			m.AccessKeyId = a.id
+			m.Status = if (a.status == "Active") "Active" else "Inactive"
+			m.CreateDate = a.created
+			return m
+		})
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateAccessKey(caller: Caller, input: api.UpdateAccessKeyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
+		const a = accessKey(db, k, input.AccessKeyId)
+		a.status = input.Status
+		db.keys.put(k, a)
+		const issued = credentials(caller.global())
+		const c = issued.get(a.id)!
+		c.status = input.Status
+		issued.put(a.id, c)
+		return new Unit()
+	}
+
+	/// The service and region of the last request the key signed that the gateway let in, at once: AWS's lag behind.
+	getAccessKeyLastUsed(caller: Caller,
+		input: api.GetAccessKeyLastUsedRequest): api.GetAccessKeyLastUsedResponse throws Fault {
+		const c = credentials(caller.global()).get(input.AccessKeyId)
+		const users = ":user/"
+		if (c == null || c.account != caller.account || c.status == "Deleted" || indexOf(c.arn, users) < 0) {
+			caller.allow(arn(caller.account, "user", "/", "*"))
+			throw api.noSuchEntityException(`The Access Key with id ${input.AccessKeyId} cannot be found.`)
+		}
+		caller.allow(c.arn)
+		const r = new api.GetAccessKeyLastUsedResponse()
+		r.UserName = c.arn.slice(lastIndexOf(c.arn, "/") + 1, c.arn.length)
+		const u = new api.AccessKeyLastUsed()
+		u.LastUsedDate = if (c.used == 0) null else c.used
+		u.ServiceName = if (c.used == 0) "N/A" else c.usedService
+		u.Region = if (c.used == 0) "N/A" else c.usedRegion
+		r.AccessKeyLastUsed = u
+		return r
+	}
+
+	deleteAccessKey(caller: Caller, input: api.DeleteAccessKeyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
+		accessKey(db, k, input.AccessKeyId)
+		db.keys.delete(k)
+		// Kept, so that the key is refused rather than taken for a root's, as one never issued is.
+		const issued = credentials(caller.global())
+		const c = issued.get(input.AccessKeyId)!
+		c.status = "Deleted"
+		issued.put(input.AccessKeyId, c)
+		return new Unit()
+	}
+
+	createRole(caller: Caller, input: api.CreateRoleRequest): api.CreateRoleResponse throws Fault {
+		tagging(caller, input.Tags)
+		caller.allow(arn(caller.account, "role", input.Path ?? "/", input.RoleName))
+		const db = new Tables(caller.store())
+		const k = key(named(input.RoleName, "roleName", 64))
+		if (db.roles.get(k) != null) {
+			throw api.entityAlreadyExistsException(`Role with name ${input.RoleName} already exists.`)
+		}
+		const r = new Role()
+		r.name = input.RoleName
+		r.path = path(input.Path, "path")
+		r.id = id("AROA", 17)
+		r.created = stamp()
+		r.trust = document(input.AssumeRolePolicyDocument, "trust")
+		r.description = input.Description
+		r.maxSession = input.MaxSessionDuration ?? 3600
+		r.tags = tagged([], input.Tags ?? [], "Role")
+		if (input.PermissionsBoundary != null) {
+			r.boundary = bound(caller, db, this.catalog, "", input.PermissionsBoundary!)
+		}
+		db.roles.put(k, r)
+		const out = new api.CreateRoleResponse()
+		out.Role = roleOf(caller.account, r, true)
+		// Which IAM does not answer on creation.
+		out.Role.Description = null
+		out.Role.MaxSessionDuration = null
+		out.Role.MaxSigninSessionDuration = null
+		return out
+	}
+
+	getRole(caller: Caller, input: api.GetRoleRequest): api.GetRoleResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const r = new api.GetRoleResponse()
+		r.Role = roleOf(caller.account, role(new Tables(caller.store()), input.RoleName), true)
+		r.Role.RoleLastUsed = new api.RoleLastUsed()
+		return r
+	}
+
+	listRoles(caller: Caller, input: api.ListRolesRequest): api.ListRolesResponse throws Fault {
+		const prefix = input.PathPrefix ?? "/"
+		caller.allow(arn(caller.account, "role", prefix, ""))
+		const [roles, next] = page(new Tables(caller.store()).roles, "", input.Marker, input.MaxItems,
+			r => startsWith(r.path, prefix))
+		const r = new api.ListRolesResponse()
+		r.Roles = roles.map(x => roleOf(caller.account, x, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateAssumeRolePolicy(caller: Caller, input: api.UpdateAssumeRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const r = role(db, input.RoleName)
+		r.trust = document(input.PolicyDocument, "trust")
+		db.roles.put(key(r.name), r)
+		return new Unit()
+	}
+
+	deleteRole(caller: Caller, input: api.DeleteRoleRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const k = key(role(db, input.RoleName).name)
+		if (db.roleAttached.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
+		}
+		if (db.roleInline.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		if (db.profiles.scan(null, 2147483647).some(e => key(e[1].role) == k)) {
+			throw api.deleteConflictException("Cannot delete entity, must remove roles from instance profile first.")
+		}
+		bound(caller, db, this.catalog, db.roles.get(k)!.boundary, "")
+		db.roles.delete(k)
+		return new Unit()
+	}
+
+	tagRole(caller: Caller, input: api.TagRoleRequest): Unit throws Fault {
+		keys(input.Tags)
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.tags = tagged(r.tags, input.Tags, "Role")
+		db.roles.put(key(r.name), r)
+		return new Unit()
+	}
+
+	untagRole(caller: Caller, input: api.UntagRoleRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.tags = r.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		db.roles.put(key(r.name), r)
+		return new Unit()
+	}
+
+	listRoleTags(caller: Caller, input: api.ListRoleTagsRequest): api.ListRoleTagsResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const [tags,
+			next] = tagPage(role(new Tables(caller.store()), input.RoleName).tags, input.Marker, input.MaxItems)
+		const r = new api.ListRoleTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	putUserPermissionsBoundary(caller: Caller, input: api.PutUserPermissionsBoundaryRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = bounded(db, input.UserName)
+		u.boundary = bound(caller, db, this.catalog, u.boundary, input.PermissionsBoundary)
+		db.users.put(key(u.name), u)
+		return new Unit()
+	}
+
+	deleteUserPermissionsBoundary(caller: Caller, input: api.DeleteUserPermissionsBoundaryRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = bounded(db, input.UserName)
+		u.boundary = bound(caller, db, this.catalog, unbound(u.boundary, u.id), "")
+		db.users.put(key(u.name), u)
+		return new Unit()
+	}
+
+	putRolePermissionsBoundary(caller: Caller, input: api.PutRolePermissionsBoundaryRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const r = role(db, input.RoleName)
+		r.boundary = bound(caller, db, this.catalog, r.boundary, input.PermissionsBoundary)
+		db.roles.put(key(r.name), r)
+		return new Unit()
+	}
+
+	deleteRolePermissionsBoundary(caller: Caller, input: api.DeleteRolePermissionsBoundaryRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const r = role(db, input.RoleName)
+		r.boundary = bound(caller, db, this.catalog, unbound(r.boundary, r.id), "")
+		db.roles.put(key(r.name), r)
+		return new Unit()
+	}
+
+	/// Of iam:TagPolicy too if it passes tags, which IAM's message names as policy <name>.
+	createPolicy(caller: Caller, input: api.CreatePolicyRequest): api.CreatePolicyResponse throws Fault {
+		const tags = caller.actions.slice(1, caller.actions.length)
+		caller.actions = caller.actions.slice(0, 1)
+		const a = arn(caller.account, "policy", input.Path ?? "/", input.PolicyName)
+		caller.allow(a)
+		if (input.Tags != null && input.Tags!.length > 0) {
+			caller.actions = tags
+			caller.allow(a, null, [], `policy ${input.PolicyName}`)
+		}
+		const db = new Tables(caller.store())
+		const k = key(named(input.PolicyName, "policyName", 128))
+		if (db.policies.get(k) != null) {
+			const why = `A policy called ${input.PolicyName} already exists. Duplicate names are not allowed.`
+			throw api.entityAlreadyExistsException(why)
+		}
+		const p = new Policy()
+		p.name = input.PolicyName
+		p.path = path(input.Path, "path")
+		p.id = id("ANPA", 17)
+		p.created = stamp()
+		p.updated = p.created
+		p.serial = db.next()
+		p.description = input.Description
+		p.tags = tagged([], input.Tags ?? [], "Policy")
+		const v = new Version()
+		v.id = "v1"
+		v.document = document(input.PolicyDocument, "identity")
+		v.created = p.created
+		db.policies.put(k, p)
+		db.versions.put(within(k, number(1)), v)
+		const r = new api.CreatePolicyResponse()
+		r.Policy = policyOf(caller.account, p, true)
+		r.Policy.Description = null // which IAM does not answer on creation
+		return r
+	}
+
+	getPolicy(caller: Caller, input: api.GetPolicyRequest): api.GetPolicyResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		if (aws(a)) {
+			const [attached, bounding] = uses(db)
+			p.attachments = attached.get(a) ?? 0
+			p.bounds = bounding.get(a) ?? 0
+		}
+		const r = new api.GetPolicyResponse()
+		r.Policy = policyOf(if (aws(a)) "aws" else caller.account, p, true)
+		r.Policy.Tags = r.Policy.Tags ?? []
+		return r
+	}
+
+	/// The account's policies in the order they were made, then AWS's in the order of their dates, as AWS made them.
+	listPolicies(caller: Caller, input: api.ListPoliciesRequest): api.ListPoliciesResponse throws Fault {
+		caller.allow(arn(caller.account, "policy", "/", ""))
+		const db = new Tables(caller.store())
+		const prefix = input.PathPrefix ?? "/"
+		const scope = input.Scope ?? "All"
+		const attached = input.OnlyAttached
+		const boundaries = input.PolicyUsageFilter == "PermissionsBoundary"
+		const keep = (p: Policy) => startsWith(p.path, prefix) && (!attached || p.attachments > 0)
+			&& (!boundaries || p.bounds > 0)
+		const listed: [string, Policy][] = [] // the account and the policy
+		if (scope != "AWS") {
+			const local = db.policies.scan(null, 2147483647).map(e => e[1]).filter(keep)
+			sortBy(local, (a, b) => a.serial < b.serial)
+			for (const p of local) {
+				listed.push([caller.account, p])
+			}
+		}
+		if (scope != "Local") {
+			const [counts, bounding] = uses(db)
+			for (const i of this.catalog.dated()) {
+				const p = this.catalog.policy(i)
+				const a = arn("aws", "policy", p.path, p.name)
+				p.attachments = counts.get(a) ?? 0
+				p.bounds = bounding.get(a) ?? 0
+				if (keep(p)) {
+					listed.push(["aws", p])
+				}
+			}
+		}
+		const [found, next] = part(listed, input.Marker, input.MaxItems)
+		const r = new api.ListPoliciesResponse()
+		r.Policies = found.map(e => policyOf(e[0], e[1], false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deletePolicy(caller: Caller, input: api.DeletePolicyRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "delete policies")
+		const k = key(p.name)
+		const versions = db.versions.scan(null, 2, within(k, ""))
+		if (versions.length > 1) {
+			throw api.deleteConflictException("This policy has more than one version. Before you delete a policy, you "
+				+ "must delete the policy's versions. The default version is deleted with the policy.")
+		}
+		if (p.attachments > 0 || p.bounds > 0) {
+			throw api.deleteConflictException("Cannot delete a policy attached to entities.")
+		}
+		db.versions.delete(versions[0][0])
+		db.policies.delete(k)
+		return new Unit()
+	}
+
+	createPolicyVersion(caller: Caller,
+		input: api.CreatePolicyVersionRequest): api.CreatePolicyVersionResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "create versions for policies")
+		const k = key(p.name)
+		const d = document(input.PolicyDocument, "identity")
+		if (db.versions.scan(null, 5, within(k, "")).length == 5) {
+			throw api.limitExceededException("A managed policy can have up to 5 versions. Before you create a new "
+				+ "version, you must delete an existing version.")
+		}
+		const v = new Version()
+		v.id = `v${p.next}`
+		v.document = d
+		v.created = stamp()
+		db.versions.put(within(k, number(p.next)), v)
+		p.next++
+		p.updated = v.created
+		if (input.SetAsDefault) {
+			p.defaultVersion = v.id
+		}
+		db.policies.put(k, p)
+		const r = new api.CreatePolicyVersionResponse()
+		r.PolicyVersion = versionOf(p, v, false)
+		return r
+	}
+
+	getPolicyVersion(caller: Caller, input: api.GetPolicyVersionRequest): api.GetPolicyVersionResponse throws Fault {
+		versionId(input.VersionId)
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		let v: Version | null = null
+		if (aws(a)) {
+			v = this.catalog.version(this.catalog.find(a), input.VersionId)
+		} else {
+			v = version(db, p, a, input.VersionId)[1]
+		}
+		if (v == null) {
+			throw unknownVersion(a, input.VersionId)
+		}
+		const r = new api.GetPolicyVersionResponse()
+		r.PolicyVersion = versionOf(p, v, true)
+		return r
+	}
+
+	/// A policy's versions, the latest first.
+	listPolicyVersions(caller: Caller,
+		input: api.ListPolicyVersionsRequest): api.ListPolicyVersionsResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const p = managed(caller, db, this.catalog, a)
+		let all = if (aws(a)) this.catalog.versions(this.catalog.find(a)) else []
+		if (!aws(a)) {
+			const made = db.versions.scan(null, 5, within(key(p.name), ""))
+			for (let i = made.length - 1; i >= 0; i--) {
+				all.push(made[i][1])
+			}
+		}
+		const [versions, next] = part(all, input.Marker, input.MaxItems)
+		const r = new api.ListPolicyVersionsResponse()
+		r.Versions = versions.map(v => versionOf(p, v, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deletePolicyVersion(caller: Caller, input: api.DeletePolicyVersionRequest): Unit throws Fault {
+		versionId(input.VersionId)
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "delete policy versions for policies",
+			`version ${input.VersionId} does not exist or is not attachable.`)
+		const [k, v] = version(db, p, input.PolicyArn, input.VersionId)
+		if (v.id == p.defaultVersion) {
+			throw api.deleteConflictException("Cannot delete the default version of a policy.")
+		}
+		db.versions.delete(k)
+		return new Unit()
+	}
+
+	setDefaultPolicyVersion(caller: Caller, input: api.SetDefaultPolicyVersionRequest): Unit throws Fault {
+		versionId(input.VersionId)
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = owned(caller, db, input.PolicyArn, "update policies")
+		p.defaultVersion = version(db, p, input.PolicyArn, input.VersionId)[1].id
+		p.updated = stamp()
+		db.policies.put(key(p.name), p)
+		return new Unit()
+	}
+
+	tagPolicy(caller: Caller, input: api.TagPolicyRequest): Unit throws Fault {
+		keys(input.Tags)
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = taggable(caller, db, input.PolicyArn)
+		p.tags = tagged(p.tags, input.Tags, "Policy")
+		db.policies.put(key(p.name), p)
+		return new Unit()
+	}
+
+	untagPolicy(caller: Caller, input: api.UntagPolicyRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = taggable(caller, db, input.PolicyArn)
+		p.tags = p.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		db.policies.put(key(p.name), p)
+		return new Unit()
+	}
+
+	/// None of AWS's.
+	listPolicyTags(caller: Caller, input: api.ListPolicyTagsRequest): api.ListPolicyTagsResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const [tags, next] = tagPage(managed(caller, db, this.catalog, a).tags, input.Marker, input.MaxItems)
+		const r = new api.ListPolicyTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	attachUserPolicy(caller: Caller, input: api.AttachUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		attach(caller, db, this.catalog, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn, "user")
+		return new Unit()
+	}
+
+	detachUserPolicy(caller: Caller, input: api.DetachUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		detach(caller, db, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn)
+		return new Unit()
+	}
+
+	listAttachedUserPolicies(caller: Caller,
+		input: api.ListAttachedUserPoliciesRequest): api.ListAttachedUserPoliciesResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		const [policies, next] = attached(db.userAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
+		const r = new api.ListAttachedUserPoliciesResponse()
+		r.AttachedPolicies = policies
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	attachRolePolicy(caller: Caller, input: api.AttachRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "role")
+		return new Unit()
+	}
+
+	detachRolePolicy(caller: Caller, input: api.DetachRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		detach(caller, db, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn)
+		return new Unit()
+	}
+
+	listAttachedRolePolicies(caller: Caller,
+		input: api.ListAttachedRolePoliciesRequest): api.ListAttachedRolePoliciesResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		const [policies, next] = attached(db.roleAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
+		const r = new api.ListAttachedRolePoliciesResponse()
+		r.AttachedPolicies = policies
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	/// The groups, then users, then roles a managed policy is attached to or bounds, each in the order of their names.
+	listEntitiesForPolicy(caller: Caller,
+		input: api.ListEntitiesForPolicyRequest): api.ListEntitiesForPolicyResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		managed(caller, db, this.catalog, a)
+		const prefix = input.PathPrefix ?? "/"
+		const f = input.EntityFilter
+		const boundaries = input.PolicyUsageFilter == "PermissionsBoundary"
+		const by = (owner: string) => owner.slice(0, indexOf(owner, "\x00"))
+		const entities: [string, string, string][] = [] // the kind, as Group, the name and the id
+		if (!boundaries && (f == null || f == "Group")) {
+			for (const [k, _] of db.groupAttached.scan(null, 2147483647).filter(e => e[1].arn == a)) {
+				const g = db.groups.get(by(k))!
+				if (startsWith(g.path, prefix)) {
+					entities.push(["Group", g.name, g.id])
+				}
+			}
+		}
+		const users = if (f != null && f != "User") []
+			else if (boundaries) db.users.scan(null, 2147483647).filter(e => e[1].boundary == a).map(e => e[1])
+			else db.userAttached.scan(null, 2147483647).filter(e => e[1].arn == a).map(e => db.users.get(by(e[0]))!)
+		for (const u of users) {
+			if (startsWith(u.path, prefix)) {
+				entities.push(["User", u.name, u.id])
+			}
+		}
+		const roles = if (f != null && f != "Role") []
+			else if (boundaries) db.roles.scan(null, 2147483647).filter(e => e[1].boundary == a).map(e => e[1])
+			else db.roleAttached.scan(null, 2147483647).filter(e => e[1].arn == a).map(e => db.roles.get(by(e[0]))!)
+		for (const x of roles) {
+			if (startsWith(x.path, prefix)) {
+				entities.push(["Role", x.name, x.id])
+			}
+		}
+		const [found, next] = part(entities, input.Marker, input.MaxItems)
+		const r = new api.ListEntitiesForPolicyResponse()
+		r.PolicyGroups = found.filter(e => e[0]
+			== "Group").map(e => ({ ...new api.PolicyGroup(), GroupName: e[1], GroupId: e[2] }))
+		r.PolicyUsers = found.filter(e => e[0]
+			== "User").map(e => ({ ...new api.PolicyUser(), UserName: e[1], UserId: e[2] }))
+		r.PolicyRoles = found.filter(e => e[0]
+			== "Role").map(e => ({ ...new api.PolicyRole(), RoleName: e[1], RoleId: e[2] }))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	putUserPolicy(caller: Caller, input: api.PutUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		embed(db.userInline, owner, input.PolicyName, input.PolicyDocument)
+		return new Unit()
+	}
+
+	getUserPolicy(caller: Caller, input: api.GetUserPolicyRequest): api.GetUserPolicyResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const p = inline(db.userInline, key(u.name), input.PolicyName, "user")
+		const r = new api.GetUserPolicyResponse()
+		r.UserName = u.name
+		r.PolicyName = p.name
+		r.PolicyDocument = escape(p.document, "component")
+		return r
+	}
+
+	listUserPolicies(caller: Caller, input: api.ListUserPoliciesRequest): api.ListUserPoliciesResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		const [policies, next] = page(db.userInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
+		const r = new api.ListUserPoliciesResponse()
+		r.PolicyNames = policies.map(p => p.name)
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteUserPolicy(caller: Caller, input: api.DeleteUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const owner = key(user(db, input.UserName).name)
+		inline(db.userInline, owner, input.PolicyName, "user")
+		db.userInline.delete(within(owner, key(input.PolicyName)))
+		return new Unit()
+	}
+
+	putRolePolicy(caller: Caller, input: api.PutRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const owner = key(role(db, input.RoleName).name)
+		embed(db.roleInline, owner, input.PolicyName, input.PolicyDocument)
+		return new Unit()
+	}
+
+	getRolePolicy(caller: Caller, input: api.GetRolePolicyRequest): api.GetRolePolicyResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const x = role(db, input.RoleName)
+		const p = inline(db.roleInline, key(x.name), input.PolicyName, "role")
+		const r = new api.GetRolePolicyResponse()
+		r.RoleName = x.name
+		r.PolicyName = p.name
+		r.PolicyDocument = escape(p.document, "component")
+		return r
+	}
+
+	listRolePolicies(caller: Caller, input: api.ListRolePoliciesRequest): api.ListRolePoliciesResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const owner = key(role(db, input.RoleName).name)
+		const [policies, next] = page(db.roleInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
+		const r = new api.ListRolePoliciesResponse()
+		r.PolicyNames = policies.map(p => p.name)
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteRolePolicy(caller: Caller, input: api.DeleteRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		modifiable(role(db, input.RoleName))
+		const owner = key(role(db, input.RoleName).name)
+		inline(db.roleInline, owner, input.PolicyName, "role")
+		db.roleInline.delete(within(owner, key(input.PolicyName)))
+		return new Unit()
+	}
+}
+
+function bounded(db: Tables, name: string): User throws Fault {
+	const u = db.users.get(key(name))
+	if (u == null) {
+		throw api.noSuchEntityException(`User ${name} was not found.`)
+	}
+	return u
+}
+
+function unbound(a: string, id: string): string throws Fault {
+	if (a == "") {
+		throw api.noSuchEntityException(`Principal ${id} does not have scope`)
+	}
+	return a
+}

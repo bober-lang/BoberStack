@@ -1,0 +1,113 @@
+//! IAM's service-linked roles: of the path /aws-service-role/<service>/, trusting the service and holding its AWS
+//! managed policy, which no ordinary operation changes.
+
+import { id } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Caller } from "../../core/service"
+import * as api from "./api"
+import { placed, role, roleOf } from "./common"
+import { arn, Attachment, Deletion, key, Role, stamp, Tables, within } from "./records"
+import { startsWith } from "std/algo"
+
+/// The service principal, the role's name, its AWS managed policy's name, and whether a custom suffix may follow.
+const services: [string, string, string, bool][] = [["autoscaling.amazonaws.com", "AWSServiceRoleForAutoScaling",
+	"AutoScalingServiceRolePolicy", true],
+	["elasticloadbalancing.amazonaws.com", "AWSServiceRoleForElasticLoadBalancing",
+	"AWSElasticLoadBalancingServiceRolePolicy", false],
+	["ecs.amazonaws.com", "AWSServiceRoleForECS", "AmazonECSServiceRolePolicy", false],
+	["rds.amazonaws.com", "AWSServiceRoleForRDS", "AmazonRDSServiceRolePolicy", false],
+	["elasticache.amazonaws.com", "AWSServiceRoleForElastiCache", "ElastiCacheServiceRolePolicy", false],
+	["es.amazonaws.com", "AWSServiceRoleForAmazonElasticsearchService", "AmazonElasticsearchServiceRolePolicy", false],
+	["opensearchservice.amazonaws.com", "AWSServiceRoleForAmazonOpenSearchService", "AmazonOpenSearchServiceRolePolicy",
+	false], ["spot.amazonaws.com", "AWSServiceRoleForEC2Spot", "AWSEC2SpotServiceRolePolicy", false],
+	["ops.apigateway.amazonaws.com", "AWSServiceRoleForAPIGateway", "APIGatewayServiceRolePolicy", false],
+	["replication.dynamodb.amazonaws.com", "AWSServiceRoleForDynamoDBReplication",
+	"DynamoDBReplicationServiceRolePolicy", false],
+	["dynamodb.application-autoscaling.amazonaws.com", "AWSServiceRoleForApplicationAutoScaling_DynamoDBTable",
+	"AWSApplicationAutoscalingDynamoDBTablePolicy", false]]
+
+export class Linked {
+	createServiceLinkedRole(caller: Caller,
+		input: api.CreateServiceLinkedRoleRequest): api.CreateServiceLinkedRoleResponse throws Fault {
+		const service = input.AWSServiceName
+		const known = services.filter(s => s[0] == service)
+		if (known.length == 0) {
+			caller.allow(arn(caller.account, "role", `/aws-service-role/${service}/`, "*"))
+			throw api.invalidInputException(`Invalid service name: ${service}`)
+		}
+		const [_, base, policy, suffixed] = known[0]
+		const suffix = input.CustomSuffix
+		if (suffix != null && !suffixed) {
+			throw api.invalidInputException(`Custom suffix is not allowed for ${service}`)
+		}
+		const name = if (suffix == null) base else `${base}_${suffix!}`
+		const r = new Role()
+		r.name = name
+		r.path = `/aws-service-role/${service}/`
+		caller.allow(arn(caller.account, "role", r.path, name))
+		const db = new Tables(caller.store())
+		if (db.roles.get(key(name)) != null) {
+			throw api.invalidInputException(`Service role name ${name} has been taken in this account, please try a different suffix.`)
+		}
+		r.id = id("AROA", 17)
+		r.created = stamp()
+		r.trust = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"${service}"},`
+			+ `"Action":"sts:AssumeRole"}]}`
+		r.description = input.Description
+		db.roles.put(key(name), r)
+		const a = `arn:aws:iam::aws:policy/aws-service-role/${policy}`
+		const at = new Attachment()
+		at.name = policy
+		at.path = "/aws-service-role/"
+		at.arn = a
+		at.serial = db.next()
+		db.roleAttached.put(within(key(name), placed(caller, a)), at)
+		const out = new api.CreateServiceLinkedRoleResponse()
+		out.Role = roleOf(caller.account, r, true)
+		out.Role!.MaxSessionDuration = null
+		return out
+	}
+
+	/// At once, with its policies: there is no background work, and no resource of a service that uses it.
+	deleteServiceLinkedRole(caller: Caller,
+		input: api.DeleteServiceLinkedRoleRequest): api.DeleteServiceLinkedRoleResponse throws Fault {
+		const db = new Tables(caller.store())
+		const found = db.roles.get(key(input.RoleName))
+		caller.allow(arn(caller.account, "role", found?.path ?? "/", input.RoleName))
+		const r = role(db, input.RoleName)
+		if (!linked(r)) {
+			throw api.invalidInputException(`Role ${r.name} is not a service linked role.`)
+		}
+		const k = key(r.name)
+		for (const [at, _] of db.roleAttached.scan(null, 2147483647, within(k, ""))) {
+			db.roleAttached.delete(at)
+		}
+		for (const [at, _] of db.roleInline.scan(null, 2147483647, within(k, ""))) {
+			db.roleInline.delete(at)
+		}
+		db.roles.delete(k)
+		const task = `task${r.path}${r.name}/${caller.requestId}`
+		const d = new Deletion()
+		d.role = r.name
+		db.deletions.put(task, d)
+		const out = new api.DeleteServiceLinkedRoleResponse()
+		out.DeletionTaskId = task
+		return out
+	}
+
+	getServiceLinkedRoleDeletionStatus(caller: Caller, input: api.GetServiceLinkedRoleDeletionStatusRequest): api.GetServiceLinkedRoleDeletionStatusResponse throws Fault {
+		caller.allow(arn(caller.account, "role", "/aws-service-role/", "*"))
+		if (new Tables(caller.store()).deletions.get(input.DeletionTaskId) == null) {
+			throw api.noSuchEntityException(`Deletion task ${input.DeletionTaskId} cannot be found.`)
+		}
+		return new api.GetServiceLinkedRoleDeletionStatusResponse()
+	}
+}
+
+export function linked(r: Role): bool { return startsWith(r.path, "/aws-service-role/") }
+
+export function modifiable(r: Role) throws Fault {
+	if (linked(r)) {
+		throw api.unmodifiableEntityException(`Cannot perform the operation on the protected role '${r.name}' - this role is only modifiable by AWS`)
+	}
+}

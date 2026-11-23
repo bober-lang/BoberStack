@@ -1,0 +1,186 @@
+//! IAM's instance profiles: each holds at most one role, which EC2 passes to the instances it launches with it.
+
+import { id } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Violations } from "../../core/protocol/model"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { keys, named, onRole, page, part, path, role, roleOf, sorted, tagging, tagPage, tagsOf } from "./common"
+import { arn, key, Profile, stamp, Tables } from "./records"
+import { indexOf, startsWith } from "std/algo"
+import { isAlphanumeric } from "std/ascii"
+
+export class Profiles {
+	createInstanceProfile(caller: Caller,
+		input: api.CreateInstanceProfileRequest): api.CreateInstanceProfileResponse throws Fault {
+		tagging(caller, input.Tags)
+		keys(input.Tags)
+		const k = key(profileName(input.InstanceProfileName))
+		const p = path(input.Path, "path")
+		caller.allow(arn(caller.account, "instance-profile", p, input.InstanceProfileName))
+		const db = new Tables(caller.store())
+		if (db.profiles.get(k) != null) {
+			throw api.entityAlreadyExistsException(`Instance Profile ${input.InstanceProfileName} already exists.`)
+		}
+		const x = new Profile()
+		x.name = input.InstanceProfileName
+		x.path = p
+		x.id = id("AIPA", 17)
+		x.created = stamp()
+		x.tags = sorted([], input.Tags ?? [], "InstanceProfile")
+		db.profiles.put(k, x)
+		const r = new api.CreateInstanceProfileResponse()
+		r.InstanceProfile = profileOf(caller.account, db, x, true)
+		return r
+	}
+
+	getInstanceProfile(caller: Caller,
+		input: api.GetInstanceProfileRequest): api.GetInstanceProfileResponse throws Fault {
+		const db = new Tables(caller.store())
+		const r = new api.GetInstanceProfileResponse()
+		r.InstanceProfile = profileOf(caller.account, db, onProfile(caller, db, input.InstanceProfileName), true)
+		return r
+	}
+
+	listInstanceProfiles(caller: Caller,
+		input: api.ListInstanceProfilesRequest): api.ListInstanceProfilesResponse throws Fault {
+		caller.allow("*")
+		const prefix = input.PathPrefix ?? "/"
+		const db = new Tables(caller.store())
+		const [found, next] = page(db.profiles, "", input.Marker, input.MaxItems, x => startsWith(x.path, prefix))
+		const r = new api.ListInstanceProfilesResponse()
+		r.InstanceProfiles = found.map(x => profileOf(caller.account, db, x, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteInstanceProfile(caller: Caller, input: api.DeleteInstanceProfileRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const x = onProfile(caller, db, input.InstanceProfileName)
+		if (x.role != "") {
+			throw api.deleteConflictException("Cannot delete entity, must remove roles from instance profile first.")
+		}
+		db.profiles.delete(key(x.name))
+		return new Unit()
+	}
+
+	/// Of iam:PassRole too, on the role.
+	addRoleToInstanceProfile(caller: Caller, input: api.AddRoleToInstanceProfileRequest): Unit throws Fault {
+		const pass = caller.actions.slice(1, caller.actions.length)
+		caller.actions = caller.actions.slice(0, 1)
+		const db = new Tables(caller.store())
+		const x = onProfile(caller, db, input.InstanceProfileName)
+		caller.actions = pass
+		onRole(caller, input.RoleName)
+		const y = role(db, input.RoleName)
+		if (x.role != "") {
+			throw api.limitExceededException("Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1")
+		}
+		x.role = y.name
+		db.profiles.put(key(x.name), x)
+		return new Unit()
+	}
+
+	removeRoleFromInstanceProfile(caller: Caller, input: api.RemoveRoleFromInstanceProfileRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		allowed(caller, db, input.InstanceProfileName)
+		const y = role(db, input.RoleName)
+		const x = profile(db, input.InstanceProfileName)
+		if (key(x.role) != key(y.name) || x.role == "") {
+			throw api.noSuchEntityException(`Role ${input.RoleName} in Instance Profile ${input.InstanceProfileName} `
+				+ "cannot be found.")
+		}
+		x.role = ""
+		db.profiles.put(key(x.name), x)
+		return new Unit()
+	}
+
+	/// In the order of the profiles' names.
+	listInstanceProfilesForRole(caller: Caller,
+		input: api.ListInstanceProfilesForRoleRequest): api.ListInstanceProfilesForRoleResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const k = key(role(db, input.RoleName).name)
+		const all = db.profiles.scan(null, 2147483647).map(e => e[1]).filter(x => x.role != "" && key(x.role) == k)
+		const [found, next] = part(all, input.Marker, input.MaxItems)
+		const r = new api.ListInstanceProfilesForRoleResponse()
+		r.InstanceProfiles = found.map(x => profileOf(caller.account, db, x, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	tagInstanceProfile(caller: Caller, input: api.TagInstanceProfileRequest): Unit throws Fault {
+		keys(input.Tags)
+		const db = new Tables(caller.store())
+		const x = onProfile(caller, db, input.InstanceProfileName)
+		x.tags = sorted(x.tags, input.Tags, "InstanceProfile")
+		db.profiles.put(key(x.name), x)
+		return new Unit()
+	}
+
+	untagInstanceProfile(caller: Caller, input: api.UntagInstanceProfileRequest): Unit throws Fault {
+		const db = new Tables(caller.store())
+		const x = onProfile(caller, db, input.InstanceProfileName)
+		x.tags = x.tags.filter(t => !input.TagKeys.includes(t[0]))
+		db.profiles.put(key(x.name), x)
+		return new Unit()
+	}
+
+	listInstanceProfileTags(caller: Caller,
+		input: api.ListInstanceProfileTagsRequest): api.ListInstanceProfileTagsResponse throws Fault {
+		const db = new Tables(caller.store())
+		const [tags,
+			next] = tagPage(onProfile(caller, db, input.InstanceProfileName).tags, input.Marker, input.MaxItems)
+		const r = new api.ListInstanceProfileTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+}
+
+function onProfile(caller: Caller, db: Tables, name: string): Profile throws Fault {
+	allowed(caller, db, name)
+	return profile(db, name)
+}
+
+function allowed(caller: Caller, db: Tables, name: string) throws Fault {
+	const x = db.profiles.get(key(name))
+	caller.allow(arn(caller.account, "instance-profile", x?.path ?? "/", x?.name ?? name))
+}
+
+function profile(db: Tables, name: string): Profile throws Fault {
+	const x = db.profiles.get(key(name))
+	if (x == null) {
+		throw api.noSuchEntityException(`Instance Profile ${name} cannot be found.`)
+	}
+	return x
+}
+
+function profileName(name: string): string throws Fault {
+	if (name.length < 1 || !name.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
+		throw new Violations(api.validation).fault(name, "instanceProfileName",
+			"Member must satisfy regular expression pattern: [\\w+=,.@-]+")
+	}
+	return named(name, "instanceProfileName", 128)
+}
+
+export function profileOf(account: string, db: Tables, x: Profile, full: bool): api.InstanceProfile {
+	const w = new api.InstanceProfile()
+	w.Path = x.path
+	w.InstanceProfileName = x.name
+	w.InstanceProfileId = x.id
+	w.Arn = arn(account, "instance-profile", x.path, x.name)
+	w.CreateDate = x.created
+	const y = if (x.role == "") null else db.roles.get(key(x.role))
+	if (y != null) {
+		const r = roleOf(account, y!, false)
+		r.MaxSessionDuration = null
+		r.MaxSigninSessionDuration = null
+		w.Roles = [r]
+	}
+	w.Tags = if (full) tagsOf(x.tags) else null
+	return w
+}

@@ -1,0 +1,124 @@
+//! What IAM keeps of an account as a whole: its summary, its alias and its password policy.
+
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { part } from "./common"
+import { Account, Passwords, Tables } from "./records"
+
+export class Accounts {
+	/// The account's entities counted, and AWS's quotas, in the order AWS gives them.
+	getAccountSummary(caller: Caller, input: Unit): api.GetAccountSummaryResponse throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const all = 2147483647
+		const versions = db.versions.scan(null, all).length
+		const r = new api.GetAccountSummaryResponse()
+		r.SummaryMap = [["GroupPolicySizeQuota", 5120], ["InstanceProfilesQuota", 1000],
+			["Policies", db.policies.scan(null, all).length], ["GroupsPerUserQuota", 10],
+			["InstanceProfiles", db.profiles.scan(null, all).length], ["AttachedPoliciesPerUserQuota", 10],
+			["Users", db.users.scan(null, all).length], ["PoliciesQuota", 1500],
+			["Providers", db.oidc.scan(null, all).length + db.saml.scan(null, all).length], ["AccountMFAEnabled", 0],
+			["AccessKeysPerUserQuota", 2], ["AssumeRolePolicySizeQuota", 2048], ["PolicyVersionsInUseQuota", 10000],
+			["GlobalEndpointTokenVersion", 1], ["VersionsPerPolicyQuota", 5], ["AttachedPoliciesPerGroupQuota", 10],
+			["PolicySizeQuota", 6144], ["Groups", db.groups.scan(null, all).length],
+			["AccountSigningCertificatesPresent", 0], ["UsersQuota", 5000], ["ServerCertificatesQuota", 20],
+			["MFADevices", 0], ["UserPolicySizeQuota", 2048], ["PolicyVersionsInUse", versions],
+			["ServerCertificates", 0], ["Roles", db.roles.scan(null, all).length], ["RolesQuota", 1000],
+			["SigningCertificatesPerUserQuota", 2], ["MFADevicesInUse", 0], ["RolePolicySizeQuota", 10240],
+			["AttachedPoliciesPerRoleQuota", 20],
+			["AccountAccessKeysPresent", if (db.keys.scan(null, 1, "\x00").length > 0) 1 else 0],
+			["AccountPasswordPresent", 0], ["GroupsQuota", 300]]
+		return r
+	}
+
+	listAccountAliases(caller: Caller,
+		input: api.ListAccountAliasesRequest): api.ListAccountAliasesResponse throws Fault {
+		caller.allow("*")
+		const a = account(new Tables(caller.store()))
+		const [aliases, next] = part(if (a.alias == "") [] else [a.alias], input.Marker, input.MaxItems)
+		const r = new api.ListAccountAliasesResponse()
+		r.AccountAliases = aliases
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	/// In place of the one the account has, if any.
+	createAccountAlias(caller: Caller, input: api.CreateAccountAliasRequest): Unit throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const a = account(db)
+		a.alias = input.AccountAlias
+		db.account.put("", a)
+		return new Unit()
+	}
+
+	deleteAccountAlias(caller: Caller, input: api.DeleteAccountAliasRequest): Unit throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const a = account(db)
+		if (a.alias != input.AccountAlias) {
+			throw api.noSuchEntityException(`The account alias ${input.AccountAlias} cannot be found.`)
+		}
+		a.alias = ""
+		db.account.put("", a)
+		return new Unit()
+	}
+
+	getAccountPasswordPolicy(caller: Caller, input: Unit): api.GetAccountPasswordPolicyResponse throws Fault {
+		caller.allow("*")
+		const p = account(new Tables(caller.store())).passwords
+		if (p == null) {
+			throw api.noSuchEntityException(`The Password Policy with domain name ${caller.account} cannot be found.`)
+		}
+		const w = new api.PasswordPolicy()
+		w.MinimumPasswordLength = p!.length
+		w.RequireSymbols = p!.symbols
+		w.RequireNumbers = p!.numbers
+		w.RequireUppercaseCharacters = p!.upper
+		w.RequireLowercaseCharacters = p!.lower
+		w.AllowUsersToChangePassword = p!.change
+		w.ExpirePasswords = p!.age != null
+		w.MaxPasswordAge = p!.age
+		w.PasswordReusePrevention = p!.reuse
+		w.HardExpiry = p!.hardExpiry
+		const r = new api.GetAccountPasswordPolicyResponse()
+		r.PasswordPolicy = w
+		return r
+	}
+
+	/// The policy given, in place of the one the account has; what it leaves out is as by default.
+	updateAccountPasswordPolicy(caller: Caller, input: api.UpdateAccountPasswordPolicyRequest): Unit throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const a = account(db)
+		const p = new Passwords()
+		p.length = input.MinimumPasswordLength ?? 6
+		p.symbols = input.RequireSymbols
+		p.numbers = input.RequireNumbers
+		p.upper = input.RequireUppercaseCharacters
+		p.lower = input.RequireLowercaseCharacters
+		p.change = input.AllowUsersToChangePassword
+		p.age = input.MaxPasswordAge
+		p.reuse = input.PasswordReusePrevention
+		p.hardExpiry = input.HardExpiry
+		a.passwords = p
+		db.account.put("", a)
+		return new Unit()
+	}
+
+	deleteAccountPasswordPolicy(caller: Caller, input: Unit): Unit throws Fault {
+		caller.allow("*")
+		const db = new Tables(caller.store())
+		const a = account(db)
+		if (a.passwords == null) {
+			throw api.noSuchEntityException("The account policy with name PasswordPolicy cannot be found.")
+		}
+		a.passwords = null
+		db.account.put("", a)
+		return new Unit()
+	}
+}
+
+function account(db: Tables): Account throws Fault { return db.account.get("") ?? new Account() }

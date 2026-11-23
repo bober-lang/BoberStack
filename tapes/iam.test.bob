@@ -7,7 +7,7 @@ import { identify } from "../services/iam/identities"
 import * as stsApi from "../services/sts/api"
 import * as sts from "../services/sts/sts"
 import { replay } from "../tools/tape/tape"
-import { catalog_text } from "../services/iam/catalog.c"
+import managed from "../models/iam-managed-policies.jsonl" @Embed["deflate"]
 
 /// A gateway of IAM, of every AWS managed policy, which the catalog's text costs this test's build; and of STS, which
 /// a tape's users call to learn that their keys work.
@@ -23,14 +23,7 @@ function gateway(catalog: Catalog): Gateway {
 	return g
 }
 
-/// The AWS managed policies.
-function managed(): Catalog {
-	const text = new u64[](2)
-	catalog_text(text)
-	return new Catalog(text[0], text[1])
-}
-
-const catalog = managed()
+const catalog = new Catalog(managed)
 
 test "IAM tapes replay" {
 	for (const tape of ["tapes/iam/users.json", "tapes/iam/roles.json", "tapes/iam/policies.json",

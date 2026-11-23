@@ -1,0 +1,122 @@
+//! The AWS managed policies, of the account aws: read-only, shared by all accounts and kept out of their trees. Their
+//! text, as models/iam-managed-policies.sh writes it, is a policy's line then a line per version's document, policies
+//! sorted by key. Only the policies' lines are decoded; a document is a slice of the text.
+
+import { arn, key, Policy, Version, within } from "./records"
+import { indexOf, lastIndexOf, partitionPoint, sortBy } from "std/algo"
+import { decode } from "std/encoding/json"
+import { ParseError } from "std/string"
+import { parseRfc3339 } from "std/time"
+
+class Line {
+	PolicyName = ""
+	PolicyId = ""
+	Arn = ""
+	Path = ""
+	DefaultVersionId = ""
+	IsAttachable = true
+	Description: string | null = null
+	CreateDate = ""
+	UpdateDate = ""
+	Versions: Listed[] = []
+}
+
+class Listed {
+	VersionId = ""
+	IsDefaultVersion = false
+	CreateDate = ""
+}
+
+/// A policy, its versions in the order IAM lists them, their documents apart.
+class Entry {
+	policy = new Policy()
+	versions: Version[] = []
+	documents: string[] = []
+}
+
+export class Catalog {
+	private entries: Entry[] = []
+	/// The indices of the policies by their dates of creation, those of one date by their keys.
+	private order: i32[] = []
+
+	/// Of text, which it keeps.
+	constructor(text: string) throws ParseError {
+		let p = 0
+		while (p < text.length) {
+			const from = p
+			const end = line(text, p)
+			const l = decode[Line](text.slice(p, end))
+			p = end + 1
+			const e = new Entry()
+			e.policy.name = l.PolicyName
+			e.policy.path = l.Path
+			e.policy.id = l.PolicyId
+			e.policy.created = parseRfc3339(l.CreateDate)
+			e.policy.updated = parseRfc3339(l.UpdateDate)
+			e.policy.description = l.Description
+			e.policy.defaultVersion = l.DefaultVersionId
+			const last = this.entries.length - 1
+			if (l.Arn != arn("aws", "policy", l.Path, l.PolicyName) || !l.IsAttachable
+				|| last >= 0 && key(l.PolicyName) <= key(this.entries[last].policy.name)) {
+				throw new ParseError("syntax", from)
+			}
+			for (const x of l.Versions) {
+				if (x.IsDefaultVersion != (x.VersionId == l.DefaultVersionId)) {
+					throw new ParseError("syntax", from)
+				}
+				const v = new Version()
+				v.id = x.VersionId
+				v.created = parseRfc3339(x.CreateDate)
+				e.versions.push(v)
+				const d = line(text, p)
+				e.documents.push(text.slice(p, d))
+				p = d + 1
+			}
+			this.entries.push(e)
+		}
+		for (let i = 0; i < this.entries.length; i++) {
+			this.order.push(i)
+		}
+		const es = this.entries
+		sortBy(this.order,
+			(i,
+			j) => es[i].policy.created < es[j].policy.created || es[i].policy.created == es[j].policy.created && i < j)
+	}
+
+	size(): i32 { return this.entries.length }
+	/// The indices of the policies in the order AWS lists them, as far as their dates tell it.
+	dated(): i32[] { return this.order }
+
+	find(a: string): i32 {
+		const i = this.after(within(key(a.slice(lastIndexOf(a, "/") + 1, a.length)), ""))
+		if (i == this.entries.length) {
+			return -1
+		}
+		const p = this.entries[i].policy
+		return if (arn("aws", "policy", p.path, p.name) == a) i else -1
+	}
+
+	/// The index of the first policy whose place in a listing comes after k.
+	after(k: string): i32 { return partitionPoint(this.entries, e => within(key(e.policy.name), "aws") > k) as i32 }
+	policy(i: i32): Policy { return { ...this.entries[i].policy } }
+	versions(i: i32): Version[] { return this.entries[i].versions.map(v => ({ ...v })) }
+
+	version(i: i32, id: string): Version | null {
+		const e = this.entries[i]
+		for (const j of 0 ... e.versions.length - 1) {
+			if (e.versions[j].id == id) {
+				return { ...e.versions[j], document: e.documents[j] }
+			}
+		}
+		return null
+	}
+}
+
+/// The index of the newline that ends the line at p.
+function line(text: string, p: i32): i32 throws ParseError {
+	const nl = indexOf(text, "\n", p)
+	if (nl < 0) {
+		throw new ParseError("syntax", p)
+	}
+	return nl
+}

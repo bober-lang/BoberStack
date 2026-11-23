@@ -1,0 +1,119 @@
+//! Who a caller is to IAM's policies, and the policies that apply to it, read from the request's own trees: what the
+//! gateway authorizes requests by.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { Caller, Identify } from "../../core/service"
+import { Table } from "../../core/state/store"
+import { Catalog } from "./catalog"
+import { arn, Attachment, Inline, key, number, Tables, within } from "./records"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { ParseError, parseInt, split } from "std/string"
+
+export function identify(catalog: Catalog): Identify { return caller => identity(catalog, caller) }
+
+/// The caller as policies see it, and the policies that apply to it: a federated user's are those of the user its
+/// session was issued to, and without session policies it has none that allow.
+function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Policies] throws Fault {
+	const a = caller.arn
+	const p = new auth.Principal()
+	p.arn = a
+	p.account = caller.account
+	const ps = new auth.Policies()
+	const db = new Tables(caller.store())
+	const c = caller.credential
+	if (c != null && c.session == "user" && caller.actions.every(x => startsWith(x, "iam:"))) {
+		// A session of GetSessionToken calls IAM only with MFA, which BoberStack's never have.
+		throw new Fault(403, "InvalidClientTokenId", "The security token included in the request is invalid")
+	}
+	if (indexOf(a, ":assumed-role/") >= 0) {
+		p.kind = "role"
+		const r = db.roles.get(key(split(a, "/")[1]))
+		if (r != null) {
+			p.role = arn(caller.account, "role", r.path, r.name)
+			p.tags = r.tags
+			ps.identity = policies(catalog, db, caller.account, db.roleInline, db.roleAttached, key(r.name))
+			ps.boundary = boundary(catalog, db, caller.account, r.boundary)
+		}
+	} else {
+		p.kind = if (indexOf(a, ":federated-user/") >= 0) "federated-user" else "user"
+		const issuer = if (p.kind == "user") a else c?.issuer ?? ""
+		const u = db.users.get(key(issuer.slice(lastIndexOf(issuer, "/") + 1, issuer.length)))
+		if (u != null) {
+			p.tags = u.tags
+			ps.identity = policies(catalog, db, caller.account, db.userInline, db.userAttached, key(u.name))
+			for (const [_, m] of db.members.scan(null, 2147483647).filter(e => key(e[1].user) == key(u.name))) {
+				ps.identity.append(policies(catalog, db, caller.account, db.groupInline, db.groupAttached,
+					key(m.group)))
+			}
+			ps.boundary = boundary(catalog, db, caller.account, u.boundary)
+		}
+	}
+	if (c != null) {
+		if (c.policy != "") {
+			ps.session.push(parsed(c.policy, "session policy"))
+		}
+		for (const x of c.policyArns) {
+			const d = managed(catalog, db, caller.account, x)
+			// One no longer there allows nothing.
+			ps.session.push(if (d == null) new auth.Policy() else parsed(d!, x))
+		}
+		if (p.kind == "federated-user" && ps.session.length == 0) {
+			ps.session.push(new auth.Policy())
+		}
+		const tags = p.tags.filter(t => !c.tags.some(s => s[0] == t[0]))
+		tags.append(c.tags)
+		p.tags = tags
+	}
+	return [p, ps]
+}
+
+function policies(catalog: Catalog, db: Tables, account: string, inline: Table[Inline], attached: Table[Attachment],
+	owner: string): auth.Policy[] throws Fault {
+	const out: auth.Policy[] = []
+	for (const [_, p] of inline.scan(null, 2147483647, within(owner, ""))) {
+		out.push(parsed(p.document, p.name))
+	}
+	for (const [_, at] of attached.scan(null, 2147483647, within(owner, ""))) {
+		const d = managed(catalog, db, account, at.arn)
+		if (d != null) {
+			out.push(parsed(d!, at.arn))
+		}
+	}
+	return out
+}
+
+/// The permissions boundary of ARN a, none if "", one that allows nothing if it is no longer there.
+function boundary(catalog: Catalog, db: Tables, account: string, a: string): auth.Policy | null throws Fault {
+	if (a == "") {
+		return null
+	}
+	const d = managed(catalog, db, account, a)
+	return if (d == null) new auth.Policy() else parsed(d!, a)
+}
+
+export function managed(catalog: Catalog, db: Tables, account: string, a: string): string | null {
+	if (startsWith(a, "arn:aws:iam::aws:")) {
+		const i = catalog.find(a)
+		return if (i < 0) null else catalog.version(i, catalog.policy(i).defaultVersion)?.document ?? null
+	}
+	const p = db.policies.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
+	if (p == null || a != arn(account, "policy", p.path, p.name)) {
+		return null
+	}
+	let n = 0
+	try {
+		n = parseInt(p.defaultVersion.slice(1, p.defaultVersion.length))
+	} catch (e: ParseError) {
+		return null
+	}
+	return db.versions.get(within(key(p.name), number(n)))?.document ?? null
+}
+
+function parsed(d: string, name: string): auth.Policy throws Fault {
+	try {
+		return auth.parse(d, "identity")
+	} catch (f: Fault) {
+		throw new Fault(500, "InternalFailure", `The policy ${name} does not parse: ${f.message}`)
+	}
+}

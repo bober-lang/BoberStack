@@ -1,0 +1,231 @@
+//! IAM's state in an account's tree: a table of records of each kind, keyed by the name lower-cased, as IAM's names
+//! are unique whatever their case; and those of a user, role or group, by its key, a NUL and their own.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { lower } from "std/string"
+import { second } from "std/time"
+
+export class User {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	boundary = ""
+	/// In the order added, the latest first.
+	tags: [string, string][] = []
+}
+
+export class Role {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	trust = ""
+	description: string | null = null
+	/// In seconds.
+	maxSession: i32 = 3600
+	boundary = ""
+	tags: [string, string][] = []
+}
+
+export class Group {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+}
+
+export class Profile {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	role = ""
+	/// In the order of their keys, which, unlike a user's, differ by case alone.
+	tags: [string, string][] = []
+}
+
+export class Oidc {
+	/// Its URL, without https://, which its ARN ends with.
+	url = ""
+	/// In the order given, sorted, then those added.
+	clients: string[] = []
+	/// Lower-cased.
+	thumbprints: string[] = []
+	/// To the millisecond.
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Saml {
+	name = ""
+	id = ""
+	metadata = ""
+	/// To the millisecond.
+	created: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Account {
+	alias = ""
+	passwords: Passwords | null = null
+}
+
+export class Passwords {
+	length: i32 = 6
+	symbols = false
+	numbers = false
+	upper = false
+	lower = false
+	change = false
+	/// In days; null if passwords do not expire.
+	age: i32 | null = null
+	/// How many of the passwords last used a new one may not repeat; null for none.
+	reuse: i32 | null = null
+	hardExpiry: bool | null = null
+}
+
+export class Login {
+	created: i64 = 0
+	reset = false
+	/// In seconds; null for AWS's default.
+	maxSession: i32 | null = null
+	/// The password's SHA-256, in hex.
+	password = ""
+}
+
+/// The deletion of a service-linked role, which is done once asked for.
+export class Deletion {
+	role = ""
+}
+
+export class Member {
+	user = ""
+	group = ""
+}
+
+export class Policy {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+	updated: i64 = 0
+	description: string | null = null
+	/// The version that is the default, and the number of the next.
+	defaultVersion = "v1"
+	next = 2
+	/// The users and roles it is attached to, and those it bounds.
+	attachments = 0
+	bounds = 0
+	serial: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Version {
+	/// v1, v2 and on, never one again once deleted.
+	id = ""
+	document = ""
+	created: i64 = 0
+}
+
+/// A user's access key, or the root's, of user "", whose secret is in the credentials of the global state.
+export class AccessKey {
+	user = ""
+	id = ""
+	status = "Active"
+	created: i64 = 0
+	serial: i64 = 0
+}
+
+export class Attachment {
+	name = ""
+	path = ""
+	arn = ""
+	serial: i64 = 0
+}
+
+export class Serial {
+	n: i64 = 0
+}
+
+export class Inline {
+	name = ""
+	document = ""
+}
+
+export class Tables {
+	users: Table[User]
+	/// The account's root, by "", as a user of no name or path, from the first request that needs it.
+	root: Table[User]
+	roles: Table[Role]
+	policies: Table[Policy]
+	/// By the policy's key and the version's number, of 10 digits so that they sort.
+	versions: Table[Version]
+	/// By the user's key, "" for the root's, and the access key's id.
+	keys: Table[AccessKey]
+	/// By the owner's key, the policy's and its account, the account's own or aws, as AWS's managed policies may share a
+	/// name with the account's.
+	userAttached: Table[Attachment]
+	roleAttached: Table[Attachment]
+	userInline: Table[Inline]
+	roleInline: Table[Inline]
+	groups: Table[Group]
+	/// By the group's key and the user's.
+	members: Table[Member]
+	groupAttached: Table[Attachment]
+	groupInline: Table[Inline]
+	profiles: Table[Profile]
+	/// By the URL, as its ARN names it.
+	oidc: Table[Oidc]
+	saml: Table[Saml]
+	logins: Table[Login]
+	deletions: Table[Deletion]
+	account: Table[Account]
+	serial: Table[Serial]
+
+	constructor(s: Store) {
+		this.users = new Table[User](s, "iam/users")
+		this.root = new Table[User](s, "iam/root")
+		this.roles = new Table[Role](s, "iam/roles")
+		this.policies = new Table[Policy](s, "iam/policies")
+		this.versions = new Table[Version](s, "iam/versions")
+		this.keys = new Table[AccessKey](s, "iam/keys")
+		this.userAttached = new Table[Attachment](s, "iam/user-attached")
+		this.roleAttached = new Table[Attachment](s, "iam/role-attached")
+		this.userInline = new Table[Inline](s, "iam/user-inline")
+		this.roleInline = new Table[Inline](s, "iam/role-inline")
+		this.groups = new Table[Group](s, "iam/groups")
+		this.members = new Table[Member](s, "iam/members")
+		this.groupAttached = new Table[Attachment](s, "iam/group-attached")
+		this.groupInline = new Table[Inline](s, "iam/group-inline")
+		this.profiles = new Table[Profile](s, "iam/profiles")
+		this.oidc = new Table[Oidc](s, "iam/oidc")
+		this.saml = new Table[Saml](s, "iam/saml")
+		this.logins = new Table[Login](s, "iam/logins")
+		this.deletions = new Table[Deletion](s, "iam/deletions")
+		this.account = new Table[Account](s, "iam/account")
+		this.serial = new Table[Serial](s, "iam/serial")
+	}
+
+	next(): i64 throws Fault {
+		const s = this.serial.get("") ?? new Serial()
+		s.n++
+		this.serial.put("", s)
+		return s.n
+	}
+}
+
+export function key(name: string): string { return lower(name) }
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+export function number(n: i32): string { return `${10000000000 + (n as i64)}`.slice(1, 11) }
+
+export function arn(account: string, kind: string, path: string, name: string): string {
+	return `arn:aws:iam::${account}:${kind}${path}${name}`
+}
+
+/// The time now, to the second, as IAM's dates are.
+export function stamp(): i64 {
+	const t = now()
+	return t - t % second
+}

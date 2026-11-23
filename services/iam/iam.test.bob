@@ -1,0 +1,889 @@
+import { request, text, texts } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { live } from "../../core/state/store"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+import { Handler } from "./iam"
+import { identify } from "./identities"
+import { indexOf } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Response } from "std/http"
+import { ParseError, replace, split } from "std/string"
+import { escape } from "std/url"
+
+const trust = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},`
+	+ `"Action":"sts:AssumeRole"}]}`
+
+const allow = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`
+
+function aws(action: string): string {
+	return `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["${action}"],"Resource":"*"}]}`
+}
+
+/// Three of AWS's managed policies, as models/iam-managed-policies.jsonl has them, but for fewer versions.
+const managed = `{"PolicyName":"APIGatewayServiceRolePolicy","PolicyId":"ANPAJQQDZNLDBF2ULTWK6",`
+	+ `"Arn":"arn:aws:iam::aws:policy/aws-service-role/APIGatewayServiceRolePolicy","Path":"/aws-service-role/",`
+	+ `"DefaultVersionId":"v1","IsAttachable":true,"Description":"Allows API Gateway to manage associated AWS `
+	+ `Resources on behalf of the customer. ","CreateDate":"2017-10-20T17:23:10+00:00","UpdateDate":`
+	+ `"2017-10-20T17:23:10+00:00","Versions":[{"VersionId":"v1","IsDefaultVersion":true,"CreateDate":`
+	+ `"2017-10-20T17:23:10+00:00"}]}\n${aws("ec2:CreateNetworkInterface")}\n`
+	+ `{"PolicyName":"ReadOnlyAccess","PolicyId":"ANPAILL3HVNFSB6DCOWYQ","Arn":"arn:aws:iam::aws:policy/ReadOnlyAccess",`
+	+ `"Path":"/","DefaultVersionId":"v3","IsAttachable":true,"Description":"Provides read-only access to AWS `
+	+ `services and resources.","CreateDate":"2015-02-06T18:39:48+00:00","UpdateDate":"2026-11-13T14:27:09+00:00",`
+	+ `"Versions":[{"VersionId":"v3","IsDefaultVersion":true,"CreateDate":"2026-11-13T14:27:09+00:00"},`
+	+ `{"VersionId":"v2","IsDefaultVersion":false,"CreateDate":"2016-01-01T00:00:00+00:00"},`
+	+ `{"VersionId":"v1","IsDefaultVersion":false,"CreateDate":"2015-02-06T18:39:48+00:00"}]}\n`
+	+ `${aws("s3:Get*")}\n${aws("s3:List*")}\n${aws("ec2:Describe*")}\n`
+	+ `{"PolicyName":"ViewOnlyAccess","PolicyId":"ANPAID22R6XPJATWOFDK6",`
+	+ `"Arn":"arn:aws:iam::aws:policy/job-function/ViewOnlyAccess","Path":"/job-function/","DefaultVersionId":"v1",`
+	+ `"IsAttachable":true,"Description":"This policy grants permissions to view resources and basic metadata across `
+	+ `all AWS services. ","CreateDate":"2016-11-10T17:20:15+00:00","UpdateDate":"2016-11-10T17:20:15+00:00",`
+	+ `"Versions":[{"VersionId":"v1","IsDefaultVersion":true,"CreateDate":"2016-11-10T17:20:15+00:00"}]}\n`
+	+ `${aws("s3:ListAllMyBuckets")}\n`
+
+function gateway(h: api.IAM = new Handler(new Catalog(managed))): Gateway {
+	const g = new Gateway()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+/// The answer of g to action with params; by default from an unknown key, the root of 000000000000.
+function call(g: Gateway, action: string, params: [string, string][] = [], accessKey = "test",
+	secret = "test"): Response {
+	const query = params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	return g.handle(request("iam", accessKey, secret, `Action=${action}&Version=2010-05-08${query}`))
+}
+
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+}
+
+function tags(n: i32, first = 1): [string, string][] {
+	const params: [string, string][] = []
+	for (let i = 0; i < n; i++) {
+		params.push([`Tags.member.${first + i}.Key`, `k${i}`])
+		params.push([`Tags.member.${first + i}.Value`, `v${i}`])
+	}
+	return params
+}
+
+test "users: create, get, list, update, delete" {
+	const before = live()
+	const g = gateway()
+	let res = call(g, "CreateUser", [["UserName", "bob"], ["Path", "/dev/"]])
+	assert res.status == 200 && text(res, "UserName") == "bob" && text(res, "Path") == "/dev/"
+	assert text(res, "Arn") == "arn:aws:iam::000000000000:user/dev/bob"
+	const id = text(res, "UserId")!
+	assert id.length == 21 && id.slice(0, 4) == "AIDA"
+	assert fails(call(g, "CreateUser", [["UserName", "BOB"]]), 409, "EntityAlreadyExists",
+		"User with name BOB already exists.")
+	assert fails(call(g, "CreateUser", [["UserName", "a/b"]]), 400, "ValidationError")
+	assert fails(call(g, "CreateUser", [["UserName", "carol"], ["Path", "dev"]]), 400, "ValidationError")
+	assert fails(call(g, "CreateUser"), 400, "ValidationError",
+		"1 validation error detected: Value at 'userName' failed to satisfy constraint: Member must not be null")
+	res = call(g, "GetUser", [["UserName", "Bob"]])
+	assert res.status == 200 && text(res, "UserId") == id && text(res, "UserName") == "bob"
+	assert fails(call(g, "GetUser", [["UserName", "nobody"]]), 404, "NoSuchEntity",
+		"The user with name nobody cannot be found.")
+	assert call(g, "CreateUser", [["UserName", "alice"]]).status == 200
+	res = call(g, "ListUsers")
+	assert texts(res, "UserName") == ["alice", "bob"] && text(res, "IsTruncated") == "false"
+	assert texts(call(g, "ListUsers", [["PathPrefix", "/dev/"]]), "UserName") == ["bob"]
+	res = call(g, "ListUsers", [["MaxItems", "1"]])
+	assert texts(res, "UserName") == ["alice"] && text(res, "IsTruncated") == "true"
+	res = call(g, "ListUsers", [["MaxItems", "1"], ["Marker", text(res, "Marker")!]])
+	assert texts(res, "UserName") == ["bob"] && text(res, "IsTruncated") == "false" && text(res, "Marker") == null
+	assert fails(call(g, "ListUsers", [["MaxItems", "0"]]), 400, "ValidationError")
+	assert call(g, "UpdateUser", [["UserName", "bob"], ["NewUserName", "robert"], ["NewPath", "/ops/"]]).status == 200
+	res = call(g, "GetUser", [["UserName", "robert"]])
+	assert text(res, "Path") == "/ops/" && text(res, "UserId") == id
+	assert text(res, "Arn") == "arn:aws:iam::000000000000:user/ops/robert"
+	assert fails(call(g, "GetUser", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	assert fails(call(g, "UpdateUser", [["UserName", "alice"], ["NewUserName", "Robert"]]), 409, "EntityAlreadyExists")
+	assert call(g, "UpdateUser", [["UserName", "alice"], ["NewUserName", "Alice"]]).status == 200
+	assert texts(call(g, "ListUsers"), "UserName") == ["Alice", "robert"]
+	assert call(g, "DeleteUser", [["UserName", "robert"]]).status == 200
+	assert fails(call(g, "GetUser", [["UserName", "robert"]]), 404, "NoSuchEntity")
+	assert fails(call(g, "DeleteUser", [["UserName", "robert"]]), 404, "NoSuchEntity")
+	assert texts(call(g, "ListUsers"), "UserName") == ["Alice"]
+	g.close()
+	assert live() == before
+}
+
+test "user and role tags: set by key whatever its case, at most 50" {
+	const g = gateway()
+	let res = call(g, "CreateUser", [["UserName", "bob"], ...tags(1)])
+	assert texts(res, "Key") == ["k0"]
+	assert call(g, "TagUser",
+		[["UserName", "bob"], ["Tags.member.1.Key", "K0"], ["Tags.member.1.Value", "new"], ["Tags.member.2.Key", "env"],
+		["Tags.member.2.Value", "prod"]]).status == 200
+	res = call(g, "ListUserTags", [["UserName", "bob"]])
+	assert texts(res, "Key") == ["K0", "env"] && texts(res, "Value") == ["new", "prod"]
+	assert texts(call(g, "GetUser", [["UserName", "bob"]]), "Key") == ["K0", "env"]
+	assert texts(call(g, "ListUsers"), "Key") == []
+	res = call(g, "ListUserTags", [["UserName", "bob"], ["MaxItems", "1"]])
+	assert texts(res, "Key") == ["K0"] && text(res, "IsTruncated") == "true"
+	res = call(g, "ListUserTags", [["UserName", "bob"], ["Marker", text(res, "Marker")!]])
+	assert texts(res, "Key") == ["env"] && text(res, "IsTruncated") == "false"
+	assert fails(call(g, "TagUser",
+		[["UserName", "bob"], ["Tags.member.1.Key", "a"], ["Tags.member.1.Value", "1"], ["Tags.member.2.Key", "A"],
+		["Tags.member.2.Value", "2"]]), 400, "InvalidInput",
+		"Duplicate tag keys found. Please note that Tag keys are case insensitive.")
+	assert fails(call(g, "TagUser", [["UserName", "bob"], ...tags(50)]), 409, "LimitExceeded")
+	assert call(g, "UntagUser", [["UserName", "bob"], ["TagKeys.member.1", "k0"], ["TagKeys.member.2", "ENV"]]).status
+		== 200
+	assert texts(call(g, "ListUserTags", [["UserName", "bob"]]), "Key") == []
+	assert call(g, "TagUser", [["UserName", "bob"], ...tags(50)]).status == 200
+	assert fails(call(g, "TagUser", [["UserName", "nobody"], ...tags(1)]), 404, "NoSuchEntity")
+	assert call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust], ...tags(2)]).status == 200
+	assert call(g, "TagRole", [["RoleName", "r"], ["Tags.member.1.Key", "k1"], ["Tags.member.1.Value", "x"]]).status
+		== 200
+	assert texts(call(g, "ListRoleTags", [["RoleName", "r"]]), "Value") == ["x", "v0"]
+	assert call(g, "UntagRole", [["RoleName", "r"], ["TagKeys.member.1", "K1"]]).status == 200
+	assert texts(call(g, "GetRole", [["RoleName", "r"]]), "Key") == ["k0"]
+	assert fails(call(g, "ListRoleTags", [["RoleName", "x"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "access keys: at most 2 a user, which cannot be deleted while it has one" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	let res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const first = text(res, "AccessKeyId")!
+	assert res.status == 200 && first.length == 20 && first.slice(0, 4) == "AKIA" && text(res, "Status") == "Active"
+	assert text(res, "SecretAccessKey")!.length == 40 && text(res, "UserName") == "bob"
+	const second = text(call(g, "CreateAccessKey", [["UserName", "bob"]]), "AccessKeyId")!
+	assert fails(call(g, "CreateAccessKey", [["UserName", "bob"]]), 409, "LimitExceeded",
+		"Cannot exceed quota for AccessKeysPerUser: 2")
+	res = call(g, "ListAccessKeys", [["UserName", "bob"]])
+	assert texts(res, "AccessKeyId").length == 2 && texts(res, "AccessKeyId").includes(first)
+	assert texts(res, "Status") == ["Active", "Active"] && texts(res, "UserName") == ["bob", "bob"]
+	assert call(g, "UpdateAccessKey", [["UserName", "bob"], ["AccessKeyId", first], ["Status", "Inactive"]]).status
+		== 200
+	res = call(g, "ListAccessKeys", [["UserName", "bob"], ["MaxItems", "1"]])
+	assert text(res, "IsTruncated") == "true"
+	const page = texts(res, "Status")[0]
+	res = call(g, "ListAccessKeys", [["UserName", "bob"], ["Marker", text(res, "Marker")!]])
+	assert [page, ...texts(res, "Status")].includes("Inactive") && text(res, "IsTruncated") == "false"
+	assert fails(call(g, "UpdateAccessKey",
+		[["UserName", "bob"], ["AccessKeyId", "AKIANOTAKEY"], ["Status", "Active"]]), 404, "NoSuchEntity",
+		"The Access Key with id AKIANOTAKEY cannot be found.")
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete access keys first.")
+	assert call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", first]]).status == 200
+	assert fails(call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", first]]), 404, "NoSuchEntity")
+	assert call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", second]]).status == 200
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	assert fails(call(g, "CreateAccessKey", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "the root, by leaving out UserName: itself, and its own access keys, at most 2" {
+	const before = live()
+	const g = gateway()
+	let res = call(g, "GetUser")
+	assert res.status == 200 && text(res, "UserId") == "000000000000"
+		&& text(res, "Arn") == "arn:aws:iam::000000000000:root"
+	const created = text(res, "CreateDate")!
+	res = call(g, "CreateAccessKey")
+	assert res.status == 200 && text(res, "Status") == "Active" && text(res, "UserName") == ""
+	const first = text(res, "AccessKeyId")!
+	const firstSecret = text(res, "SecretAccessKey")!
+	assert first.slice(0, 4) == "AKIA" && firstSecret.length == 40
+	res = call(g, "GetUser", [], first, firstSecret)
+	assert res.status == 200 && text(res, "Arn") == "arn:aws:iam::000000000000:root"
+		&& text(res, "CreateDate") == created
+	assert fails(call(g, "GetUser", [], first, "wrong"), 403, "SignatureDoesNotMatch")
+	res = call(g, "CreateAccessKey", [], first, firstSecret)
+	const second = text(res, "AccessKeyId")!
+	const secondSecret = text(res, "SecretAccessKey")!
+	assert fails(call(g, "CreateAccessKey"), 409, "LimitExceeded", "Cannot exceed quota for AccessKeysPerUser: 2")
+	res = call(g, "ListAccessKeys")
+	assert texts(res, "AccessKeyId").length == 2 && texts(res, "AccessKeyId").includes(second)
+	assert texts(res, "UserName") == [] && texts(res, "Status") == ["Active", "Active"]
+	// A user's keys are not the root's, nor the root's a user's.
+	call(g, "CreateUser", [["UserName", "bob"]])
+	assert call(g, "CreateAccessKey", [["UserName", "bob"]]).status == 200
+	assert texts(call(g, "ListAccessKeys"), "AccessKeyId").length == 2
+	assert fails(call(g, "UpdateAccessKey", [["UserName", "bob"], ["AccessKeyId", first], ["Status", "Inactive"]]), 404,
+		"NoSuchEntity")
+	assert call(g, "UpdateAccessKey", [["AccessKeyId", first], ["Status", "Inactive"]], second, secondSecret).status
+		== 200
+	assert fails(call(g, "GetUser", [], first, firstSecret), 403, "InvalidClientTokenId")
+	assert texts(call(g, "ListAccessKeys"), "Status").includes("Inactive")
+	assert call(g, "DeleteAccessKey", [["AccessKeyId", first]], second, secondSecret).status == 200
+	assert texts(call(g, "ListAccessKeys"), "AccessKeyId") == [second]
+	assert fails(call(g, "UpdateAccessKey", [["AccessKeyId", first], ["Status", "Active"]]), 404, "NoSuchEntity")
+	assert fails(call(g, "DeleteAccessKey", [["AccessKeyId", first]]), 404, "NoSuchEntity")
+	assert fails(call(g, "GetUser", [], first, firstSecret), 403, "InvalidClientTokenId",
+		"The security token included in the request is invalid.")
+	assert text(call(g, "CreateAccessKey"), "AccessKeyId") != null
+	g.close()
+	assert live() == before
+}
+
+test "a deleted access key is refused, where one never issued is taken for a root's" {
+	const g = gateway()
+	g.identify = identify(new Catalog(managed))
+	call(g, "CreateUser", [["UserName", "bob"]])
+	let res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const key = text(res, "AccessKeyId")!
+	const secret = text(res, "SecretAccessKey")!
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	const own = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetUser","Resource":"*"}]}`
+	call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "own"], ["PolicyDocument", own]])
+	assert text(call(g, "GetUser", [], key, secret), "UserName") == "bob"
+	assert call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", key]]).status == 200
+	assert fails(call(g, "GetUser", [], key, secret), 403, "InvalidClientTokenId",
+		"The security token included in the request is invalid.")
+	assert fails(call(g, "ListUsers", [], key, "anything"), 403, "InvalidClientTokenId")
+	assert texts(call(g, "ListAccessKeys", [["UserName", "bob"]]), "AccessKeyId") == []
+	assert fails(call(g, "UpdateAccessKey", [["UserName", "bob"], ["AccessKeyId", key], ["Status", "Active"]]), 404,
+		"NoSuchEntity")
+	call(g, "DeleteUserPolicy", [["UserName", "bob"], ["PolicyName", "own"]])
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	assert fails(call(g, "GetUser", [], key, secret), 403, "InvalidClientTokenId")
+	res = call(g, "GetUser", [], "AKIANEVERISSUEDKEY00", "anything")
+	assert res.status == 200 && text(res, "Arn") == "arn:aws:iam::000000000000:root"
+	g.close()
+}
+
+test "an access key's last use: the service and region of the last request it signed" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	const res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const key = text(res, "AccessKeyId")!
+	let used = call(g, "GetAccessKeyLastUsed", [["AccessKeyId", key]])
+	assert text(used, "UserName") == "bob" && text(used, "ServiceName") == "N/A" && text(used, "Region") == "N/A"
+	assert text(used, "LastUsedDate") == null
+	call(g, "GetUser", [], key, text(res, "SecretAccessKey")!)
+	used = call(g, "GetAccessKeyLastUsed", [["AccessKeyId", key]])
+	assert text(used, "ServiceName") == "iam" && text(used, "Region") == "us-east-1"
+	assert text(used, "LastUsedDate") == "2015-06-26T14:00:00Z"
+	assert fails(call(g, "GetAccessKeyLastUsed", [["AccessKeyId", "AKIANEVERISSUEDKEY00"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "login profiles: kept to the password policy; a user that has one is not deleted" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	assert fails(call(g, "GetLoginProfile", [["UserName", "bob"]]), 404, "NoSuchEntity",
+		"Login Profile for User bob cannot be found.")
+	let res = call(g, "CreateLoginProfile", [["UserName", "bob"], ["Password", "a"], ["PasswordResetRequired", "true"]])
+	assert res.status == 200 && text(res, "PasswordResetRequired") == "true"
+	assert fails(call(g, "CreateLoginProfile", [["UserName", "bob"], ["Password", "a"]]), 409, "EntityAlreadyExists")
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete login profile first.")
+	call(g, "UpdateAccountPasswordPolicy",
+		[["MinimumPasswordLength", "10"], ["RequireNumbers", "true"], ["RequireSymbols", "true"]])
+	assert fails(call(g, "UpdateLoginProfile", [["UserName", "bob"], ["Password", "short"]]), 400,
+		"PasswordPolicyViolation", "Password should have a minimum length of 10")
+	assert fails(call(g, "UpdateLoginProfile", [["UserName", "bob"], ["Password", "longenough1"]]), 400,
+		"PasswordPolicyViolation", "Password should have at least one symbol")
+	res = call(g, "UpdateLoginProfile",
+		[["UserName", "bob"], ["Password", "long-enough1"], ["PasswordResetRequired", "false"],
+		["MaxSigninSessionDuration", "7200"]])
+	assert res.status == 200
+	res = call(g, "GetLoginProfile", [["UserName", "bob"]])
+	assert text(res, "PasswordResetRequired") == "false" && text(res, "MaxSigninSessionDuration") == "7200"
+	assert fails(call(g, "ChangePassword", [["OldPassword", "long-enough1"], ["NewPassword", "other-pass2"]]), 400,
+		"InvalidUserType")
+	res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const [id, secret] = [text(res, "AccessKeyId")!, text(res, "SecretAccessKey")!]
+	const change = (old: string,
+		now: string) => call(g, "ChangePassword", [["OldPassword", old], ["NewPassword", now]], id, secret)
+	// Without a policy, a user changes their own password only as the account's password policy allows users to.
+	assert fails(change("long-enough1", "other-pass2"), 403, "AccessDenied")
+	call(g, "UpdateAccountPasswordPolicy",
+		[["MinimumPasswordLength", "10"], ["RequireNumbers", "true"], ["RequireSymbols", "true"],
+		["AllowUsersToChangePassword", "true"]])
+	assert fails(change("wrong", "other-pass2"), 400, "InvalidUserType")
+	assert fails(change("long-enough1", "short"), 400, "PasswordPolicyViolation",
+		"Password should have a minimum length of 10")
+	assert change("long-enough1", "other-pass2").status == 200
+	assert fails(change("long-enough1", "third-pass3"), 400, "InvalidUserType")
+	assert change("other-pass2", "third-pass3").status == 200
+	assert call(g, "DeleteLoginProfile", [["UserName", "bob"]]).status == 200
+	assert fails(change("third-pass3", "fourth-pass4"), 404, "NoSuchEntity")
+	assert fails(call(g, "DeleteLoginProfile", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", id]])
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	g.close()
+}
+
+test "service-linked roles: made as AWS makes them, changed by no ordinary operation, deleted at once" {
+	const g = gateway()
+	let res = call(g, "CreateServiceLinkedRole", [["AWSServiceName", "ops.apigateway.amazonaws.com"]])
+	assert res.status == 200 && text(res, "RoleName") == "AWSServiceRoleForAPIGateway"
+	assert text(res, "Path") == "/aws-service-role/ops.apigateway.amazonaws.com/"
+	assert text(res, "Arn")
+		== "arn:aws:iam::000000000000:role/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway"
+	assert texts(call(g, "ListAttachedRolePolicies", [["RoleName", "AWSServiceRoleForAPIGateway"]]), "PolicyArn")
+		== ["arn:aws:iam::aws:policy/aws-service-role/APIGatewayServiceRolePolicy"]
+	assert fails(call(g, "CreateServiceLinkedRole", [["AWSServiceName", "ops.apigateway.amazonaws.com"]]), 400,
+		"InvalidInput")
+	assert fails(call(g, "CreateServiceLinkedRole",
+		[["AWSServiceName", "ops.apigateway.amazonaws.com"], ["CustomSuffix", "x"]]), 400, "InvalidInput")
+	assert fails(call(g, "CreateServiceLinkedRole", [["AWSServiceName", "nothing.amazonaws.com"]]), 400, "InvalidInput")
+	assert fails(call(g, "DeleteRole", [["RoleName", "AWSServiceRoleForAPIGateway"]]), 400, "UnmodifiableEntity",
+		"Cannot perform the operation on the protected role 'AWSServiceRoleForAPIGateway' - this role is only "
+		+ "modifiable by AWS")
+	assert fails(call(g, "PutRolePolicy",
+		[["RoleName", "AWSServiceRoleForAPIGateway"], ["PolicyName", "p"], ["PolicyDocument", allow]]), 400,
+		"UnmodifiableEntity")
+	call(g, "CreateRole", [["RoleName", "plain"], ["AssumeRolePolicyDocument", trust]])
+	assert fails(call(g, "DeleteServiceLinkedRole", [["RoleName", "plain"]]), 400, "InvalidInput")
+	res = call(g, "DeleteServiceLinkedRole", [["RoleName", "AWSServiceRoleForAPIGateway"]])
+	const task = text(res, "DeletionTaskId")!
+	assert indexOf(task, "task/aws-service-role/ops.apigateway.amazonaws.com/AWSServiceRoleForAPIGateway/") == 0
+	assert text(call(g, "GetServiceLinkedRoleDeletionStatus", [["DeletionTaskId", task]]), "Status") == "SUCCEEDED"
+	assert fails(call(g, "GetRole", [["RoleName", "AWSServiceRoleForAPIGateway"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "the policy simulator: a principal's policies, its groups', and those given" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateGroup", [["GroupName", "g"]])
+	call(g, "AddUserToGroup", [["GroupName", "g"], ["UserName", "bob"]])
+	const tagged = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*",`
+		+ `"Condition":{"StringEquals":{"aws:RequestTag/Team":"red"}}}]}`
+	call(g, "PutGroupPolicy", [["GroupName", "g"], ["PolicyName", "tagged"], ["PolicyDocument", tagged]])
+	const bob: [string, string][] = [["PolicySourceArn", "arn:aws:iam::000000000000:user/bob"],
+		["ActionNames.member.1", "s3:GetObject"]]
+	let res = call(g, "SimulatePrincipalPolicy", bob)
+	assert text(res, "EvalDecision") == "implicitDeny" && texts(res, "MissingContextValues") == ["aws:RequestTag/Team"]
+	const given = bob.slice(0, 2)
+	given.append([["ContextEntries.member.1.ContextKeyName", "aws:requesttag/team"],
+		["ContextEntries.member.1.ContextKeyValues.member.1", "red"],
+		["ContextEntries.member.1.ContextKeyType", "string"]])
+	res = call(g, "SimulatePrincipalPolicy", given)
+	assert text(res, "EvalDecision") == "allowed" && text(res, "SourcePolicyId") == "tagged"
+	assert text(res, "SourcePolicyType") == "group"
+	const deny = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:*","Resource":"*"}]}`
+	given.push(["PolicyInputList.member.1", deny])
+	res = call(g, "SimulatePrincipalPolicy", given)
+	assert text(res, "EvalDecision") == "explicitDeny" && text(res, "SourcePolicyId") == "PolicyInputList.1"
+	res = call(g, "GetContextKeysForPrincipalPolicy", [["PolicySourceArn", "arn:aws:iam::000000000000:user/bob"]])
+	assert texts(res, "member") == ["aws:RequestTag/Team"]
+	assert fails(call(g, "SimulatePrincipalPolicy",
+		[["PolicySourceArn", "arn:aws:iam::000000000000:role/none"], ["ActionNames.member.1", "s3:GetObject"]]), 404,
+		"NoSuchEntity", "Unable to retrieve specified IAM entity.")
+	g.close()
+}
+
+test "the account's details and credential report: every user, group, role and policy in it" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateGroup", [["GroupName", "devs"]])
+	call(g, "AddUserToGroup", [["GroupName", "devs"], ["UserName", "bob"]])
+	call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "s3"], ["PolicyDocument", allow]])
+	call(g, "CreateRole", [["RoleName", "app"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "AttachRolePolicy", [["RoleName", "app"], ["PolicyArn", "arn:aws:iam::aws:policy/ReadOnlyAccess"]])
+	call(g, "CreatePolicy", [["PolicyName", "mine"], ["PolicyDocument", allow]])
+	let res = call(g, "GetAccountAuthorizationDetails")
+	assert texts(res, "UserName") == ["bob"] && texts(res, "GroupName") == ["devs"] && texts(res, "RoleName") == ["app"]
+	assert texts(res, "PolicyName").includes("s3") && texts(res, "PolicyDocument").includes(escape(allow, "component"))
+	assert texts(res, "Arn").includes("arn:aws:iam::aws:policy/ReadOnlyAccess") && texts(res, "VersionId").length == 4
+	res = call(g, "GetAccountAuthorizationDetails", [["Filter.member.1", "Role"], ["MaxItems", "1"]])
+	assert texts(res, "RoleName") == ["app"] && texts(res, "UserName").length == 0
+		&& text(res, "IsTruncated") == "false"
+	res = call(g, "GetAccountAuthorizationDetails", [["MaxItems", "2"]])
+	assert text(res, "IsTruncated") == "true" && texts(res, "UserName") == ["bob"]
+		&& texts(res, "GroupName") == ["devs"]
+	call(g, "CreateAccessKey", [["UserName", "bob"]])
+	assert text(call(g, "GenerateCredentialReport"), "State") == "COMPLETE"
+	const lines = split(base64.decode(text(call(g, "GetCredentialReport"), "Content")!), "\n")
+	assert lines.length == 3 && split(lines[0], ",").length == 22 && split(lines[1], ",").length == 22
+	assert indexOf(lines[1], "<root_account>,") == 0 && indexOf(lines[2], "bob,") == 0
+	assert indexOf(lines[2], ",false,N/A,N/A,N/A,false,true,") > 0
+	g.close()
+}
+
+test "groups: their members take their policies, and neither goes while the other holds it" {
+	const g = gateway()
+	g.identify = identify(new Catalog(managed))
+	call(g, "CreateUser", [["UserName", "bob"]])
+	let res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const key = text(res, "AccessKeyId")!
+	const secret = text(res, "SecretAccessKey")!
+	assert text(call(g, "CreateGroup", [["GroupName", "devs"], ["Path", "/team/"]]), "Arn")
+		== "arn:aws:iam::000000000000:group/team/devs"
+	assert fails(call(g, "CreateGroup", [["GroupName", "DEVS"]]), 409, "EntityAlreadyExists")
+	assert fails(call(g, "AddUserToGroup", [["GroupName", "ops"], ["UserName", "bob"]]), 404, "NoSuchEntity",
+		"The group with name ops cannot be found.")
+	call(g, "AddUserToGroup", [["GroupName", "devs"], ["UserName", "bob"]])
+	assert texts(call(g, "GetGroup", [["GroupName", "devs"]]), "UserName") == ["bob"]
+	assert texts(call(g, "ListGroupsForUser", [["UserName", "bob"]]), "GroupName") == ["devs"]
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	call(g, "PutGroupPolicy", [["GroupName", "devs"], ["PolicyName", "own"], ["PolicyDocument", aws("iam:GetUser")]])
+	assert text(call(g, "GetUser", [], key, secret), "UserName") == "bob"
+	const deny = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"iam:GetUser","Resource":"*"}]}`
+	call(g, "CreatePolicy", [["PolicyName", "deny"], ["PolicyDocument", deny]])
+	const p = "arn:aws:iam::000000000000:policy/deny"
+	call(g, "AttachGroupPolicy", [["GroupName", "devs"], ["PolicyArn", p]])
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", p]]), "GroupName") == ["devs"]
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict")
+	call(g, "UpdateGroup", [["GroupName", "devs"], ["NewGroupName", "builders"]])
+	assert texts(call(g, "ListGroupsForUser", [["UserName", "bob"]]), "GroupName") == ["builders"]
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must remove users from group first.")
+	call(g, "RemoveUserFromGroup", [["GroupName", "builders"], ["UserName", "bob"]])
+	assert fails(call(g, "RemoveUserFromGroup", [["GroupName", "builders"], ["UserName", "bob"]]), 404, "NoSuchEntity",
+		"The user with name bob cannot be found.")
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must detach all policies first.")
+	call(g, "DetachGroupPolicy", [["GroupName", "builders"], ["PolicyArn", p]])
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete policies first.")
+	call(g, "DeleteGroupPolicy", [["GroupName", "builders"], ["PolicyName", "own"]])
+	assert call(g, "DeleteGroup", [["GroupName", "builders"]]).status == 200
+	assert texts(call(g, "ListGroups"), "GroupName") == []
+	g.close()
+}
+
+test "the account: its summary counted from its state, its one alias" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "CreateInstanceProfile", [["InstanceProfileName", "p"]])
+	const summary = call(g, "GetAccountSummary")
+	const names = texts(summary, "key")
+	const values = texts(summary, "value")
+	assert names.length == 34 && values.length == 34
+	assert values[names.indexOf("Users")] == "1" && values[names.indexOf("Roles")] == "1"
+	assert values[names.indexOf("InstanceProfiles")] == "1" && values[names.indexOf("RolesQuota")] == "1000"
+	assert texts(call(g, "ListAccountAliases"), "member") == []
+	call(g, "CreateAccountAlias", [["AccountAlias", "first"]])
+	call(g, "CreateAccountAlias", [["AccountAlias", "second"]])
+	assert texts(call(g, "ListAccountAliases"), "member") == ["second"]
+	assert fails(call(g, "DeleteAccountAlias", [["AccountAlias", "first"]]), 404, "NoSuchEntity")
+	call(g, "DeleteAccountAlias", [["AccountAlias", "second"]])
+	assert texts(call(g, "ListAccountAliases"), "member") == []
+	g.close()
+}
+
+test "SAML providers: stored of a metadata document of an identity provider" {
+	const g = gateway()
+	const idp = `<?xml version="1.0"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" `
+		+ `entityID="https://idp.example.com/saml"><md:IDPSSODescriptor protocolSupportEnumeration="`
+		+ `urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="`
+		+ `urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example.com/sso"/>`
+		+ `</md:IDPSSODescriptor></md:EntityDescriptor>`
+	let metadata = idp
+	while (metadata.length < 1000) {
+		metadata += " "
+	}
+	const sp = replace(metadata, "IDPSSODescriptor", "SPSSODescriptor") + "    "
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "bad name"], ["SAMLMetadataDocument", metadata]]), 400,
+		"ValidationError",
+		"1 validation error detected: Value at 'name' failed to satisfy constraint: Member must "
+		+ "satisfy regular expression pattern: [\\w._-]+")
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "idp"], ["SAMLMetadataDocument", sp]]), 400, "InvalidInput",
+		"Could not parse metadata")
+	const a = "arn:aws:iam::000000000000:saml-provider/idp"
+	assert text(call(g, "CreateSAMLProvider", [["Name", "idp"], ["SAMLMetadataDocument", metadata]]), "SAMLProviderArn")
+		== a
+	assert fails(call(g, "CreateSAMLProvider", [["Name", "IDP"], ["SAMLMetadataDocument", metadata]]), 409,
+		"EntityAlreadyExists")
+	assert text(call(g, "GetSAMLProvider", [["SAMLProviderArn", a]]), "SAMLMetadataDocument") == metadata
+	assert texts(call(g, "ListSAMLProviders"), "Arn") == [a]
+	const tagging: [string, string][] = [["SAMLProviderArn", a]]
+	tagging.append(tags(2))
+	call(g, "TagSAMLProvider", tagging)
+	assert texts(call(g, "ListSAMLProviderTags", [["SAMLProviderArn", a]]), "Key") == ["k0", "k1"]
+	assert fails(call(g, "UpdateSAMLProvider", [["SAMLProviderArn", a], ["SAMLMetadataDocument", sp]]), 400,
+		"InvalidInput")
+	call(g, "DeleteSAMLProvider", [["SAMLProviderArn", a]])
+	assert fails(call(g, "GetSAMLProvider", [["SAMLProviderArn", a]]), 404, "NoSuchEntity",
+		`SAMLProvider ${a} does not exist.`)
+	g.close()
+}
+
+test "roles: create, get, list, update the trust policy, delete" {
+	const g = gateway()
+	let res = call(g, "CreateRole",
+		[["RoleName", "app"], ["Path", "/svc/"], ["AssumeRolePolicyDocument", trust], ["Description", "the app"]])
+	assert res.status == 200 && text(res, "Arn") == "arn:aws:iam::000000000000:role/svc/app"
+	const id = text(res, "RoleId")!
+	assert id.length == 21 && id.slice(0, 4) == "AROA"
+	assert text(res, "AssumeRolePolicyDocument") == escape(trust, "component")
+	assert fails(call(g, "CreateRole", [["RoleName", "APP"], ["AssumeRolePolicyDocument", trust]]), 409,
+		"EntityAlreadyExists", "Role with name APP already exists.")
+	assert fails(call(g, "CreateRole", [["RoleName", "x"], ["AssumeRolePolicyDocument", "{\"Version\": "]]), 400,
+		"MalformedPolicyDocument", "This policy contains invalid Json")
+	assert fails(call(g, "CreateRole",
+		[["RoleName", "x"], ["AssumeRolePolicyDocument", trust], ["MaxSessionDuration", "60"]]), 400, "ValidationError")
+	res = call(g, "GetRole", [["RoleName", "app"]])
+	assert text(res, "RoleId") == id && text(res, "Description") == "the app"
+		&& text(res, "MaxSessionDuration") == "3600"
+	assert text(res, "AssumeRolePolicyDocument") == escape(trust, "component") && texts(res, "RoleLastUsed").length == 1
+	assert fails(call(g, "GetRole", [["RoleName", "nope"]]), 404, "NoSuchEntity",
+		"The role with name nope cannot be found.")
+	call(g, "CreateRole", [["RoleName", "other"], ["AssumeRolePolicyDocument", trust], ["MaxSessionDuration", "7200"]])
+	res = call(g, "ListRoles")
+	assert texts(res, "RoleName") == ["app", "other"] && texts(res, "MaxSessionDuration") == ["3600", "7200"]
+	assert texts(res, "AssumeRolePolicyDocument") == [escape(trust, "component"), escape(trust, "component")]
+	assert texts(call(g, "ListRoles", [["PathPrefix", "/svc"]]), "RoleName") == ["app"]
+	assert fails(call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", allow]]), 400,
+		"MalformedPolicyDocument", "Has prohibited field Resource")
+	const other = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"000000000000"},`
+		+ `"Action":"sts:AssumeRole"}]}`
+	assert call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", other]]).status == 200
+	assert text(call(g, "GetRole", [["RoleName", "app"]]), "AssumeRolePolicyDocument") == escape(other, "component")
+	assert fails(call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", "[]"]]), 400,
+		"MalformedPolicyDocument")
+	assert call(g, "DeleteRole", [["RoleName", "app"]]).status == 200
+	assert fails(call(g, "DeleteRole", [["RoleName", "app"]]), 404, "NoSuchEntity")
+	assert texts(call(g, "ListRoles"), "RoleName") == ["other"]
+	g.close()
+}
+
+test "managed policies and their versions" {
+	const g = gateway()
+	const arn = "arn:aws:iam::000000000000:policy/team/p"
+	let res = call(g, "CreatePolicy",
+		[["PolicyName", "p"], ["Path", "/team/"], ["PolicyDocument", allow], ["Description", "s3"]])
+	assert res.status == 200 && text(res, "Arn") == arn && text(res, "DefaultVersionId") == "v1"
+	assert text(res, "AttachmentCount") == "0" && text(res, "IsAttachable") == "true"
+		&& text(res, "Description") == null
+	assert text(res, "PolicyId")!.slice(0, 4) == "ANPA"
+	assert fails(call(g, "CreatePolicy", [["PolicyName", "P"], ["PolicyDocument", allow]]), 409, "EntityAlreadyExists",
+		"A policy called P already exists. Duplicate names are not allowed.")
+	assert fails(call(g, "CreatePolicy", [["PolicyName", "q"], ["PolicyDocument", "nope"]]), 400,
+		"MalformedPolicyDocument")
+	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "PolicyName") == "p"
+	assert fails(call(g, "GetPolicy", [["PolicyArn", "arn:aws:iam::000000000000:policy/p"]]), 404, "NoSuchEntity",
+		"Policy arn:aws:iam::000000000000:policy/p was not found.")
+	const short = "1 validation error detected: Value at 'policyArn' failed to satisfy constraint: Member must have length greater than or equal to 20"
+	assert fails(call(g, "GetPolicy", [["PolicyArn", "p"]]), 400, "ValidationError", short)
+	const doc = (i: i32) => `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:Get${i}","Resource":"*"}]}`
+	for (const i of 2 ... 5) {
+		const params: [string, string][] = [["PolicyArn", arn], ["PolicyDocument", doc(i)]]
+		res = call(g, "CreatePolicyVersion", if (i == 3) [...params, ["SetAsDefault", "true"]] else params)
+		assert text(res, "VersionId") == `v${i}` && text(res, "IsDefaultVersion") == `${i == 3}`
+	}
+	assert fails(call(g, "CreatePolicyVersion", [["PolicyArn", arn], ["PolicyDocument", allow]]), 409, "LimitExceeded")
+	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "DefaultVersionId") == "v3"
+	res = call(g, "ListPolicyVersions", [["PolicyArn", arn]])
+	assert texts(res, "VersionId") == ["v5", "v4", "v3", "v2", "v1"] && texts(res, "Document") == []
+	assert texts(res, "IsDefaultVersion") == ["false", "false", "true", "false", "false"]
+	res = call(g, "GetPolicyVersion", [["PolicyArn", arn], ["VersionId", "v2"]])
+	assert text(res, "Document") == escape(doc(2), "component") && text(res, "IsDefaultVersion") == "false"
+	assert text(call(g, "GetPolicyVersion", [["PolicyArn", arn], ["VersionId", "v1"]]), "Document")
+		== escape(allow, "component")
+	assert fails(call(g, "GetPolicyVersion", [["PolicyArn", arn], ["VersionId", "v9"]]), 404, "NoSuchEntity",
+		`Policy ${arn} version v9 does not exist or is not attachable.`)
+	assert fails(call(g, "DeletePolicyVersion", [["PolicyArn", arn], ["VersionId", "v3"]]), 409, "DeleteConflict",
+		"Cannot delete the default version of a policy.")
+	assert fails(call(g, "SetDefaultPolicyVersion", [["PolicyArn", arn], ["VersionId", "v6"]]), 404, "NoSuchEntity")
+	assert call(g, "SetDefaultPolicyVersion", [["PolicyArn", arn], ["VersionId", "v5"]]).status == 200
+	for (const v of ["v1", "v2", "v3", "v4"]) {
+		assert call(g, "DeletePolicyVersion", [["PolicyArn", arn], ["VersionId", v]]).status == 200
+	}
+	assert fails(call(g, "DeletePolicyVersion", [["PolicyArn", arn], ["VersionId", "v4"]]), 404, "NoSuchEntity")
+	assert text(call(g, "CreatePolicyVersion", [["PolicyArn", arn], ["PolicyDocument", allow]]), "VersionId") == "v6"
+	call(g, "CreatePolicy", [["PolicyName", "other"], ["PolicyDocument", allow]])
+	res = call(g, "ListPolicies", [["Scope", "Local"]])
+	assert texts(res, "PolicyName") == ["p", "other"] && texts(res, "DefaultVersionId") == ["v5", "v1"]
+	assert texts(res, "Description") == []
+	assert texts(call(g, "ListPolicies", [["Scope", "Local"], ["PathPrefix", "/team/"]]), "PolicyName") == ["p"]
+	assert texts(call(g, "ListPolicies", [["Scope", "AWS"]]), "PolicyName")
+		== ["ReadOnlyAccess", "ViewOnlyAccess", "APIGatewayServiceRolePolicy"]
+	assert texts(call(g, "ListPolicies", [["OnlyAttached", "true"]]), "PolicyName") == []
+	assert fails(call(g, "ListPolicies", [["Scope", "Mine"]]), 400, "ValidationError")
+	assert fails(call(g, "DeletePolicy", [["PolicyArn", arn]]), 409, "DeleteConflict")
+	assert call(g, "DeletePolicyVersion", [["PolicyArn", arn], ["VersionId", "v6"]]).status == 200
+	assert call(g, "DeletePolicy", [["PolicyArn", arn]]).status == 200
+	assert fails(call(g, "GetPolicy", [["PolicyArn", arn]]), 404, "NoSuchEntity")
+	assert fails(call(g, "ListPolicyVersions", [["PolicyArn", arn]]), 404, "NoSuchEntity")
+	assert call(g, "CreatePolicy", [["PolicyName", "p"], ["PolicyDocument", allow]]).status == 200
+	assert texts(call(g, "ListPolicyVersions", [["PolicyArn", "arn:aws:iam::000000000000:policy/p"]]), "VersionId")
+		== ["v1"]
+	g.close()
+}
+
+test "attached policies" {
+	const g = gateway()
+	const arn = "arn:aws:iam::000000000000:policy/p"
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "CreatePolicy", [["PolicyName", "p"], ["PolicyDocument", allow]])
+	assert call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", arn]]).status == 200
+	assert call(g, "AttachUserPolicy", [["UserName", "BOB"], ["PolicyArn", arn]]).status == 200
+	assert call(g, "AttachRolePolicy", [["RoleName", "r"], ["PolicyArn", arn]]).status == 200
+	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "AttachmentCount") == "2"
+	let res = call(g, "ListAttachedUserPolicies", [["UserName", "bob"]])
+	assert texts(res, "PolicyName") == ["p"] && texts(res, "PolicyArn") == [arn]
+	assert texts(call(g, "ListAttachedRolePolicies", [["RoleName", "r"], ["PathPrefix", "/x/"]]), "PolicyName") == []
+	assert texts(call(g, "ListPolicies", [["OnlyAttached", "true"]]), "PolicyName") == ["p"]
+	assert fails(call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", arn + "x"]]), 404, "NoSuchEntity",
+		`Policy ${arn}x does not exist or is not attachable.`)
+	assert fails(call(g, "AttachRolePolicy", [["RoleName", "x"], ["PolicyArn", arn]]), 404, "NoSuchEntity")
+	assert fails(call(g, "ListAttachedUserPolicies", [["UserName", "x"]]), 404, "NoSuchEntity")
+	assert fails(call(g, "DeletePolicy", [["PolicyArn", arn]]), 409, "DeleteConflict",
+		"Cannot delete a policy attached to entities.")
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must detach all policies first.")
+	assert fails(call(g, "DeleteRole", [["RoleName", "r"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must detach all policies first.")
+	assert call(g, "DetachUserPolicy", [["UserName", "bob"], ["PolicyArn", arn]]).status == 200
+	assert fails(call(g, "DetachUserPolicy", [["UserName", "bob"], ["PolicyArn", arn]]), 404, "NoSuchEntity",
+		`Policy ${arn} was not found.`)
+	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "AttachmentCount") == "1"
+	assert call(g, "DetachRolePolicy", [["RoleName", "r"], ["PolicyArn", arn]]).status == 200
+	assert texts(call(g, "ListAttachedRolePolicies", [["RoleName", "r"]]), "PolicyName") == []
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	assert call(g, "DeleteRole", [["RoleName", "r"]]).status == 200
+	assert call(g, "DeletePolicy", [["PolicyArn", arn]]).status == 200
+	g.close()
+}
+
+test "inline policies" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	assert fails(call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "t"], ["PolicyDocument", trust]]), 400,
+		"MalformedPolicyDocument", "Policy document should not specify a principal.")
+	for (const name of ["b", "a"]) {
+		assert call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", name], ["PolicyDocument", allow]]).status
+			== 200
+	}
+	assert call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "A"], ["PolicyDocument", allow]]).status == 200
+	let res = call(g, "GetUserPolicy", [["UserName", "BOB"], ["PolicyName", "a"]])
+	assert text(res, "UserName") == "bob" && text(res, "PolicyName") == "A"
+	assert text(res, "PolicyDocument") == escape(allow, "component")
+	assert texts(call(g, "ListUserPolicies", [["UserName", "bob"]]), "member") == ["A", "b"]
+	assert fails(call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "c"], ["PolicyDocument", "{"]]), 400,
+		"MalformedPolicyDocument")
+	assert fails(call(g, "GetUserPolicy", [["UserName", "bob"], ["PolicyName", "c"]]), 404, "NoSuchEntity",
+		"The user policy with name c cannot be found.")
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete policies first.")
+	for (const name of ["a", "b"]) {
+		assert call(g, "DeleteUserPolicy", [["UserName", "bob"], ["PolicyName", name]]).status == 200
+	}
+	assert fails(call(g, "DeleteUserPolicy", [["UserName", "bob"], ["PolicyName", "a"]]), 404, "NoSuchEntity")
+	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
+	assert call(g, "PutRolePolicy", [["RoleName", "r"], ["PolicyName", "p"], ["PolicyDocument", allow]]).status == 200
+	res = call(g, "GetRolePolicy", [["RoleName", "r"], ["PolicyName", "p"]])
+	assert text(res, "RoleName") == "r" && text(res, "PolicyDocument") == escape(allow, "component")
+	assert texts(call(g, "ListRolePolicies", [["RoleName", "r"]]), "member") == ["p"]
+	assert fails(call(g, "GetRolePolicy", [["RoleName", "r"], ["PolicyName", "q"]]), 404, "NoSuchEntity",
+		"The role policy with name q cannot be found.")
+	assert fails(call(g, "DeleteRole", [["RoleName", "r"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete policies first.")
+	assert call(g, "DeleteRolePolicy", [["RoleName", "r"], ["PolicyName", "P"]]).status == 200
+	assert call(g, "DeleteRole", [["RoleName", "r"]]).status == 200
+	assert fails(call(g, "PutRolePolicy", [["RoleName", "r"], ["PolicyName", "p"], ["PolicyDocument", allow]]), 404,
+		"NoSuchEntity")
+	g.close()
+}
+
+test "renaming a user takes its access keys and policies along" {
+	const g = gateway()
+	call(g, "CreateUser", [["UserName", "bob"]])
+	call(g, "CreatePolicy", [["PolicyName", "p"], ["PolicyDocument", allow]])
+	const key = text(call(g, "CreateAccessKey", [["UserName", "bob"]]), "AccessKeyId")!
+	call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", "arn:aws:iam::000000000000:policy/p"]])
+	call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "i"], ["PolicyDocument", allow]])
+	assert call(g, "UpdateUser", [["UserName", "bob"], ["NewUserName", "rob"]]).status == 200
+	let res = call(g, "ListAccessKeys", [["UserName", "rob"]])
+	assert texts(res, "AccessKeyId") == [key] && texts(res, "UserName") == ["rob"]
+	assert texts(call(g, "ListAttachedUserPolicies", [["UserName", "rob"]]), "PolicyName") == ["p"]
+	assert texts(call(g, "ListUserPolicies", [["UserName", "rob"]]), "member") == ["i"]
+	assert fails(call(g, "ListAccessKeys", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	g.close()
+}
+
+test "AWS managed policies: read from the catalog, changed by no one" {
+	const g = gateway()
+	const ro = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+	let res = call(g, "GetPolicy", [["PolicyArn", ro]])
+	assert res.status == 200 && text(res, "PolicyName") == "ReadOnlyAccess" && text(res, "Arn") == ro
+	assert text(res, "PolicyId") == "ANPAILL3HVNFSB6DCOWYQ" && text(res, "Path") == "/"
+		&& text(res, "DefaultVersionId") == "v3"
+	assert text(res, "AttachmentCount") == "0" && text(res, "PermissionsBoundaryUsageCount") == "0"
+		&& text(res, "IsAttachable") == "true"
+	assert text(res, "Description") == "Provides read-only access to AWS services and resources."
+	assert text(res, "CreateDate") == "2015-02-06T18:39:48Z" && text(res, "UpdateDate") == "2026-11-13T14:27:09Z"
+	assert texts(res, "Tags") == [""]
+	assert text(call(g, "GetPolicy", [["PolicyArn", "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess"]]), "Path")
+		== "/job-function/"
+	for (const missing of ["arn:aws:iam::aws:policy/Nope", "arn:aws:iam::aws:policy/ViewOnlyAccess",
+		"arn:aws:iam::000000000000:policy/ReadOnlyAccess"]) {
+		assert fails(call(g, "GetPolicy", [["PolicyArn", missing]]), 404, "NoSuchEntity",
+			`Policy ${missing} was not found.`)
+	}
+	res = call(g, "ListPolicyVersions", [["PolicyArn", ro]])
+	assert texts(res, "VersionId") == ["v3", "v2", "v1"] && texts(res, "Document") == []
+	assert texts(res, "IsDefaultVersion") == ["true", "false", "false"]
+	assert texts(res, "CreateDate")[1] == "2016-01-01T00:00:00Z" && text(res, "IsTruncated") == "false"
+	res = call(g, "ListPolicyVersions", [["PolicyArn", ro], ["MaxItems", "2"]])
+	assert texts(res, "VersionId") == ["v3", "v2"] && text(res, "IsTruncated") == "true"
+	res = call(g, "ListPolicyVersions", [["PolicyArn", ro], ["Marker", text(res, "Marker")!]])
+	assert texts(res, "VersionId") == ["v1"] && text(res, "IsTruncated") == "false"
+	assert fails(call(g, "ListPolicyVersions", [["PolicyArn", "arn:aws:iam::aws:policy/Nope"]]), 404, "NoSuchEntity")
+	res = call(g, "GetPolicyVersion", [["PolicyArn", ro], ["VersionId", "v2"]])
+	assert text(res, "Document") == escape(aws("s3:List*"), "component") && text(res, "IsDefaultVersion") == "false"
+	assert text(res, "VersionId") == "v2" && text(res, "CreateDate") == "2016-01-01T00:00:00Z"
+	assert text(call(g, "GetPolicyVersion", [["PolicyArn", ro], ["VersionId", "v3"]]), "IsDefaultVersion") == "true"
+	assert fails(call(g, "GetPolicyVersion", [["PolicyArn", ro], ["VersionId", "v4"]]), 404, "NoSuchEntity",
+		`Policy ${ro} version v4 does not exist or is not attachable.`)
+	const denied = (what: string) => `Cannot ${what} outside your own account.`
+	assert fails(call(g, "CreatePolicyVersion", [["PolicyArn", ro], ["PolicyDocument", allow]]), 403, "AccessDenied",
+		denied("create versions for policies"))
+	assert fails(call(g, "DeletePolicy", [["PolicyArn", ro]]), 403, "AccessDenied", denied("delete policies"))
+	assert fails(call(g, "DeletePolicyVersion", [["PolicyArn", ro], ["VersionId", "v1"]]), 403, "AccessDenied",
+		denied("delete policy versions for policies"))
+	assert fails(call(g, "SetDefaultPolicyVersion", [["PolicyArn", ro], ["VersionId", "v1"]]), 403, "AccessDenied",
+		denied("update policies"))
+	assert text(call(g, "GetPolicy", [["PolicyArn", ro]]), "DefaultVersionId") == "v3"
+	g.close()
+}
+
+test "listing the account's policies and AWS's" {
+	const g = gateway()
+	for (const name of ["ReadOnlyAccess", "b", "z"]) {
+		call(g, "CreatePolicy", [["PolicyName", name], ["PolicyDocument", allow]])
+	}
+	// The account's in the order made, then AWS's by date.
+	const all = ["ReadOnlyAccess", "b", "z", "ReadOnlyAccess", "ViewOnlyAccess", "APIGatewayServiceRolePolicy"]
+	let res = call(g, "ListPolicies")
+	assert texts(res, "PolicyName") == all && text(res, "IsTruncated") == "false" && texts(res, "Description") == []
+	assert texts(res, "Arn")[0] == "arn:aws:iam::000000000000:policy/ReadOnlyAccess"
+		&& texts(res, "Arn")[3] == "arn:aws:iam::aws:policy/ReadOnlyAccess"
+	for (const n of 1 ... 6) {
+		const listed: string[] = []
+		let marker: string | null = null
+		while (true) {
+			const params: [string, string][] = [["MaxItems", `${n}`]]
+			res = call(g, "ListPolicies", if (marker == null) params else [...params, ["Marker", marker!]])
+			listed.append(texts(res, "PolicyName"))
+			marker = text(res, "Marker")
+			if (text(res, "IsTruncated") == "false") {
+				break
+			}
+		}
+		test `in pages of ${n}` {
+			assert listed == all && marker == null
+		}
+	}
+	assert texts(call(g, "ListPolicies", [["Scope", "AWS"], ["PathPrefix", "/job-function/"]]), "PolicyName")
+		== ["ViewOnlyAccess"]
+	assert texts(call(g, "ListPolicies", [["Scope", "Local"]]), "PolicyName") == ["ReadOnlyAccess", "b", "z"]
+	assert texts(call(g, "ListPolicies", [["PolicyUsageFilter", "PermissionsBoundary"]]), "PolicyName") == []
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "AttachRolePolicy",
+		[["RoleName", "r"], ["PolicyArn", "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess"]])
+	call(g, "AttachRolePolicy", [["RoleName", "r"], ["PolicyArn", "arn:aws:iam::000000000000:policy/b"]])
+	res = call(g, "ListPolicies", [["OnlyAttached", "true"]])
+	assert texts(res, "PolicyName") == ["b", "ViewOnlyAccess"] && texts(res, "AttachmentCount") == ["1", "1"]
+	assert texts(call(g, "ListPolicies", [["OnlyAttached", "true"], ["Scope", "AWS"]]), "PolicyName")
+		== ["ViewOnlyAccess"]
+	g.close()
+}
+
+test "attaching AWS managed policies, counted in each account" {
+	const before = live()
+	const g = gateway()
+	const ro = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+	const mine = "arn:aws:iam::000000000000:policy/ReadOnlyAccess"
+	call(g, "CreateUser", [["UserName", "bob"], ["Path", "/dev/"]])
+	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	call(g, "CreatePolicy", [["PolicyName", "ReadOnlyAccess"], ["PolicyDocument", allow]])
+	assert call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", ro]]).status == 200
+	assert call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", ro]]).status == 200
+	assert call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", mine]]).status == 200
+	assert call(g, "AttachRolePolicy", [["RoleName", "r"], ["PolicyArn", ro]]).status == 200
+	let res = call(g, "ListAttachedUserPolicies", [["UserName", "bob"]])
+	assert texts(res, "PolicyArn") == [ro, mine] && texts(res, "PolicyName") == ["ReadOnlyAccess", "ReadOnlyAccess"]
+	assert text(call(g, "GetPolicy", [["PolicyArn", ro]]), "AttachmentCount") == "2"
+	assert text(call(g, "GetPolicy", [["PolicyArn", mine]]), "AttachmentCount") == "1"
+	assert text(call(g, "GetPolicy", [["PolicyArn", ro]], "111122223333"), "AttachmentCount") == "0"
+	res = call(g, "ListEntitiesForPolicy", [["PolicyArn", ro]])
+	assert texts(res, "UserName") == ["bob"] && texts(res, "RoleName") == ["r"] && texts(res, "PolicyGroups") == [""]
+	assert texts(res, "UserId") == [text(call(g, "GetUser", [["UserName", "bob"]]), "UserId")!]
+	assert texts(res, "RoleId") == [text(call(g, "GetRole", [["RoleName", "r"]]), "RoleId")!]
+	res = call(g, "ListEntitiesForPolicy", [["PolicyArn", ro], ["MaxItems", "1"]])
+	assert texts(res, "UserName") == ["bob"] && texts(res, "RoleName") == [] && text(res, "IsTruncated") == "true"
+	res = call(g, "ListEntitiesForPolicy", [["PolicyArn", ro], ["Marker", text(res, "Marker")!]])
+	assert texts(res, "UserName") == [] && texts(res, "RoleName") == ["r"] && text(res, "IsTruncated") == "false"
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", ro], ["EntityFilter", "Role"]]), "UserName") == []
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", ro], ["PathPrefix", "/dev/"]]), "RoleName") == []
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", mine]]), "UserName") == ["bob"]
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", ro]], "111122223333"), "UserName") == []
+	assert fails(call(g, "ListEntitiesForPolicy", [["PolicyArn", "arn:aws:iam::aws:policy/Nope"]]), 404, "NoSuchEntity",
+		"Policy arn:aws:iam::aws:policy/Nope was not found.")
+	assert fails(call(g, "AttachRolePolicy", [["RoleName", "r"], ["PolicyArn", "arn:aws:iam::aws:policy/Nope"]]), 404,
+		"NoSuchEntity", "Policy arn:aws:iam::aws:policy/Nope does not exist or is not attachable.")
+	assert fails(call(g, "AttachRolePolicy",
+		[["RoleName", "r"], ["PolicyArn", "arn:aws:iam::aws:policy/aws-service-role/APIGatewayServiceRolePolicy"]]),
+		400, "PolicyNotAttachable", "Cannot attach AWS reserved policy to an IAM role.")
+	assert call(g, "UpdateUser", [["UserName", "bob"], ["NewUserName", "rob"]]).status == 200
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", ro]]), "UserName") == ["rob"]
+	assert call(g, "DetachUserPolicy", [["UserName", "rob"], ["PolicyArn", ro]]).status == 200
+	assert fails(call(g, "DetachUserPolicy", [["UserName", "rob"], ["PolicyArn", ro]]), 404, "NoSuchEntity",
+		`Policy ${ro} was not found.`)
+	assert texts(call(g, "ListAttachedUserPolicies", [["UserName", "rob"]]), "PolicyArn") == [mine]
+	assert text(call(g, "GetPolicy", [["PolicyArn", ro]]), "AttachmentCount") == "1"
+	assert call(g, "DetachRolePolicy", [["RoleName", "r"], ["PolicyArn", ro]]).status == 200
+	assert call(g, "DeleteRole", [["RoleName", "r"]]).status == 200
+	g.close()
+	assert live() == before
+}
+
+test "a catalog that does not parse" {
+	for (const text of ["{}", `{"PolicyName":"x"}\n`, managed.slice(0, managed.length - 1),
+		managed.slice(indexOf(managed, "\n{\"PolicyName\":\"ReadOnlyAccess\"") + 1, managed.length) + managed]) {
+		let failed = false
+		try {
+			new Catalog(text)
+		} catch (e: ParseError) {
+			failed = true
+		}
+		assert failed
+	}
+}
+
+/// The service's users, but CreateUser fails after creating the user.
+class Failing {
+	...api.Unimplemented
+
+	h = new Handler(new Catalog(""))
+
+	createUser(caller: Caller, input: api.CreateUserRequest): api.CreateUserResponse throws Fault {
+		this.h.createUser(caller, input)
+		throw api.limitExceededException("no more")
+	}
+
+	getUser(caller: Caller, input: api.GetUserRequest): api.GetUserResponse throws Fault {
+		return this.h.getUser(caller, input)
+	}
+
+	listUsers(caller: Caller, input: api.ListUsersRequest): api.ListUsersResponse throws Fault {
+		return this.h.listUsers(caller, input)
+	}
+}
+
+test "a handler that fails after writing leaves no trace" {
+	const before = live()
+	const g = gateway(new Failing())
+	assert fails(call(g, "CreateUser", [["UserName", "bob"]]), 409, "LimitExceeded", "no more")
+	assert fails(call(g, "GetUser", [["UserName", "bob"]]), 404, "NoSuchEntity")
+	assert texts(call(g, "ListUsers"), "UserName") == []
+	g.close()
+	assert live() == before
+}
+
+test "an operation not implemented" {
+	const g = gateway()
+	const res = call(g, "CreateVirtualMFADevice", [["VirtualMFADeviceName", "m"]])
+	assert fails(res, 501, "NotImplemented", "The operation CreateVirtualMFADevice is not implemented")
+	g.close()
+}

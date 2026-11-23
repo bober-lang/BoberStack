@@ -1,0 +1,20 @@
+import { Catalog } from "./catalog"
+import { decode, Keys } from "std/encoding/json"
+import managed from "../../models/iam-managed-policies.jsonl" @Embed["deflate"]
+
+test "the AWS managed policies, all of them" {
+	const c = new Catalog(managed)
+	assert c.size() == 1622
+	let versions = 0
+	for (const i of 0 ... c.size() - 1) {
+		const p = c.policy(i)
+		assert c.find(`arn:aws:iam::aws:policy${p.path}${p.name}`) == i
+		for (const v of c.versions(i)) {
+			const d = c.version(i, v.id)!.document
+			assert decode[Keys](d).all.some(m => m[0] == "Statement")
+			versions++
+		}
+		assert c.version(i, p.defaultVersion) != null
+	}
+	assert versions == 7347
+}
