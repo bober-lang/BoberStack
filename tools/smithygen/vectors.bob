@@ -60,29 +60,28 @@ export function sameJson(res: Response, want: string): bool throws ParseError {
 	return if (startsWith(t, "{") || startsWith(t, "[")) canonical(got) == canonical(want) else got == want
 }
 
-/// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
-type Item = f64 | string | bool | json.Keys | null | (f64 | string | bool | json.Keys | null)[]
+type Scalar = f64 | string | bool | null
 
-/// The JSON s, without whitespace and with the members of its objects in order of their names.
+/// The JSON s, without whitespace, its numbers as std writes them and its objects' members in order of their names.
 function canonical(s: string): string throws ParseError {
 	const t = trim(s)
 	if (startsWith(t, "{")) {
-		const members = json.decode[json.Keys](t).all.map(m => `${json.quoted(m[0])}:${canonical(m[1])}`)
+		const members = json.decode[json.Keys](t).all.map(m => `${json.quoted(m[0])}:${canonical(m[1].text)}`)
 		sort(members)
 		return `{${members.join(",")}}`
 	}
 	if (startsWith(t, "[")) {
 		const items: string[] = []
-		for (const x of json.decode[Item[]](t)) {
-			items.push(canonical(encode(x)))
+		for (const x of json.decode[json.Raw[]](t)) {
+			items.push(canonical(x.text))
 		}
 		return `[${items.join(",")}]`
 	}
-	return encode(json.decode[Item](t))
+	return encode(json.decode[Scalar](t))
 }
 
 /// The JSON of x, which it can hold.
-function encode(x: Item): string {
+function encode(x: Scalar): string {
 	try {
 		return json.encode(x)
 	} catch (e: json.EncodeError) {

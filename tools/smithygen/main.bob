@@ -397,10 +397,11 @@ class Generator {
 	unwrapped: string[] = []
 	/// How the service answers a request breaking its model's constraints, null if they are not checked.
 	validation: [string, string, bool, bool] | null = null
-	/// The aliases of the constraints of shapes, by their ids; whether a tag of core/protocol/model is used; and the
-	/// patterns std/regex cannot run in any form, by their shapes' ids, which go unchecked.
+	/// The aliases of the constraints of shapes, by their ids; whether a tag of core/protocol/model is used, and of
+	/// core/protocol/xml; and the patterns std/regex cannot run in any form, by their shapes' ids, which go unchecked.
 	aliases: [string, string][] = []
 	modeled = false
+	xmlTagged = false
 	unchecked: string[] = []
 	/// The members whose constraints, and their items', go unchecked, and whether the member being typed is one.
 	unconstrained: string[] = []
@@ -429,7 +430,7 @@ class Generator {
 	/// The names declared, the imported ones too, to fail on a second of one.
 	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
 		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes", "rest",
-		"restjson", "handleJson"]
+		"restjson", "handleJson", "xml"]
 
 	/// The service's protocol, awsQuery, awsJson1_0, awsJson1_1, restXml or restJson1, once api has begun; and its
 	/// shape id, operations and
@@ -551,7 +552,7 @@ class Generator {
 		const head: Decl[] = if (this.twofold) [new Decl("import",
 			[`import * as json from "${root(out)}core/protocol/json"`])]
 			else []
-		head.append(imports(out, codec, unit, this.modeled || validated))
+		head.append(imports(out, codec, unit, this.modeled || validated, this.xmlTagged))
 		const unchecked = if (this.unchecked.length == 0) []
 			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
 		if (unserved.length > 0) {
@@ -830,10 +831,10 @@ class Generator {
 		const sent = this.xmlNames.find(x => x[0] == id)
 		const xmlName = if (sent == null) s.traits.xmlName else sent![1]
 		if (this.protocol == "restXml" && xmlName != null) {
-			tags += ` @restxml.Name[${json.quoted(xmlName!)}]`
+			tags += ` ${this.tag(`Name[${json.quoted(xmlName!)}]`)}`
 		}
 		if (this.protocol == "restXml" && s.traits.xmlNamespace != null) {
-			tags += ` ${namespace(s.traits.xmlNamespace!)}`
+			tags += ` ${this.tag(namespace(s.traits.xmlNamespace!))}`
 		}
 		if (this.unwrapped.includes(id)) {
 			tags += " @restxml.Unwrapped"
@@ -870,8 +871,21 @@ class Generator {
 	rest(): bool { return this.protocol == "restXml" || this.protocol == "restJson1" }
 	/// Whether the service's bodies are JSON.
 	json(): bool { return this.codec() == "json" || this.codec() == "restjson" }
-	/// The tag n of the service's codec.
-	tag(n: string): string { return `@${this.codec()}.${n}` }
+
+	/// The tag n of core/protocol/xml.
+	tag(n: string): string {
+		this.xmlTagged = true
+		return `@xml.${n}`
+	}
+
+	/// The tag of the timestamp r of the shape s, of no format if r's is otherwise, the default where it is; but always
+	/// of r's when the service serves awsJson too, whose default is another.
+	timestamp(r: Ref, s: Shape, otherwise: string): string {
+		this.modeled = true
+		const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? ""
+		return if (format == "" || format == otherwise && !this.twofold) "@model.Timestamp"
+			else `@model.Timestamp[${json.quoted(format)}]`
+	}
 
 	/// The tags of a REST protocol that bind the member r to where it is on the wire, and of restXml those that shape
 	/// its XML: of a payload, its element's name too.
@@ -901,14 +915,14 @@ class Generator {
 			tags.push("@rest.Payload")
 			if (xml && t.xmlName == null) {
 				const s = this.shape(r.target)
-				tags.push(`@restxml.Name[${json.quoted(s.traits.xmlName ?? name(r.target))}]`)
+				tags.push(this.tag(`Name[${json.quoted(s.traits.xmlName ?? name(r.target))}]`))
 			}
 		}
 		if (xml && t.xmlAttribute != null) {
-			tags.push("@restxml.Attr")
+			tags.push(this.tag("Attr"))
 		}
 		if (xml && t.xmlNamespace != null) {
-			tags.push(namespace(t.xmlNamespace!))
+			tags.push(this.tag(namespace(t.xmlNamespace!)))
 		}
 		return tags
 	}
@@ -934,7 +948,7 @@ class Generator {
 			tags.push(`@json.Name[${json.quoted(t.jsonName!)}]`)
 		}
 		const d = m[1].traits.rest.find(x => x[0] == "smithy.api#default")
-		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
+		const initial = if (d == null || d[1].text == "null") null else this.defaultOf(m[1], d[1].text)
 		if (initial != null) {
 			tags.push("@model.Default")
 			this.modeled = true
@@ -1073,8 +1087,6 @@ class Generator {
 			return enumName(r.target)
 		}
 		const xml = this.protocol == "awsQuery" || this.protocol == "restXml" || this.bound
-		// the module of the timestamp and blob tags
-		const of = if (this.protocol == "awsQuery") "query" else if (xml) "rest" else "json"
 		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
 			return this.jsonType(r, s, tags)
 		}
@@ -1088,22 +1100,14 @@ class Generator {
 			case "float": return "f32"
 			case "double": return "f64"
 			case "timestamp":
-				// that of core/protocol/rest is of where the member is bound
-				const otherwise = if (of == "rest") "" else "date-time"
-				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? otherwise
-				tags.push(if (format == otherwise) `@${of}.Timestamp` else `@${of}.Timestamp[${json.quoted(format)}]`)
-				if (this.twofold) {
-					this.jsonType(r, s, tags)
-				}
+				tags.push(this.timestamp(r, s, if (this.protocol == "awsQuery") "date-time" else ""))
 				return "i64"
 			case "blob":
 				if (s.traits.streaming != null && !this.payload) {
 					throw new ModelError(`${r.target}: a stream`)
 				}
-				tags.push(`@${of}.Blob`)
-				if (this.twofold) {
-					tags.push("@json.Blob")
-				}
+				tags.push("@model.Blob")
+				this.modeled = true
 				return "string"
 			case "list":
 				const m = s.member!
@@ -1148,9 +1152,7 @@ class Generator {
 	jsonType(r: Ref, s: Shape, tags: string[]): string throws ModelError {
 		switch (s.type) {
 			case "timestamp":
-				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? "epoch-seconds"
-				tags.push(if (format == "epoch-seconds") "@json.Timestamp"
-					else `@json.Timestamp[${json.quoted(format)}]`)
+				tags.push(this.timestamp(r, s, "epoch-seconds"))
 				return "i64"
 			case "document":
 				tags.push("@json.Document")
@@ -1339,12 +1341,12 @@ class Generator {
 			}
 			let text = if (message == null && !query && this.protocol != "restXml") ""
 				else if (given == null) "\"\""
-				else this.literal(message![1], given[1])
+				else this.literal(message![1], given[1].text)
 			const others = v.params.all.filter(p => message == null || p[0] != message[0])
 			if (others.length > 0) {
 				body.push(`\t\tconst e = new api.${name(error)}()`)
 				for (const p of others) {
-					body.append(wrap(`\t\te.${p[0]} = ${this.literal(this.member(error, p[0]), p[1])}`))
+					body.append(wrap(`\t\te.${p[0]} = ${this.literal(this.member(error, p[0]), p[1].text)}`))
 				}
 				text = if (text == "") "e" else `${text}, e`
 			}
@@ -1446,7 +1448,7 @@ class Generator {
 	assignments(x: string, r: Ref | null, params: json.Keys): string[] throws ModelError | ParseError {
 		const lines: string[] = []
 		for (const p of params.all) {
-			lines.append(wrap(`${x}.${p[0]} = ${this.literal(this.member(r!.target, p[0]), p[1])}`))
+			lines.append(wrap(`${x}.${p[0]} = ${this.literal(this.member(r!.target, p[0]), p[1].text)}`))
 		}
 		return lines
 	}
@@ -1481,41 +1483,29 @@ class Generator {
 				return `${(round(json.decode[f64](v) * 1000.0) as i64) * 1000000}`
 			case "list":
 				const items: string[] = []
-				for (const x of json.decode[Item[]](v)) {
-					items.push(this.literal(s.member!, encode(x)))
+				for (const x of json.decode[json.Raw[]](v)) {
+					items.push(this.literal(s.member!, x.text))
 				}
 				return `[${items.join(", ")}]`
 			case "map":
 				const entries: string[] = []
 				for (const e of json.decode[json.Keys](v).all) {
-					entries.push(`[${json.quoted(e[0])}, ${this.literal(s.value!, e[1])}]`)
+					entries.push(`[${json.quoted(e[0])}, ${this.literal(s.value!, e[1].text)}]`)
 				}
 				return `[${entries.join(", ")}]`
 			case "structure":
 				const members: string[] = []
 				for (const p of json.decode[json.Keys](v).all) {
-					members.push(`, ${p[0]}: ${this.literal(this.member(r.target, p[0]), p[1])}`)
+					members.push(`, ${p[0]}: ${this.literal(this.member(r.target, p[0]), p[1].text)}`)
 				}
 				return `{ ...new api.${name(r.target)}()${members.join("")} }`
 			case "union":
 				const m = json.decode[json.Keys](v).all[0]
 				const variant = `${name(r.target)}$${m[0]}`
-				return `{ ...new api.${variant}(), ${m[0]}: ${this.literal(this.member(r.target, m[0]), m[1])} }`
+				return `{ ...new api.${variant}(), ${m[0]}: ${this.literal(this.member(r.target, m[0]), m[1].text)} }`
 			case "document": return json.quoted(v)
 			default: throw new ModelError(`${r.target}: a ${s.type} in a vector`)
 		}
-	}
-}
-
-/// An item of a list in a vector's params, a list of items of no lists if one.
-type Item = string | f64 | bool | json.Keys | null | (string | f64 | bool | json.Keys | null)[]
-
-/// The JSON of x, which it can hold.
-function encode(x: Item): string {
-	try {
-		return json.encode(x)
-	} catch (e: json.EncodeError) {
-		return "" // a float of JSON is finite
 	}
 }
 
@@ -1550,8 +1540,8 @@ function root(out: string): string {
 }
 
 /// The imports of the file out, of the codec, the bindings of a REST one and the JSON of restjson's, of Unit if unit,
-/// and of the codecs' model if modeled.
-function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] {
+/// of the codecs' model if modeled and of their XML if xml.
+function imports(out: string, codec: string, unit: bool, modeled: bool, xml: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
 	const of = if (codec == "restjson") [codec, "rest", "json"]
@@ -1562,6 +1552,9 @@ function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] 
 	}
 	if (modeled) {
 		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))
+	}
+	if (xml) {
+		decls.push(new Decl("import", [`import * as xml from "${up}core/protocol/xml"`]))
 	}
 	decls.push(new Decl("import", [`import { Fault } from "${up}core/fault"`]))
 	const names = if (unit) "Caller, notImplemented, Unit" else "Caller, notImplemented"
@@ -1788,10 +1781,10 @@ function tabs(line: string): i32 {
 	return n
 }
 
-/// The restXml tag of the XML namespace ns.
+/// The name of the tag of the XML namespace ns.
 function namespace(ns: Namespace): string {
 	const prefix = if (ns.prefix == "") "" else `, ${json.quoted(ns.prefix)}`
-	return `@restxml.Namespace[${json.quoted(ns.uri)}${prefix}]`
+	return `Namespace[${json.quoted(ns.uri)}${prefix}]`
 }
 
 /// Whether s has sub in it.
