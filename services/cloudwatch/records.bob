@@ -1,0 +1,94 @@
+//! CloudWatch's state in an account's regional tree: its metrics by their key, the namespace, a NUL, the name and each
+//! dimension's name and value after a NUL, sorted by name; each metric's samples by its key, 0x01, the sample's
+//! timestamp in 20 digits and its request's id and place, so that a time range is a range of keys; its alarms by name,
+//! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { sortBy } from "std/algo"
+import { EncodeError } from "std/encoding/json"
+import { Decodable } from "std/types"
+
+export class Series {
+	namespace = ""
+	name = ""
+	/// Sorted by name.
+	dimensions: [string, string][] = []
+	/// When data was last put to it, in ns as are all times here.
+	put: i64 = 0
+}
+
+/// What one datum put: its statistics, and the values and their counts it gave, none for a statistic set.
+export class Sample {
+	count = 0.0
+	sum = 0.0
+	min = 0.0
+	max = 0.0
+	values: f64[] = []
+	counts: f64[] = []
+	unit = "None"
+}
+
+export class Alarm {
+	name = ""
+	description: string | null = null
+	actionsEnabled = true
+	ok: string[] = []
+	alarm: string[] = []
+	insufficient: string[] = []
+	namespace: string | null = null
+	metric: string | null = null
+	dimensions: [string, string][] = []
+	statistic: string | null = null
+	extended: string | null = null
+	period: i32 = 0
+	unit: string | null = null
+	evaluationPeriods: i32 = 1
+	datapointsToAlarm: i32 = 1
+	threshold = 0.0
+	comparison = ""
+	treatMissingData = "missing"
+	metrics: api.MetricDataQuery[] = []
+	tags: [string, string][] = []
+	updated: i64 = 0
+	state = "INSUFFICIENT_DATA"
+	reason = "Unchecked: Initial alarm creation"
+	stateUpdated: i64 = 0
+	transitioned: i64 = 0
+	/// Until when a state set by SetAlarmState holds: the end of the period it was set in.
+	held: i64 = 0
+}
+
+export class History {
+	type = ""
+	summary = ""
+	data = ""
+	at: i64 = 0
+}
+
+export function series(s: Store): Table[Series] { return new Table[Series](s, "cloudwatch/series") }
+export function samples(s: Store): Table[Sample] { return new Table[Sample](s, "cloudwatch/samples") }
+export function alarms(s: Store): Table[Alarm] { return new Table[Alarm](s, "cloudwatch/alarms") }
+export function history(s: Store): Table[History] { return new Table[History](s, "cloudwatch/history") }
+
+/// The key of the metric of namespace, name and dimensions, which it sorts.
+export function key(namespace: string, name: string, dimensions: [string, string][]): string {
+	sortBy(dimensions, (a, b) => a[0] < b[0])
+	return [namespace, name, ...dimensions.map(d => `${d[0]}\x00${d[1]}`)].join("\x00")
+}
+
+/// t in 20 digits, as keys sort it.
+export function padded(t: i64): string {
+	const s = `${t}`
+	return "00000000000000000000".slice(0, 20 - s.length) + s
+}
+
+/// Puts v in t at key; a record holds no float that JSON cannot, which PutMetricData does not take.
+export function save[V extends Decodable](t: Table[V], key: string, v: V) throws Fault {
+	try {
+		t.put(key, v)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

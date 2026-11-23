@@ -8,3 +8,6 @@ for service in iam sts sqs dynamodb sns events s3 secretsmanager ssm logs kms ki
 	curl -fsS -A curl "https://servicereference.us-east-1.amazonaws.com/v1/$service/$service.json" \
 		| jq "del(.Operations[].SDK)" >"$service-auth.json"
 done
+# CloudWatch signs as monitoring.
+curl -fsS -A curl "https://servicereference.us-east-1.amazonaws.com/v1/cloudwatch/cloudwatch.json" \
+	| jq "del(.Operations[].SDK)" >monitoring-auth.json
