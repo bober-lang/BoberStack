@@ -21,8 +21,8 @@ import { ParseError } from "std/string"
 
 /// A service's answer to a request, its body whole, from caller.
 export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
-/// A service's answer to a fault of the gateway's, in its protocol, under a request id.
-export type Faulted = (f: Fault, requestId: string) => Response
+/// A service's answer to a fault of the gateway's, in its protocol, under a request id, to the request if it has one.
+export type Faulted = (f: Fault, requestId: string, req: Request | null) => Response
 
 /// One request at a time reads and writes the state: each in a transaction of the trees it opens, which commit together
 /// if it answers 2xx and are dropped if not, so that a request that fails leaves no trace.
@@ -99,7 +99,7 @@ export class Gateway {
 			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
 				`<ProposedSize>${size}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
 			const faulted = this.faults.get(name)
-			return if (faulted == null) query.error(why, id) else faulted!(why, id)
+			return if (faulted == null) query.error(why, id) else faulted!(why, id, null)
 		}
 		if (name == "monitoring") {
 			const why = new Fault(413, "RequestEntityTooLarge", `Request size ${size} exceeded ${limit} bytes`, true)
@@ -145,7 +145,7 @@ export class Gateway {
 		}
 		if (why != null) {
 			const faulted = this.faults.get(name)
-			return if (faulted == null) query.error(why!, id) else faulted!(why!, id)
+			return if (faulted == null) query.error(why!, id) else faulted!(why!, id, req)
 		}
 		let caller = new Caller("", auth?.region ?? "us-east-1", "*", id, "anonymous", this.trees)
 		if (auth != null) {

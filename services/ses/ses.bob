@@ -1,20 +1,23 @@
 //! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, their
-//! attributes and sending authorization policies, templates, configuration sets and their event destinations, tags,
-//! the account's suppression list and the messages sent.
+//! attributes and sending authorization policies, templates, configuration sets with their options and event
+//! destinations, tags, the account's settings and suppression list, and the messages sent.
 //!
 //! An identity is verified at once, as nobody can follow a verification mail's link: its verification and DKIM status
 //! are Success from its creation on, as is its MAIL FROM domain's. Nothing is sent anywhere: each message is stored, in
 //! its account's regional state, as LocalStack's /_aws/ses lists it (core/internal), and delivered, or bounced or
-//! complained of as the mailbox simulator's addresses ask, bounced if suppressed, as the notifications published inside the request to the
-//! identity's SNS topics and its configuration set's SNS event destinations tell. A template's message is rendered when
-//! sent: one that cannot be, of data that is not JSON or lacks an attribute the template names, is accepted with a
-//! message id and then not sent, as AWS reports it by a rendering failure event, so it is not stored.
+//! complained of as the mailbox simulator's addresses ask, bounced if suppressed for a reason the account or its
+//! configuration set suppresses, as the notifications published inside the request to the identity's SNS topics and
+//! its configuration set's SNS event destinations tell. An account whose sending is paused is refused each send. A
+//! template's message is rendered when sent: one that cannot be, of data that is not JSON or lacks an attribute the
+//! template names, is accepted with a message id and then not sent, as AWS reports it by a rendering failure event, so
+//! it is not stored. Nothing is received: there are no receipt rules, nor contact lists.
 //!
 //! Where AWS differs: first, the account has production access, out of its sandbox, so only the source is checked,
 //! by its address or its domain, never the recipients as AWS checks them in the sandbox. A rendered template's MIME
 //! message has no Date or Message-ID header; event destinations other than SNS are stored but nothing is published to
-//! them, nor are open, click or rendering failure events; the send statistics are empty; a request to v2 that fails
-//! before it is routed, as one badly signed, is answered as the classic API answers it.
+//! them, nor are open, click or rendering failure events; the send statistics are empty; a configuration set's
+//! sending, delivery, reputation and tracking options are kept, not followed; a request to v2 that fails before it is
+//! routed is answered as the classic API answers it, but for a bad signature.
 
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
@@ -72,6 +75,21 @@ class ConfigurationSet {
 	created: i64 = 0
 	tags: [string, string][] = []
 	destinations: Destination[] = []
+	/// Its options as v2 puts them, null where never put.
+	tracking: v2.TrackingOptions | null = null
+	delivery: v2.DeliveryOptions | null = null
+	reputation: v2.ReputationOptions | null = null
+	sending: v2.SendingOptions | null = null
+	suppression: v2.SuppressionOptions | null = null
+}
+
+/// The account's settings, as v2 puts them.
+class Account {
+	details: v2.AccountDetails | null = null
+	production = true
+	sending = true
+	/// The reasons the account's suppression list suppresses an address for.
+	reasons: string[] = ["BOUNCE", "COMPLAINT"]
 }
 
 /// An event destination, its event types and dimension sources as v2 names them; a target null if not given.
@@ -137,6 +155,7 @@ class Suppressed {
 
 /// SES's state in an account's regional tree.
 class Tables {
+	account: Table[Account]
 	identities: Table[Identity]
 	suppressed: Table[Suppressed]
 	templates: Table[Template]
@@ -144,6 +163,7 @@ class Tables {
 	sent: Table[Sent]
 
 	constructor(s: Store) {
+		this.account = new Table[Account](s, "ses.account")
 		this.identities = new Table[Identity](s, "ses.identities")
 		this.suppressed = new Table[Suppressed](s, "ses.suppressed")
 		this.templates = new Table[Template](s, "ses.templates")
@@ -361,6 +381,7 @@ export class Handler {
 	}
 
 	sendEmail(caller: Caller, input: api.SendEmailRequest): api.SendEmailResponse throws Fault {
+		authorized(caller, "ses:SendEmail")
 		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
 		s.Subject = input.Message.Subject.Data
 		s.Body = parts(input.Message.Body.Text?.Data, input.Message.Body.Html?.Data)
@@ -370,6 +391,7 @@ export class Handler {
 	}
 
 	sendRawEmail(caller: Caller, input: api.SendRawEmailRequest): api.SendRawEmailResponse throws Fault {
+		authorized(caller, "ses:SendRawEmail")
 		const data = input.RawMessage.Data
 		const source = input.Source ?? header(data, "From")
 		if (source == null) {
@@ -384,6 +406,7 @@ export class Handler {
 
 	sendTemplatedEmail(caller: Caller,
 		input: api.SendTemplatedEmailRequest): api.SendTemplatedEmailResponse throws Fault {
+		authorized(caller, "ses:SendTemplatedEmail")
 		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
 		const t = template(caller, input.Template)
 		const r = new api.SendTemplatedEmailResponse()
@@ -393,6 +416,7 @@ export class Handler {
 
 	sendBulkTemplatedEmail(caller: Caller,
 		input: api.SendBulkTemplatedEmailRequest): api.SendBulkTemplatedEmailResponse throws Fault {
+		authorized(caller, "ses:SendBulkTemplatedEmail")
 		const t = template(caller, input.Template)
 		const r = new api.SendBulkTemplatedEmailResponse()
 		for (const d of input.Destinations) {
@@ -533,8 +557,15 @@ export class Handler {
 	getAccountSendingEnabled(caller: Caller, input: Unit): api.GetAccountSendingEnabledResponse throws Fault {
 		caller.allow("*")
 		const r = new api.GetAccountSendingEnabledResponse()
-		r.Enabled = true
+		r.Enabled = account(caller).sending
 		return r
+	}
+
+	updateAccountSendingEnabled(caller: Caller, input: api.UpdateAccountSendingEnabledRequest): Unit throws Fault {
+		changeAccount(caller, a => {
+			a.sending = input.Enabled
+		})
+		return new Unit()
 	}
 }
 
@@ -748,6 +779,7 @@ export class V2 {
 	}
 
 	sendEmail(caller: Caller, input: v2.SendEmailRequest): v2.SendEmailResponse throws Fault {
+		authorized(caller, "ses:SendEmail", true)
 		const c = input.Content
 		const raw = c.Raw
 		const from = input.FromEmailAddress ?? (if (raw == null) null else header(raw!.Data, "From"))
@@ -776,6 +808,7 @@ export class V2 {
 	}
 
 	sendBulkEmail(caller: Caller, input: v2.SendBulkEmailRequest): v2.SendBulkEmailResponse throws Fault {
+		authorized(caller, "ses:SendBulkEmail", true)
 		const t = input.DefaultContent.Template
 		if (t == null || input.FromEmailAddress == null) {
 			throw v2.badRequestException(if (t == null) "Missing required parameter: DefaultContent.Template"
@@ -843,13 +876,87 @@ export class V2 {
 	getAccount(caller: Caller, input: v2.GetAccountRequest): v2.GetAccountResponse throws Fault {
 		caller.allow("*")
 		const r = new v2.GetAccountResponse()
+		const a = account(caller)
 		r.DedicatedIpAutoWarmupEnabled = true
 		r.EnforcementStatus = "HEALTHY"
-		r.ProductionAccessEnabled = true
-		r.SendingEnabled = true
+		r.ProductionAccessEnabled = a.production
+		r.SendingEnabled = a.sending
+		r.Details = a.details
+		r.SuppressionAttributes = { ...new v2.SuppressionAttributes(),
+			SuppressedReasons: a.reasons.map(e => if (e == "COMPLAINT") "COMPLAINT" else "BOUNCE") }
 		r.SendQuota = { ...new v2.SendQuota(), Max24HourSend: 200.0, MaxSendRate: 1.0,
 			SentLast24Hours: lastDay(caller) }
 		return r
+	}
+
+	putAccountDetails(caller: Caller, input: v2.PutAccountDetailsRequest): v2.PutAccountDetailsResponse throws Fault {
+		changeAccount(caller, a => {
+			a.details = { ...new v2.AccountDetails(), MailType: input.MailType, WebsiteURL: input.WebsiteURL,
+				ContactLanguage: input.ContactLanguage, UseCaseDescription: input.UseCaseDescription,
+				AdditionalContactEmailAddresses: input.AdditionalContactEmailAddresses }
+			a.production = input.ProductionAccessEnabled ?? a.production
+		})
+		return new v2.PutAccountDetailsResponse()
+	}
+
+	putAccountSendingAttributes(caller: Caller,
+		input: v2.PutAccountSendingAttributesRequest): v2.PutAccountSendingAttributesResponse throws Fault {
+		changeAccount(caller, a => {
+			a.sending = input.SendingEnabled
+		})
+		return new v2.PutAccountSendingAttributesResponse()
+	}
+
+	putAccountSuppressionAttributes(caller: Caller,
+		input: v2.PutAccountSuppressionAttributesRequest): v2.PutAccountSuppressionAttributesResponse throws Fault {
+		changeAccount(caller, a => {
+			a.reasons = (input.SuppressedReasons ?? []).map(e => e as string)
+		})
+		return new v2.PutAccountSuppressionAttributesResponse()
+	}
+
+	putConfigurationSetSuppressionOptions(caller: Caller, input: v2.PutConfigurationSetSuppressionOptionsRequest): v2.PutConfigurationSetSuppressionOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.suppression = { ...new v2.SuppressionOptions(), SuppressedReasons: input.SuppressedReasons,
+				SuppressionScope: input.SuppressionScope, ValidationOptions: input.ValidationOptions }
+		})
+		return new v2.PutConfigurationSetSuppressionOptionsResponse()
+	}
+
+	putConfigurationSetSendingOptions(caller: Caller,
+		input: v2.PutConfigurationSetSendingOptionsRequest): v2.PutConfigurationSetSendingOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.sending = { ...new v2.SendingOptions(), SendingEnabled: input.SendingEnabled }
+		})
+		return new v2.PutConfigurationSetSendingOptionsResponse()
+	}
+
+	putConfigurationSetReputationOptions(caller: Caller, input: v2.PutConfigurationSetReputationOptionsRequest): v2.PutConfigurationSetReputationOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.reputation = { ...new v2.ReputationOptions(), ReputationMetricsEnabled: input.ReputationMetricsEnabled }
+		})
+		return new v2.PutConfigurationSetReputationOptionsResponse()
+	}
+
+	putConfigurationSetTrackingOptions(caller: Caller, input: v2.PutConfigurationSetTrackingOptionsRequest): v2.PutConfigurationSetTrackingOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			const domain = input.CustomRedirectDomain
+			c.tracking = null
+			if (domain != null) {
+				c.tracking = { ...new v2.TrackingOptions(), CustomRedirectDomain: domain!,
+					HttpsPolicy: input.HttpsPolicy }
+			}
+		})
+		return new v2.PutConfigurationSetTrackingOptionsResponse()
+	}
+
+	putConfigurationSetDeliveryOptions(caller: Caller, input: v2.PutConfigurationSetDeliveryOptionsRequest): v2.PutConfigurationSetDeliveryOptionsResponse throws Fault {
+		changeSet(caller, input.ConfigurationSetName, c => {
+			c.delivery = { ...new v2.DeliveryOptions(), TlsPolicy: input.TlsPolicy,
+				SendingPoolName: input.SendingPoolName, MaxDeliverySeconds: input.MaxDeliverySeconds,
+				SharedPoolDeliveryMode: input.SharedPoolDeliveryMode }
+		})
+		return new v2.PutConfigurationSetDeliveryOptionsResponse()
 	}
 
 	listEmailTemplates(caller: Caller,
@@ -901,6 +1008,11 @@ export class V2 {
 		r.Tags = c.tags.map(t => {
 			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
 		})
+		r.TrackingOptions = c.tracking
+		r.DeliveryOptions = c.delivery
+		r.ReputationOptions = c.reputation
+		r.SendingOptions = c.sending
+		r.SuppressionOptions = c.suppression
 		return r
 	}
 
@@ -1075,6 +1187,26 @@ function suppressed(caller: Caller, address: string): Suppressed throws Fault {
 		throw v2.notFoundException(`Email address ${address} does not exist on your suppression list.`)
 	}
 	return d!
+}
+
+/// The account's settings.
+function account(caller: Caller): Account throws Fault {
+	return new Tables(caller.regional()).account.get("") ?? new Account()
+}
+
+/// Makes the account's settings over by f.
+function changeAccount(caller: Caller, f: (a: Account) => void) throws Fault {
+	caller.allow("*")
+	const a = account(caller)
+	f(a)
+	save(new Tables(caller.regional()).account, "", a)
+}
+
+/// Makes the configuration set of name over by f, as v2 answers one that does not exist.
+function changeSet(caller: Caller, name: string, f: (c: ConfigurationSet) => void) throws Fault {
+	const c = configurationSet(caller, name, true)
+	f(c)
+	save(new Tables(caller.regional()).sets, name, c)
 }
 
 /// The SNS topic of i's notifications of kind, of v1's names, null if it has none.
@@ -1534,6 +1666,17 @@ function sent(caller: Caller, source: string, recipients: Recipients | null,
 	return s
 }
 
+/// Has the caller authorized by action alone, as AWS authorizes a send: the authorization reference, of both APIs,
+/// gives SendEmail all three of v1's sending actions, and some sends none. Throws, as v2 or the classic API answers it,
+/// if the account's sending is paused.
+function authorized(caller: Caller, action: string, ofV2 = false) throws Fault {
+	caller.actions = [action]
+	if (!account(caller).sending) {
+		throw if (ofV2) v2.sendingPausedException("Sending is paused for this account.")
+			else api.accountSendingPausedException("Email sending is disabled for this account.")
+	}
+}
+
 /// The sending authorization policies of i, as one, null if it has none.
 function policyOf(i: Identity): string | null {
 	const statements: string[] = []
@@ -1619,7 +1762,11 @@ function notify(caller: Caller, s: Sent, set: string | null, sns: snsApi.SNS) th
 		}
 	}
 	const at0 = `${s.Timestamp}.000Z`
-	const suppressing = recipients.filter(r => db.suppressed.get(r) != null)
+	const own = c?.suppression
+	const reasons = if (own != null
+		&& own!.SuppressionScope != "ACCOUNT") (own!.SuppressedReasons ?? []).map(e => e as string)
+		else account(caller).reasons
+	const suppressing = recipients.filter(r => reasons.includes(db.suppressed.get(r)?.reason ?? ""))
 	const source = identityArn(caller, i?.name ?? address)
 	let mail = `{"timestamp":${json.quoted(at0)},"source":${json.quoted(s.Source)},"sourceArn":${json.quoted(source)},`
 		+ `"sendingAccountId":${json.quoted(caller.account)},"messageId":${json.quoted(s.Id)},`

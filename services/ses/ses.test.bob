@@ -196,13 +196,29 @@ test "an identity's attributes, and its policies let another account send from i
 		["Message.Body.Text.Data", "Hello"]]
 	assert call(g, "SendEmail", send, "111111111111").status == 403
 	const policy = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "111111111111"}, `
-		+ `"Action": "ses:Send*", "Resource": "${arn}"}]}`
+		+ `"Action": "ses:SendEmail", "Resource": "${arn}"}]}`
 	assert callV2(g, "POST", "/v2/email/identities/example.com/policies/p", `{"Policy": ${quoted(policy)}}`).status
 		== 200
 	assert text(call(g, "ListIdentityPolicies", [["Identity", "example.com"]]), "member") == "p"
 	assert call(g, "SendEmail", send, "111111111111").status == 200
+	const raw: [string, string][] = [["Source", "a@example.com"], ["SourceArn", arn],
+		["RawMessage.Data", "RnJvbTogYUBleGFtcGxlLmNvbQ0KDQpC"]]
+	assert call(g, "SendRawEmail", raw, "111111111111").status == 403
 	assert call(g, "DeleteIdentityPolicy", [["Identity", "example.com"], ["PolicyName", "p"]]).status == 200
 	assert call(g, "SendEmail", send, "111111111111").status == 403
+}
+
+test "a badly signed request is answered in the protocol of the API it is to" {
+	const g = stack(new Catalog(0, 0))
+	const created = g.handle(request("iam", "test", "test", "Action=CreateAccessKey&Version=2010-05-08"))
+	const key = text(created, "AccessKeyId")!
+	const req = new Request("GET", "http://localhost:4566/v2/email/account")
+	sign(req, "", "ses", "us-east-1", key, "wrong", "", "20150626T140000Z")
+	const res = g.handle(req)
+	assert res.status == 403 && res.headers.get("content-type") == "application/json"
+		&& res.headers.get("x-amzn-errortype") == "SignatureDoesNotMatch"
+	const classic = request("ses", key, "wrong", "Action=GetSendQuota&Version=2010-12-01")
+	assert text(g.handle(classic), "Code") == "SignatureDoesNotMatch"
 }
 
 /// s as a JSON string.
@@ -288,4 +304,47 @@ test "a send to a suppressed address is stored, and bounces" {
 		&& indexOf(topics.published[0].Message, `"bounceSubType":"OnAccountSuppressionList"`) > 0
 	assert callV2(g, "DELETE", "/v2/email/suppression/addresses/b@x.net").status == 200
 	assert callV2(g, "GET", "/v2/email/suppression/addresses/b@x.net").status == 404
+}
+
+test "the account's settings decide what is suppressed and whether mail is sent" {
+	const topics = new Topics()
+	const g = publishing(topics)
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	call(g, "SetIdentityNotificationTopic",
+		[["Identity", "example.com"], ["NotificationType", "Bounce"],
+		["SnsTopic", "arn:aws:sns:us-east-1:000000000000:t"]])
+	callV2(g, "PUT", "/v2/email/suppression/addresses", `{"EmailAddress": "b@x.net", "Reason": "COMPLAINT"}`)
+	assert callV2(g, "PUT", "/v2/email/account/suppression", `{"SuppressedReasons": ["BOUNCE"]}`).status == 200
+	assert callV2(g, "POST", "/v2/email/account/details",
+		`{"MailType": "TRANSACTIONAL", "WebsiteURL": "https://example.com", "ProductionAccessEnabled": false}`).status
+		== 200
+	const a = callV2(g, "GET", "/v2/email/account")
+	assert has(a, `"SuppressedReasons":["BOUNCE"]`) && has(a, `"MailType":"TRANSACTIONAL"`)
+		&& has(a, `"ProductionAccessEnabled":false`)
+	const send: [string, string][] = [["Source", "a@example.com"], ["Destination.ToAddresses.member.1", "b@x.net"],
+		["Message.Subject.Data", "Hi"], ["Message.Body.Text.Data", "Hello"]]
+	assert call(g, "SendEmail", send).status == 200 && topics.published.length == 0
+	assert callV2(g, "PUT", "/v2/email/account/sending", `{"SendingEnabled": false}`).status == 200
+	assert has(call(g, "SendEmail", send), "<Code>AccountSendingPausedException</Code>")
+	assert has(call(g, "GetAccountSendingEnabled"), "<Enabled>false</Enabled>")
+	call(g, "UpdateAccountSendingEnabled", [["Enabled", "true"]])
+	assert call(g, "SendEmail", send).status == 200
+}
+
+test "a configuration set keeps the options put to it" {
+	const g = publishing(new Topics())
+	assert callV2(g, "POST", "/v2/email/configuration-sets", `{"ConfigurationSetName": "c"}`).status == 200
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/c/suppression-options",
+		`{"SuppressedReasons": ["COMPLAINT"]}`).status == 200
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/c/sending", `{"SendingEnabled": false}`).status == 200
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/c/delivery-options", `{"TlsPolicy": "REQUIRE"}`).status == 200
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/c/reputation-options",
+		`{"ReputationMetricsEnabled": true}`).status == 200
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/c/tracking-options",
+		`{"CustomRedirectDomain": "t.example.com"}`).status == 200
+	const c = callV2(g, "GET", "/v2/email/configuration-sets/c")
+	assert has(c, `"SuppressedReasons":["COMPLAINT"]`) && has(c, `"SendingEnabled":false`)
+		&& has(c, `"TlsPolicy":"REQUIRE"`) && has(c, `"ReputationMetricsEnabled":true`)
+		&& has(c, `"CustomRedirectDomain":"t.example.com"`)
+	assert callV2(g, "PUT", "/v2/email/configuration-sets/d/sending", `{"SendingEnabled": false}`).status == 404
 }

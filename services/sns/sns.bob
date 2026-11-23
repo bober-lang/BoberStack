@@ -380,7 +380,10 @@ export class Handler {
 		if (input.TargetArn != null && indexOf(a!, ":endpoint/") >= 0) {
 			throw new Fault(501, "NotImplemented", "Publishing to a platform endpoint is not implemented")
 		}
-		const [p, t] = topic(caller, a!, if (input.TopicArn != null) "TopicArn" else "TargetArn")
+		// SES and CloudWatch, publishing for a resource of theirs, name its owner, as the default policy asks; EventBridge
+		// and S3 do not.
+		const owner: Context = if (owning.includes(caller.arn)) [["aws:SourceOwner", caller.account]] else []
+		const [p, t] = topic(caller, a!, if (input.TopicArn != null) "TopicArn" else "TargetArn", owner)
 		const m = new Message()
 		m.message = input.Message
 		m.subject = input.Subject
@@ -651,14 +654,15 @@ function placeOf(caller: Caller, parts: string[], m: string): Place throws Fault
 	return new Place(new Tables(tree!), name, account, arn)
 }
 
-/// The topic of ARN a, given as the member m, and its place, once the caller is allowed it, of the context keys of
+/// The topic of ARN a, given as the member m, and its place, once the caller is allowed it by the topic's policy or else
+/// AWS's default one, of the context keys of
 /// context besides its tags.
 function topic(caller: Caller, a: string, m: string, context: Context = []): [Place, Topic] throws Fault {
 	const p = place(caller, a, m)
 	const t = p.db.topics.get(p.name)
 	const keys = tagsOf(t)
 	keys.append(context)
-	caller.allow(p.arn, policy(t), keys)
+	caller.allow(p.arn, policy(t) ?? (if (t == null) null else defaultPolicy(p)), keys)
 	if (t == null) {
 		throw api.notFoundException("Topic does not exist")
 	}
@@ -1109,6 +1113,9 @@ function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] 
 	}
 	return out
 }
+
+/// The services that publish naming the owner of the resource they publish for, AWS:SourceOwner.
+const owning = ["ses.amazonaws.com", "cloudwatch.amazonaws.com"]
 
 /// AWS's policy of a topic that has none of its own: the account's own may do all with it.
 function defaultPolicy(p: Place): string {
