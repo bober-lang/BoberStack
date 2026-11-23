@@ -177,6 +177,8 @@ test "an execution waits at an activity's task until a worker answers it" {
 	const g = world()
 	const activity = "arn:aws:states:us-east-1:000000000000:activity:a"
 	assert ok(sfn(g, "CreateActivity", `{"name":"a"}`), `"activityArn":"${activity}"`)
+	assert ok(sfn(g, "TagResource", `{"resourceArn":"${activity}","tags":[{"key":"k","value":"v"}]}`))
+	assert ok(sfn(g, "ListTagsForResource", `{"resourceArn":"${activity}"}`), `{"key":"k","value":"v"}`)
 	const d = `{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"${activity}","ResultPath":"$.r","Next":"B"},`
 		+ `"B":{"Type":"Pass","Parameters":{"id.$":"States.UUID()","r.$":"$.r"},"Next":"C"},`
 		+ `"C":{"Type":"Task","Resource":"${activity}","End":true}}}`

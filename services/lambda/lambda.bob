@@ -530,26 +530,23 @@ export class Handler {
 	}
 
 	tagResource(caller: Caller, input: api.TagResourceRequest): Unit throws Fault {
-		const [db, f] = tagged(caller, input.Resource)
-		const kept = f.tags.filter(e => input.Tags.filter(n => n[0] == e[0]).length == 0)
+		const [tags, save] = tagged(caller, input.Resource)
+		const kept = tags.filter(e => input.Tags.filter(n => n[0] == e[0]).length == 0)
 		for (const e of input.Tags) {
 			kept.push(e)
 		}
-		f.tags = kept
-		db.functions.put(f.name, f)
+		save(kept)
 		return new Unit()
 	}
 
 	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
-		const [db, f] = tagged(caller, input.Resource)
-		f.tags = f.tags.filter(e => input.TagKeys.filter(k => k == e[0]).length == 0)
-		db.functions.put(f.name, f)
+		const [tags, save] = tagged(caller, input.Resource)
+		save(tags.filter(e => input.TagKeys.filter(k => k == e[0]).length == 0))
 		return new Unit()
 	}
 
 	listTags(caller: Caller, input: api.ListTagsRequest): api.ListTagsResponse throws Fault {
-		const [_, f] = tagged(caller, input.Resource)
-		return { ...new api.ListTagsResponse(), Tags: f.tags }
+		return { ...new api.ListTagsResponse(), Tags: tagged(caller, input.Resource)[0] }
 	}
 
 	putFunctionConcurrency(caller: Caller, input: api.PutFunctionConcurrencyRequest): api.Concurrency throws Fault {
@@ -1206,7 +1203,18 @@ function aliasOf(caller: Caller, name: string, a: Alias): api.AliasConfiguration
 	return r
 }
 
-function tagged(caller: Caller, resource: string): [Tables, Function] throws Fault {
+/// The tags of resource, a function or an event source mapping by its ARN, and what replaces them.
+function tagged(caller: Caller,
+	resource: string): [[string, string][], (tags: [string, string][]) => void] throws Fault {
+	const marker = ":event-source-mapping:"
+	const at = indexOf(resource, marker)
+	if (at >= 0) {
+		const [db, m] = mapping(caller, resource.slice(at + marker.length, resource.length))
+		return [m.tags, tags => {
+			m.tags = tags
+			db.mappings.put(m.uuid, m)
+		}]
+	}
 	const t = unqualified(caller, resource)
 	const db = new Tables(caller)
 	allowed(caller, db, t)
@@ -1214,7 +1222,10 @@ function tagged(caller: Caller, resource: string): [Tables, Function] throws Fau
 	if (f == null) {
 		throw notFound(caller, t.name, null)
 	}
-	return [db, f!]
+	return [f!.tags, tags => {
+		f!.tags = tags
+		db.functions.put(f!.name, f!)
+	}]
 }
 
 function url(caller: Caller, t: Target): Url throws Fault {

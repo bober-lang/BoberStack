@@ -1727,8 +1727,20 @@ function doesNotExist(arn: string): Fault {
 
 function retag(caller: Caller, arn: string, context: [string, string | string[]][],
 	edit: (tags: [string, string][]) => [string, string][]) throws Fault {
-	const name = machineName(arn)
 	const db = new Tables(caller.regional())
+	if (split(arn, ":").length > 5 && split(arn, ":")[5] == "activity") {
+		const a = db.activities.get(nameOf(arn, "activity"))
+		const keys = resourceTags(a?.tags ?? [])
+		keys.append(context)
+		caller.allow(arn, null, keys)
+		if (a == null) {
+			throw api.resourceNotFound(`Resource not found: '${arn}'`)
+		}
+		a.tags = edit(a.tags)
+		db.activities.put(a.name, a)
+		return
+	}
+	const name = machineName(arn)
 	const m = db.machines.get(name)
 	const keys = resourceTags(m?.tags ?? [])
 	keys.append(context)
