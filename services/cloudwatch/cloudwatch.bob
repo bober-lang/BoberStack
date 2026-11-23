@@ -1,31 +1,39 @@
-//! Amazon CloudWatch: metrics, their statistics and metric math, and metric alarms, in awsQuery and awsJson alike.
-//! Datapoints are stored as put, by metric and time, and aggregated at each read. There is no background work: an
-//! alarm is evaluated against the request's time when data is put to its metric, within that PutMetricData, and before
-//! DescribeAlarms, DescribeAlarmsForMetric and DescribeAlarmHistory answer; on a change of state, and on
-//! SetAlarmState, whose state holds to the end of the alarm's period, its actions are delivered within the request, if enabled, by a direct call of SNS's Publish as the
-//! principal cloudwatch.amazonaws.com on behalf of the alarm's ARN, so that the topic's policy decides, the message
-//! CloudWatch's alarm JSON. Composite alarms, dashboards, anomaly detectors, insight rules, metric streams and the rest
-//! are not implemented. Where AWS differs:
+//! Amazon CloudWatch: metrics, their statistics and metric math, metric alarms and dashboards, in awsQuery and awsJson
+//! alike. Datapoints are stored as put, by metric and time, and aggregated at each read. There is no background work:
+//! an alarm is evaluated against the request's time when data is put to its metric, within that PutMetricData, and
+//! before DescribeAlarms, DescribeAlarmsForMetric and DescribeAlarmHistory answer; on a change of state, and on
+//! SetAlarmState, whose state holds to the end of the alarm's period, its actions are delivered within the request, if
+//! enabled, by a direct call of SNS's Publish as the principal cloudwatch.amazonaws.com on behalf of the alarm's ARN,
+//! so that the topic's policy decides, the message CloudWatch's alarm JSON. A dashboard's body is checked for what AWS
+//! requires of it, an object of widgets each of a type, and kept as given. Composite alarms, anomaly detectors, insight
+//! rules, metric streams and the rest are not implemented. Where AWS differs:
 //!
 //! - Retention is of the request's time: data older than 15 months is not read, nor that of a period under 5 minutes
 //!   older than 15 days or under an hour older than 63 days; a metric without data put in two weeks is not listed.
 //! - Percentiles are exact, of the values put, where AWS's are of its approximation; a statistic set has none.
-//! - A request missing a required member, or of a value outside an enum, is answered ValidationError, as the codec
-//!   checks it, where AWS answers MissingParameter or InvalidParameterValue in words of its own.
+//! - PutMetricData, GetMetricStatistics and ListMetrics answer a missing member or a value outside an enum in AWS's
+//!   words; the other operations as the codec checks them: AWS lists an enum's values in an order of its own, and of
+//!   some operations, as GetMetricData and PutDashboard, does not quote the value.
 //! - Metric math knows + - * / ^, comparisons, METRICS(), SUM, AVG, MIN, MAX, FILL with a number, RATE, IF and
 //!   ABS; any other function is not found, as AWS answers one it does not know. An expression's series are of the
 //!   period of the request's first metric. GetMetricData answers in one page, MaxDatapoints aside.
 //! - Only alarms of a single metric are evaluated; one of metric math stays as it is but by SetAlarmState. Only actions
 //!   of SNS are delivered; an alarm message's Region is the region's code, its reason in short words, and the alarm's
-//!   StateReasonData is not given.
+//!   StateReasonData is not given. An alarm has no CreationId, which the model lacks, and its Threshold is written as
+//!   the codec writes a number, 1 where AWS writes 1.0.
 //! - DescribeAlarmHistory answers in one page, MaxRecords aside.
+//! - A dashboard's body is checked for its widgets' types only, and its Size is the body's length, where AWS counts
+//!   more.
 
 import { Fault } from "../../core/fault"
 import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as snsApi from "../sns/api"
 import * as api from "./api"
-import { Alarm, alarms, History, history, key, padded, Sample, samples, save, Series, series } from "./records"
+
+import { Alarm, alarms, Dashboard, dashboards, History, history, key, padded, Sample, samples, save, Series,
+	series } from "./records"
+
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
 import * as json from "std/encoding/json"
@@ -43,6 +51,12 @@ const pointLimit = 1440
 const statistics = ["SampleCount", "Average", "Sum", "Minimum", "Maximum"]
 const idPattern = "^[a-z][a-zA-Z0-9_]*$"
 
+/// The units, in the order AWS lists them.
+const units = ["Megabits", "Terabits", "Gigabits", "Count", "Bytes", "Gigabytes", "Gigabytes/Second", "Kilobytes",
+	"Kilobits/Second", "Terabytes", "Terabits/Second", "Bytes/Second", "Percent", "Megabytes", "Megabits/Second",
+	"Milliseconds", "Microseconds", "Kilobytes/Second", "Gigabits/Second", "Megabytes/Second", "Bits", "Bits/Second",
+	"Count/Second", "Seconds", "Kilobits", "Terabytes/Second", "None"]
+
 /// The service, of the operations on metrics and metric alarms.
 export class Handler {
 	...api.Unimplemented
@@ -54,6 +68,7 @@ export class Handler {
 
 	putMetricData(caller: Caller, input: api.PutMetricDataInput): Unit throws Fault {
 		caller.allow("*")
+		const namespace = required(input.Namespace, "Namespace")
 		const data = input.MetricData ?? []
 		if (data.length == 0) {
 			throw api.missingRequiredParameterException("At least one MetricDatum object must be present in the request.")
@@ -67,6 +82,8 @@ export class Handler {
 		for (let i = 0; i < data.length; i++) {
 			const d = data[i]
 			const at = `MetricData.member.${i + 1}`
+			const name = required(d.MetricName, `${at}.MetricName`)
+			checkUnit(d.Unit, `${at}.Unit`)
 			const s = sample(d, at)
 			const when = d.Timestamp ?? t
 			if (when < t - 14 * day) {
@@ -80,9 +97,8 @@ export class Handler {
 				throw api.invalidParameterValueException(`The parameter ${at}.StorageResolution must be a value in the set [ 1, 60 ].`)
 			}
 			const dims = dimensionsOf(d.Dimensions ?? [], `${at}.Dimensions`)
-			const k = key(input.Namespace, d.MetricName, dims)
-			save(series(db), k,
-				{ ...new Series(), namespace: input.Namespace, name: d.MetricName, dimensions: dims, put: t })
+			const k = key(namespace, name, dims)
+			save(series(db), k, { ...new Series(), namespace: namespace, name: name, dimensions: dims, put: t })
 			save(samples(db), `${k}\x01${padded(when)}\x01${caller.requestId}${padded(i as i64)}`, s)
 			if (!keys.includes(k)) {
 				keys.push(k)
@@ -98,6 +114,9 @@ export class Handler {
 
 	listMetrics(caller: Caller, input: api.ListMetricsInput): api.ListMetricsOutput throws Fault {
 		caller.allow("*")
+		if (input.RecentlyActive != null && input.RecentlyActive != "PT3H") {
+			throw api.invalidParameterValueException("Request parameter recentlyActive value is invalid")
+		}
 		const t = now()
 		const prefix = if (input.Namespace == null) ""
 			else if (input.MetricName == null) `${input.Namespace!}\x00`
@@ -131,7 +150,19 @@ export class Handler {
 	getMetricStatistics(caller: Caller,
 		input: api.GetMetricStatisticsInput): api.GetMetricStatisticsOutput throws Fault {
 		caller.allow("*")
+		const namespace = required(input.Namespace, "Namespace")
+		const metric = required(input.MetricName, "MetricName")
+		const start = required(input.StartTime, "StartTime")
+		const end = required(input.EndTime, "EndTime")
+		const period = required(input.Period, "Period")
 		const stats = input.Statistics ?? []
+		for (let i = 0; i < stats.length; i++) {
+			if (!statistics.includes(stats[i])) {
+				throw api.invalidParameterValueException(`The parameter Statistics.member.${i + 1}.<list element> must be a `
+					+ `value in the set [${statistics.join(", ")}].`)
+			}
+		}
+		checkUnit(input.Unit, "Unit")
 		const extended = input.ExtendedStatistics ?? []
 		if (stats.length == 0 && extended.length == 0) {
 			throw api.invalidParameterCombinationException("At least one of the parameters Statistics and ExtendedStatistics must be specified.")
@@ -141,20 +172,20 @@ export class Handler {
 				throw api.invalidParameterValueException(`The value ${extended[i]} for parameter ExtendedStatistics.member.${i + 1}.<list element> is not supported.`)
 			}
 		}
-		checkPeriod(input.Period, "The parameter Period must be a multiple of 60.")
-		if (input.StartTime >= input.EndTime) {
+		checkPeriod(period, "The parameter Period must be a multiple of 60.")
+		if (start >= end) {
 			throw api.invalidParameterValueException("The parameter StartTime must be less than the parameter EndTime.")
 		}
-		const g = grid(input.StartTime, input.EndTime, input.Period, now())
+		const g = grid(start, end, period, now())
 		if (g.points > pointLimit) {
 			throw api.invalidParameterCombinationException(`You have requested up to ${g.points} datapoints, which exceeds `
 				+ `the limit of ${pointLimit}. You may reduce the datapoints requested by increasing Period, or decreasing the `
 				+ "time range.")
 		}
 		const dims = dimensionsOf(input.Dimensions ?? [], "Dimensions")
-		const buckets = bucketed(caller, key(input.Namespace, input.MetricName, dims), g, input.Unit)
+		const buckets = bucketed(caller, key(namespace, metric, dims), g, input.Unit as (api.StandardUnit | null))
 		const out = new api.GetMetricStatisticsOutput()
-		out.Label = input.MetricName
+		out.Label = metric
 		out.Datapoints = []
 		for (let i = 0; i < buckets.length; i++) {
 			const b = buckets[i]
@@ -289,7 +320,8 @@ export class Handler {
 		}
 		const n = input.EvaluationPeriods ?? 0
 		if (n < 1) {
-			throw api.validationException("EvaluationPeriods must be greater than or equal to 1")
+			throw api.validationException(`1 validation error detected: Value '${n}' at 'evaluationPeriods' failed to `
+				+ "satisfy constraint: Member must have value greater than or equal to 1")
 		}
 		const m = input.DatapointsToAlarm ?? n
 		if (m < 1 || m > n) {
@@ -333,9 +365,11 @@ export class Handler {
 		a.unit = input.Unit
 		a.evaluationPeriods = n
 		a.datapointsToAlarm = m
+		a.datapointsGiven = input.DatapointsToAlarm != null
 		a.threshold = input.Threshold ?? 0.0
 		a.comparison = cmp!
 		a.treatMissingData = missing
+		a.missingGiven = input.TreatMissingData != null
 		a.metrics = metrics
 		a.updated = t
 		a.held = 0
@@ -350,6 +384,64 @@ export class Handler {
 		return new Unit()
 	}
 
+	putDashboard(caller: Caller, input: api.PutDashboardInput): api.PutDashboardOutput throws Fault {
+		const name = input.DashboardName
+		caller.allow(dashboardArn(caller, name))
+		if (!dashboardName(name)) {
+			throw api.invalidParameterValueException("The value for field DashboardName contains invalid characters. It "
+				+ "can only contain alphanumerics, dash (-) and underscore (_).\n")
+		}
+		checkBody(input.DashboardBody)
+		save(dashboards(caller.regional()), name, { ...new Dashboard(), body: input.DashboardBody, modified: now() })
+		const out = new api.PutDashboardOutput()
+		out.DashboardValidationMessages = []
+		return out
+	}
+
+	getDashboard(caller: Caller, input: api.GetDashboardInput): api.GetDashboardOutput throws Fault {
+		const name = input.DashboardName
+		caller.allow(dashboardArn(caller, name))
+		const d = dashboards(caller.regional()).get(name)
+		if (d == null) {
+			throw api.dashboardNotFoundError(`Dashboard ${name} does not exist`)
+		}
+		const out = new api.GetDashboardOutput()
+		out.DashboardArn = dashboardArn(caller, name)
+		out.DashboardBody = d!.body
+		out.DashboardName = name
+		return out
+	}
+
+	listDashboards(caller: Caller, input: api.ListDashboardsInput): api.ListDashboardsOutput throws Fault {
+		caller.allow("*")
+		const out = new api.ListDashboardsOutput()
+		out.DashboardEntries = []
+		const page = dashboards(caller.regional()).scan(input.NextToken, 1000, input.DashboardNamePrefix ?? "")
+		for (const [name, d] of page) {
+			const e = new api.DashboardEntry()
+			e.DashboardName = name
+			e.DashboardArn = dashboardArn(caller, name)
+			e.LastModified = d.modified
+			e.Size = d.body.length as i64
+			out.DashboardEntries!.push(e)
+		}
+		if (page.length == 1000) {
+			out.NextToken = page[999][0]
+		}
+		return out
+	}
+
+	deleteDashboards(caller: Caller, input: api.DeleteDashboardsInput): api.DeleteDashboardsOutput throws Fault {
+		const db = dashboards(caller.regional())
+		for (const name of input.DashboardNames) {
+			caller.allow(dashboardArn(caller, name))
+		}
+		for (const name of input.DashboardNames) {
+			db.delete(name)
+		}
+		return new api.DeleteDashboardsOutput()
+	}
+
 	describeAlarms(caller: Caller, input: api.DescribeAlarmsInput): api.DescribeAlarmsOutput throws Fault {
 		caller.allow("*")
 		const most = input.MaxRecords ?? 50
@@ -361,6 +453,7 @@ export class Handler {
 		const out = new api.DescribeAlarmsOutput()
 		out.MetricAlarms = []
 		out.CompositeAlarms = []
+		out.LogAlarms = []
 		if (!types.includes("MetricAlarm")) {
 			return out
 		}
@@ -527,8 +620,7 @@ export class Handler {
 		}
 		caller.allow(arn, null, context)
 		if (a == null) {
-			throw api.resourceNotFoundException(`Alarm ${arn} not found`,
-				{ ...new api.ResourceNotFoundException(), ResourceType: "Alarm", ResourceId: arn })
+			throw api.resourceNotFoundException("")
 		}
 		return [db, a!]
 	}
@@ -600,6 +692,7 @@ export class Handler {
 			return a
 		}
 		const old = a.state
+		const was = a.reason
 		const changed = old != state
 		a.state = state
 		a.reason = reason
@@ -608,8 +701,8 @@ export class Handler {
 			a.transitioned = t
 		}
 		save(alarms(caller.regional()), a.name, a)
-		const data = `{"version":"1.0","oldState":{"stateValue":${json.quoted(old)}},"newState":{"stateValue":`
-			+ `${json.quoted(state)},"stateReason":${json.quoted(reason)}}}`
+		const data = `{"version":"1.0","oldState":{"stateValue":${json.quoted(old)},"stateReason":${json.quoted(was)}},`
+			+ `"newState":{"stateValue":${json.quoted(state)},"stateReason":${json.quoted(reason)}}}`
 		note(caller, a.name, "StateUpdate", `Alarm updated from ${old} to ${state}`, data, t)
 		if (!a.actionsEnabled) {
 			return a
@@ -1145,6 +1238,58 @@ function dimensionsOf(ds: api.Dimension[], at: string): [string, string][] throw
 	return out
 }
 
+/// The ARN of the dashboard name, which names no region.
+function dashboardArn(caller: Caller, name: string): string {
+	return `arn:aws:cloudwatch::${caller.account}:dashboard/${name}`
+}
+
+/// Throws unless body is a dashboard's: an object of widgets, each of a type; in AWS's words, the errors listed.
+function checkBody(body: string) throws Fault {
+	let top = new json.Keys()
+	try {
+		top = json.decode[json.Keys](body)
+	} catch (e: ParseError) {
+		throw api.dashboardInvalidInputError("The field DashboardBody must be a valid JSON object")
+	}
+	const errors: [string, string][] = []
+	const widgets = top.all.find(k => k[0] == "widgets")
+	if (widgets == null) {
+		errors.push(["", "Should have required property 'widgets'"])
+	} else {
+		let items: json.Keys[] = []
+		try {
+			items = json.decode[json.Keys[]](widgets[1])
+		} catch (e: ParseError) {
+			errors.push(["/widgets", "Should be array"])
+		}
+		for (let i = 0; i < items.length; i++) {
+			if (!items[i].all.some(k => k[0] == "type")) {
+				errors.push([`/widgets/${i}`, "Should have required property 'type'"])
+			}
+		}
+	}
+	if (errors.length > 0) {
+		const listed = errors.map(e => `  {\n    "dataPath": ${json.quoted(e[0])},\n    "message": ${json.quoted(e[1])}\n  }`)
+		throw api.dashboardInvalidInputError(`The dashboard body is invalid, there are ${errors.length} validation `
+			+ `errors:\n[\n${listed.join(",\n")}\n]`)
+	}
+}
+
+/// v, the parameter at, unless null, which AWS answers MissingParameter.
+function required[T](v: T | null, at: string): T throws Fault {
+	if (v == null) {
+		throw api.missingRequiredParameterException(`The parameter ${at} is required.`)
+	}
+	return v!
+}
+
+/// Throws unless u, the parameter at, is a unit or null, in AWS's words and order of the units.
+function checkUnit(u: string | null, at: string) throws Fault {
+	if (u != null && !units.includes(u!)) {
+		throw api.invalidParameterValueException(`The parameter ${at} must be a value in the set [ ${units.join(", ")} ].`)
+	}
+}
+
 /// Throws why unless p is a period CloudWatch takes: 1, 5, 10, 20 or 30, or a multiple of 60.
 function checkPeriod(p: i32, why: string) throws Fault {
 	if (p <= 0 || p % 60 != 0 && ![1, 5, 10, 20, 30].includes(p)) {
@@ -1358,10 +1503,10 @@ function described(caller: Caller, a: Alarm): api.MetricAlarm {
 	m.Period = if (a.metrics.length == 0) a.period else null
 	m.Unit = a.unit as (api.StandardUnit | null)
 	m.EvaluationPeriods = a.evaluationPeriods
-	m.DatapointsToAlarm = a.datapointsToAlarm
+	m.DatapointsToAlarm = if (a.datapointsGiven) a.datapointsToAlarm else null
 	m.Threshold = a.threshold
 	m.ComparisonOperator = a.comparison as api.ComparisonOperator
-	m.TreatMissingData = a.treatMissingData
+	m.TreatMissingData = if (a.missingGiven) a.treatMissingData else null
 	m.Metrics = if (a.metrics.length == 0) null else a.metrics
 	return m
 }
@@ -1392,6 +1537,16 @@ function upper(s: string): string {
 		out.push(if (c >= 97 && c <= 122) c - 32 else c)
 	}
 	return fromBytes(out)
+}
+
+/// Whether name is one a dashboard may have: of alphanumerics, dashes and underscores.
+function dashboardName(name: string): bool {
+	for (let i = 0; i < name.length; i++) {
+		if (!isAlphanumeric(name[i]) && name[i] != 45 && name[i] != 95) {
+			return false
+		}
+	}
+	return true
 }
 
 /// Whether id is one a query may have.

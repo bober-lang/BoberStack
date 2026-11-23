@@ -231,8 +231,22 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 
 /// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
 /// with an error of the service's own.
-const strings: [string,
-	string[]][] = [["com.amazonaws.sqs#AmazonSQS", ["com.amazonaws.sqs#ReceiveMessageRequest$AttributeNames"]]]
+const strings: [string, string[]][] = [["com.amazonaws.sqs#AmazonSQS",
+	["com.amazonaws.sqs#ReceiveMessageRequest$AttributeNames"]],
+	["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
+	["com.amazonaws.cloudwatch#MetricDatum$Unit", "com.amazonaws.cloudwatch#GetMetricStatisticsInput$Statistics",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Unit",
+	"com.amazonaws.cloudwatch#ListMetricsInput$RecentlyActive"]]]
+
+/// The required members of the services below that AWS answers the lack of with an error of its own, by their shape
+/// ids: they take null, and their handlers answer as AWS does.
+const optional: [string, string[]][] = [["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
+	["com.amazonaws.cloudwatch#PutMetricDataInput$Namespace", "com.amazonaws.cloudwatch#MetricDatum$MetricName",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Namespace",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$MetricName",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$StartTime",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$EndTime",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Period"]]]
 
 /// The services whose enums are all strings: AWS takes a value outside an enum, or answers it with an error of its own.
 const opened = ["com.amazonaws.s3#AmazonS3"]
@@ -314,6 +328,8 @@ class Generator {
 	unconstrained: string[] = []
 	/// The members whose enums are strings, or whether all are, and whether the member being typed is one.
 	strings: string[] = []
+	/// The required members that take null.
+	optional: string[] = []
 	opened = false
 	open = false
 	/// The flattened lists written as one, by their structures' ids.
@@ -369,6 +385,8 @@ class Generator {
 		this.unconstrained = if (exempt == null) [] else exempt[1]
 		const open = strings.find(s => s[0] == services[0][0])
 		this.strings = if (open == null) [] else open[1]
+		const lax = optional.find(o => o[0] == services[0][0])
+		this.optional = if (lax == null) [] else lax[1]
 		this.opened = opened.includes(services[0][0])
 		const merged = interleaved.find(i => i[0] == services[0][0])
 		this.interleaved = if (merged == null) [] else merged[1]
@@ -723,7 +741,7 @@ class Generator {
 		}
 		const fields: Decl[] = []
 		for (const m of s.members) {
-			fields.push(this.field(id, m, m[1].traits.required != null))
+			fields.push(this.field(id, m, m[1].traits.required != null && !this.optional.includes(`${id}$${m[0]}`)))
 		}
 		const merged = this.interleaved.find(i => i[0] == id)
 		if (merged != null) {

@@ -1,7 +1,7 @@
 //! CloudWatch's state in an account's regional tree: its metrics by their key, the namespace, a NUL, the name and each
 //! dimension's name and value after a NUL, sorted by name; each metric's samples by its key, 0x01, the sample's
 //! timestamp in 20 digits and its request's id and place, so that a time range is a range of keys; its alarms by name,
-//! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence.
+//! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence; its dashboards by name.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -49,6 +49,9 @@ export class Alarm {
 	threshold = 0.0
 	comparison = ""
 	treatMissingData = "missing"
+	/// Whether the two above were given, as DescribeAlarms shows them only then.
+	datapointsGiven = false
+	missingGiven = false
 	metrics: api.MetricDataQuery[] = []
 	tags: [string, string][] = []
 	updated: i64 = 0
@@ -67,10 +70,16 @@ export class History {
 	at: i64 = 0
 }
 
+export class Dashboard {
+	body = ""
+	modified: i64 = 0
+}
+
 export function series(s: Store): Table[Series] { return new Table[Series](s, "cloudwatch/series") }
 export function samples(s: Store): Table[Sample] { return new Table[Sample](s, "cloudwatch/samples") }
 export function alarms(s: Store): Table[Alarm] { return new Table[Alarm](s, "cloudwatch/alarms") }
 export function history(s: Store): Table[History] { return new Table[History](s, "cloudwatch/history") }
+export function dashboards(s: Store): Table[Dashboard] { return new Table[Dashboard](s, "cloudwatch/dashboards") }
 
 /// The key of the metric of namespace, name and dimensions, which it sorts.
 export function key(namespace: string, name: string, dimensions: [string, string][]): string {
