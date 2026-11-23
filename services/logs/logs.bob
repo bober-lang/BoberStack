@@ -8,9 +8,6 @@
 //!   publishes no metric.
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
-//! - DescribeLogGroups by pattern, and ListLogGroups, give no token after their last page; AWS does.
-//! - The model declares no eventId of GetLogEvents' events and no searchStatistics of FilterLogEvents', which AWS
-//!   answers, so they are not answered.
 
 import { Fault } from "../../core/fault"
 import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
@@ -98,7 +95,9 @@ export class Handler {
 		const r = new api.DescribeLogGroupsResponse()
 		r.logGroups = found.map(g => wire(caller, g, metricFilters(s).scan(null, 1000, g.name + "\x00").length,
 			pattern == null))
-		r.nextToken = if (more) found[found.length - 1].name else null
+		// AWS gives a token after the last page of a search by pattern or class too, of which the next page is empty
+		const searched = pattern != null || input.logGroupClass != null
+		r.nextToken = if (more || searched && found.length > 0) found[found.length - 1].name else null
 		return r
 	}
 
@@ -114,7 +113,8 @@ export class Handler {
 		const r = new api.ListLogGroupsResponse()
 		r.logGroups = found.map(g => ({ ...new api.LogGroupSummary(), logGroupName: g.name,
 			logGroupArn: arnOf(caller, g.name), logGroupClass: g.class as api.LogGroupClass }))
-		r.nextToken = if (more) found[found.length - 1].name else null
+		// AWS gives a token after the last page too, of which the next page is empty
+		r.nextToken = if (found.length > 0) found[found.length - 1].name else null
 		return r
 	}
 
@@ -341,7 +341,7 @@ export class Handler {
 		}
 		const r = new api.GetLogEventsResponse()
 		r.events = got.map(e => ({ ...new api.OutputLogEvent(), timestamp: stamp(e[0]), message: e[1].message,
-			ingestionTime: e[1].ingested }))
+			ingestionTime: e[1].ingested, eventId: e[0] }))
 		const edge = if (token != null) token!.slice(2, 58) else pad(start, 20) + pad(0, 36)
 		r.nextForwardToken = `f/${if (got.length == 0) edge else got[got.length - 1][0]}/s`
 		r.nextBackwardToken = `b/${if (got.length == 0) edge else got[0][0]}/s`
@@ -384,6 +384,7 @@ export class Handler {
 		const r = new api.FilterLogEventsResponse()
 		r.events = []
 		r.searchedLogStreams = []
+		r.searchStatistics = new api.SearchStatistics() // AWS's counts are 0 too
 		while (r.events!.length < n) {
 			let next: Cursor | null = null
 			for (const c of cursors) {

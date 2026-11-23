@@ -7,6 +7,7 @@ import { endsWith, sortBy, startsWith } from "std/algo"
 import { parseFloat } from "std/float"
 import { compile, Regex } from "std/regex"
 import { lower, ParseError } from "std/string"
+import { has } from "std/types"
 import { Fault } from "../fault"
 
 /// Tags a member that takes its initial value when a request leaves it out, as Smithy's default.
@@ -16,6 +17,8 @@ export class Default {}
 export class Valid[Min extends string, Max extends string, P extends string] {}
 /// Tags a list or map member with the number of its items, from Min to Max, either "" for no bound.
 export class Size[Min extends string, Max extends string] {}
+/// Tags a member, or its items, whose values AWS does not quote in a message on their constraints, as a blob's.
+export class Sensitive {}
 
 /// How a service answers a request breaking its model: the code of the fault, whether its message quotes the values,
 /// and the unions it words on their own: by a union's name, the message where none of its members is set and where
@@ -41,9 +44,9 @@ export class Violations {
 
 	constructor(validation: Validation) { this.validation = validation }
 
-	/// Notes the value v, or null, at the member path at, failing why.
-	note(v: string | null, at: string, why: string) {
-		const value = if (!this.validation.quoted) "" else if (v == null) " null" else ` '${v}'`
+	/// Notes the value v, or null, at the member path at, failing why; quoted unless hidden.
+	note(v: string | null, at: string, why: string, hidden: bool = false) {
+		const value = if (!this.validation.quoted || hidden) "" else if (v == null) " null" else ` '${v}'`
 		this.found.push(`Value${value} at '${at}' failed to satisfy constraint: ${why}`)
 	}
 
@@ -123,8 +126,9 @@ export function path(at: string, n: string): string {
 }
 
 /// Notes into v how x, at the member path at, of a member tagged tags, breaks the constraints those hold: of its
-/// length in bytes if bytes, as a blob's.
+/// length in bytes if bytes, as a blob's, whose value is not quoted, as a sensitive member's is not.
 export function check[T](x: T, at: string, tags: Type[], v: Violations, bytes: bool = false) {
+	const hidden = bytes || has(tags, Sensitive)
 	for (const t of tags) {
 		const size = t.base == Size
 		if (t.base != Valid && !size) {
@@ -146,16 +150,16 @@ export function check[T](x: T, at: string, tags: Type[], v: Violations, bytes: b
 			default: continue
 		}
 		if (min != "" && n < number(min)) {
-			v.note(text(x), at, `Member must have ${what} greater than or equal to ${min}`)
+			v.note(text(x), at, `Member must have ${what} greater than or equal to ${min}`, hidden)
 		} else if (max != "" && n > number(max)) {
-			v.note(text(x), at, `Member must have ${what} less than or equal to ${max}`)
+			v.note(text(x), at, `Member must have ${what} less than or equal to ${max}`, hidden)
 		}
 		const p = if (size) "" else t.args[2].value as string
 		if (T.kind == "string" && p != "") {
 			const r = regex(p)
 			if (r != null && !r!.test(x)) {
 				const shown = p.slice(if (startsWith(p, "^")) 1 else 0, p.length - (if (endsWith(p, "$")) 1 else 0))
-				v.note(text(x), at, `Member must satisfy regular expression pattern: ${shown}`)
+				v.note(text(x), at, `Member must satisfy regular expression pattern: ${shown}`, hidden)
 			}
 		}
 	}

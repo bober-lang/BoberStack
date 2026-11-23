@@ -1,7 +1,7 @@
 import { Fault } from "../fault"
 import { Caller, notImplemented, Unit } from "../service"
 import { Blob, Call, decode, Document, ErrorShape, error, result, Service, Timestamp } from "./json"
-import { Valid, Validation } from "./model"
+import { Sensitive, Valid, Validation } from "./model"
 import { Request } from "std/http"
 
 // The inputs, outputs and bodies are after the Smithy awsJson specs' and protocol tests' examples.
@@ -135,6 +135,18 @@ test "a union the service words on its own" {
 	const short = message("Value 'ab' at 'short' failed to satisfy constraint: Member must have length greater than or equal to 3")
 	assert decode[Choosings](`{"Short": "ab", "Many": {"b": {}}}`,
 		worded) throws new Fault(400, "ValidationException", short)
+}
+
+class Secrets {
+	Plaintext: string | null @Blob @Valid["", "2", ""]
+	Token: string | null @Valid["4", "", ""] @Sensitive
+}
+
+test "values not quoted" {
+	const plaintext = message("Value at 'plaintext' failed to satisfy constraint: Member must have length less than or equal to 2")
+	assert decode[Secrets](`{"Plaintext": "YWJj"}`) throws new Fault(400, "ValidationException", plaintext)
+	const token = message("Value at 'token' failed to satisfy constraint: Member must have length greater than or equal to 4")
+	assert decode[Secrets](`{"Token": "abc"}`) throws new Fault(400, "ValidationException", token)
 }
 
 class Output {
