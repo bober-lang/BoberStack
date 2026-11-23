@@ -1,0 +1,33 @@
+import { Gateway } from "../core/gateway"
+import * as api from "../services/iam/api"
+import { Catalog } from "../services/iam/catalog"
+import * as iam from "../services/iam/iam"
+import { replay } from "../tools/tape/tape"
+import { catalog_text } from "../services/iam/catalog.c"
+
+/// A gateway of IAM, of every AWS managed policy, which the catalog's text costs this test's build.
+function gateway(catalog: Catalog): Gateway {
+	const g = new Gateway()
+	const h = new iam.Handler(catalog)
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+/// The AWS managed policies.
+function managed(): Catalog {
+	const text = new u64[](2)
+	catalog_text(text)
+	return new Catalog(text[0], text[1])
+}
+
+const catalog = managed()
+
+test "IAM tapes replay" {
+	for (const tape of ["tapes/iam/users.json", "tapes/iam/roles.json", "tapes/iam/policies.json",
+		"tapes/iam/managed.json"]) {
+		test `${tape}` {
+			const differences = replay(tape, gateway(catalog))
+			assert differences == []
+		}
+	}
+}

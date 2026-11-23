@@ -1,0 +1,1531 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UpdateDate"
+	],
+	"steps": [
+		{
+			"name": "create user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"Path": "/${prefix}/"
+			},
+			"capture": {
+				"userId": "User/UserId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-user</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-user</Arn>\n      <UserId>${userId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "create role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"Path": "/${prefix}/",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"capture": {
+				"roleId": "Role/RoleId"
+			},
+			"differs": "MaxSessionDuration is answered",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Path>/boberstack-ab-00000000/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "create",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-policy",
+				"Path": "/${prefix}/",
+				"Description": "a policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0"
+			},
+			"capture": {
+				"policyId": "Policy/PolicyId"
+			},
+			"differs": "Description is answered",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>${policyId}</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </CreatePolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "create again",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-policy",
+				"Path": "/${prefix}/",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>A policy called boberstack-ab-00000000-policy already exists. Duplicate names are not allowed.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create malformed",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-bad",
+				"PolicyDocument": "{"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Syntax errors in policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of an action without a service",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-bad",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"GetObject\",\"Resource\":\"*\"}]}"
+			},
+			"differs": "an action without a service is accepted",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Actions/Conditions must be prefaced by a vendor, e.g., iam, sdb, ec2, etc.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of a bad version",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-bad",
+				"PolicyDocument": "{\"Version\":\"2020-01-01\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}"
+			},
+			"differs": "the policy of step 6 was created",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Syntax errors in policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create without a document",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-bad"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'policyDocument' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get, with tags?",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>${policyId}</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      <Description>a policy</Description>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </GetPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "get missing",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy-none was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get by a malformed ARN",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "not-an-arn"
+			},
+			"differs": "a short ARN is refused as invalid, not by its length",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'policyArn' failed to satisfy constraint: Member must have length greater than or equal to 20</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create version 2",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v2</VersionId>\n      <IsDefaultVersion>false</IsDefaultVersion>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </CreatePolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "create version 3, the default",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"*\"}]}",
+				"SetAsDefault": "true"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v3</VersionId>\n      <IsDefaultVersion>true</IsDefaultVersion>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </CreatePolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "create version 4",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:DeleteObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v4</VersionId>\n      <IsDefaultVersion>false</IsDefaultVersion>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </CreatePolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "create version 5",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetBucketPolicy\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v5</VersionId>\n      <IsDefaultVersion>false</IsDefaultVersion>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </CreatePolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "create a sixth version",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetBucketAcl\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>LimitExceeded</Code>\n    <Message>A managed policy can have up to 5 versions. Before you create a new version, you must delete an existing version.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create a version of a malformed document",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "nope"
+			},
+			"differs": "the version limit is checked before the document",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Syntax errors in policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list versions",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicyVersions",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"differs": "versions are listed oldest first, AWS's newest first",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPolicyVersionsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPolicyVersionsResult>\n    <IsTruncated>false</IsTruncated>\n    <Versions>\n      <member>\n        <VersionId>v5</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v4</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v3</VersionId>\n        <IsDefaultVersion>true</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v2</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v1</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Versions>\n  </ListPolicyVersionsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPolicyVersionsResponse>\n"
+			}
+		},
+		{
+			"name": "list versions, two",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicyVersions",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"MaxItems": "2"
+			},
+			"capture": {
+				"marker": "Marker"
+			},
+			"differs": "versions are listed oldest first, AWS's newest first",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPolicyVersionsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPolicyVersionsResult>\n    <IsTruncated>true</IsTruncated>\n    <Versions>\n      <member>\n        <VersionId>v5</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v4</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Versions>\n    <Marker>${marker}</Marker>\n  </ListPolicyVersionsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPolicyVersionsResponse>\n"
+			}
+		},
+		{
+			"name": "list versions, the next two",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicyVersions",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"MaxItems": "2",
+				"Marker": "${marker}"
+			},
+			"differs": "versions are listed oldest first, AWS's newest first",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPolicyVersionsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPolicyVersionsResult>\n    <IsTruncated>true</IsTruncated>\n    <Versions>\n      <member>\n        <VersionId>v3</VersionId>\n        <IsDefaultVersion>true</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v2</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Versions>\n    <Marker>AEwXNd+5+Sk0O60dUAxNH53kj68iLq53wA3NV6rUxsBkRYEurI/el0dIii98XHIcWXn4hGzemv+IzHLg1JG1BN8hkOkB4rlqVUd60/D18+Kqew91OSOW7WDFHf+qMVfll+Ku54WLlEpy1qtzovNYfBA=</Marker>\n  </ListPolicyVersionsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPolicyVersionsResponse>\n"
+			}
+		},
+		{
+			"name": "get version 1",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v1</VersionId>\n      <IsDefaultVersion>false</IsDefaultVersion>\n      <Document>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%22s3%3AGetObject%22%2C%22Resource%22%3A%22%2A%22%7D%5D%7D</Document>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </GetPolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "get version 3",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v3"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v3</VersionId>\n      <IsDefaultVersion>true</IsDefaultVersion>\n      <Document>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%22s3%3AListBucket%22%2C%22Resource%22%3A%22%2A%22%7D%5D%7D</Document>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </GetPolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "get version 9",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v9"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v9 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get version 'x'",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "x"
+			},
+			"differs": "a malformed version id is not found, not refused",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'versionId' failed to satisfy constraint: Member must satisfy regular expression pattern: v[1-9][0-9]*(\\.[A-Za-z0-9-]*)?</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get, version 3 the default",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v3</DefaultVersionId>\n      <PolicyId>${policyId}</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      <Description>a policy</Description>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </GetPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "make version 2 the default",
+			"service": "iam",
+			"query": {
+				"Action": "SetDefaultPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SetDefaultPolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SetDefaultPolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "make version 9 the default",
+			"service": "iam",
+			"query": {
+				"Action": "SetDefaultPolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v9"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v9 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the default version",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v2"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete the default version of a policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 4",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v4"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 4 again",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v4"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v4 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create version 6",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetBucketAcl\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyVersionResult>\n    <PolicyVersion>\n      <VersionId>v6</VersionId>\n      <IsDefaultVersion>false</IsDefaultVersion>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </PolicyVersion>\n  </CreatePolicyVersionResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "list versions, 4 deleted",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicyVersions",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"differs": "versions are listed oldest first, AWS's newest first",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPolicyVersionsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPolicyVersionsResult>\n    <IsTruncated>false</IsTruncated>\n    <Versions>\n      <member>\n        <VersionId>v6</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v5</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v3</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v2</VersionId>\n        <IsDefaultVersion>true</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <VersionId>v1</VersionId>\n        <IsDefaultVersion>false</IsDefaultVersion>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Versions>\n  </ListPolicyVersionsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPolicyVersionsResponse>\n"
+			}
+		},
+		{
+			"name": "create another",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-other",
+				"Path": "/${prefix}/",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"*\"}]}"
+			},
+			"capture": {
+				"otherId": "Policy/PolicyId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>${otherId}</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-other</PolicyName>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </CreatePolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list local",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/"
+			},
+			"differs": "policies are listed by name, AWS's in the order created",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <Policies>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v2</DefaultVersionId>\n        <PolicyId>${policyId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n        <AttachmentCount>0</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v1</DefaultVersionId>\n        <PolicyId>${otherId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-other</PolicyName>\n        <AttachmentCount>0</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Policies>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list local, one",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"policyMarker": "Marker"
+			},
+			"differs": "policies are listed by name, AWS's in the order created",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>true</IsTruncated>\n    <Marker>${policyMarker}</Marker>\n    <Policies>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v2</DefaultVersionId>\n        <PolicyId>${policyId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n        <AttachmentCount>0</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Policies>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list local, the next",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1",
+				"Marker": "${policyMarker}"
+			},
+			"differs": "policies are listed by name, AWS's in the order created",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <Policies>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v1</DefaultVersionId>\n        <PolicyId>${otherId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-other</PolicyName>\n        <AttachmentCount>0</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Policies>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list local and attached",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/",
+				"OnlyAttached": "true"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <Policies/>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list of a bad scope",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Mine",
+				"PathPrefix": "/${prefix}/"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'scope' failed to satisfy constraint: Member must satisfy enum value set: [All, Local, AWS]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "attach to the user",
+			"service": "iam",
+			"query": {
+				"Action": "AttachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AttachUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AttachUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "attach to the user again",
+			"service": "iam",
+			"query": {
+				"Action": "AttachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AttachUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AttachUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "attach the other to the user",
+			"service": "iam",
+			"query": {
+				"Action": "AttachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AttachUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AttachUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "attach to the role",
+			"service": "iam",
+			"query": {
+				"Action": "AttachRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AttachRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AttachRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "attach to a missing user",
+			"service": "iam",
+			"query": {
+				"Action": "AttachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "attach a missing policy",
+			"service": "iam",
+			"query": {
+				"Action": "AttachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy-none does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "attach by a malformed ARN",
+			"service": "iam",
+			"query": {
+				"Action": "AttachRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyArn": "nope"
+			},
+			"differs": "a short ARN is refused as invalid, not by its length",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'policyArn' failed to satisfy constraint: Member must have length greater than or equal to 20</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list the user's",
+			"service": "iam",
+			"query": {
+				"Action": "ListAttachedUserPolicies",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAttachedUserPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAttachedUserPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <AttachedPolicies>\n      <member>\n        <PolicyArn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</PolicyArn>\n        <PolicyName>boberstack-ab-00000000-other</PolicyName>\n      </member>\n      <member>\n        <PolicyArn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</PolicyArn>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      </member>\n    </AttachedPolicies>\n  </ListAttachedUserPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAttachedUserPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list the user's, one",
+			"service": "iam",
+			"query": {
+				"Action": "ListAttachedUserPolicies",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"attachedMarker": "Marker"
+			},
+			"differs": "attached policies are listed by name, AWS's in the order attached",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAttachedUserPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAttachedUserPoliciesResult>\n    <IsTruncated>true</IsTruncated>\n    <Marker>${attachedMarker}</Marker>\n    <AttachedPolicies>\n      <member>\n        <PolicyArn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</PolicyArn>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      </member>\n    </AttachedPolicies>\n  </ListAttachedUserPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAttachedUserPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list the user's, the next",
+			"service": "iam",
+			"query": {
+				"Action": "ListAttachedUserPolicies",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"MaxItems": "1",
+				"Marker": "${attachedMarker}"
+			},
+			"differs": "attached policies are listed by name, AWS's in the order attached",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAttachedUserPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAttachedUserPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <AttachedPolicies>\n      <member>\n        <PolicyArn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</PolicyArn>\n        <PolicyName>boberstack-ab-00000000-other</PolicyName>\n      </member>\n    </AttachedPolicies>\n  </ListAttachedUserPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAttachedUserPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list the role's",
+			"service": "iam",
+			"query": {
+				"Action": "ListAttachedRolePolicies",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAttachedRolePoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAttachedRolePoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <AttachedPolicies>\n      <member>\n        <PolicyArn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</PolicyArn>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      </member>\n    </AttachedPolicies>\n  </ListAttachedRolePoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAttachedRolePoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "list the entities",
+			"service": "iam",
+			"query": {
+				"Action": "ListEntitiesForPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListEntitiesForPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListEntitiesForPolicyResult>\n    <PolicyRoles>\n      <member>\n        <RoleId>${roleId}</RoleId>\n        <RoleName>boberstack-ab-00000000-role</RoleName>\n      </member>\n    </PolicyRoles>\n    <IsTruncated>false</IsTruncated>\n    <PolicyUsers>\n      <member>\n        <UserName>boberstack-ab-00000000-user</UserName>\n        <UserId>${userId}</UserId>\n      </member>\n    </PolicyUsers>\n    <PolicyGroups/>\n  </ListEntitiesForPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListEntitiesForPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list the entities that are users",
+			"service": "iam",
+			"query": {
+				"Action": "ListEntitiesForPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"EntityFilter": "User"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListEntitiesForPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListEntitiesForPolicyResult>\n    <PolicyRoles/>\n    <IsTruncated>false</IsTruncated>\n    <PolicyUsers>\n      <member>\n        <UserName>boberstack-ab-00000000-user</UserName>\n        <UserId>${userId}</UserId>\n      </member>\n    </PolicyUsers>\n    <PolicyGroups/>\n  </ListEntitiesForPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListEntitiesForPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "get, attached twice",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v2</DefaultVersionId>\n      <PolicyId>${policyId}</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n      <Description>a policy</Description>\n      <AttachmentCount>2</AttachmentCount>\n      <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </GetPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list local and attached, attached",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/",
+				"OnlyAttached": "true"
+			},
+			"differs": "policies are listed by name, AWS's in the order created",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <Policies>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v2</DefaultVersionId>\n        <PolicyId>${policyId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-policy</PolicyName>\n        <AttachmentCount>2</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v1</DefaultVersionId>\n        <PolicyId>${otherId}</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-other</PolicyName>\n        <AttachmentCount>1</AttachmentCount>\n        <Arn>arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Policies>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user, attached",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must detach all policies first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role, attached",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must detach all policies first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete, attached",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"differs": "the attachments are checked before the versions",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>This policy has more than one version. Before you delete a policy, you must delete the policy's versions. The default version is deleted with the policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "detach from the user",
+			"service": "iam",
+			"query": {
+				"Action": "DetachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DetachUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DetachUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "detach from the user again",
+			"service": "iam",
+			"query": {
+				"Action": "DetachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "detach the other from the user",
+			"service": "iam",
+			"query": {
+				"Action": "DetachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DetachUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DetachUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "detach from the role",
+			"service": "iam",
+			"query": {
+				"Action": "DetachRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DetachRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DetachRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list the entities, none",
+			"service": "iam",
+			"query": {
+				"Action": "ListEntitiesForPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListEntitiesForPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListEntitiesForPolicyResult>\n    <PolicyRoles/>\n    <IsTruncated>false</IsTruncated>\n    <PolicyUsers/>\n    <PolicyGroups/>\n  </ListEntitiesForPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListEntitiesForPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "tag",
+			"service": "iam",
+			"query": {
+				"Action": "TagPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"Tags.member.1.Key": "t0",
+				"Tags.member.1.Value": "v0",
+				"Tags.member.2.Key": "t1",
+				"Tags.member.2.Value": "v1"
+			},
+			"differs": "TagPolicy is not implemented",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicyTags",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"differs": "ListPolicyTags is not implemented",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPolicyTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPolicyTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>t0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>t1</Key>\n      </member>\n    </Tags>\n  </ListPolicyTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPolicyTagsResponse>\n"
+			}
+		},
+		{
+			"name": "untag",
+			"service": "iam",
+			"query": {
+				"Action": "UntagPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"TagKeys.member.1": "k0"
+			},
+			"differs": "UntagPolicy is not implemented",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete, of versions",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>This policy has more than one version. Before you delete a policy, you must delete the policy's versions. The default version is deleted with the policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 1",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 3",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v3"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 5",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v5"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "delete version 6",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v6"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyVersionResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyVersionResponse>\n"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "get, deleted",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete again",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the other",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the user's",
+			"service": "iam",
+			"query": {
+				"Action": "DetachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-user cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the user's other",
+			"service": "iam",
+			"query": {
+				"Action": "DetachUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-other"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-user cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role's",
+			"service": "iam",
+			"query": {
+				"Action": "DetachRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up version 1",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v1"
+			},
+			"differs": "a version of a deleted policy is said not found, not not attachable",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v1 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up version 3",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v3"
+			},
+			"differs": "a version of a deleted policy is said not found, not not attachable",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v3 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up version 4",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v4"
+			},
+			"differs": "a version of a deleted policy is said not found, not not attachable",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v4 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up version 5",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v5"
+			},
+			"differs": "a version of a deleted policy is said not found, not not attachable",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v5 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up version 6",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicyVersion",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy",
+				"VersionId": "v6"
+			},
+			"differs": "a version of a deleted policy is said not found, not not attachable",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy version v6 does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-policy"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-policy was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the other",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}/${prefix}-other"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000/boberstack-ab-00000000-other was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-user"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-user cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	]
+}

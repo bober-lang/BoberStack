@@ -1,0 +1,1143 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"SecretAccessKey"
+	],
+	"steps": [
+		{
+			"name": "create alice",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"Path": "/${prefix}/"
+			},
+			"capture": {
+				"aliceId": "User/UserId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "create alice again",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>User with name boberstack-ab-00000000-alice already exists.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create alice in capitals",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-ALICE"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>User with name boberstack-ab-00000000-ALICE already exists.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create with a slash in the name",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}/x"
+			},
+			"differs": "AWS says the user name is invalid in words, not by the pattern",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>The specified value for userName is invalid. It must contain only alphanumeric characters and/or the following: +=,.@_-</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create with a path without slashes",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-x",
+				"Path": "tape"
+			},
+			"differs": "AWS says the path is invalid in words, not by the pattern",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>The specified value for path is invalid. It must begin and end with / and contain only alphanumeric characters and/or / characters.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create without a name",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'userName' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create with a name of 65 characters",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'userName' failed to satisfy constraint: Member must have length less than or equal to 64</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create bob with tags",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob",
+				"Path": "/${prefix}/",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0",
+				"Tags.member.2.Key": "k1",
+				"Tags.member.2.Value": "v1"
+			},
+			"capture": {
+				"bobId": "User/UserId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-bob</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-bob</Arn>\n      <UserId>${bobId}</UserId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n        <member>\n          <Value>v1</Value>\n          <Key>k1</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "get alice",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "get alice in capitals",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-ALICE"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "get bob, with tags",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-bob</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-bob</Arn>\n      <UserId>${bobId}</UserId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n        <member>\n          <Value>v1</Value>\n          <Key>k1</Key>\n        </member>\n      </Tags>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "get missing",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-nobody"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-nobody cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUsersResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUsersResult>\n    <IsTruncated>false</IsTruncated>\n    <Users>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UserName>boberstack-ab-00000000-alice</UserName>\n        <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-alice</Arn>\n        <UserId>${aliceId}</UserId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UserName>boberstack-ab-00000000-bob</UserName>\n        <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-bob</Arn>\n        <UserId>${bobId}</UserId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Users>\n  </ListUsersResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUsersResponse>\n"
+			}
+		},
+		{
+			"name": "list one",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"marker": "Marker"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUsersResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUsersResult>\n    <IsTruncated>true</IsTruncated>\n    <Marker>${marker}</Marker>\n    <Users>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UserName>boberstack-ab-00000000-alice</UserName>\n        <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-alice</Arn>\n        <UserId>${aliceId}</UserId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Users>\n  </ListUsersResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUsersResponse>\n"
+			}
+		},
+		{
+			"name": "list the next",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1",
+				"Marker": "${marker}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUsersResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUsersResult>\n    <IsTruncated>false</IsTruncated>\n    <Users>\n      <member>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UserName>boberstack-ab-00000000-bob</UserName>\n        <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-bob</Arn>\n        <UserId>${bobId}</UserId>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Users>\n  </ListUsersResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUsersResponse>\n"
+			}
+		},
+		{
+			"name": "list none",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "0"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'maxItems' failed to satisfy constraint: Member must have value greater than or equal to 1</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list by a bad marker",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"Marker": "nonsense"
+			},
+			"differs": "a bad marker is not refused",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Invalid Marker.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "rename alice carol",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"NewUserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateUserResponse>\n"
+			}
+		},
+		{
+			"name": "get alice, renamed",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-alice cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get carol",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UserName>boberstack-ab-00000000-carol</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000/boberstack-ab-00000000-carol</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "rename bob carol",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob",
+				"NewUserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>User with name boberstack-ab-00000000-carol already exists.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "rename missing",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-nobody",
+				"NewUserName": "${prefix}-x"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-nobody cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "tag carol",
+			"service": "iam",
+			"query": {
+				"Action": "TagUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"Tags.member.1.Key": "t0",
+				"Tags.member.1.Value": "v0",
+				"Tags.member.2.Key": "t1",
+				"Tags.member.2.Value": "v1",
+				"Tags.member.3.Key": "t2",
+				"Tags.member.3.Value": "v2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagUserResponse>\n"
+			}
+		},
+		{
+			"name": "list carol's tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListUserTags",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUserTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUserTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>t0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>t1</Key>\n      </member>\n      <member>\n        <Value>v2</Value>\n        <Key>t2</Key>\n      </member>\n    </Tags>\n  </ListUserTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUserTagsResponse>\n"
+			}
+		},
+		{
+			"name": "tag carol with an empty key",
+			"service": "iam",
+			"query": {
+				"Action": "TagUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"Tags.member.1.Key": "",
+				"Tags.member.1.Value": "v"
+			},
+			"differs": "an empty tag key is not refused",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>2 validation errors detected: Value at 'tags.1.member.key' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'tags.1.member.key' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]+</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "tag carol with 51 tags",
+			"service": "iam",
+			"query": {
+				"Action": "TagUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"Tags.member.1.Key": "many0",
+				"Tags.member.1.Value": "v0",
+				"Tags.member.2.Key": "many1",
+				"Tags.member.2.Value": "v1",
+				"Tags.member.3.Key": "many2",
+				"Tags.member.3.Value": "v2",
+				"Tags.member.4.Key": "many3",
+				"Tags.member.4.Value": "v3",
+				"Tags.member.5.Key": "many4",
+				"Tags.member.5.Value": "v4",
+				"Tags.member.6.Key": "many5",
+				"Tags.member.6.Value": "v5",
+				"Tags.member.7.Key": "many6",
+				"Tags.member.7.Value": "v6",
+				"Tags.member.8.Key": "many7",
+				"Tags.member.8.Value": "v7",
+				"Tags.member.9.Key": "many8",
+				"Tags.member.9.Value": "v8",
+				"Tags.member.10.Key": "many9",
+				"Tags.member.10.Value": "v9",
+				"Tags.member.11.Key": "many10",
+				"Tags.member.11.Value": "v10",
+				"Tags.member.12.Key": "many11",
+				"Tags.member.12.Value": "v11",
+				"Tags.member.13.Key": "many12",
+				"Tags.member.13.Value": "v12",
+				"Tags.member.14.Key": "many13",
+				"Tags.member.14.Value": "v13",
+				"Tags.member.15.Key": "many14",
+				"Tags.member.15.Value": "v14",
+				"Tags.member.16.Key": "many15",
+				"Tags.member.16.Value": "v15",
+				"Tags.member.17.Key": "many16",
+				"Tags.member.17.Value": "v16",
+				"Tags.member.18.Key": "many17",
+				"Tags.member.18.Value": "v17",
+				"Tags.member.19.Key": "many18",
+				"Tags.member.19.Value": "v18",
+				"Tags.member.20.Key": "many19",
+				"Tags.member.20.Value": "v19",
+				"Tags.member.21.Key": "many20",
+				"Tags.member.21.Value": "v20",
+				"Tags.member.22.Key": "many21",
+				"Tags.member.22.Value": "v21",
+				"Tags.member.23.Key": "many22",
+				"Tags.member.23.Value": "v22",
+				"Tags.member.24.Key": "many23",
+				"Tags.member.24.Value": "v23",
+				"Tags.member.25.Key": "many24",
+				"Tags.member.25.Value": "v24",
+				"Tags.member.26.Key": "many25",
+				"Tags.member.26.Value": "v25",
+				"Tags.member.27.Key": "many26",
+				"Tags.member.27.Value": "v26",
+				"Tags.member.28.Key": "many27",
+				"Tags.member.28.Value": "v27",
+				"Tags.member.29.Key": "many28",
+				"Tags.member.29.Value": "v28",
+				"Tags.member.30.Key": "many29",
+				"Tags.member.30.Value": "v29",
+				"Tags.member.31.Key": "many30",
+				"Tags.member.31.Value": "v30",
+				"Tags.member.32.Key": "many31",
+				"Tags.member.32.Value": "v31",
+				"Tags.member.33.Key": "many32",
+				"Tags.member.33.Value": "v32",
+				"Tags.member.34.Key": "many33",
+				"Tags.member.34.Value": "v33",
+				"Tags.member.35.Key": "many34",
+				"Tags.member.35.Value": "v34",
+				"Tags.member.36.Key": "many35",
+				"Tags.member.36.Value": "v35",
+				"Tags.member.37.Key": "many36",
+				"Tags.member.37.Value": "v36",
+				"Tags.member.38.Key": "many37",
+				"Tags.member.38.Value": "v37",
+				"Tags.member.39.Key": "many38",
+				"Tags.member.39.Value": "v38",
+				"Tags.member.40.Key": "many39",
+				"Tags.member.40.Value": "v39",
+				"Tags.member.41.Key": "many40",
+				"Tags.member.41.Value": "v40",
+				"Tags.member.42.Key": "many41",
+				"Tags.member.42.Value": "v41",
+				"Tags.member.43.Key": "many42",
+				"Tags.member.43.Value": "v42",
+				"Tags.member.44.Key": "many43",
+				"Tags.member.44.Value": "v43",
+				"Tags.member.45.Key": "many44",
+				"Tags.member.45.Value": "v44",
+				"Tags.member.46.Key": "many45",
+				"Tags.member.46.Value": "v45",
+				"Tags.member.47.Key": "many46",
+				"Tags.member.47.Value": "v46",
+				"Tags.member.48.Key": "many47",
+				"Tags.member.48.Value": "v47",
+				"Tags.member.49.Key": "many48",
+				"Tags.member.49.Value": "v48",
+				"Tags.member.50.Key": "many49",
+				"Tags.member.50.Value": "v49",
+				"Tags.member.51.Key": "many50",
+				"Tags.member.51.Value": "v50"
+			},
+			"differs": "51 tags are refused as over the quota, not as invalid",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'tags' failed to satisfy constraint: Member must have length less than or equal to 50</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "untag carol",
+			"service": "iam",
+			"query": {
+				"Action": "UntagUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"TagKeys.member.1": "t1",
+				"TagKeys.member.2": "none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagUserResponse>\n"
+			}
+		},
+		{
+			"name": "list carol's tags, untagged",
+			"service": "iam",
+			"query": {
+				"Action": "ListUserTags",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"differs": "the empty key of step 25 was stored",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUserTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUserTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>t0</Key>\n      </member>\n      <member>\n        <Value>v2</Value>\n        <Key>t2</Key>\n      </member>\n    </Tags>\n  </ListUserTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUserTagsResponse>\n"
+			}
+		},
+		{
+			"name": "tag missing",
+			"service": "iam",
+			"query": {
+				"Action": "TagUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-nobody",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-nobody cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create a key",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"capture": {
+				"key1": "AccessKey/AccessKeyId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${key1}</AccessKeyId>\n      <SecretAccessKey>x</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-carol</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "create a second key",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"capture": {
+				"key2": "AccessKey/AccessKeyId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${key2}</AccessKeyId>\n      <SecretAccessKey>x</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-carol</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "create a third key",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>LimitExceeded</Code>\n    <Message>Cannot exceed quota for AccessKeysPerUser: 2</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list keys",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"volatile": [
+				"AccessKeyId",
+				"Status"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAccessKeysResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAccessKeysResult>\n    <IsTruncated>false</IsTruncated>\n    <AccessKeyMetadata>\n      <member>\n        <AccessKeyId>${key2}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-carol</UserName>\n        <Status>Active</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <AccessKeyId>${key1}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-carol</UserName>\n        <Status>Active</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </AccessKeyMetadata>\n  </ListAccessKeysResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAccessKeysResponse>\n"
+			}
+		},
+		{
+			"name": "deactivate the first",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key1}",
+				"Status": "Inactive"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "set a bad status",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key1}",
+				"Status": "Off"
+			},
+			"differs": "validation messages quote the value, AWS IAM's do not",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'status' failed to satisfy constraint: Member must satisfy enum value set: [Expired, Active, Inactive]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list keys, one inactive",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"volatile": [
+				"AccessKeyId",
+				"Status"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListAccessKeysResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListAccessKeysResult>\n    <IsTruncated>false</IsTruncated>\n    <AccessKeyMetadata>\n      <member>\n        <AccessKeyId>${key2}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-carol</UserName>\n        <Status>Active</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <AccessKeyId>${key1}</AccessKeyId>\n        <UserName>boberstack-ab-00000000-carol</UserName>\n        <Status>Inactive</Status>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </AccessKeyMetadata>\n  </ListAccessKeysResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListAccessKeysResponse>\n"
+			}
+		},
+		{
+			"name": "list keys of missing",
+			"service": "iam",
+			"query": {
+				"Action": "ListAccessKeys",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-nobody"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-nobody cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete carol with keys",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must delete access keys first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put an inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "inline",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "put a malformed inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "bad",
+				"PolicyDocument": "{"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Syntax errors in policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put an inline policy of no statement",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "bad",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\"}"
+			},
+			"differs": "a policy of no statement is accepted",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Syntax errors in policy.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "GetUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserPolicyResult>\n    <PolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%22s3%3AGetObject%22%2C%22Resource%22%3A%22%2A%22%7D%5D%7D</PolicyDocument>\n    <PolicyName>inline</PolicyName>\n    <UserName>boberstack-ab-00000000-carol</UserName>\n  </GetUserPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "get a missing inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "GetUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user policy with name none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list inline policies",
+			"service": "iam",
+			"query": {
+				"Action": "ListUserPolicies",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"differs": "the policy of step 41 was stored",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUserPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUserPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <PolicyNames>\n      <member>inline</member>\n    </PolicyNames>\n  </ListUserPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUserPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "delete the first key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key1}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the first key again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key1}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The Access Key with id ${key1} cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the second key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key2}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "delete carol with an inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must delete policies first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete carol",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"differs": "the policy of step 41 keeps carol",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "delete bob, tagged",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "delete bob again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-bob cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list, none left",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"differs": "the policy of step 41 keeps carol",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListUsersResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListUsersResult>\n    <IsTruncated>false</IsTruncated>\n    <Users/>\n  </ListUsersResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListUsersResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the first key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key1}"
+			},
+			"differs": "carol was kept",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-carol cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the second key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${key2}"
+			},
+			"differs": "carol was kept",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-carol cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "inline"
+			},
+			"differs": "carol was kept",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-carol cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up alice",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-alice cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up carol",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"differs": "carol was kept",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-carol cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up bob",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-bob cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	]
+}

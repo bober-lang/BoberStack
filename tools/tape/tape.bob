@@ -1,0 +1,488 @@
+//! Tapes: what real AWS answered to a scenario's requests, recorded once by ./main.bob and replayed against a Gateway
+//! by a test, which checks that BoberStack answers as AWS did.
+//!
+//! A scenario is a JSON file of steps, which recording rewrites as a tape, the steps with AWS's answers:
+//!
+//! ```json
+//! {
+//! 	"volatile": ["RequestId", "CreateDate", "UserId"],
+//! 	"steps": [
+//! 		{"name": "create", "service": "iam", "capture": {"arn": "User/Arn"},
+//! 			"query": {"Action": "CreateUser", "Version": "2010-05-08", "UserName": "${prefix}-u"}},
+//! 		{"name": "get missing", "service": "iam", "differs": "BoberStack answers 400",
+//! 			"query": {"Action": "GetUser", "Version": "2010-05-08", "UserName": "${prefix}-none"}},
+//! 		{"name": "queue", "service": "sqs", "target": "AmazonSQS.CreateQueue", "until": 200,
+//! 			"json": {"QueueName": "${prefix}-q"}}
+//! 	],
+//! 	"cleanup": [{"name": "delete", "service": "iam",
+//! 		"query": {"Action": "DeleteUser", "Version": "2010-05-08", "UserName": "${prefix}-u"}}]
+//! }
+//! ```
+//!
+//! A step is a request to the service of the signing name `service`: `POST /` unless `method` and `path` say
+//! otherwise, its body the form of the parameters `query` (awsQuery), or the JSON object `json` (awsJson, as
+//! `application/x-amz-json-1.0` unless `contentType` says otherwise), with `target` as X-Amz-Target. `${name}` in a
+//! path or a value is replaced by what name is bound to: `prefix` to `boberstack-ab-` and 8 random hex digits when
+//! recording, which name every resource made, `account` to the account and `region` to us-east-1, and the names that
+//! earlier steps `capture`, each the text at a path of its answer: segments separated by /, each the first element of
+//! XML, or member or index of JSON, of that name below the one before. Recording retries a step `until` its answer
+//! has that status, for what AWS makes eventually consistent, and runs `cleanup` even after a step failed.
+//!
+//! A tape holds nothing of the account: recording makes its id 000000000000, the caller's identity the account's
+//! root, which a replay sends as, the prefix `boberstack-ab-00000000`, a value captured `${name}` wherever it is, and
+//! that of a member named `volatile`, of the tape or the step, its form; and it refuses to write a tape that still
+//! names the account or the caller, or holds a unique id, which encodes the account: capture those, or make them
+//! volatile.
+//!
+//! A replay compares the status, the headers in `headers`, and the body as a tree: of XML elements, or JSON members
+//! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
+//! does not. A captured value is expected where AWS's was, as is a volatile member, of the same form: its runs of
+//! letters, digits and +/= the same in number, between the same other characters, but for a date's fraction of a
+//! second, which BoberStack's have unless it is 0 and AWS's never do. A step with `differs`, the reason
+//! BoberStack answers otherwise, is expected to differ, until it no longer does.
+
+import * as client from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import * as json from "std/encoding/json"
+import { Keys, Mapping, OmitEmpty } from "std/encoding/json"
+import * as xml from "std/encoding/xml"
+import { readFile } from "std/fs"
+import { Request, Response } from "std/http"
+import { CryptoError } from "std/crypto/error"
+import { ParseError, replace, split, trim } from "std/string"
+import { escape } from "std/url"
+
+/// The headers of an answer that a tape holds.
+export const headers = ["content-type", "x-amzn-errortype", "x-amzn-query-error"]
+/// The prefix of the names in a tape, as long as a recording's.
+export const prefix = "boberstack-ab-00000000"
+
+/// An answer as a tape holds it: a JSON body as an object, any other as text.
+export class Answer {
+	status: i32 = 0
+	headers: [string, string][] @Mapping = []
+	body: string @OmitEmpty = ""
+	json: Keys | null @OmitEmpty = null
+}
+
+/// A request, what to bind from its answer, and once recorded what AWS answered.
+export class Step {
+	name = ""
+	/// The signing name of the service.
+	service = ""
+	/// POST and / if "".
+	method: string @OmitEmpty = ""
+	path: string @OmitEmpty = ""
+	target: string @OmitEmpty = ""
+	contentType: string @OmitEmpty = ""
+	/// awsQuery's parameters, or awsJson's object.
+	query: [string, string][] @Mapping @OmitEmpty = []
+	json: Keys | null @OmitEmpty = null
+	/// By name, the path of the text to bind it to.
+	capture: [string, string][] @Mapping @OmitEmpty = []
+	volatile: string[] @OmitEmpty = []
+	/// The status to retry for while recording, 0 for none.
+	until: i32 @OmitEmpty = 0
+	/// Why BoberStack answers otherwise than AWS, "" if it does not.
+	differs: string @OmitEmpty = ""
+	/// What AWS answered, once recorded.
+	response: Answer | null @OmitEmpty = null
+}
+
+/// A scenario, or once recorded a tape.
+export class Tape {
+	/// The members of every answer whose values differ from one run to the next.
+	volatile: string[] @OmitEmpty = []
+	steps: Step[] = []
+	/// Run after the steps, even if one failed while recording.
+	cleanup: Step[] @OmitEmpty = []
+}
+
+/// The tape, or scenario, in the file at path.
+export function load(path: string): Tape throws IoError | ParseError { return json.decode[Tape](readFile(path)) }
+
+/// t as its file holds it.
+export function text(t: Tape): string {
+	try {
+		return json.indent(json.encode(t)) + "\n"
+	} catch (e: json.EncodeError) {
+		return "" // a tape holds no float
+	}
+}
+
+/// The request of s to endpoint, as https://iam.amazonaws.com, with each ${name} replaced by its value in values,
+/// unsigned.
+export function request(s: Step, values: [string, string][], endpoint: string): Request throws ParseError {
+	let body = ""
+	let kind = s.contentType
+	if (s.json != null) {
+		body = fill(objectText(s.json!), values, true)
+		kind = if (kind == "") "application/x-amz-json-1.0" else kind
+	} else if (s.query.length > 0) {
+		body = s.query.map(p => `${escape(p[0], "component")}=${escape(fill(p[1], values, false), "component")}`).join("&")
+		kind = if (kind == "") "application/x-www-form-urlencoded; charset=utf-8" else kind
+	}
+	const path = fill(if (s.path == "") "/" else s.path, values, false)
+	const req = new Request(if (s.method == "") "POST" else s.method, endpoint + path, body)
+	if (kind != "") {
+		req.headers.set("content-type", kind)
+	}
+	if (s.target != "") {
+		req.headers.set("x-amz-target", s.target)
+	}
+	return req
+}
+
+/// The answer that res is, its body body.
+export function answer(res: Response, body: string): Answer {
+	const a = new Answer()
+	a.status = res.status
+	for (const h of headers) {
+		const v = res.headers.get(h)
+		if (v != null) {
+			a.headers.push([h, v])
+		}
+	}
+	if (trim(body).slice(0, 1) == "{") {
+		try {
+			a.json = json.decode[Keys](body)
+			return a
+		} catch (e: ParseError) {}
+	}
+	a.body = body
+	return a
+}
+
+/// The text of a's body.
+export function bodyOf(a: Answer): string { return if (a.json != null) objectText(a.json!) else a.body }
+
+/// The text at path in the body, null if there is none.
+export function find(body: string, path: string): string | null throws ParseError {
+	let t: Tree | null = tree(body)
+	for (const name of split(path, "/")) {
+		t = below(t!, name)
+		if (t == null) {
+			return null
+		}
+	}
+	return if (t!.leaf) t!.text else null
+}
+
+/// The texts of the members named one of names in body, those of 8 characters or more.
+export function volatiles(body: string, names: string[]): string[] throws ParseError {
+	const out: string[] = []
+	collect(tree(body), names, out)
+	return out
+}
+
+/// What differs between the answers of g to the tape at path, its steps then its cleanup, and those it holds: a line
+/// for each difference, naming the step, the path in the body and both values. g is sent requests as the root of
+/// 000000000000.
+export function replay(path: string, g: Gateway): string[] {
+	let t = new Tape()
+	try {
+		t = load(path)
+	} catch (e: IoError | ParseError) {
+		return [`${path}: ${e}`]
+	}
+	const values: [string, string][] = [["prefix", prefix], ["account", "000000000000"], ["region", "us-east-1"]]
+	const out: string[] = []
+	const steps = t.steps.slice(0, t.steps.length)
+	steps.append(t.cleanup)
+	for (let i = 0; i < steps.length; i++) {
+		const s = steps[i]
+		const name = `step ${i + 1} (${s.name})`
+		let lines: string[] = []
+		try {
+			lines = check(s, send(s, values, g), t.volatile, values)
+		} catch (e: IoError | ParseError | CryptoError) {
+			lines = [`${e}`]
+		}
+		if (s.differs == "") {
+			out.append(lines.map(l => `${name}: ${l}`))
+		} else if (lines.length == 0) {
+			out.push(`${name}: answers as AWS did, though marked as differing: ${s.differs}`)
+		}
+	}
+	return out
+}
+
+/// The answer of g to s, its ${name}s replaced by values, from the root of 000000000000.
+function send(s: Step, values: [string, string][], g: Gateway): Response throws IoError | ParseError | CryptoError {
+	const req = request(s, values, "http://localhost:4566")
+	client.sign(req, req.body.whole ?? "", s.service, "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// How res differs from the answer s holds, whose captures it binds in values.
+function check(s: Step, res: Response, volatile: string[],
+	values: [string, string][]): string[] throws IoError | ParseError {
+	const want = s.response ?? new Answer()
+	const body = res.body.text()
+	const out: string[] = []
+	if (res.status != want.status) {
+		out.push(`status: expected ${want.status}, got ${res.status}`)
+	}
+	for (const h of headers) {
+		const w = lookup(want.headers, h)
+		const v = res.headers.get(h)
+		if (w != v) {
+			out.push(`header ${h}: expected ${show(w)}, got ${show(v)}`)
+		}
+	}
+	for (const [name, path] of s.capture) {
+		const v = find(body, path)
+		if (v == null) {
+			out.push(`${path}: nothing to capture as ${name}`)
+		} else {
+			bind(values, name, v!)
+		}
+	}
+	const names = volatile.slice(0, volatile.length)
+	names.append(s.volatile)
+	compare(tree(bodyOf(want)), tree(body), "", names, values, out)
+	return out
+}
+
+/// The value of name in pairs, null if none.
+function lookup(pairs: [string, string][], name: string): string | null {
+	for (const [k, v] of pairs) {
+		if (k == name) {
+			return v
+		}
+	}
+	return null
+}
+
+/// Sets name to v in values.
+export function bind(values: [string, string][], name: string, v: string) {
+	for (const e of values) {
+		if (e[0] == name) {
+			e[1] = v
+			return
+		}
+	}
+	values.push([name, v])
+}
+
+/// s with each ${name} replaced by its value in values, escaped for a JSON string if quoted.
+function fill(s: string, values: [string, string][], quoted: bool): string {
+	let out = s
+	for (const [name, v] of values) {
+		const q = json.quoted(v)
+		out = replace(out, "${" + name + "}", if (quoted) q.slice(1, q.length - 1) else v)
+	}
+	return out
+}
+
+/// The JSON object k holds.
+function objectText(k: Keys): string {
+	try {
+		return json.encode(k)
+	} catch (e: json.EncodeError) {
+		return "{}" // the text of JSON is finite
+	}
+}
+
+/// A body as compared: an XML element or a JSON value, named by its element, member or index; a leaf has a text.
+class Tree {
+	name: string
+	text = ""
+	leaf = true
+	children: Tree[] = []
+
+	constructor(name: string) { this.name = name }
+}
+
+/// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
+type Item = i64 | f64 | string | bool | Keys | null | (i64 | f64 | string | bool | Keys | null)[]
+
+/// The tree of body: XML, JSON, or else a leaf of its text.
+function tree(body: string): Tree throws ParseError {
+	const first = trim(body).slice(0, 1)
+	if (first == "<") {
+		return element(xml.parse(body), "")
+	}
+	if (first == "{" || first == "[") {
+		return value(body, "")
+	}
+	const t = new Tree("")
+	t.text = body
+	return t
+}
+
+/// The tree of the XML node n, named name: its attributes as leaves named @name, then its elements; or if it has
+/// neither a leaf of its text, trimmed.
+function element(n: xml.Node, name: string): Tree {
+	const t = new Tree(name)
+	for (const a of n.attrs) {
+		const l = new Tree(`@${a.name}`)
+		l.text = a.value
+		t.children.push(l)
+	}
+	const elements = n.children.filter(c => c.kind == "element")
+	for (const e of elements) {
+		t.children.push(element(e, e.name))
+	}
+	if (t.children.length == 0) {
+		t.text = trim(n.text())
+	} else {
+		t.leaf = false
+		if (elements.length == 0) {
+			const l = new Tree("#text")
+			l.text = trim(n.text())
+			t.children.push(l)
+		}
+	}
+	return t
+}
+
+/// The tree of the JSON s, named name: an object's members and an array's items by index; a string's leaf its value,
+/// any other scalar's its JSON.
+function value(s: string, name: string): Tree throws ParseError {
+	const t = new Tree(name)
+	const first = trim(s).slice(0, 1)
+	if (first == "{") {
+		t.leaf = false
+		for (const [k, v] of json.decode[Keys](s).all) {
+			t.children.push(value(v, k))
+		}
+	} else if (first == "[") {
+		t.leaf = false
+		const items = json.decode[Item[]](s)
+		for (let i = 0; i < items.length; i++) {
+			let item = "null"
+			try {
+				item = json.encode(items[i])
+			} catch (e: json.EncodeError) {} // a float of JSON is finite
+			t.children.push(value(item, `${i}`))
+		}
+	} else if (first == "\"") {
+		t.text = json.decode[string](s)
+	} else {
+		t.text = trim(s)
+	}
+	return t
+}
+
+/// The first of t's descendants named name, depth first, null if none.
+function below(t: Tree, name: string): Tree | null {
+	for (const c of t.children) {
+		if (c.name == name) {
+			return c
+		}
+		const d = below(c, name)
+		if (d != null) {
+			return d
+		}
+	}
+	return null
+}
+
+/// Adds to out the texts of 8 characters or more of the leaves below t named one of names.
+function collect(t: Tree, names: string[], out: string[]): void {
+	for (const c of t.children) {
+		if (c.leaf && names.includes(c.name) && c.text.length >= 8) {
+			out.push(c.text)
+		}
+		collect(c, names, out)
+	}
+}
+
+/// Adds to out how a, at path, differs from e, AWS's, whose ${name}s are as values has them, and whose members named
+/// one of volatile need only be of the same form.
+function compare(e: Tree, a: Tree, path: string, volatile: string[], values: [string, string][], out: string[]): void {
+	const at = if (path == "") "body" else path
+	const want = fill(e.text, values, false)
+	if (volatile.includes(e.name) && e.leaf && a.leaf) {
+		if (whole(form(want)) != whole(form(a.text))) {
+			out.push(`${at}: expected the form of ${show(want)}, got ${show(a.text)}`)
+		}
+		return
+	}
+	if (e.leaf || a.leaf) {
+		if (e.leaf && a.leaf && want != a.text) {
+			out.push(`${at}: ${contrast(want, a.text)}`)
+		} else if (!e.leaf || !a.leaf) {
+			out.push(`${at}: expected ${if (e.leaf) show(want) else outline(e)}, got ${if (a.leaf) show(a.text) else outline(a)}`)
+		}
+		return
+	}
+	const seen: [string, i32][] = []
+	for (const c of e.children) {
+		const n = count(seen, c.name)
+		const ds = a.children.filter(x => x.name == c.name)
+		const p = `${path}/${c.name}${if (ds.length > 1 || named(e, c.name) > 1) `[${n + 1}]` else ""}`
+		if (n >= ds.length) {
+			out.push(`${p}: expected ${if (c.leaf) show(c.text) else outline(c)}, got nothing`)
+		} else {
+			compare(c, ds[n], p, volatile, values, out)
+		}
+	}
+	const extra: [string, i32][] = []
+	for (const d of a.children) {
+		const n = count(extra, d.name)
+		if (n >= named(e, d.name)) {
+			const p = `${path}/${d.name}${if (named(a, d.name) > 1) `[${n + 1}]` else ""}`
+			out.push(`${p}: expected nothing, got ${if (d.leaf) show(d.text) else outline(d)}`)
+		}
+	}
+}
+
+/// How many of name seen counts, which it counts once more.
+function count(seen: [string, i32][], name: string): i32 {
+	for (const e of seen) {
+		if (e[0] == name) {
+			e[1]++
+			return e[1] - 1
+		}
+	}
+	seen.push([name, 1])
+	return 0
+}
+
+/// How many of t's children are named name.
+function named(t: Tree, name: string): i32 { return t.children.filter(c => c.name == name).length }
+
+/// The form of v: each run of letters, digits and +/= an x.
+export function form(v: string): string {
+	const out: u8[] = []
+	for (let i = 0; i < v.length; i++) {
+		if (!formed(v[i])) {
+			out.push(v[i])
+		} else if (i == 0 || !formed(v[i - 1])) {
+			out.push(120)
+		}
+	}
+	return fromBytes(out)
+}
+
+/// The form f of a date without its fraction of a second, which BoberStack's have when not 0 and AWS's do not.
+function whole(f: string): string { return replace(f, ":x.x", ":x") }
+
+/// Whether c is a letter, digit or +/=.
+function formed(c: u8): bool {
+	return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 43 || c == 47 || c == 61
+}
+
+/// "expected want, got v", of texts that differ; of long ones, from 20 characters before the first that differs and
+/// up to 100 on.
+function contrast(want: string, v: string): string {
+	let i = 0
+	while (i < want.length && i < v.length && want[i] == v[i]) {
+		i++
+	}
+	if (want.length <= 100 && v.length <= 100) {
+		return `expected ${show(want)}, got ${show(v)}`
+	}
+	const from = if (i > 20) i - 20 else 0
+	const cut = (s: string) => (if (from > 0) "…" else "")
+		+ show(s.slice(from, if (from + 100 < s.length) from + 100 else s.length))
+		+ (if (from + 100 < s.length) "…" else "")
+	return `expected ${cut(want)}, got ${cut(v)}`
+}
+
+/// v quoted, or none.
+function show(v: string | null): string { return if (v == null) "none" else json.quoted(v!) }
+/// The names of t's children, in braces.
+function outline(t: Tree): string { return `{${t.children.map(c => c.name).join(", ")}}` }
