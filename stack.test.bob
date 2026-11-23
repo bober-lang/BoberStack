@@ -952,9 +952,14 @@ test "S3 puts its object events on the default bus, without a policy; DeleteObje
 	g.close()
 }
 
-/// The answer of g to the operation op of Kinesis or CloudWatch Logs, of JSON 1.1, with body, signed by the root.
+/// The answer of g to the operation op of Kinesis, Firehose or CloudWatch Logs, of JSON 1.1, with body, signed by the
+/// root.
 function json11Of(g: Gateway, service: string, op: string, body: string): Response {
-	const target = if (service == "kinesis") "Kinesis_20131202" else "Logs_20140328"
+	const target = switch (service) {
+		case "kinesis": "Kinesis_20131202"
+		case "firehose": "Firehose_20150804"
+		default: "Logs_20140328"
+	}
 	const req = new Request("POST", "http://localhost:4566/", body)
 	req.headers.set("content-type", "application/x-amz-json-1.1")
 	req.headers.set("x-amz-target", `${target}.${op}`)
@@ -1103,5 +1108,78 @@ test "DynamoDB puts each item write's change record on its Kinesis streaming des
 		+ `"tableName":"tab","eventSource":"aws:dynamodb"}`) > 0
 	assert indexOf(got[1], `"Keys":{"k":{"S":"a"}},"OldImage":{"k":{"S":"a"},"v":{"N":"1"}}`) > 0
 	assert indexOf(got[1], `"eventName":"REMOVE"`) > 0
+	g.close()
+}
+
+/// The keys and contents of the objects of the bucket b, in the keys' order.
+function objects(g: Gateway, b: string): [string, string][] {
+	const body = s3(g, "GET", `/${b}?list-type=2`).body.whole ?? ""
+	const out: [string, string][] = []
+	let at = indexOf(body, "<Key>")
+	while (at >= 0) {
+		const to = indexOf(body, "</Key>", at)
+		const key = body.slice(at + 5, to)
+		out.push([key, s3(g, "GET", `/${b}/${key}`).body.whole ?? ""])
+		at = indexOf(body, "<Key>", to)
+	}
+	return out
+}
+
+test "Firehose writes each put as one S3 object as its role, from Logs, EventBridge and SNS too" {
+	const g = gateway()
+	assert s3(g, "PUT", "/bkt").status == 200
+	role(g, "write", "firehose.amazonaws.com", policy([statement("Allow", `"s3:PutObject"`, "arn:aws:s3:::bkt/*")]))
+	role(g, "none", "firehose.amazonaws.com")
+	for (const [name, r] of [["s", "write"], ["d", "none"]]) {
+		assert json11Of(g, "firehose", "CreateDeliveryStream",
+			`{"DeliveryStreamName":"${name}","ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::bkt",`
+			+ `"RoleARN":"arn:aws:iam::000000000000:role/${r}","Prefix":"in/"}}`).status == 200
+	}
+	assert json11Of(g, "firehose", "PutRecord", `{"DeliveryStreamName":"d","Record":{"Data":"YWI="}}`).status == 200
+	assert objects(g, "bkt").length == 0
+	const res = json11Of(g, "firehose", "PutRecordBatch",
+		`{"DeliveryStreamName":"s","Records":[{"Data":"YWI="},{"Data":"Y2Q="}]}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"FailedPutCount":0`) >= 0
+	let got = objects(g, "bkt")
+	assert got.length == 1 && startsWith(got[0][0], "in/") && indexOf(got[0][0], "/s-1-") == 16 && got[0][1] == "abcd"
+	const stream = "arn:aws:firehose:us-east-1:000000000000:deliverystream/s"
+	role(g, "toFirehose", "logs.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	assert json11Of(g, "logs", "PutSubscriptionFilter",
+		`{"logGroupName":"/g","filterName":"f","filterPattern":"","destinationArn":"${stream}",`
+		+ `"roleArn":"arn:aws:iam::000000000000:role/toFirehose"}`).status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":[{"timestamp":${t},"message":"one"}]}`).status == 200
+	got = objects(g, "bkt")
+	assert got.length == 3
+	let control = false
+	for (const [_, body] of got) {
+		try {
+			control = control
+				|| indexOf(gunzip(body), "CWL CONTROL MESSAGE: Checking health of destination Firehose.") > 0
+		} catch (e: ParseError) {}
+	}
+	assert control
+	role(g, "put", "events.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert fails(call(g, "events", "PutTargets", `{"Rule":"r","Targets":[{"Id":"f","Arn":"${stream}"}]}`), 400,
+		"ValidationException", "Parameter(s) RoleArn must be specified for target: f.")
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"f","Arn":"${stream}",`
+		+ `"RoleArn":"arn:aws:iam::000000000000:role/put"}]}`).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	role(g, "sns", "sns.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	topic(g, "t")
+	assert query(g, "sns",
+		[["Action", "Subscribe"], ["TopicArn", topicArn("t")], ["Protocol", "firehose"], ["Endpoint", stream],
+		["Attributes.entry.1.key", "SubscriptionRoleArn"],
+		["Attributes.entry.1.value", "arn:aws:iam::000000000000:role/sns"]]).status == 200
+	assert publish(g, topicArn("t"), "hello").status == 200
+	got = objects(g, "bkt")
+	assert got.length == 5
+	assert got.some(o => indexOf(o[1], `"source":"app"`) > 0)
+	assert got.some(o => indexOf(o[1], `"Type":"Notification"`) > 0 && indexOf(o[1], `"Message":"hello"`) > 0)
 	g.close()
 }

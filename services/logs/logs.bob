@@ -4,12 +4,12 @@
 //! differs:
 //!
 //! - Nothing runs between requests: retention hides events older than it at each request, and a metric filter
-//!   publishes no metric. A subscription filter to a Kinesis stream is tried with AWS's control message when put, and
-//!   sent the events of each PutLogEvents it matches within that request, gzipped as AWS sends them, by calling the
-//!   Kinesis handler directly as a session of the filter's role, whose trust policy is not consulted; one the stream
-//!   refuses is dropped, never retried, and the record's partition key is the request's id. A filter's events carry no
-//!   extractedFields. There is no Lambda, Firehose or destination to deliver to: a filter to one is refused, as AWS
-//!   refuses one that cannot be reached.
+//!   publishes no metric. A subscription filter to a Kinesis or Firehose stream is tried with AWS's control message
+//!   when put, and sent the events of each PutLogEvents it matches within that request, gzipped as AWS sends them, by
+//!   calling the Kinesis or Firehose handler directly as a session of the filter's role, whose trust policy is not
+//!   consulted; one the stream refuses is dropped, never retried, and a Kinesis record's partition key is the request's
+//!   id. A filter's events carry no extractedFields. There is no Lambda or destination to deliver to: a filter to one
+//!   is refused, as AWS refuses one that cannot be reached.
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
 
@@ -19,6 +19,7 @@ import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { match, parse } from "./pattern"
 import { list, member } from "../events/pattern"
+import * as firehoseApi from "../firehose/api"
 import * as kinesisApi from "../kinesis/api"
 
 import { events, Event, Group, groups, MetricFilter, metricFilters, policies, Policy, save, Sequence, sequence, Stream,
@@ -52,10 +53,25 @@ export class Handler {
 
 	/// What subscription filters deliver to, which the stack sets.
 	kinesis: kinesisApi.Kinesis | null = null
+	firehose: firehoseApi.Firehose | null = null
 
-	/// Puts data gzipped on the Kinesis stream of the ARN stream, as CloudWatch Logs under the role of the ARN role on
-	/// behalf of the log group of the ARN source: whether the stream took it.
+	/// Puts data gzipped on the Kinesis stream or Firehose delivery stream of the ARN stream, as CloudWatch Logs under
+	/// the role of the ARN role on behalf of the log group of the ARN source: whether the stream took it.
 	private send(caller: Caller, stream: string, role: string, source: string, data: string): bool {
+		if (startsWith(stream, "arn:aws:firehose:")) {
+			if (this.firehose == null) {
+				return false
+			}
+			const p = new firehoseApi.PutRecordInput()
+			p.DeliveryStreamName = stream.slice(indexOf(stream, "/") + 1, stream.length)
+			p.Record.Data = gzip(data)
+			try {
+				this.firehose!.putRecord(assumed(caller, role, source, ["firehose:PutRecord"]), p)
+			} catch (f: Fault) {
+				return false
+			}
+			return true
+		}
 		if (this.kinesis == null) {
 			return false
 		}
@@ -556,8 +572,9 @@ export class Handler {
 		}
 		const control = `{"messageType":"CONTROL_MESSAGE","owner":"CloudwatchLogs","logGroup":"","logStream":"",`
 			+ `"subscriptionFilters":[],"logEvents":[{"id":"","timestamp":${ms()},`
-			+ `"message":"CWL CONTROL MESSAGE: Checking health of destination Kinesis stream."}]}`
-		if (vendor == "firehose" || !this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
+			+ `"message":"CWL CONTROL MESSAGE: Checking health of destination `
+			+ (if (vendor == "kinesis") "Kinesis stream" else "Firehose") + `."}]}`
+		if (!this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
 			const named = if (vendor == "kinesis") "Kinesis" else "Firehose"
 			throw invalid(`Could not deliver test message to specified ${named} stream. Check if the given ${named} `
 				+ "stream is in ACTIVE state.")

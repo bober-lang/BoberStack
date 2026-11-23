@@ -2,9 +2,12 @@
 //! publishing to them, which delivers to the Amazon SQS queues subscribed by a call of the SQS service within the
 //! publishing request, as SNS's principal on behalf of the topic. Known differences from AWS:
 //!
-//! - Only sqs subscriptions are delivered to. Those of http, https, email and email-json are kept pending
-//!   confirmation, as AWS keeps them until the endpoint confirms, but no confirmation request is sent, so their token
-//!   is never told; those of sms, lambda, firehose and application are confirmed at once and never delivered to.
+//! - Only sqs and firehose subscriptions are delivered to, a firehose one by a call of the Firehose service as a
+//!   session of its SubscriptionRoleArn, whose trust policy is not consulted, the notification as an SQS queue gets
+//!   it, signature and all; a record the delivery stream refuses is dropped. Those of http, https, email and
+//!   email-json are kept pending confirmation, as AWS keeps them until the endpoint confirms, but no confirmation
+//!   request is sent, so their token is never told; those of sms, lambda and application are confirmed at once and
+//!   never delivered to.
 //! - A message is delivered once, within the publish: no retries, delays or delivery policies. One that a queue
 //!   refuses, as one that does not exist or whose policy denies SNS, goes to the subscription's dead-letter queue if
 //!   it has one, else is dropped, without the attributes AWS adds to it there.
@@ -20,6 +23,7 @@ import { secret } from "../../core/auth/credentials"
 import { Fault } from "../../core/fault"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
+import * as firehoseApi from "../firehose/api"
 import { decryptAs, encryptAs } from "../kms/kms"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
@@ -44,6 +48,8 @@ export class Handler {
 
 	/// What delivers to the queues subscribed.
 	sqs: sqsApi.SQS
+	/// What delivers to the Firehose delivery streams subscribed, which the stack sets.
+	firehose: firehoseApi.Firehose | null = null
 
 	constructor(sqs: sqsApi.SQS) { this.sqs = sqs }
 
@@ -334,8 +340,7 @@ export class Handler {
 	}
 
 	setSubscriptionAttributes(caller: Caller, input: api.SetSubscriptionAttributesInput): Unit throws Fault {
-		// iam:PassRole is authorized of a SubscriptionRoleArn, which only firehose subscriptions, never delivered to,
-		// take.
+		// iam:PassRole is not authorized of a SubscriptionRoleArn, which only firehose subscriptions take.
 		caller.actions = ["sns:SetSubscriptionAttributes"]
 		const [p, s] = subscription(caller, input.SubscriptionArn)
 		const name = input.AttributeName
@@ -466,7 +471,7 @@ export class Handler {
 			save(p.db.published, key, { ...new Published(), id: id, sequence: seq!, at: now() })
 		}
 		for (const [_, s] of subscriptions(p.db, t.name)) {
-			if (s.confirmed && s.protocol == "sqs") {
+			if (s.confirmed && (s.protocol == "sqs" || s.protocol == "firehose")) {
 				this.deliver(caller, p, t, s, m, id, seq)
 			}
 		}
@@ -500,9 +505,22 @@ export class Handler {
 		if (!passes(s, m, payload)) {
 			return
 		}
+		const raw = attribute(s.attributes, "RawMessageDelivery") == "true"
+		if (s.protocol == "firehose") {
+			if (this.firehose != null) {
+				const r = new firehoseApi.PutRecordInput()
+				r.DeliveryStreamName = s.endpoint.slice(indexOf(s.endpoint, "/") + 1, s.endpoint.length)
+				r.Record.Data = if (raw) payload else envelope(caller, p, t, s, m, payload, id, seq)
+				try {
+					this.firehose!.putRecord(assumed(caller, attribute(s.attributes, "SubscriptionRoleArn") ?? "",
+						p.arn), r)
+				} catch (f: Fault) {} // dropped
+			}
+			return
+		}
 		const input = new sqsApi.SendMessageRequest()
 		input.QueueUrl = queueUrl(caller, s.endpoint)
-		if (attribute(s.attributes, "RawMessageDelivery") == "true") {
+		if (raw) {
 			input.MessageBody = payload
 			input.MessageAttributes = if (m.attributes.length == 0) null
 				else m.attributes.map(a => [a[0],
@@ -1022,6 +1040,21 @@ function attributesDoc(m: Message): string {
 
 /// The notification of m, whose message to s is payload, of id and sequence number seq, published to t at p, as SNS
 /// delivers it to a queue: a JSON object of AWS's members in AWS's order, unsigned on a FIFO topic.
+/// The caller that SNS is in a session of the role of the ARN role, on behalf of the topic of the ARN source, to put a
+/// record on a delivery stream; the role's trust policy is not consulted.
+function assumed(caller: Caller, role: string, source: string): Caller {
+	const c = caller.internal("sns.amazonaws.com", source, ["firehose:PutRecord"])
+	const p = split(role, ":")
+	const path = split(p[p.length - 1], "/")
+	if (p.length == 6) {
+		c.account = p[4]
+	}
+	c.arn = `arn:aws:sts::${c.account}:assumed-role/${path[path.length - 1]}/${caller.requestId}`
+	c.userId = c.arn
+	c.source = ""
+	return c
+}
+
 function envelope(caller: Caller, p: Place, t: Topic, s: Subscription, m: Message, payload: string, id: string,
 	seq: string | null): string throws Fault {
 	const members: [string, string][] = [["Type", "Notification"], ["MessageId", id]]

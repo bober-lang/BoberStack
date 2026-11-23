@@ -3,7 +3,7 @@
 //! and delivers it, as its targets' Input, InputPath or InputTransformer make it, within the request, by calling the
 //! other services' handlers directly: to an SQS queue or SNS topic as their policies allow EventBridge; to a Kinesis
 //! stream as a session of the target's role, which it must have, keyed by its PartitionKeyPath or the event's id; to a
-//! CloudWatch Logs log group, in a stream named by the event's id, as the account's resource policies allow
+//! Firehose delivery stream as a session of the target's role, which it must have; to a CloudWatch Logs log group, in a stream named by the event's id, as the account's resource policies allow
 //! EventBridge; or to another bus of the account and region, as its policy allows EventBridge or the target's role
 //! allows events:PutEvents, whose rules it is matched against in turn, a bus it has passed through not again. The
 //! events of AWS's own services, as S3's, are put on the default bus by emit, unauthorized. Where AWS differs:
@@ -26,6 +26,7 @@ import { result } from "../../core/protocol/json"
 import * as json from "../../core/protocol/json"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
+import * as firehoseApi from "../firehose/api"
 import * as kinesisApi from "../kinesis/api"
 import * as logsApi from "../logs/api"
 import * as snsApi from "../sns/api"
@@ -52,6 +53,7 @@ export class Handler {
 	sqs: sqsApi.SQS
 	sns: snsApi.SNS
 	kinesis: kinesisApi.Kinesis | null = null
+	firehose: firehoseApi.Firehose | null = null
 	logs: logsApi.CloudWatchLogs | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS) {
@@ -551,6 +553,11 @@ export class Handler {
 				const key = if (path == null) null else pick(event, path!)
 				m.PartitionKey = if (key == null) idOf(event) else str(key!) ?? key!
 				this.kinesis!.putRecord(assumed(caller, t.RoleArn ?? "", source, ["kinesis:PutRecord"]), m)
+			} else if (service == "firehose" && this.firehose != null) {
+				const m = new firehoseApi.PutRecordInput()
+				m.DeliveryStreamName = resource.slice(indexOf(resource, "/") + 1, resource.length)
+				m.Record.Data = body
+				this.firehose!.putRecord(assumed(caller, t.RoleArn ?? "", source, ["firehose:PutRecord"]), m)
 			} else if (service == "logs" && this.logs != null) {
 				this.log(caller, source, resource, body, idOf(event))
 			} else {
@@ -752,7 +759,7 @@ function checkTarget(t: api.Target) throws Fault {
 	if (service == "sqs" && endsWith(resource, ".fifo") && t.SqsParameters?.MessageGroupId == null) {
 		throw validation(`Parameter(s) SqsParameters must be specified for target: ${t.Id}.`)
 	}
-	if (service == "kinesis" && t.RoleArn == null) {
+	if ((service == "kinesis" || service == "firehose") && t.RoleArn == null) {
 		throw validation(`Parameter(s) RoleArn must be specified for target: ${t.Id}.`)
 	}
 }

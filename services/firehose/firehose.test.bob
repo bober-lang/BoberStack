@@ -1,0 +1,86 @@
+import { sign } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import * as api from "./api"
+import { Handler } from "./firehose"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+/// The answer of g to the operation op with the JSON input body, from the root of 000000000000.
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `Firehose_20150804.${op}`)
+	sign(req, body, "firehose", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function has(res: Response, text: string): bool { return indexOf(res.body.whole ?? "", text) >= 0 }
+
+function fails(res: Response, code: string, message: string): bool {
+	return res.status == 400 && has(res, `"__type":"${code}"`) && has(res, `"message":"${message}"`)
+}
+
+const destination = `"S3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+	+ `"RoleARN":"arn:aws:iam::000000000000:role/r"}`
+
+test "a delivery stream is ACTIVE at once, described as both an S3 and an extended S3 destination" {
+	const g = gateway()
+	const res = call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`)
+	assert res.status == 200
+		&& has(res, `"DeliveryStreamARN":"arn:aws:firehose:us-east-1:000000000000:deliverystream/s"`)
+	assert fails(call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`), "ResourceInUseException",
+		"Firehose s under accountId 000000000000 already exists")
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"s"}`)
+	assert has(d, `"DeliveryStreamStatus":"ACTIVE"`) && has(d, `"VersionId":"1"`)
+		&& has(d, `"DestinationId":"destinationId-000000000001"`) && has(d, `"ExtendedS3DestinationDescription":{`)
+		&& has(d, `"BufferingHints":{"SizeInMBs":5,"IntervalInSeconds":300}`)
+		&& has(d, `"EncryptionConfiguration":{"NoEncryptionConfig":"NoEncryption"}`)
+		&& has(d, `"DeliveryStreamEncryptionConfiguration":{"Status":"DISABLED"}`)
+	assert fails(call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"x"}`), "ResourceNotFoundException",
+		"Firehose x under account 000000000000 not found.")
+	assert has(call(g, "ListDeliveryStreams", "{}"), `"DeliveryStreamNames":["s"],"HasMoreDeliveryStreams":false`)
+	g.close()
+}
+
+test "UpdateDestination needs the current version, and takes the next" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`).status == 200
+	const update = (v: string) => call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"s",`
+		+ `"CurrentDeliveryStreamVersionId":"${v}","DestinationId":"destinationId-000000000001",`
+		+ `"S3DestinationUpdate":{"Prefix":"p/"}}`)
+	assert fails(update("2"), "ConcurrentModificationException",
+		"Cannot update firehose: s since the current version id: 1 and specified version id: 2 do not match")
+	assert update("1").status == 200
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"s"}`)
+	assert has(d, `"VersionId":"2"`) && has(d, `"Prefix":"p/"`) && has(d, `"LastUpdateTimestamp":`)
+	g.close()
+}
+
+test "tags, encryption, and a Kinesis-sourced stream refusing records" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream", `{"DeliveryStreamName":"s",${destination}}`).status == 200
+	assert call(g, "TagDeliveryStream", `{"DeliveryStreamName":"s","Tags":[{"Key":"a","Value":"1"}]}`).status == 200
+	assert has(call(g, "ListTagsForDeliveryStream", `{"DeliveryStreamName":"s"}`),
+		`"Tags":[{"Key":"a","Value":"1"}],"HasMoreTags":false`)
+	assert call(g, "UntagDeliveryStream", `{"DeliveryStreamName":"s","TagKeys":["a"]}`).status == 200
+	assert call(g, "StartDeliveryStreamEncryption", `{"DeliveryStreamName":"s"}`).status == 200
+	assert has(call(g, "PutRecord", `{"DeliveryStreamName":"s","Record":{"Data":"YQ=="}}`), `"Encrypted":true`)
+	assert call(g, "StopDeliveryStreamEncryption", `{"DeliveryStreamName":"s"}`).status == 200
+	assert call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"k","DeliveryStreamType":"KinesisStreamAsSource",`
+		+ `"KinesisStreamSourceConfiguration":{"KinesisStreamARN":"arn:aws:kinesis:us-east-1:000000000000:stream/s",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r"},${destination}}`).status == 200
+	assert fails(call(g, "PutRecord", `{"DeliveryStreamName":"k","Record":{"Data":"YQ=="}}`),
+		"InvalidArgumentException", "This operation is not permitted on KinesisStreamAsSource delivery stream type.")
+	assert call(g, "DeleteDeliveryStream", `{"DeliveryStreamName":"k"}`).status == 200
+	assert has(call(g, "ListDeliveryStreams", "{}"), `"DeliveryStreamNames":["s"]`)
+	g.close()
+}

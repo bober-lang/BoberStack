@@ -1,0 +1,58 @@
+//! Firehose's state in an account's regional tree: its delivery streams by name.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+
+export class Stream {
+	name = ""
+	/// DirectPut or KinesisStreamAsSource.
+	kind = "DirectPut"
+	/// In ns, as are all times here; updated is null until a change after its creation.
+	created: i64 = 0
+	updated: i64 | null = null
+	/// Its configuration's version, which each change to a destination takes the next of.
+	version = 1
+	tags: [string, string][] = []
+	/// The Kinesis stream it reads, and the role it reads as, of a KinesisStreamAsSource; "" of a DirectPut.
+	source = ""
+	sourceRole = ""
+	/// Its server-side encryption, DISABLED or ENABLED, and the key's type and ARN.
+	encryption = "DISABLED"
+	keyType: string | null = null
+	keyArn: string | null = null
+	destinations: Destination[] = []
+}
+
+/// An S3 destination, as an extended one is, which the other kinds of destination's configurations describe too.
+export class Destination {
+	id = ""
+	role = ""
+	bucket = ""
+	prefix: string | null = null
+	errorPrefix: string | null = null
+	/// The buffer's size in MiB and its interval in seconds.
+	size = 5
+	interval = 300
+	compression = "UNCOMPRESSED"
+	/// The KMS key the objects are encrypted by, null for none.
+	key: string | null = null
+	logging = false
+	logGroup: string | null = null
+	logStream: string | null = null
+	/// Of an extended one: whether a backup is made, the objects' extension and time zone.
+	backup = "Disabled"
+	extension: string | null = null
+	zone: string | null = null
+}
+
+export function streams(s: Store): Table[Stream] { return new Table[Stream](s, "firehose/streams") }
+
+/// Puts s in t; a record holds no float, so JSON encodes it.
+export function save(t: Table[Stream], s: Stream) throws Fault {
+	try {
+		t.put(s.name, s)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}
