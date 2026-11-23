@@ -1,0 +1,105 @@
+import { sign } from "../../core/auth/sigv4"
+import { Gateway } from "../../core/gateway"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+const role = "arn:aws:iam::000000000000:role/r"
+const target = `"Target":{"Arn":"arn:aws:sqs:us-east-1:000000000000:q","RoleArn":"${role}"}`
+const off = `"FlexibleTimeWindow":{"Mode":"OFF"}`
+
+function call(g: Gateway, method: string, path: string, body: string = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	if (body != "") {
+		req.headers.set("content-type", "application/json")
+	}
+	sign(req, body, "scheduler", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function iam(g: Gateway, params: [string, string][]): Response {
+	const body = "Version=2010-05-08"
+		+ params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, "iam", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function is(res: Response, status: i32, ...parts: string[]): bool {
+	const b = res.body.whole ?? ""
+	const fine = res.status == status && parts.every(p => indexOf(b, p) >= 0)
+	if (!fine) {
+		print(`${res.status} ${b}`)
+	}
+	return fine
+}
+
+function world(principal: string = "scheduler.amazonaws.com"): Gateway {
+	const g = stack(new Catalog(""))
+	const trust = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"${principal}"},`
+		+ `"Action":"sts:AssumeRole"}]}`
+	assert iam(g, [["Action", "CreateRole"], ["RoleName", "r"], ["AssumeRolePolicyDocument", trust]]).status == 200
+	return g
+}
+
+test "a schedule is created in the default group, described, replaced whole, listed and deleted" {
+	const g = world()
+	const made = call(g, "POST", "/schedules/s",
+		`{"ScheduleExpression":"rate(5 minutes)","Description":"d","ClientToken":"t",${target},${off}}`)
+	assert is(made, 200, `"ScheduleArn":"arn:aws:scheduler:us-east-1:000000000000:schedule/default/s"`)
+	assert is(call(g, "POST", "/schedules/s",
+		`{"ScheduleExpression":"rate(5 minutes)","ClientToken":"t",${target},${off}}`), 200, `schedule/default/s`)
+	assert is(call(g, "POST", "/schedules/s", `{"ScheduleExpression":"rate(5 minutes)",${target},${off}}`), 409,
+		"Schedule s already exists.")
+	assert is(call(g, "GET", "/schedules/s"), 200, `"GroupName":"default"`, `"Description":"d"`, `"State":"ENABLED"`,
+		`"ActionAfterCompletion":"NONE"`)
+	assert is(call(g, "PUT", "/schedules/s",
+		`{"ScheduleExpression":"at(2030-01-01T00:00:00)","State":"DISABLED",` + `${target},${off}}`), 200)
+	const got = call(g, "GET", "/schedules/s")
+	assert is(got, 200, `"ScheduleExpression":"at(2030-01-01T00:00:00)"`, `"State":"DISABLED"`)
+	assert indexOf(got.body.whole ?? "", `"Description"`) < 0
+	assert is(call(g, "GET", "/schedules?State=DISABLED"), 200, `"Name":"s"`)
+	assert is(call(g, "GET", "/schedules?State=ENABLED"), 200, `"Schedules":[]`)
+	assert is(call(g, "DELETE", "/schedules/s"), 200)
+	assert is(call(g, "GET", "/schedules/s"), 404, "Schedule s does not exist.")
+}
+
+test "a schedule's expression, window, dates and role are checked" {
+	const g = world()
+	assert is(call(g, "POST", "/schedules/s", `{"ScheduleExpression":"rate(5 minute)",${target},${off}}`), 400,
+		"Invalid Schedule Expression rate(5 minute).")
+	assert is(call(g, "POST", "/schedules/s",
+		`{"ScheduleExpression":"cron(0 12 * * ? *)",`
+		+ `"ScheduleExpressionTimezone":"Mars/Olympus",${target},${off}}`), 400, "Invalid ScheduleExpressionTimezone")
+	assert is(call(g, "POST", "/schedules/s",
+		`{"ScheduleExpression":"rate(1 hour)",${target},` + `"FlexibleTimeWindow":{"Mode":"FLEXIBLE"}}`), 400,
+		"MaximumWindowInMinutes")
+	assert is(call(g, "POST", "/schedules/s", `{"ScheduleExpression":"rate(1 hour)","EndDate":1000,${target},${off}}`),
+		400, "EndDate")
+	assert is(call(g, "POST", "/schedules/s",
+		`{"ScheduleExpression":"rate(1 hour)","GroupName":"nope",${target},` + `${off}}`), 404,
+		"Schedule group nope does not exist.")
+	const other = world("states.amazonaws.com")
+	assert is(call(other, "POST", "/schedules/s", `{"ScheduleExpression":"rate(1 hour)",${target},${off}}`), 400,
+		"The execution role you provide must allow AWS EventBridge Scheduler to assume the role.")
+}
+
+test "a schedule group is tagged, and deleting it deletes its schedules; the default group stays" {
+	const g = world()
+	assert is(call(g, "POST", "/schedule-groups/grp", `{"Tags":[{"Key":"k","Value":"v"}]}`), 200,
+		`"ScheduleGroupArn":"arn:aws:scheduler:us-east-1:000000000000:schedule-group/grp"`)
+	assert is(call(g, "POST", "/schedule-groups/grp", `{}`), 409)
+	assert is(call(g, "POST", "/schedules/s",
+		`{"GroupName":"grp","ScheduleExpression":"rate(1 day)",${target},` + `${off}}`), 200)
+	const arn = "arn%3Aaws%3Ascheduler%3Aus-east-1%3A000000000000%3Aschedule-group%2Fgrp"
+	assert is(call(g, "GET", `/tags/${arn}`), 200, `{"Key":"k","Value":"v"}`)
+	assert is(call(g, "GET", "/schedule-groups"), 200, `"Name":"default"`, `"Name":"grp"`, `"State":"ACTIVE"`)
+	assert is(call(g, "GET", "/schedule-groups?MaxResults=1"), 200, `"NextToken":`)
+	assert is(call(g, "DELETE", "/schedule-groups/grp"), 200)
+	assert is(call(g, "GET", "/schedules/s?groupName=grp"), 404)
+	assert is(call(g, "DELETE", "/schedule-groups/default"), 400, "The default schedule group cannot be deleted.")
+	assert is(call(g, "GET", "/schedule-groups/default"), 200, `"Name":"default"`)
+}

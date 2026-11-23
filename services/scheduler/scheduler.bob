@@ -1,0 +1,354 @@
+//! Amazon EventBridge Scheduler: schedules, schedule groups and their tags. Where AWS differs:
+//!
+//! - Nothing ever fires: a target is never invoked, and a one-time schedule never completes nor is deleted after.
+//! - A group is ACTIVE at once, and DeleteScheduleGroup deletes it and its schedules at once, where AWS answers
+//!   DELETING. The default group is made on first use and never deleted.
+//! - An expression is checked as EventBridge checks a rule's; a cron's fields are not checked further. Error wording
+//!   is this server's where AWS documents none.
+//! - A customer's KMS key and the target's ARN, dead-letter queue and parameters are stored unchecked.
+//! - The request's tags are not checked against IAM policies.
+
+import { Fault } from "../../core/fault"
+import { Caller } from "../../core/service"
+import { schedule } from "../events/events"
+import { actAs, passRole } from "../sts/sts"
+import * as api from "./api"
+import { Group, key, Schedule, Tables } from "./records"
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { isDigit } from "std/ascii"
+import * as hex from "std/encoding/hex"
+import { ParseError } from "std/string"
+import { load, minute } from "std/time"
+
+const principal = "scheduler.amazonaws.com"
+const untrusted = "The execution role you provide must allow AWS EventBridge Scheduler to assume the role."
+
+export class Handler {
+	...api.Unimplemented
+
+	createScheduleGroup(caller: Caller,
+		input: api.CreateScheduleGroupInput): api.CreateScheduleGroupOutput throws Fault {
+		const arn = groupArn(caller, input.Name)
+		caller.allow(arn)
+		const t = new Tables(caller.regional())
+		const token = input.ClientToken ?? ""
+		const was = group(t, input.Name)
+		if (was != null) {
+			if (token != "" && was!.token == token) {
+				return { ...new api.CreateScheduleGroupOutput(), ScheduleGroupArn: arn }
+			}
+			throw api.conflictException(`Schedule group ${input.Name} already exists.`)
+		}
+		const g = new Group()
+		g.name = input.Name
+		g.token = token
+		g.created = now()
+		g.modified = g.created
+		g.tags = (input.Tags ?? []).map(x => [x.Key, x.Value] as [string, string])
+		t.groups.put(g.name, g)
+		return { ...new api.CreateScheduleGroupOutput(), ScheduleGroupArn: arn }
+	}
+
+	getScheduleGroup(caller: Caller, input: api.GetScheduleGroupInput): api.GetScheduleGroupOutput throws Fault {
+		caller.allow(groupArn(caller, input.Name))
+		const g = existing(new Tables(caller.regional()), input.Name)
+		const s = summary(caller, g)
+		const out = new api.GetScheduleGroupOutput()
+		out.Arn = s.Arn
+		out.Name = s.Name
+		out.State = s.State
+		out.CreationDate = s.CreationDate
+		out.LastModificationDate = s.LastModificationDate
+		return out
+	}
+
+	listScheduleGroups(caller: Caller, input: api.ListScheduleGroupsInput): api.ListScheduleGroupsOutput throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.regional())
+		group(t, "default")
+		const gs = t.groups.scan(null,
+			1000000).map(e => e[1]).filter(g => input.NamePrefix == null || startsWith(g.name, input.NamePrefix!))
+		const [from, to, next] = page(gs.map(g => g.name), input.NextToken, input.MaxResults)
+		const out = new api.ListScheduleGroupsOutput()
+		out.ScheduleGroups = gs.slice(from, to).map(g => summary(caller, g))
+		out.NextToken = next
+		return out
+	}
+
+	deleteScheduleGroup(caller: Caller,
+		input: api.DeleteScheduleGroupInput): api.DeleteScheduleGroupOutput throws Fault {
+		caller.allow(groupArn(caller, input.Name))
+		const t = new Tables(caller.regional())
+		if (input.Name == "default") {
+			throw api.validationException("The default schedule group cannot be deleted.")
+		}
+		existing(t, input.Name)
+		for (const s of schedules(t).filter(s => s.group == input.Name)) {
+			t.schedules.delete(key(s.group, s.name))
+		}
+		t.groups.delete(input.Name)
+		return new api.DeleteScheduleGroupOutput()
+	}
+
+	createSchedule(caller: Caller, input: api.CreateScheduleInput): api.CreateScheduleOutput throws Fault {
+		const g = input.GroupName ?? "default"
+		const arn = scheduleArn(caller, g, input.Name)
+		caller.allow(arn)
+		const t = new Tables(caller.regional())
+		existing(t, g)
+		const was = t.schedules.get(key(g, input.Name))
+		if (was != null) {
+			if (input.ClientToken != null && was!.token == input.ClientToken!) {
+				return { ...new api.CreateScheduleOutput(), ScheduleArn: arn }
+			}
+			throw api.conflictException(`Schedule ${input.Name} already exists.`)
+		}
+		const s = new Schedule()
+		s.group = g
+		s.name = input.Name
+		s.token = input.ClientToken ?? ""
+		s.created = now()
+		fill(caller, s, arn, input.ScheduleExpression, input.ScheduleExpressionTimezone, input.StartDate, input.EndDate,
+			input.Description, input.State, input.KmsKeyArn, input.Target, input.FlexibleTimeWindow,
+			input.ActionAfterCompletion)
+		t.schedules.put(key(g, s.name), s)
+		return { ...new api.CreateScheduleOutput(), ScheduleArn: arn }
+	}
+
+	updateSchedule(caller: Caller, input: api.UpdateScheduleInput): api.UpdateScheduleOutput throws Fault {
+		const g = input.GroupName ?? "default"
+		const arn = scheduleArn(caller, g, input.Name)
+		caller.allow(arn)
+		const t = new Tables(caller.regional())
+		const s = found(t, g, input.Name)
+		fill(caller, s, arn, input.ScheduleExpression, input.ScheduleExpressionTimezone, input.StartDate, input.EndDate,
+			input.Description, input.State, input.KmsKeyArn, input.Target, input.FlexibleTimeWindow,
+			input.ActionAfterCompletion)
+		t.schedules.put(key(g, s.name), s)
+		return { ...new api.UpdateScheduleOutput(), ScheduleArn: arn }
+	}
+
+	getSchedule(caller: Caller, input: api.GetScheduleInput): api.GetScheduleOutput throws Fault {
+		const g = input.GroupName ?? "default"
+		caller.allow(scheduleArn(caller, g, input.Name))
+		const s = found(new Tables(caller.regional()), g, input.Name)
+		const out = new api.GetScheduleOutput()
+		out.Arn = scheduleArn(caller, g, s.name)
+		out.GroupName = g
+		out.Name = s.name
+		out.ScheduleExpression = s.expression
+		out.StartDate = s.start
+		out.EndDate = s.end
+		out.Description = s.description
+		out.ScheduleExpressionTimezone = s.timezone
+		out.State = s.state
+		out.CreationDate = s.created
+		out.LastModificationDate = s.modified
+		out.KmsKeyArn = s.key
+		out.Target = s.target
+		out.FlexibleTimeWindow = s.window
+		out.ActionAfterCompletion = s.after
+		return out
+	}
+
+	listSchedules(caller: Caller, input: api.ListSchedulesInput): api.ListSchedulesOutput throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.regional())
+		const ss = schedules(t).filter(s => (input.GroupName == null || s.group == input.GroupName!)
+			&& (input.NamePrefix == null || startsWith(s.name, input.NamePrefix!))
+			&& (input.State == null || s.state == input.State!))
+		const [from, to, next] = page(ss.map(s => key(s.group, s.name)), input.NextToken, input.MaxResults)
+		const out = new api.ListSchedulesOutput()
+		out.Schedules = ss.slice(from, to).map(s => {
+			const o = new api.ScheduleSummary()
+			o.Arn = scheduleArn(caller, s.group, s.name)
+			o.Name = s.name
+			o.GroupName = s.group
+			o.State = s.state
+			o.CreationDate = s.created
+			o.LastModificationDate = s.modified
+			o.Target = { ...new api.TargetSummary(), Arn: s.target.Arn }
+			return o
+		})
+		out.NextToken = next
+		return out
+	}
+
+	deleteSchedule(caller: Caller, input: api.DeleteScheduleInput): api.DeleteScheduleOutput throws Fault {
+		const g = input.GroupName ?? "default"
+		caller.allow(scheduleArn(caller, g, input.Name))
+		const t = new Tables(caller.regional())
+		found(t, g, input.Name)
+		t.schedules.delete(key(g, input.Name))
+		return new api.DeleteScheduleOutput()
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceInput): api.TagResourceOutput throws Fault {
+		caller.allow(input.ResourceArn)
+		const t = new Tables(caller.regional())
+		const g = tagged(caller, t, input.ResourceArn)
+		for (const x of input.Tags) {
+			g.tags = g.tags.filter(k => k[0] != x.Key)
+			g.tags.push([x.Key, x.Value])
+		}
+		t.groups.put(g.name, g)
+		return new api.TagResourceOutput()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceInput): api.UntagResourceOutput throws Fault {
+		caller.allow(input.ResourceArn)
+		const t = new Tables(caller.regional())
+		const g = tagged(caller, t, input.ResourceArn)
+		g.tags = g.tags.filter(k => !input.TagKeys.includes(k[0]))
+		t.groups.put(g.name, g)
+		return new api.UntagResourceOutput()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceInput): api.ListTagsForResourceOutput throws Fault {
+		caller.allow(input.ResourceArn)
+		const g = tagged(caller, new Tables(caller.regional()), input.ResourceArn)
+		const out = new api.ListTagsForResourceOutput()
+		out.Tags = g.tags.map(k => ({ ...new api.Tag(), Key: k[0], Value: k[1] }))
+		return out
+	}
+}
+
+function groupArn(caller: Caller, name: string): string {
+	return `arn:aws:scheduler:${caller.region}:${caller.account}:schedule-group/${name}`
+}
+
+function scheduleArn(caller: Caller, group: string, name: string): string {
+	return `arn:aws:scheduler:${caller.region}:${caller.account}:schedule/${group}/${name}`
+}
+
+/// The group named name in t, null if there is none; the default group, made if it is not yet.
+function group(t: Tables, name: string): Group | null throws Fault {
+	const g = t.groups.get(name)
+	if (g != null || name != "default") {
+		return g
+	}
+	const made = new Group()
+	made.name = name
+	made.created = now()
+	made.modified = made.created
+	t.groups.put(name, made)
+	return made
+}
+
+function existing(t: Tables, name: string): Group throws Fault {
+	const g = group(t, name)
+	if (g == null) {
+		throw api.resourceNotFoundException(`Schedule group ${name} does not exist.`)
+	}
+	return g!
+}
+
+function tagged(caller: Caller, t: Tables, arn: string): Group throws Fault {
+	const prefix = groupArn(caller, "")
+	if (!startsWith(arn, prefix)) {
+		throw api.resourceNotFoundException(`Schedule group ${arn} does not exist.`)
+	}
+	return existing(t, arn.slice(prefix.length, arn.length))
+}
+
+function summary(caller: Caller, g: Group): api.ScheduleGroupSummary {
+	const out = new api.ScheduleGroupSummary()
+	out.Arn = groupArn(caller, g.name)
+	out.Name = g.name
+	out.State = "ACTIVE"
+	out.CreationDate = g.created
+	out.LastModificationDate = g.modified
+	return out
+}
+
+function schedules(t: Tables): Schedule[] { return t.schedules.scan(null, 1000000).map(e => e[1]) }
+
+function found(t: Tables, group: string, name: string): Schedule throws Fault {
+	const s = t.schedules.get(key(group, name))
+	if (s == null) {
+		throw api.resourceNotFoundException(`Schedule ${name} does not exist.`)
+	}
+	return s!
+}
+
+function page(keys: string[], token: string | null, max: i32 | null): [i32, i32, string | null] throws Fault {
+	let from = 0
+	if (token != null) {
+		from = keys.indexOf(fromToken(token!))
+		if (from < 0) {
+			throw api.validationException("Invalid NextToken.")
+		}
+	}
+	const n = max ?? 100
+	const to = if (from + n < keys.length) from + n else keys.length
+	return [from, to, if (to < keys.length) hex.encode(keys[to]) else null]
+}
+
+function fromToken(token: string): string throws Fault {
+	try {
+		return hex.decode(token)
+	} catch (e: ParseError) {
+		throw api.validationException("Invalid NextToken.")
+	}
+}
+
+function fill(caller: Caller, s: Schedule, arn: string, expression: string, timezone: string | null, start: i64 | null,
+	end: i64 | null, description: string | null, state: api.ScheduleState | null, key: string | null,
+	target: api.Target, window: api.FlexibleTimeWindow, after: api.ActionAfterCompletion | null) throws Fault {
+	if (!(if (startsWith(expression, "at(")) at(expression) else schedule(expression))) {
+		throw api.validationException(`Invalid Schedule Expression ${expression}.`)
+	}
+	if (timezone != null && timezone! != "UTC") {
+		try {
+			load(timezone!)
+		} catch (e: IoError | ParseError) {
+			throw api.validationException(`Invalid ScheduleExpressionTimezone ${timezone!}.`)
+		}
+	}
+	const t = now()
+	if (start != null && start! < t - 5 * minute) {
+		throw api.validationException("The StartDate you specify cannot be earlier than 5 minutes ago.")
+	}
+	if (end != null && end! <= t) {
+		throw api.validationException("The EndDate you specify cannot be earlier than the current time.")
+	}
+	if (start != null && end != null && end! <= start!) {
+		throw api.validationException("The EndDate you specify must be later than the StartDate.")
+	}
+	if (window.Mode == "FLEXIBLE" && window.MaximumWindowInMinutes == null) {
+		throw api.validationException("MaximumWindowInMinutes must be provided when Mode is FLEXIBLE.")
+	}
+	if (window.Mode == "OFF" && window.MaximumWindowInMinutes != null) {
+		throw api.validationException("MaximumWindowInMinutes must not be provided when Mode is OFF.")
+	}
+	passRole(caller, target.RoleArn, principal)
+	if (actAs(caller, principal, target.RoleArn, arn, [], "") == null) {
+		throw api.validationException(untrusted)
+	}
+	s.expression = expression
+	s.timezone = timezone
+	s.start = start
+	s.end = end
+	s.description = description
+	s.state = state ?? "ENABLED"
+	s.key = key
+	s.target = target
+	s.window = window
+	s.after = after ?? "NONE"
+	s.modified = t
+}
+
+function at(e: string): bool {
+	if (!endsWith(e, ")") || e.length != 23) {
+		return false
+	}
+	const d = e.slice(3, 22)
+	for (let i = 0; i < d.length; i++) {
+		const sep = if (i == 4 || i == 7) "-" else if (i == 10) "T" else if (i == 13 || i == 16) ":" else ""
+		if (if (sep == "") !isDigit(d[i]) else d[i] != sep[0]) {
+			return false
+		}
+	}
+	return true
+}

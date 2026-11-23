@@ -1,0 +1,43 @@
+//! EventBridge Scheduler's state in an account's region: its schedule groups by name, and their schedules by group
+//! and name.
+
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+
+export class Group {
+	name = ""
+	token = ""
+	created: i64 = 0
+	modified: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Schedule {
+	group = ""
+	name = ""
+	token = ""
+	expression = ""
+	timezone: string | null = null
+	start: i64 | null = null
+	end: i64 | null = null
+	description: string | null = null
+	state: api.ScheduleState = "ENABLED"
+	key: string | null = null
+	target: api.Target = new api.Target()
+	window: api.FlexibleTimeWindow = new api.FlexibleTimeWindow()
+	after: api.ActionAfterCompletion = "NONE"
+	created: i64 = 0
+	modified: i64 = 0
+}
+
+export class Tables {
+	groups: Table[Group]
+	schedules: Table[Schedule]
+
+	constructor(s: Store) {
+		this.groups = new Table[Group](s, "scheduler/groups")
+		this.schedules = new Table[Schedule](s, "scheduler/schedules")
+	}
+}
+
+export function key(group: string, name: string): string { return `${group}\x00${name}` }
