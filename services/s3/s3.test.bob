@@ -258,6 +258,8 @@ test "access: bucket policies allow others and anyone; others are denied plainly
 	assert fails(s3(g, "PUT", "/bkt?policy", "nope"), 400, "MalformedPolicy")
 	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",`
 		+ `"Resource":"arn:aws:s3:::bkt/*"}]}`
+	assert fails(s3(g, "PUT", "/bkt?policy", p), 403, "AccessDenied")
+	assert s3(g, "DELETE", "/bkt?publicAccessBlock").status == 204
 	assert s3(g, "PUT", "/bkt?policy", p).status == 204
 	assert all(s3(g, "GET", "/bkt?policy")) == p
 	assert text(s3(g, "GET", "/bkt?policyStatus"), "IsPublic") == "true"

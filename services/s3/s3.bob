@@ -16,6 +16,8 @@ import { crc32c } from "../../core/hash/crc32c"
 import { crc64nvme } from "../../core/hash/crc64nvme"
 import { Blob, Table } from "../../core/state/store"
 import * as api from "./api"
+import { arn, authorize, bucketPolicy, Found, found, member, noSuchBucket, noSuchKey, owner } from "./common"
+import { acl, Config, exposed, forget, mfaDelete, preflight, publicPolicy, versioned } from "./config"
 
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
 	version, Version } from "./records"
@@ -33,11 +35,16 @@ import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
 import { second } from "std/time"
 import { escape, Query, unescape } from "std/url"
 
+/// The subresources of a bucket whose GET S3 answers of no content type.
+const untyped = ["cors", "encryption", "lifecycle", "notification", "ownershipControls", "policyStatus",
+	"publicAccessBlock", "requestPayment", "versioning"]
+
 /// The smallest part of a multipart upload but its last.
 const smallest: i64 = 5242880
 
 /// The service, of the operations implemented.
 export class Handler {
+	...Config
 	...api.Unimplemented
 
 	/// The body of the GetObject being answered when it streams a blob, which serve sends in place of the output's.
@@ -122,6 +129,7 @@ export class Handler {
 		for (const [k, u] of f.db.uploads.scan(null, 10000, `${input.Bucket}/`)) {
 			end(f.db, k, u, null)
 		}
+		forget(f)
 		f.db.buckets.delete(input.Bucket)
 		places(caller.global()).delete(input.Bucket)
 		return new Unit()
@@ -170,6 +178,7 @@ export class Handler {
 			caller.actions.push("s3:PutObjectTagging")
 		}
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		acl(f, if (input.ACL == null) null else `${input.ACL!}`)
 		const data = input.Body
 		digest(input.ContentMD5, data)
 		const [algorithm, sum] = checksum(input.ChecksumAlgorithm ?? "",
@@ -212,6 +221,7 @@ export class Handler {
 		v.algorithm = algorithm
 		v.checksum = sum
 		const k = write(caller, f, v, data)
+		this.notify(caller, f, "ObjectCreated:Put", v)
 		const r = new api.PutObjectOutput()
 		r.ETag = v.etag
 		r.ServerSideEncryption = "AES256"
@@ -299,6 +309,8 @@ export class Handler {
 		caller.actions = [if (input.VersionId == null) "s3:DeleteObject" else "s3:DeleteObjectVersion"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const [id, marker] = remove(caller, f, input.Key, input.VersionId)
+		this.notify(caller, f, if (marker) "ObjectRemoved:DeleteMarkerCreated" else "ObjectRemoved:Delete",
+			{ ...new Version(), key: input.Key, id: id ?? "null", order: f.bucket.next })
 		const r = new api.DeleteObjectOutput()
 		r.VersionId = id
 		r.DeleteMarker = if (marker) true else null
@@ -444,6 +456,7 @@ export class Handler {
 		share(f.db, "s3/versions", version(sb, sk, s.order), f.db.versions, "s3/versions",
 			version(input.Bucket, input.Key, v.order), v)
 		restore(f.db, input.Bucket, input.Key)
+		this.notify(caller, f, "ObjectCreated:Copy", v)
 		const r = new api.CopyObjectOutput()
 		r.CopyObjectResult = { ...new api.CopyObjectResult(), ETag: v.etag, LastModified: v.modified }
 		if (v.algorithm != "") {
@@ -664,6 +677,7 @@ export class Handler {
 		}
 		restore(f.db, input.Bucket, input.Key)
 		end(f.db, uk, u, "completed")
+		this.notify(caller, f, "ObjectCreated:CompleteMultipartUpload", v)
 		const r = new api.CompleteMultipartUploadOutput()
 		r.Location = location
 		r.Bucket = input.Bucket
@@ -789,14 +803,7 @@ export class Handler {
 	putBucketPolicy(caller: Caller, input: api.PutBucketPolicyRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketPolicy"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
-		if (!startsWith(trim(input.Policy), "{")) {
-			throw malformedPolicy("Policies must be valid JSON and the first byte must be '{'")
-		}
-		try {
-			parse(input.Policy, "resource")
-		} catch (e: Fault) {
-			throw malformedPolicy(e.message)
-		}
+		publicPolicy(caller, f, bucketPolicy(caller, f, input.Policy))
 		f.bucket.policy = input.Policy
 		put(f.db.buckets, input.Bucket, f.bucket)
 		return new Unit()
@@ -893,6 +900,7 @@ export class Handler {
 			throw new Fault(400, "MalformedXML",
 				"The XML you provided was not well-formed or did not validate against our published schema")
 		}
+		versioned(f, input)
 		f.bucket.versioning = s!
 		put(f.db.buckets, input.Bucket, f.bucket)
 		return new Unit()
@@ -907,6 +915,7 @@ export class Handler {
 		if (f.bucket.versioning != "") {
 			r.Status = f.bucket.versioning
 		}
+		r.MFADelete = mfaDelete(f)
 		return r
 	}
 
@@ -1025,6 +1034,13 @@ export function serve(h: Handler, caller: Caller, req: Request): Response throws
 	if (mode != null && lower(mode!) == "enabled") {
 		req.headers.set("x-amz-checksum-mode", "ENABLED")
 	}
+	if (req.method == "OPTIONS") {
+		try {
+			return preflight(caller, req)
+		} catch (f: Fault) {
+			return restxml.error(api.service, f, caller.requestId)
+		}
+	}
 	const listed = listedBucket(req)
 	let region: string | null = null
 	let res: Response | null = null
@@ -1035,10 +1051,20 @@ export function serve(h: Handler, caller: Caller, req: Request): Response throws
 	} catch (f: Fault) {
 		res = restxml.error(api.service, f, caller.requestId)
 	}
+	try {
+		exposed(caller, req, res!)
+	} catch (f: Fault) {}
 	const b = h.streamed
 	h.streamed = null
 	if (h.partial && res!.status == 200) {
 		res!.status = 206
+	}
+	// S3 answers GetBucketPolicy as JSON, and these of its bucket's configuration of no type
+	const q = req.url.query
+	if (req.method == "GET" && res!.status == 200 && q.has("policy")) {
+		res!.headers.set("content-type", "application/json")
+	} else if (req.method == "GET" && res!.status == 200 && untyped.some(n => q.has(n))) {
+		res!.headers.delete("content-type")
 	}
 	h.partial = false
 	if (h.typed != null && res!.status < 300) {
@@ -1064,11 +1090,11 @@ export function serve(h: Handler, caller: Caller, req: Request): Response throws
 	return res!
 }
 
-/// The bucket that req lists the objects of, "" if it is not a ListObjects or ListObjectsV2, whose answers say the
-/// bucket's region.
+/// The bucket that req heads or lists the objects of, "" if it is not a HeadBucket, ListObjects or ListObjectsV2,
+/// whose answers say the bucket's region.
 function listedBucket(req: Request): string {
 	const p = req.url.path
-	if (req.method != "GET" || p.length < 2 || indexOf(p.slice(1, p.length - 1), "/") >= 0) {
+	if (req.method != "GET" && req.method != "HEAD" || p.length < 2 || indexOf(p.slice(1, p.length - 1), "/") >= 0) {
 		return ""
 	}
 	const params = ["prefix", "delimiter", "marker", "max-keys", "encoding-type", "list-type", "continuation-token",
@@ -1159,48 +1185,6 @@ export function address(req: Request) {
 	}
 }
 
-/// A bucket a request is of: the tables of its owner's tree of its region, and its record.
-class Found {
-	db: Tables
-	bucket: Bucket
-
-	constructor(db: Tables, bucket: Bucket) {
-		this.db = db
-		this.bucket = bucket
-	}
-}
-
-/// The bucket named name, once the caller is allowed its actions on resource, the bucket's ARN if null, of the
-/// context keys of context; a bucket of an account other than expected is denied.
-function found(caller: Caller, name: string, expected: string | null, resource: string | null = null,
-	context: Context = []): Found throws Fault {
-	const g = caller.existing("")
-	const p = if (g == null) null else places(g!).get(name)
-	if (p == null) {
-		throw noSuchBucket(name)
-	}
-	const db = new Tables(caller.tree(`${p.account}/${p.region}`))
-	const b = db.buckets.get(name)!
-	authorize(caller, b, resource ?? arn(name), context)
-	if (expected != null && expected! != b.owner) {
-		throw new Fault(403, "AccessDenied", "Access Denied")
-	}
-	return new Found(db, b)
-}
-
-/// Throws S3's access denied unless the caller may perform its actions on resource of the bucket b: of the reason to
-/// a caller of b's account, else of none.
-function authorize(caller: Caller, b: Bucket, resource: string, context: Context = []) throws Fault {
-	try {
-		caller.allow(resource, b.policy, context, `"${resource}"`, b.owner)
-	} catch (f: Fault) {
-		if (f.code == "AccessDenied" && caller.account != b.owner) {
-			throw new Fault(403, "AccessDenied", "Access Denied")
-		}
-		throw f
-	}
-}
-
 /// The context keys of a listing.
 function listing(prefix: string | null, delimiter: string | null, max: i32 | null): Context {
 	const c: Context = [["s3:prefix", prefix ?? ""]]
@@ -1209,11 +1193,6 @@ function listing(prefix: string | null, delimiter: string | null, max: i32 | nul
 	}
 	c.push(["s3:max-keys", `${max ?? 1000}`])
 	return c
-}
-
-/// The ARN of a bucket, or of an object in it.
-function arn(bucket: string, key: string | null = null): string {
-	return if (key == null) `arn:aws:s3:::${bucket}` else `arn:aws:s3:::${bucket}/${key!}`
 }
 
 /// Throws InvalidBucketName unless name is a bucket's: 3 to 63 lower-case letters, digits, dots and hyphens, starting
@@ -1239,33 +1218,13 @@ function invalidName(name: string): Fault {
 	return new Fault(400, "InvalidBucketName", "The specified bucket is not valid.", true, member("BucketName", name))
 }
 
-/// The element named n of the text s, escaped, as an error's member.
-function member(n: string, s: string): string {
-	return `<${n}>${replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")}</${n}>`
-}
-
-function noSuchBucket(name: string): Fault {
-	return new Fault(404, "NoSuchBucket", "The specified bucket does not exist", true, member("BucketName", name))
-}
-
-function noSuchKey(key: string): Fault {
-	return new Fault(404, "NoSuchKey", "The specified key does not exist.", true, member("Key", key))
-}
-
 function noPolicy(bucket: string): Fault {
 	return new Fault(404, "NoSuchBucketPolicy", "The bucket policy does not exist", true, member("BucketName", bucket))
 }
 
-function malformedPolicy(message: string): Fault { return new Fault(400, "MalformedPolicy", message) }
-
 function precondition(condition: string): Fault {
 	return new Fault(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", true,
 		member("Condition", condition))
-}
-
-/// The owner as S3 names one: by a canonical id, made of the account.
-function owner(account: string): api.Owner throws Fault {
-	return { ...new api.Owner(), ID: hex.encode(hash(sha256, `canonical ${account}`)) }
 }
 
 /// The digest by f of s.

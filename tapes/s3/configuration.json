@@ -1,0 +1,1350 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"last-modified",
+		"LastModified",
+		"CreationDate"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-c.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put k",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"contentType": "text/plain",
+			"body": "k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"8ce4b16b22b58894aa86c421e8759df3\"",
+					"x-amz-checksum-crc64nvme": "1O6JYby0ELs=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "the public access block a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"publicAccessBlock": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>"
+			}
+		},
+		{
+			"name": "put a public access block",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"publicAccessBlock": ""
+			},
+			"body": "<PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get the public access block",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"publicAccessBlock": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>"
+			}
+		},
+		{
+			"name": "a public policy it blocks",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-c/*\"}]}",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:root is not authorized to perform: s3:PutBucketPolicy on resource: \"arn:aws:s3:::boberstack-ab-00000000-c\" because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete the public access block",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"publicAccessBlock": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get the public access block, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"publicAccessBlock": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchPublicAccessBlockConfiguration</Code><Message>The public access block configuration was not found</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a public policy",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-c/*\"}]}",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "the policy status",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"policyStatus": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PolicyStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsPublic>true</IsPublic></PolicyStatus>"
+			}
+		},
+		{
+			"name": "delete the policy",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"policy": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "the bucket's ACL",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"acl": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>${owner}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"
+			}
+		},
+		{
+			"name": "the object's ACL",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"acl": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>${owner}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"
+			}
+		},
+		{
+			"name": "a canned ACL",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"acl": ""
+			},
+			"headers": {
+				"x-amz-acl": "public-read"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessControlListNotSupported</Code><Message>The bucket does not allow ACLs</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the private canned ACL",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"acl": ""
+			},
+			"headers": {
+				"x-amz-acl": "private"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessControlListNotSupported</Code><Message>The bucket does not allow ACLs</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a canned ACL of the object",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"acl": ""
+			},
+			"headers": {
+				"x-amz-acl": "public-read"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessControlListNotSupported</Code><Message>The bucket does not allow ACLs</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put an object of a canned ACL",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c/acl",
+			"headers": {
+				"x-amz-acl": "public-read"
+			},
+			"body": "a",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessControlListNotSupported</Code><Message>The bucket does not allow ACLs</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the ownership controls a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>"
+			}
+		},
+		{
+			"name": "put ownership controls",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"body": "<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get ownership controls",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>"
+			}
+		},
+		{
+			"name": "delete ownership controls",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get ownership controls, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>OwnershipControlsNotFoundError</Code><Message>The bucket ownership controls were not found</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put ownership controls back",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"ownershipControls": ""
+			},
+			"body": "<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "the encryption a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"encryption": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><BucketKeyEnabled>false</BucketKeyEnabled><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule></ServerSideEncryptionConfiguration>"
+			}
+		},
+		{
+			"name": "put encryption",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"encryption": ""
+			},
+			"body": "<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get encryption",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"encryption": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><BucketKeyEnabled>true</BucketKeyEnabled><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule></ServerSideEncryptionConfiguration>"
+			}
+		},
+		{
+			"name": "delete encryption",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"encryption": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get encryption, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"encryption": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><BucketKeyEnabled>false</BucketKeyEnabled><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule></ServerSideEncryptionConfiguration>"
+			}
+		},
+		{
+			"name": "CORS, of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"cors": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchCORSConfiguration</Code><Message>The CORS configuration does not exist</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put CORS",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"cors": ""
+			},
+			"headers": {
+				"content-md5": "4TkFHihaMYRzx+yuIQdl3w=="
+			},
+			"body": "<CORSConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><CORSRule><ID>web</ID><AllowedHeader>*</AllowedHeader><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedOrigin>https://example.com</AllowedOrigin><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>3000</MaxAgeSeconds></CORSRule><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get CORS",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"cors": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CORSConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><CORSRule><ID>web</ID><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod><MaxAgeSeconds>3000</MaxAgeSeconds><ExposeHeader>ETag</ExposeHeader><AllowedHeader>*</AllowedHeader></CORSRule><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"
+			}
+		},
+		{
+			"name": "a preflight",
+			"service": "s3",
+			"method": "OPTIONS",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://example.com",
+				"access-control-request-method": "PUT",
+				"access-control-request-headers": "content-type,x-amz-meta-a"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 200,
+				"headers": {
+					"access-control-allow-origin": "https://example.com",
+					"access-control-allow-methods": "GET, PUT",
+					"access-control-allow-headers": "content-type, x-amz-meta-a",
+					"access-control-expose-headers": "ETag",
+					"access-control-max-age": "3000",
+					"access-control-allow-credentials": "true",
+					"vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "a preflight of another origin",
+			"service": "s3",
+			"method": "OPTIONS",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://other.example",
+				"access-control-request-method": "GET"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 200,
+				"headers": {
+					"access-control-allow-origin": "*",
+					"access-control-allow-methods": "GET",
+					"vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "a preflight of a method no rule allows",
+			"service": "s3",
+			"method": "OPTIONS",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://other.example",
+				"access-control-request-method": "DELETE"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessForbidden</Code><Message>CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.</Message><Method>DELETE</Method><ResourceType>OBJECT</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a preflight of no origin",
+			"service": "s3",
+			"method": "OPTIONS",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"access-control-request-method": "GET"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BadRequest</Code><Message>Insufficient information. Origin request header needed.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a get of an origin",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://example.com"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"access-control-allow-origin": "https://example.com",
+					"access-control-allow-methods": "GET, PUT",
+					"access-control-expose-headers": "ETag",
+					"access-control-max-age": "3000",
+					"access-control-allow-credentials": "true",
+					"vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"8ce4b16b22b58894aa86c421e8759df3\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "1"
+				},
+				"size": 1,
+				"sha256": "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a"
+			}
+		},
+		{
+			"name": "a get of another origin",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://other.example"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"access-control-allow-origin": "*",
+					"access-control-allow-methods": "GET",
+					"vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"8ce4b16b22b58894aa86c421e8759df3\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "1"
+				},
+				"size": 1,
+				"sha256": "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a"
+			}
+		},
+		{
+			"name": "delete CORS",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"cors": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get CORS, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"cors": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchCORSConfiguration</Code><Message>The CORS configuration does not exist</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a preflight, of no CORS",
+			"service": "s3",
+			"method": "OPTIONS",
+			"path": "/${prefix}-c/k",
+			"headers": {
+				"origin": "https://example.com",
+				"access-control-request-method": "GET"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessForbidden</Code><Message>CORSResponse: CORS is not enabled for this bucket.</Message><Method>GET</Method><ResourceType>BUCKET</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "lifecycle, of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchLifecycleConfiguration</Code><Message>The lifecycle configuration does not exist</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put lifecycle",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"headers": {
+				"content-md5": "xMQAQ8mVcCiOVPYNbqBkhg=="
+			},
+			"body": "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule><Rule><ID>uploads</ID><Filter></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get lifecycle",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule><Rule><ID>uploads</ID><Filter/><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
+			}
+		},
+		{
+			"name": "a lifecycle of zero days",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"headers": {
+				"content-md5": "ofm+f+/0E3B8rukmv1f1Eg=="
+			},
+			"body": "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>zero</ID><Filter><Prefix>a/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>'Days' for Expiration action must be a positive integer</Message><ArgumentName>Days</ArgumentName><ArgumentValue>0</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a lifecycle of two rules of an ID",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"headers": {
+				"content-md5": "OaaPm6sa61gEslrpF3WHkw=="
+			},
+			"body": "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>same</ID><Filter><Prefix>a/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule><Rule><ID>same</ID><Filter><Prefix>b/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>Rule ID must be unique. Found same ID for more than one rule</Message><ArgumentName>ID</ArgumentName><ArgumentValue>same</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete lifecycle",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get lifecycle, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"lifecycle": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchLifecycleConfiguration</Code><Message>The lifecycle configuration does not exist</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "website, of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"website": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchWebsiteConfiguration</Code><Message>The specified bucket does not have a website configuration</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put website",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"website": ""
+			},
+			"body": "<WebsiteConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument></WebsiteConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get website",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"website": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<WebsiteConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument></WebsiteConfiguration>"
+			}
+		},
+		{
+			"name": "delete website",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"website": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get website, once deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"website": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchWebsiteConfiguration</Code><Message>The specified bucket does not have a website configuration</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the logging a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"logging": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <!--<LoggingEnabled><TargetBucket>myLogsBucket</TargetBucket><TargetPrefix>add/this/prefix/to/my/log/files/access_log-</TargetPrefix></LoggingEnabled>-->\n</BucketLoggingStatus>\n"
+			}
+		},
+		{
+			"name": "put logging",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"logging": ""
+			},
+			"body": "<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LoggingEnabled><TargetBucket>${prefix}-c</TargetBucket><TargetPrefix>logs/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get logging",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"logging": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LoggingEnabled><TargetBucket>boberstack-ab-00000000-c</TargetBucket><TargetPrefix>logs/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>"
+			}
+		},
+		{
+			"name": "put no logging",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"logging": ""
+			},
+			"body": "<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get logging, once off",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"logging": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <!--<LoggingEnabled><TargetBucket>myLogsBucket</TargetBucket><TargetPrefix>add/this/prefix/to/my/log/files/access_log-</TargetPrefix></LoggingEnabled>-->\n</BucketLoggingStatus>\n"
+			}
+		},
+		{
+			"name": "the request payment a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"requestPayment": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RequestPaymentConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>"
+			}
+		},
+		{
+			"name": "put request payment",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"requestPayment": ""
+			},
+			"body": "<RequestPaymentConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Payer>Requester</Payer></RequestPaymentConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get request payment",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"requestPayment": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<RequestPaymentConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Payer>Requester</Payer></RequestPaymentConfiguration>"
+			}
+		},
+		{
+			"name": "put request payment back",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"requestPayment": ""
+			},
+			"body": "<RequestPaymentConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "the acceleration a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"accelerate": ""
+			},
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>GET</Method><ResourceType>accelerate</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put acceleration",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"accelerate": ""
+			},
+			"body": "<AccelerateConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></AccelerateConfiguration>",
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>PUT</Method><ResourceType>accelerate</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get acceleration",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"accelerate": ""
+			},
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>GET</Method><ResourceType>accelerate</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "suspend acceleration",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"accelerate": ""
+			},
+			"body": "<AccelerateConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></AccelerateConfiguration>",
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>PUT</Method><ResourceType>accelerate</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get acceleration, once suspended",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"accelerate": ""
+			},
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>GET</Method><ResourceType>accelerate</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the object lock configuration a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"object-lock": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message><BucketName>boberstack-ab-00000000-c</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put an object lock configuration",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"object-lock": ""
+			},
+			"headers": {
+				"content-md5": "COnSsTfBs9Q8g1KhUSKPIA=="
+			},
+			"body": "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketState</Code><Message>Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "versioning of MFA delete, without MFA",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"versioning": ""
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Mfa Authentication must be used for this request</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "versioning suspended, MFA delete disabled",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"versioning": ""
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status><MfaDelete>Disabled</MfaDelete></VersioningConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get versioning",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"versioning": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status><MfaDelete>Disabled</MfaDelete></VersioningConfiguration>"
+			}
+		},
+		{
+			"name": "the notifications a bucket has",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+			}
+		},
+		{
+			"name": "notify a queue not there",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"body": "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><QueueConfiguration><Id>q</Id><Queue>arn:aws:sqs:eu-north-1:${account}:${prefix}-none</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Unable to validate the following destination configurations</Message><ArgumentName1>arn:aws:sqs:eu-north-1:000000000000:boberstack-ab-00000000-none</ArgumentName1><ArgumentValue1>The destination queue does not exist</ArgumentValue1><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "notify a topic not there",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"body": "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TopicConfiguration><Id>t</Id><Topic>arn:aws:sns:eu-north-1:${account}:${prefix}-none</Topic><Event>s3:ObjectRemoved:*</Event></TopicConfiguration></NotificationConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Unable to validate the following destination configurations</Message><ArgumentName1>arn:aws:sns:eu-north-1:000000000000:boberstack-ab-00000000-none</ArgumentName1><ArgumentValue1>Permissions on the destination topic do not allow S3 to publish notifications from this bucket</ArgumentValue1><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "notify of an event not S3's",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"body": "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><QueueConfiguration><Id>q</Id><Queue>arn:aws:sqs:eu-north-1:${account}:${prefix}-none</Queue><Event>s3:Nothing</Event></QueueConfiguration></NotificationConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>The event is not supported for notifications</Message><ArgumentName>Event</ArgumentName><ArgumentValue>s3:Nothing</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "notify EventBridge",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"body": "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><EventBridgeConfiguration></EventBridgeConfiguration></NotificationConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get notifications",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><EventBridgeConfiguration/></NotificationConfiguration>"
+			}
+		},
+		{
+			"name": "notify none",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"body": "<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></NotificationConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get notifications, once none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-c",
+			"params": {
+				"notification": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<NotificationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the policy",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"params": {
+				"policy": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete k",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/k",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "null"
+				}
+			}
+		},
+		{
+			"name": "delete acl",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c/acl",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "null"
+				}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-c",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

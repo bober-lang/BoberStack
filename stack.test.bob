@@ -511,3 +511,76 @@ test "condition keys: sns:Protocol and sns:Endpoint, dynamodb:LeadingKeys and dy
 	assert call(g, "events", "PutEvents", entry("other"), k).status == 400
 	g.close()
 }
+
+/// The answer of g to an S3 request of method to path, of body, signed by the account's root.
+function s3(g: Gateway, method: string, path: string, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	sign(req, body, "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// A bucket's notification configuration of the queue of ARN q, of the events and the key's prefix and suffix.
+function notifying(q: string, events: string[], prefix: string, suffix: string): string {
+	return `<NotificationConfiguration><QueueConfiguration><Id>c</Id><Queue>${q}</Queue>`
+		+ events.map(e => `<Event>${e}</Event>`).join("") + "<Filter><S3Key>"
+		+ `<FilterRule><Name>prefix</Name><Value>${prefix}</Value></FilterRule>`
+		+ `<FilterRule><Name>suffix</Name><Value>${suffix}</Value></FilterRule>`
+		+ "</S3Key></Filter></QueueConfiguration></NotificationConfiguration>"
+}
+
+test "S3 notifies a queue of the objects made and removed under its filter, as the queue's policy lets it" {
+	const g = stack(new Catalog(0, 0))
+	assert s3(g, "PUT", "/bkt").status == 200
+	queue(g, "open", sendable("open", "s3.amazonaws.com", "arn:aws:s3:::bkt"))
+	queue(g, "closed")
+	const events = ["s3:ObjectCreated:*", "s3:ObjectRemoved:Delete"]
+	let res = s3(g, "PUT", "/bkt?notification", notifying(queueArn("closed"), events, "in/", ".txt"))
+	assert fails(res, 400, "InvalidArgument", "Unable to validate the following destination configurations")
+	assert indexOf(res.body.whole ?? "", "Permissions on the destination queue do not allow S3") > 0
+	res = s3(g, "PUT", "/bkt?notification", notifying(queueArn("none"), events, "in/", ".txt"))
+	assert indexOf(res.body.whole ?? "", "The destination queue does not exist") > 0
+	assert s3(g, "PUT", "/bkt?notification", notifying(queueArn("open"), events, "in/", ".txt")).status == 200
+	const test = bodies(g, "open")
+	assert test.length == 1 && indexOf(test[0], `"Event":"s3:TestEvent"`) > 0
+	assert s3(g, "PUT", "/bkt/in/a%20b.txt", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/out/a.txt", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/in/a.bin", "ab").status == 200
+	assert s3(g, "DELETE", "/bkt/in/a%20b.txt").status == 204
+	const got = bodies(g, "open")
+	assert got.length == 2
+	assert indexOf(got[0], `"eventVersion":"2.1"`) > 0 && indexOf(got[0], `"eventName":"ObjectCreated:Put"`) > 0
+	assert indexOf(got[0], `"key":"in/a+b.txt","size":2,"eTag":"187ef4436122d1cc2f40dc2b92f0eba0"`) > 0
+	assert indexOf(got[0], `"arn":"arn:aws:s3:::bkt"`) > 0 && indexOf(got[0], `"configurationId":"c"`) > 0
+	assert indexOf(got[1], `"eventName":"ObjectRemoved:Delete"`) > 0 && indexOf(got[1], `"key":"in/a+b.txt"`) > 0
+	const n = s3(g, "GET", "/bkt?notification")
+	assert indexOf(n.body.whole ?? "", "<Queue>arn:aws:sqs:us-east-1:000000000000:open</Queue>") > 0
+	g.close()
+}
+
+test "S3 answers a CORS preflight by its bucket's rules, and names them on an answer to an origin" {
+	const g = stack(new Catalog(0, 0))
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert s3(g, "PUT", "/bkt/k", "k").status == 200
+	const preflight = (origin: string, method: string) => {
+		const req = new Request("OPTIONS", "http://localhost:4566/bkt/k", "")
+		req.headers.set("origin", origin)
+		req.headers.set("access-control-request-method", method)
+		return g.handle(req)
+	}
+	assert fails(preflight("https://a.example", "GET"), 403, "AccessForbidden",
+		"CORSResponse: CORS is not enabled for this bucket.")
+	const rules = "<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>"
+		+ "<AllowedOrigin>https://*.example</AllowedOrigin><MaxAgeSeconds>60</MaxAgeSeconds></CORSRule></CORSConfiguration>"
+	assert s3(g, "PUT", "/bkt?cors", rules).status == 200
+	const ok = preflight("https://a.example", "GET")
+	assert ok.status == 200 && ok.headers.get("access-control-allow-origin") == "https://a.example"
+	assert ok.headers.get("access-control-max-age") == "60"
+	assert preflight("https://a.example", "PUT").status == 403
+	assert preflight("https://a.other", "GET").status == 403
+	const req = new Request("GET", "http://localhost:4566/bkt/k", "")
+	req.headers.set("origin", "https://a.example")
+	sign(req, "", "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	const res = g.handle(req)
+	assert res.status == 200 && res.headers.get("access-control-allow-methods") == "GET"
+	g.close()
+}
