@@ -1,0 +1,823 @@
+//! IAM policies: documents parsed once into statements, and AWS's evaluation of a request against the policies that
+//! apply to it, as IAM's policy evaluation logic has it: an explicit deny in any policy wins; within an account either
+//! an identity-based policy or a resource-based policy that names the principal allows, the permissions boundary and
+//! the session policies limiting what the former allows; across accounts both sides must allow.
+
+import { indexOf, startsWith } from "std/algo"
+
+import { apostrophe, backslash, dollar, isAlphanumeric, isDigit, isHexDigit, lbrace, lbracket, question, quote,
+	star } from "std/ascii"
+
+import * as base64 from "std/encoding/base64"
+import * as std from "std/encoding/json"
+import { lower, ParseError, split, trim } from "std/string"
+import { parseRfc3339, second } from "std/time"
+import { Fault } from "../fault"
+
+/// What a document is: an identity-based policy, which a permissions boundary and a session policy are too, a
+/// resource-based policy, or a role's trust policy.
+export type Kind = "identity" | "resource" | "trust"
+
+/// A condition: its operator, positive, as StringEquals for StringNotEquals, which negated marks, the key it tests
+/// and the values the policy gives.
+class Condition {
+	op = ""
+	negated = false
+	ifExists = false
+	/// "", ForAllValues or ForAnyValue.
+	set = ""
+	key = ""
+	values: string[] = []
+}
+
+class Statement {
+	sid = ""
+	allow = true
+	/// The principals named, as [type, value]: type AWS, Service, Federated, CanonicalUser, or * for "*"; none in an
+	/// identity-based policy.
+	principals: [string, string][] = []
+	notPrincipal = false
+	/// Lower-cased.
+	actions: string[] = []
+	notAction = false
+	/// Null for a trust policy's, which names none.
+	resources: string[] | null = null
+	notResource = false
+	conditions: Condition[] = []
+}
+
+export class Policy {
+	kind: Kind = "identity"
+	/// "2012-10-17", "2008-10-17", or "" for none; policy variables are only of the first.
+	version = ""
+	id = ""
+	statements: Statement[] = []
+}
+
+/// Who makes a request: the root user of an account, an IAM user, a role's session, a federated user's session (of
+/// GetFederationToken), a web or SAML identity provider's user, or an AWS service.
+export type PrincipalKind = "root" | "user" | "role" | "federated-user" | "federated" | "service"
+
+export class Principal {
+	kind: PrincipalKind = "user"
+	/// Its ARN: arn:aws:iam::<account>:root, a user's, arn:aws:sts::<account>:assumed-role/<role>/<session>,
+	/// arn:aws:sts::<account>:federated-user/<name>; the provider's for a federated one, the service principal's
+	/// name, as sqs.amazonaws.com, for a service.
+	arn = ""
+	/// The account it is of; "" for a federated one or a service.
+	account = ""
+	/// The ARN of a session's role, with its path.
+	role = ""
+}
+
+/// A request, as policies see it.
+export class Request {
+	principal = new Principal()
+	action = ""
+	/// The ARN of the resource, "*" for none.
+	resource = "*"
+	/// The account that owns the resource.
+	owner = ""
+	/// The context keys, their names in any case, and their values: one of a single-valued key, a list of a
+	/// multivalued one.
+	context: [string, string | string[]][] = []
+}
+
+/// The policies that apply to a request.
+export class Policies {
+	identity: Policy[] = []
+	/// The resource's, or the role's trust policy for an sts:AssumeRole* request.
+	resource: Policy | null = null
+	boundary: Policy | null = null
+	/// None if the principal is not a session with session policies.
+	session: Policy[] = []
+}
+
+export type Effect = "allowed" | "implicitDeny" | "explicitDeny"
+/// The kind of policy that decides, and names an access denied: an identity-based policy, a resource-based policy,
+/// a permissions boundary, a session policy, or the role trust policy.
+export type By = "identity" | "resource" | "boundary" | "session" | "trust"
+
+export class Decision {
+	effect: Effect
+	by: By
+
+	constructor(effect: Effect, by: By) {
+		this.effect = effect
+		this.by = by
+	}
+}
+
+/// The policy the JSON document is, of kind k, or the MalformedPolicyDocument it is, as IAM words it.
+export function parse(document: string, k: Kind): Policy throws Fault {
+	const p = new Policy()
+	p.kind = k
+	let doc: std.Unknown[] = []
+	try {
+		doc = std.decode[std.Keys](document).all
+	} catch (e: ParseError) {
+		throw malformed(if (k == "trust") "This policy contains invalid Json" else syntax)
+	}
+	let statements: string[] | null = null
+	for (const [name, v] of doc) {
+		switch (name) {
+			case "Version":
+				p.version = text(v)
+				if (p.version != "2012-10-17" && p.version != "2008-10-17") {
+					throw malformed(syntax)
+				}
+			case "Id": p.id = text(v)
+			case "Statement": statements = if (v.length > 0 && v[0] == lbracket) items(v) else [v]
+			default: throw malformed(syntax)
+		}
+	}
+	if (statements == null || statements.length == 0) {
+		throw malformed(syntax)
+	}
+	for (const s of statements) {
+		const st = statement(s, k)
+		if (st.sid != "" && p.statements.some(o => o.sid == st.sid)) {
+			throw malformed("Statement IDs (SID) in a single policy must be unique.")
+		}
+		p.statements.push(st)
+	}
+	return p
+}
+
+/// What the policies decide for r: allowed, implicitly or explicitly denied, and by which kind of policy.
+export function evaluate(r: Request, p: Policies): Decision {
+	const action = lower(r.action)
+	const resource = p.resource
+	const rk: By = if (resource != null && resource.kind == "trust") "trust" else "resource"
+	if (p.identity.some(x => decides(x, r, action, false))) {
+		return new Decision("explicitDeny", "identity")
+	}
+	if (resource != null && decides(resource, r, action, false)) {
+		return new Decision("explicitDeny", rk)
+	}
+	if (p.boundary != null && decides(p.boundary, r, action, false)) {
+		return new Decision("explicitDeny", "boundary")
+	}
+	if (p.session.some(x => decides(x, r, action, false))) {
+		return new Decision("explicitDeny", "session")
+	}
+	const who = r.principal
+	const grant = if (resource == null) "" else granted(resource, r, action)
+	if (who.kind == "service" || who.kind == "federated") {
+		return if (grant != "") new Decision("allowed", rk) else new Decision("implicitDeny", rk)
+	}
+	const identity = who.kind == "root" || p.identity.some(x => decides(x, r, action, true))
+	const boundary = p.boundary == null || decides(p.boundary, r, action, true)
+	const session = p.session.length == 0 || p.session.some(x => decides(x, r, action, true))
+	const limited: By = if (!identity) "identity" else if (!boundary) "boundary" else "session"
+	if (who.account == r.owner) {
+		if (grant == "principal" || grant == "role" && boundary && session) {
+			return new Decision("allowed", rk)
+		}
+		return if (identity && boundary && session) new Decision("allowed", "identity")
+			else new Decision("implicitDeny", limited)
+	}
+	if (!(identity && boundary && session)) {
+		return new Decision("implicitDeny", limited)
+	}
+	return if (grant != "") new Decision("allowed", rk) else new Decision("implicitDeny", rk)
+}
+
+/// The message of the AccessDenied that d, a denial of r, answers with, as AWS words it.
+export function denied(r: Request, d: Decision): string {
+	const on = if (r.resource == "*" || r.resource == "") "" else ` on resource: ${r.resource}`
+	const head = `User: ${r.principal.arn} is not authorized to perform: ${r.action}${on}`
+	if (d.effect == "explicitDeny") {
+		return `${head} with an explicit deny in ${if (d.by == "trust") "the" else article(d.by)} ${named(d.by)}`
+	}
+	return `${head} because no ${named(d.by)} allows the ${r.action} action`
+}
+
+const syntax = "Syntax errors in policy."
+
+function malformed(message: string): Fault { return new Fault(400, "MalformedPolicyDocument", message) }
+
+function named(by: By): string {
+	switch (by) {
+		case "identity": return "identity-based policy"
+		case "resource": return "resource-based policy"
+		case "boundary": return "permissions boundary"
+		case "session": return "session policy"
+		default: return "role trust policy"
+	}
+}
+
+function article(by: By): string { return if (by == "identity") "an" else "a" }
+
+/// The statement the JSON object s is, of a policy of kind k.
+function statement(s: string, k: Kind): Statement throws Fault {
+	const st = new Statement()
+	let effect = false
+	let actions = false
+	let resources = false
+	let principal = false
+	let members: std.Unknown[] = []
+	try {
+		members = std.decode[std.Keys](s).all
+	} catch (e: ParseError) {
+		throw malformed(syntax)
+	}
+	for (const [name, v] of members) {
+		switch (name) {
+			case "Sid":
+				st.sid = text(v)
+				if (!st.sid.every(isAlphanumeric)) {
+					throw malformed("Statement IDs (SID) must be alpha-numeric. Check that your input satisfies the regular expression [0-9A-Za-z]*")
+				}
+			case "Effect":
+				const e = text(v)
+				if (e != "Allow" && e != "Deny") {
+					throw malformed(syntax)
+				}
+				st.allow = e == "Allow"
+				effect = true
+			case "Principal", "NotPrincipal":
+				if (principal) {
+					throw malformed(syntax)
+				}
+				principal = true
+				st.notPrincipal = name == "NotPrincipal"
+				st.principals = principals(v, k)
+			case "Action", "NotAction":
+				if (actions) {
+					throw malformed(syntax)
+				}
+				actions = true
+				st.notAction = name == "NotAction"
+				for (const a of strings(v)) {
+					if (a != "*" && indexOf(a, ":") <= 0) {
+						throw malformed("Actions/Conditions must be prefaced by a vendor, e.g., iam, sdb, ec2, etc.")
+					}
+					st.actions.push(lower(a))
+				}
+			case "Resource", "NotResource":
+				if (k == "trust") {
+					throw malformed(`Has prohibited field ${name}`)
+				}
+				if (resources) {
+					throw malformed(syntax)
+				}
+				resources = true
+				st.notResource = name == "NotResource"
+				const rs = strings(v)
+				for (const r of rs) {
+					if (r != "*" && indexOf(r, "arn:") != 0) {
+						throw malformed(`Resource ${r} must be in ARN format or "*".`)
+					}
+				}
+				st.resources = rs
+			case "Condition": st.conditions = conditions(v)
+			default: throw malformed(syntax)
+		}
+	}
+	if (!effect) {
+		throw malformed(syntax)
+	}
+	if (k == "identity" && principal) {
+		throw malformed("Policy document should not specify a principal.")
+	}
+	if (k != "identity" && !principal) {
+		throw malformed("Missing required field Principal")
+	}
+	if (!actions || st.actions.length == 0) {
+		throw malformed("Policy statement must contain actions.")
+	}
+	if (k == "trust" && (st.notAction || !st.actions.every(a => indexOf(a, "sts:") == 0))) {
+		throw malformed("AssumeRole policy may only specify STS AssumeRole actions.")
+	}
+	if (k != "trust" && (!resources || st.resources!.length == 0)) {
+		throw malformed("Policy statement must contain resources.")
+	}
+	return st
+}
+
+/// The principals of the Principal element v: "*", or an object of types, each of one value or a list.
+function principals(v: string, k: Kind): [string, string][] throws Fault {
+	if (v.length > 0 && v[0] == quote) {
+		if (text(v) != "*") {
+			throw malformed(syntax)
+		}
+		return [["*", "*"]]
+	}
+	const out: [string, string][] = []
+	for (const [t, xs] of object(v)) {
+		if (t != "AWS" && t != "Service" && t != "Federated" && t != "CanonicalUser") {
+			throw malformed(syntax)
+		}
+		for (const x of strings(xs)) {
+			if (t == "AWS" && x != "*" && !account(x) && indexOf(x, "arn:") != 0) {
+				throw malformed(`Invalid principal in policy: "AWS":"${x}"`)
+			}
+			out.push([t, x])
+		}
+	}
+	return out
+}
+
+/// The conditions of the Condition element v: an object of operators, each an object of keys and their values.
+function conditions(v: string): Condition[] throws Fault {
+	const out: Condition[] = []
+	for (const [operator, keys] of object(v)) {
+		let op = operator
+		let set = ""
+		const colon = indexOf(op, ":")
+		if (colon >= 0) {
+			set = op.slice(0, colon)
+			op = op.slice(colon + 1, op.length)
+			if (set != "ForAllValues" && set != "ForAnyValue") {
+				throw malformed(syntax)
+			}
+		}
+		const ifExists = op.length > 8 && op.slice(op.length - 8, op.length) == "IfExists"
+		if (ifExists) {
+			op = op.slice(0, op.length - 8)
+		}
+		const base = positive(op)
+		if (base == "" || ifExists && base == "Null") {
+			throw malformed(syntax)
+		}
+		for (const [key, values] of object(keys)) {
+			const c = new Condition()
+			c.op = base
+			c.negated = base != op
+			c.ifExists = ifExists
+			c.set = set
+			c.key = lower(key)
+			c.values = strings(values, true)
+			out.push(c)
+		}
+	}
+	return out
+}
+
+/// The positive operator of op, op itself if it is one; "" if op is none.
+function positive(op: string): string {
+	switch (op) {
+		case "StringNotEquals": return "StringEquals"
+		case "StringNotEqualsIgnoreCase": return "StringEqualsIgnoreCase"
+		case "StringNotLike": return "StringLike"
+		case "NumericNotEquals": return "NumericEquals"
+		case "DateNotEquals": return "DateEquals"
+		case "NotIpAddress": return "IpAddress"
+		case "ArnNotEquals": return "ArnEquals"
+		case "ArnNotLike": return "ArnLike"
+		case "StringEquals", "StringEqualsIgnoreCase", "StringLike", "NumericEquals", "NumericLessThan",
+			"NumericLessThanEquals", "NumericGreaterThan", "NumericGreaterThanEquals", "DateEquals", "DateLessThan",
+			"DateLessThanEquals", "DateGreaterThan", "DateGreaterThanEquals", "Bool", "BinaryEquals", "IpAddress",
+			"ArnEquals", "ArnLike", "Null": return op
+		default: return ""
+	}
+}
+
+/// Whether a statement of p of the effect allow (or deny) applies to r, whose action is action lower-cased.
+function decides(p: Policy, r: Request, action: string, allow: bool): bool {
+	return p.statements.some(s => s.allow == allow && applies(p, s, r, action) && principal(s, r.principal) != "")
+}
+
+/// How the resource-based policy p allows r: "principal" if it names the principal itself, "role" if a session's
+/// role, "account" if its account; "" if it does not.
+function granted(p: Policy, r: Request, action: string): string {
+	let grant = ""
+	for (const s of p.statements) {
+		if (s.allow && applies(p, s, r, action)) {
+			const g = principal(s, r.principal)
+			if (g == "principal" || g == "role" && grant != "principal" || g == "account" && grant == "") {
+				grant = g
+			}
+		}
+	}
+	return grant
+}
+
+/// Whether s of p applies to r's action, resource and context.
+function applies(p: Policy, s: Statement, r: Request, action: string): bool {
+	if (s.actions.some(a => glob(a, action)) == s.notAction) {
+		return false
+	}
+	const rs = s.resources
+	if (rs != null && rs.some(x => {
+		const pattern = expand(p, x, r, true)
+		return pattern != null && glob(pattern, r.resource)
+	}) == s.notResource) {
+		return false
+	}
+	return s.conditions.every(c => holds(p, c, r))
+}
+
+/// How s names who, as granted says, "*" for any principal or for s naming none; "" if it does not.
+function principal(s: Statement, who: Principal): string {
+	if (s.principals.length == 0 && !s.notPrincipal) {
+		return "principal"
+	}
+	if (s.notPrincipal) {
+		// Excluded only if every name of who is: its own, its role's for a session, and its account.
+		const own = s.principals.some(n => names(n, who) == "principal")
+		const role = who.kind != "role" || s.principals.some(n => names(n, who) == "role")
+		const acct = who.account == "" || who.kind == "root" || s.principals.some(n => names(n, who) == "account")
+		return if (own && role && acct) "" else "principal"
+	}
+	let best = ""
+	for (const n of s.principals) {
+		const g = names(n, who)
+		if (g == "principal" || g == "role" && best != "principal" || g == "account" && best == "") {
+			best = g
+		}
+	}
+	return best
+}
+
+/// How the principal n names who: "principal", "role", "account", or "".
+function names(n: [string, string], who: Principal): string {
+	const [t, v] = n
+	if (t == "*" || t == "AWS" && v == "*") {
+		return "principal"
+	}
+	switch (t) {
+		case "AWS":
+			if (who.account == "") {
+				return ""
+			}
+			if (v == who.account || v == `arn:aws:iam::${who.account}:root`) {
+				return if (who.kind == "root") "principal" else "account"
+			}
+			if (v == who.arn) {
+				return "principal"
+			}
+			return if (who.kind == "role" && v == who.role) "role" else ""
+		case "Service": return if (who.kind == "service" && v == who.arn) "principal" else ""
+		case "Federated": return if (who.kind == "federated" && v == who.arn) "principal" else ""
+		default: return ""
+	}
+}
+
+/// Whether the condition c of p holds for r, as IAM's policy simulator has it: a key missing holds for ForAllValues,
+/// IfExists and a negated operator, a multivalued key only under ForAllValues or ForAnyValue, and a value not of the
+/// operator's type matches nothing, negated or not.
+function holds(p: Policy, c: Condition, r: Request): bool {
+	const found = r.context.find(e => lower(e[0]) == c.key)
+	const value = if (found == null) [] else found[1]
+	const values = if (value instanceof string) [value] else value
+	if (c.op == "Null") {
+		return c.values.some(v => (lower(v) == "true") == (values.length == 0))
+	}
+	if (values.length == 0) {
+		return if (c.set == "ForAllValues") true else if (c.set == "ForAnyValue") false else c.ifExists || c.negated
+	}
+	const like = c.op == "StringLike" || c.op == "ArnEquals" || c.op == "ArnLike"
+	const variables = c.op == "StringEquals" || c.op == "StringEqualsIgnoreCase" || like
+	const wanted: string[] = []
+	for (const v of c.values) {
+		const x = if (variables) expand(p, v, r, like) else v
+		if (x != null) {
+			wanted.push(x)
+		}
+	}
+	const test = (v: string) => typed(c.op, v) && wanted.some(w => matches(c.op, v, w)) != c.negated
+	switch (c.set) {
+		case "ForAllValues": return values.every(test)
+		case "ForAnyValue": return values.some(test)
+		default: return value instanceof string && test(value)
+	}
+}
+
+/// Whether the context value v is of the type the positive operator op compares.
+function typed(op: string, v: string): bool {
+	switch (op) {
+		case "BinaryEquals": try {
+			base64.decode(v)
+			return true
+		} catch (e: ParseError) {
+			return false
+		}
+		case "IpAddress": return ip(v) != null
+		case "ArnEquals", "ArnLike": return arn(v) != null
+		default:
+			if (startsWith(op, "Numeric")) {
+				return number(v) != null
+			}
+			return !startsWith(op, "Date") || date(v) != null
+	}
+}
+
+/// Whether the context value v matches the policy's w under the positive operator op.
+function matches(op: string, v: string, w: string): bool {
+	switch (op) {
+		case "StringEquals": return v == w
+		case "StringEqualsIgnoreCase": return lower(v) == lower(w)
+		case "StringLike": return glob(w, v)
+		case "Bool": return lower(v) == lower(w)
+		case "BinaryEquals": try {
+			return base64.decode(v) == base64.decode(w)
+		} catch (e: ParseError) {
+			return false
+		}
+		case "IpAddress":
+			const a = ip(v)
+			const net = ip(w)
+			return a != null && net != null && within(a[0], net)
+		case "ArnEquals", "ArnLike":
+			const vs = arn(v)
+			const ws = arn(w)
+			if (vs == null || ws == null) {
+				return false
+			}
+			for (let i = 0; i < 6; i++) {
+				if (!glob(ws[i], vs[i])) {
+					return false
+				}
+			}
+			return true
+		default:
+			if (startsWith(op, "Numeric")) {
+				const x = number(v)
+				const y = number(w)
+				return x != null && y != null && compare(op.slice(7, op.length), x, y)
+			}
+			const x = date(v)
+			const y = date(w)
+			return x != null && y != null && compare(op.slice(4, op.length), x as f64, y as f64)
+	}
+}
+
+/// Whether x stands to y as the operator's suffix rel says: Equals, LessThan, LessThanEquals, GreaterThan or
+/// GreaterThanEquals.
+function compare(rel: string, x: f64, y: f64): bool {
+	switch (rel) {
+		case "Equals": return x == y
+		case "LessThan": return x < y
+		case "LessThanEquals": return x <= y
+		case "GreaterThan": return x > y
+		default: return x >= y
+	}
+}
+
+/// The number s is, null if it is none.
+function number(s: string): f64 | null {
+	try {
+		return std.decode[f64](s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The instant in seconds since 1970 that s names, as an ISO 8601 date or date and time, or seconds; null if none.
+function date(s: string): i64 | null {
+	if (s.length > 0 && s.every(isDigit)) {
+		const n = number(s)
+		return if (n == null) null else n as i64
+	}
+	try {
+		return parseRfc3339(if (s.length == 10) `${s}T00:00:00Z` else s) / second
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The six parts of the ARN s, the last its resource whatever colons it holds; null if s is none.
+function arn(s: string): string[] | null {
+	const parts = split(s, ":")
+	if (parts.length < 6 || parts[0] != "arn") {
+		return null
+	}
+	return [...parts.slice(0, 5), parts.slice(5, parts.length).join(":")]
+}
+
+/// The address s, v4 or v6, as bytes, and the length of its prefix, all its bits if s has none; null if s is none.
+function ip(s: string): [u8[], i32] | null {
+	const slash = indexOf(s, "/")
+	const host = if (slash < 0) s else s.slice(0, slash)
+	const a = if (indexOf(host, ":") >= 0) v6(host) else v4(host)
+	if (a == null) {
+		return null
+	}
+	if (slash < 0) {
+		return [a, a.length * 8]
+	}
+	const bits = s.slice(slash + 1, s.length)
+	if (bits.length == 0 || bits.length > 3 || !bits.every(isDigit)) {
+		return null
+	}
+	const n = number(bits)! as i32
+	return if (n > a.length * 8) null else [a, n]
+}
+
+function v4(s: string): u8[] | null {
+	const parts = split(s, ".")
+	if (parts.length != 4) {
+		return null
+	}
+	const out: u8[] = []
+	for (const p of parts) {
+		if (p.length == 0 || p.length > 3 || !p.every(isDigit)) {
+			return null
+		}
+		const n = number(p)! as i32
+		if (n > 255) {
+			return null
+		}
+		out.push(n as u8)
+	}
+	return out
+}
+
+function v6(s: string): u8[] | null {
+	const gap = indexOf(s, "::")
+	const head = if (gap < 0) s else s.slice(0, gap)
+	const tail = if (gap < 0) "" else s.slice(gap + 2, s.length)
+	const front = groups(head)
+	const back = groups(tail)
+	if (front == null || back == null) {
+		return null
+	}
+	const n = front.length + back.length
+	if (gap < 0 && n != 8 || gap >= 0 && n > 7) {
+		return null
+	}
+	const out: u8[] = []
+	const all = [...front, ...new i32[](8 - n), ...back]
+	for (const g of all) {
+		out.push((g >> 8) as u8)
+		out.push((g & 255) as u8)
+	}
+	return out
+}
+
+/// The 16-bit groups of s, colon-separated; null if s is not such.
+function groups(s: string): i32[] | null {
+	const out: i32[] = []
+	if (s == "") {
+		return out
+	}
+	for (const g of split(s, ":")) {
+		if (g.length == 0 || g.length > 4 || !g.every(isHexDigit)) {
+			return null
+		}
+		let n = 0
+		for (let i = 0; i < g.length; i++) {
+			const ch = g[i] as i32
+			n = n * 16 + (if (ch <= 57) ch - 48 else (ch | 32) - 87)
+		}
+		out.push(n)
+	}
+	return out
+}
+
+/// Whether the address a is in the network net.
+function within(a: u8[], net: [u8[], i32]): bool {
+	const [b, bits] = net
+	if (a.length != b.length) {
+		return false
+	}
+	for (let i = 0; i < bits; i++) {
+		const mask = (128 >> (i % 8)) as u8
+		if ((a[i / 8] & mask) != (b[i / 8] & mask)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The text s of p with its policy variables replaced by r's values, those of 2012-10-17 only: ${key}, ${key,
+/// 'default'}, and ${*}, ${?} and ${$} for those characters; null if a key it names has no single value. With
+/// pattern, a literal \, * or ? of the result is escaped by a \, as glob takes it.
+function expand(p: Policy, s: string, r: Request, pattern: bool): string | null {
+	const vars = p.version == "2012-10-17"
+	if ((!vars || indexOf(s, "${") < 0) && (!pattern || indexOf(s, "\\") < 0)) {
+		return s
+	}
+	const out: u8[] = []
+	let i = 0
+	while (i < s.length) {
+		const end = if (vars && s[i] == dollar && s.at(i + 1) == lbrace) indexOf(s, "}", i) else -1
+		if (end < 0) {
+			literal(out, s[i], pattern && s[i] == backslash)
+			i++
+			continue
+		}
+		const v = variable(s.slice(i + 2, end), r)
+		if (v == null) {
+			return null
+		}
+		for (let j = 0; j < v.length; j++) {
+			const ch = v[j]
+			literal(out, ch, pattern && (ch == backslash || ch == star || ch == question))
+		}
+		i = end + 1
+	}
+	return fromBytes(out)
+}
+
+function literal(out: u8[], ch: u8, escape: bool) {
+	if (escape) {
+		out.push(backslash)
+	}
+	out.push(ch)
+}
+
+/// The value of the policy variable inside ${…}, null if it has none.
+function variable(name: string, r: Request): string | null {
+	switch (name) {
+		case "*", "?", "$": return name
+	}
+	const comma = indexOf(name, ",")
+	const key = trim(lower(if (comma < 0) name else name.slice(0, comma)))
+	const found = r.context.find(e => lower(e[0]) == key)
+	const v = if (found == null) null else found[1]
+	if (v instanceof string) {
+		return v
+	}
+	if (comma < 0) {
+		return null
+	}
+	const d = trim(name.slice(comma + 1, name.length))
+	return if (d.length >= 2 && d[0] == apostrophe && d[d.length - 1] == apostrophe) d.slice(1, d.length - 1) else null
+}
+
+/// Whether s matches the pattern p, in which * matches any run of characters, ? any one, and \ escapes the next.
+function glob(p: string, s: string): bool {
+	let i = 0
+	let j = 0
+	let back = -1
+	let mark = 0
+	while (j < s.length) {
+		if (i < p.length && p[i] == star) {
+			back = i
+			mark = j
+			i++
+		} else if (i < p.length && (p[i] == question || one(p, i) == s[j])) {
+			i += if (p[i] == backslash && i + 1 < p.length) 2 else 1
+			j++
+		} else if (back >= 0) {
+			i = back + 1
+			mark++
+			j = mark
+		} else {
+			return false
+		}
+	}
+	while (i < p.length && p[i] == star) {
+		i++
+	}
+	return i == p.length
+}
+
+/// The literal character at i of the pattern p, the one after it if it is a \.
+function one(p: string, i: i32): u8 { return if (p[i] == backslash && i + 1 < p.length) p[i + 1] else p[i] }
+/// Whether s is an account id.
+function account(s: string): bool { return s.length == 12 && s.every(isDigit) }
+
+/// The text of the JSON string s; any other scalar's JSON as it is.
+function text(s: string): string {
+	try {
+		return std.decode[string](s)
+	} catch (e: ParseError) {
+		return s
+	}
+}
+
+/// The members of the JSON object v.
+function object(v: string): std.Unknown[] throws Fault {
+	try {
+		return std.decode[std.Keys](v).all
+	} catch (e: ParseError) {
+		throw malformed(syntax)
+	}
+}
+
+/// An item of a JSON array, as std/encoding/json decodes any.
+type Item = i64 | f64 | string | bool | std.Keys | null | (i64 | f64 | string | bool | std.Keys | null)[]
+
+/// The JSON text of each item of the array v.
+function items(v: string): string[] throws Fault {
+	try {
+		return std.decode[Item[]](v).map(x => json(x))
+	} catch (e: ParseError) {
+		throw malformed(syntax)
+	}
+}
+
+function json(x: Item): string {
+	try {
+		return std.encode(x)
+	} catch (e: std.EncodeError) {
+		return "" // a float of JSON is finite
+	}
+}
+
+/// The strings of v: one string, or a list of them; with scalars, of numbers and bools too, as their JSON.
+function strings(v: string, scalars = false): string[] throws Fault {
+	const xs = if (v.length > 0 && v[0] == lbracket) items(v) else [v]
+	const out: string[] = []
+	for (const x of xs) {
+		if (x.length == 0 || x[0] == lbrace || x[0] == lbracket || x == "null" || !scalars && x[0] != quote) {
+			throw malformed(syntax)
+		}
+		out.push(text(x))
+	}
+	return out
+}

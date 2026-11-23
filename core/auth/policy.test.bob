@@ -1,0 +1,266 @@
+import { endsWith } from "std/algo"
+import { decode } from "std/encoding/json"
+import { readFile } from "std/fs"
+import { split } from "std/string"
+import { Fault } from "../fault"
+
+import { By, Decision, denied, evaluate, Kind, parse, Policies, Policy, Principal, PrincipalKind,
+	Request } from "./policy"
+
+/// A context key of a case, of the simulator's type.
+class Entry {
+	key = ""
+	type = ""
+	values: string[] = []
+}
+
+/// A case of policy.cases.json: IAM's policy simulator's decision for an IAM user's request, and, where real
+/// enforcement is documented to differ from the simulator, that decision and why.
+class Case {
+	name = ""
+	policies: string[] = []
+	boundary: string[] = []
+	resource = ""
+	caller = ""
+	owner = ""
+	action = ""
+	arn = ""
+	context: Entry[] = []
+	decision = ""
+	enforced = ""
+	note = ""
+}
+
+test "the policy simulator's decisions" {
+	for (const c of decode[Case[]](readFile("core/auth/policy.cases.json"))) {
+		test `${c.name}` {
+			const r = new Request()
+			r.principal.arn = c.caller
+			r.principal.account = split(c.caller, ":")[4]
+			r.action = c.action
+			r.resource = c.arn
+			r.owner = c.owner
+			for (const e of c.context) {
+				r.context.push([e.key, if (endsWith(e.type, "List")) e.values else e.values[0]])
+			}
+			// The simulator takes aws:username from the caller's ARN unless the context gives it.
+			if (!c.context.some(e => e.key == "aws:username")) {
+				r.context.push(["aws:username", split(c.caller, "/").pop()!])
+			}
+			const p = new Policies()
+			p.identity = c.policies.map(d => parse(d, "identity"))
+			p.boundary = if (c.boundary.length == 0) null else parse(c.boundary[0], "identity")
+			p.resource = if (c.resource == "") null else parse(c.resource, "resource")
+			const want = if (c.enforced == "") c.decision else c.enforced
+			assert evaluate(r, p).effect == want
+		}
+	}
+}
+
+function malformed(doc: string, k: Kind): string {
+	try {
+		parse(doc, k)
+		return ""
+	} catch (f: Fault) {
+		assert f.code == "MalformedPolicyDocument" && f.status == 400
+		return f.message
+	}
+}
+
+// IAM's messages, of CreatePolicy for an identity-based policy and CreateRole for a trust policy.
+test "malformed documents" {
+	const s = `"Effect":"Allow","Action":"s3:GetObject","Resource":"*"`
+	const syntax = "Syntax errors in policy."
+	for (const d of ["not json", "{}", `{"Version":"2012-10-17"}`, `{"Version":"2012-10-17","Statement":[]}`,
+		`{"Version":"2012-10-18","Statement":{${s}}}`, `{"Version":"2012-10-17","Foo":1,"Statement":{${s}}}`,
+		`{"Statement":{"Action":"s3:GetObject","Resource":"*"}}`,
+		`{"Statement":{"Effect":"Maybe","Action":"s3:GetObject","Resource":"*"}}`,
+		`{"Statement":{"Effect":"Allow","Action":"s3:GetObject","NotAction":"s3:Put*","Resource":"*"}}`,
+		`{"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"*","NotResource":"*"}}`,
+		`{"Statement":{${s},"Foo":"bar"}}`, `{"Statement":{${s},"Condition":{"StringFoo":{"a":"b"}}}}`,
+		`{"Statement":{${s},"Condition":{"StringEquals":"x"}}}`,
+		`{"Statement":{"Effect":"Allow","Action":5,"Resource":"*"}}`]) {
+		assert malformed(d, "identity") == syntax
+	}
+	assert malformed(`{"Statement":{"Effect":"Allow","Resource":"*"}}`, "identity")
+		== "Policy statement must contain actions."
+	assert malformed(`{"Statement":{"Effect":"Allow","Action":[],"Resource":"*"}}`, "identity")
+		== "Policy statement must contain actions."
+	assert malformed(`{"Statement":{"Effect":"Allow","Action":"s3:GetObject"}}`, "identity")
+		== "Policy statement must contain resources."
+	assert malformed(`{"Statement":{${s},"Principal":"*"}}`, "identity")
+		== "Policy document should not specify a principal."
+	assert malformed(`{"Statement":{"Effect":"Allow","Action":"getobject","Resource":"*"}}`, "identity")
+		== "Actions/Conditions must be prefaced by a vendor, e.g., iam, sdb, ec2, etc."
+	assert malformed(`{"Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":"bucket"}}`, "identity")
+		== "Resource bucket must be in ARN format or \"*\"."
+	assert malformed(`{"Statement":[{${s},"Sid":"a"},{${s},"Sid":"a"}]}`, "identity")
+		== "Statement IDs (SID) in a single policy must be unique."
+	assert malformed(`{"Statement":{${s},"Sid":"a b"}}`, "identity")
+		== "Statement IDs (SID) must be alpha-numeric. Check that your input satisfies the regular expression [0-9A-Za-z]*"
+	assert malformed(`{"Version":"2012-10-17","Statement":{${s}}}`, "identity") == ""
+	assert malformed("not json", "trust") == "This policy contains invalid Json"
+	assert malformed(`{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole"}}`, "trust")
+		== "Missing required field Principal"
+	assert malformed(`{"Statement":{"Effect":"Allow","Principal":{"AWS":"111122223333"},"Action":"sts:AssumeRole",`
+		+ `"Resource":"*"}}`, "trust") == "Has prohibited field Resource"
+	assert malformed(`{"Statement":{"Effect":"Allow","Principal":{"AWS":"nonsense"},"Action":"sts:AssumeRole"}}`,
+		"trust") == "Invalid principal in policy: \"AWS\":\"nonsense\""
+	assert malformed(`{"Statement":{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},`
+		+ `"Action":"s3:GetObject"}}`, "trust") == "AssumeRole policy may only specify STS AssumeRole actions."
+	assert malformed(`{"Statement":{"Effect":"Allow","Principal":{"Service":["ec2.amazonaws.com"]},`
+		+ `"Action":["sts:AssumeRole","sts:TagSession"]}}`, "trust") == ""
+}
+
+function request(kind: PrincipalKind, arn: string, account: string, action: string, resource: string,
+	owner: string): Request {
+	const r = new Request()
+	r.principal.kind = kind
+	r.principal.arn = arn
+	r.principal.account = account
+	r.action = action
+	r.resource = resource
+	r.owner = owner
+	return r
+}
+
+function policy(statement: string, k: Kind = "identity"): Policy {
+	return parse(`{"Version":"2012-10-17","Statement":${statement}}`, k)
+}
+
+function is(d: Decision, effect: string, by: By): bool { return d.effect == effect && d.by == by }
+
+const role = "arn:aws:iam::111122223333:role/path/r"
+const session = "arn:aws:sts::111122223333:assumed-role/r/s"
+const queue = "arn:aws:sqs:us-east-1:111122223333:q"
+
+function sessionRequest(): Request {
+	const r = request("role", session, "111122223333", "sqs:SendMessage", queue, "111122223333")
+	r.principal.role = role
+	return r
+}
+
+function grant(principal: string): Policy {
+	return policy(`{"Effect":"Allow","Principal":{"AWS":"${principal}"},"Action":"sqs:*","Resource":"${queue}"}`,
+		"resource")
+}
+
+const silent = `{"Effect":"Allow","Action":"sqs:ReceiveMessage","Resource":"*"}`
+const sends = `{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}`
+
+// The documented rules the simulator cannot show, whose caller can only be an IAM user: a resource-based policy
+// naming a role's session allows it unlimited by the permissions boundary and the session policies, one naming its
+// role allows it within them (IAM User Guide, "Permissions boundaries for IAM entities" and "Session policies").
+test "role sessions" {
+	const r = sessionRequest()
+	const p = new Policies()
+	p.identity = [policy(silent)]
+	p.boundary = policy(silent)
+	p.session = [policy(silent)]
+	p.resource = grant(session)
+	assert is(evaluate(r, p), "allowed", "resource")
+	p.resource = grant(role)
+	assert is(evaluate(r, p), "implicitDeny", "identity")
+	p.boundary = policy(sends)
+	assert is(evaluate(r, p), "implicitDeny", "identity")
+	p.session = [policy(sends)]
+	assert is(evaluate(r, p), "allowed", "resource")
+	p.resource = grant("111122223333")
+	assert is(evaluate(r, p), "implicitDeny", "identity")
+	p.identity = [policy(sends)]
+	assert is(evaluate(r, p), "allowed", "identity")
+	p.session = [policy(silent)]
+	assert is(evaluate(r, p), "implicitDeny", "session")
+	p.session = [policy(silent), policy(sends)]
+	assert is(evaluate(r, p), "allowed", "identity")
+	p.session = [policy(`{"Effect":"Deny","Action":"sqs:*","Resource":"*"}`)]
+	assert is(evaluate(r, p), "explicitDeny", "session")
+	assert denied(r, evaluate(r, p))
+		== "User: arn:aws:sts::111122223333:assumed-role/r/s is not authorized to perform: "
+		+ "sqs:SendMessage on resource: arn:aws:sqs:us-east-1:111122223333:q with an explicit deny in a session policy"
+}
+
+// A trust policy is the resource-based policy of sts:AssumeRole on the role; one naming the account delegates to its
+// identity-based policies.
+test "trust policies" {
+	const trust = policy(`[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},`
+		+ `"Action":"sts:AssumeRole"},{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},`
+		+ `"Action":"sts:AssumeRole"},{"Effect":"Allow","Principal":{"Federated":"accounts.google.com"},`
+		+ `"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"accounts.google.com:aud":"app"}}},`
+		+ `{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111122223333:user/mallory"},"Action":"sts:*"}]`, "trust")
+	const p = new Policies()
+	p.resource = trust
+	const alice = request("user", "arn:aws:iam::111122223333:user/alice", "111122223333", "sts:AssumeRole", role,
+		"111122223333")
+	assert is(evaluate(alice, p), "implicitDeny", "identity")
+	assert denied(alice, evaluate(alice, p))
+		== "User: arn:aws:iam::111122223333:user/alice is not authorized to "
+		+ "perform: sts:AssumeRole on resource: arn:aws:iam::111122223333:role/path/r because no identity-based policy "
+		+ "allows the sts:AssumeRole action"
+	p.identity = [policy(`{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"${role}"}`)]
+	assert is(evaluate(alice, p), "allowed", "identity")
+	const mallory = request("user", "arn:aws:iam::111122223333:user/mallory", "111122223333", "sts:AssumeRole", role,
+		"111122223333")
+	assert is(evaluate(mallory, p), "explicitDeny", "trust")
+	assert denied(mallory, evaluate(mallory, p))
+		== "User: arn:aws:iam::111122223333:user/mallory is not authorized "
+		+ "to perform: sts:AssumeRole on resource: arn:aws:iam::111122223333:role/path/r with an explicit deny in the "
+		+ "role trust policy"
+	const other = request("user", "arn:aws:iam::444455556666:user/eve", "444455556666", "sts:AssumeRole", role,
+		"111122223333")
+	assert is(evaluate(other, p), "implicitDeny", "trust")
+	assert denied(other, evaluate(other, p))
+		== "User: arn:aws:iam::444455556666:user/eve is not authorized to "
+		+ "perform: sts:AssumeRole on resource: arn:aws:iam::111122223333:role/path/r because no role trust policy "
+		+ "allows the sts:AssumeRole action"
+	const lambda = request("service", "lambda.amazonaws.com", "", "sts:AssumeRole", role, "111122223333")
+	assert is(evaluate(lambda, p), "allowed", "trust")
+	lambda.principal.arn = "ec2.amazonaws.com"
+	assert is(evaluate(lambda, p), "implicitDeny", "trust")
+	const web = request("federated", "accounts.google.com", "", "sts:AssumeRoleWithWebIdentity", role, "111122223333")
+	assert is(evaluate(web, p), "implicitDeny", "trust")
+	web.context.push(["accounts.google.com:aud", "app"])
+	assert is(evaluate(web, p), "allowed", "trust")
+	const root = request("root", "arn:aws:iam::111122223333:root", "111122223333", "sts:AssumeRole", role,
+		"111122223333")
+	assert is(evaluate(root, new Policies()), "allowed", "identity")
+}
+
+// With NotPrincipal, a principal is excluded only if its own ARN, its role's for a session, and its account are
+// named (IAM User Guide, "AWS JSON policy elements: NotPrincipal").
+test "NotPrincipal" {
+	const r = sessionRequest()
+	const p = new Policies()
+	p.identity = [policy(`{"Effect":"Allow","Action":"sqs:*","Resource":"*"}`)]
+	const deny = (names: string) => policy(`[{"Effect":"Deny","NotPrincipal":{"AWS":[${names}]},"Action":"sqs:*",`
+		+ `"Resource":"${queue}"}]`, "resource")
+	p.resource = deny(`"${session}"`)
+	assert is(evaluate(r, p), "explicitDeny", "resource")
+	p.resource = deny(`"${session}","${role}"`)
+	assert is(evaluate(r, p), "explicitDeny", "resource")
+	p.resource = deny(`"${session}","${role}","111122223333"`)
+	assert is(evaluate(r, p), "allowed", "identity")
+}
+
+test "messages" {
+	const r = request("user", "arn:aws:iam::123456789012:user/John", "123456789012", "codecommit:ListRepositories", "*",
+		"123456789012")
+	assert denied(r, new Decision("implicitDeny", "identity"))
+		== "User: arn:aws:iam::123456789012:user/John is not "
+		+ "authorized to perform: codecommit:ListRepositories because no identity-based policy allows the "
+		+ "codecommit:ListRepositories action"
+	r.resource = "arn:aws:codecommit:us-east-1:123456789012:repo"
+	assert denied(r, new Decision("explicitDeny", "identity"))
+		== "User: arn:aws:iam::123456789012:user/John is not "
+		+ "authorized to perform: codecommit:ListRepositories on resource: "
+		+ "arn:aws:codecommit:us-east-1:123456789012:repo with an explicit deny in an identity-based policy"
+	assert denied(r, new Decision("implicitDeny", "boundary"))
+		== "User: arn:aws:iam::123456789012:user/John is not "
+		+ "authorized to perform: codecommit:ListRepositories on resource: "
+		+ "arn:aws:codecommit:us-east-1:123456789012:repo because no permissions boundary allows the "
+		+ "codecommit:ListRepositories action"
+	assert denied(r, new Decision("explicitDeny", "resource"))
+		== "User: arn:aws:iam::123456789012:user/John is not "
+		+ "authorized to perform: codecommit:ListRepositories on resource: "
+		+ "arn:aws:codecommit:us-east-1:123456789012:repo with an explicit deny in a resource-based policy"
+}
