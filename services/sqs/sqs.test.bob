@@ -1,0 +1,362 @@
+import { sign } from "../../core/client"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import * as protocol from "../../core/protocol/json"
+import { Caller } from "../../core/service"
+import { live } from "../../core/state/store"
+import * as api from "./api"
+import { changeVisibility, counts, create, found, Handler, purge, receive, send } from "./sqs"
+import { Decodable } from "std/types"
+import { Request, Response } from "std/http"
+import { minute, second } from "std/time"
+
+const account = "000000000000"
+const base = "http://localhost:4566/000000000000/"
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+/// The answer of g to the operation op with the JSON input body, from the root of 000000000000.
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.0")
+	req.headers.set("x-amz-target", `AmazonSQS.${op}`)
+	sign(req, body, "sqs", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// The T that res holds.
+function out[T extends Decodable](res: Response): T {
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+/// Whether res is the error of status whose code under awsQuery is code.
+function fails(res: Response, status: i32, code: string): bool {
+	return res.status == status && res.headers.get("x-amzn-query-error") == `${code};Sender`
+}
+
+/// A caller of the root of 000000000000, of trees of its own, which done closes.
+function caller(): Caller { return new Caller(account, "us-east-1", `arn:aws:iam::${account}:root`, "r") }
+
+function done(c: Caller) {
+	for (const [_, s] of c.opened) {
+		s.close()
+	}
+}
+
+/// The queue named name, of the attributes given, created at t.
+function queue(c: Caller, name: string, attributes: [api.QueueAttributeName, string][] = [], t: i64 = 0): string {
+	const r = create(c, { ...new api.CreateQueueRequest(), QueueName: name, Attributes: attributes }, t)
+	return r.QueueUrl!
+}
+
+/// Sends body to the queue at u at t, in group if not null.
+function put(c: Caller, u: string, body: string, t: i64, group: string | null = null,
+	dedup: string | null = null): api.SendMessageResult {
+	const r = new api.SendMessageRequest()
+	r.QueueUrl = u
+	r.MessageBody = body
+	r.MessageGroupId = group
+	r.MessageDeduplicationId = dedup
+	return send(c, r, t)
+}
+
+/// The messages received from the queue at u at t, up to n, of visibility timeout vt unless null.
+function take(c: Caller, u: string, t: i64, n = 10, vt: i32 | null = null): api.Message[] {
+	const r = new api.ReceiveMessageRequest()
+	r.QueueUrl = u
+	r.MaxNumberOfMessages = n
+	r.VisibilityTimeout = vt
+	r.MessageSystemAttributeNames = ["All"]
+	return receive(c, r, t).Messages ?? []
+}
+
+/// The bodies of ms.
+function bodies(ms: api.Message[]): string[] { return ms.map(m => m.Body!) }
+
+/// The value of k in the map xs, null if none.
+function entry[K, V](xs: [K, V][], k: K): V | null {
+	for (const [x, v] of xs) {
+		if (x == k) {
+			return v
+		}
+	}
+	return null
+}
+
+/// The system attribute k of m.
+function system(m: api.Message, k: api.MessageSystemAttributeName): string | null {
+	return entry(m.Attributes ?? [], k)
+}
+
+test "queues: create, find, list, attributes, tags, delete" {
+	const before = live()
+	const g = gateway()
+	let res = call(g, "CreateQueue", `{"QueueName":"q1","Attributes":{"VisibilityTimeout":"5"},"tags":{"a":"1"}}`)
+	assert out[api.CreateQueueResult](res).QueueUrl == base + "q1"
+	assert call(g, "CreateQueue", `{"QueueName":"q1","Attributes":{"VisibilityTimeout":"5"}}`).status == 200
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q1","Attributes":{"VisibilityTimeout":"6"}}`), 400,
+		"QueueAlreadyExists")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"a b"}`), 400, "InvalidParameterValue")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q.fifo"}`), 400, "InvalidParameterValue")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q","Attributes":{"FifoQueue":"true"}}`), 400,
+		"InvalidParameterValue")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q","Attributes":{"DelaySeconds":"901"}}`), 400,
+		"InvalidAttributeValue")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q","Attributes":{"ContentBasedDeduplication":"true"}}`), 400,
+		"InvalidAttributeName")
+	res = call(g, "GetQueueUrl", `{"QueueName":"q1"}`)
+	assert out[api.GetQueueUrlResult](res).QueueUrl == base + "q1"
+	assert fails(call(g, "GetQueueUrl", `{"QueueName":"none"}`), 400, "AWS.SimpleQueueService.NonExistentQueue")
+	// Found by the last two segments of its URL, whatever the scheme and host.
+	res = call(g, "GetQueueAttributes", `{"QueueUrl":"https://sqs.example/000000000000/q1","AttributeNames":["All"]}`)
+	const attributes = out[api.GetQueueAttributesResult](res).Attributes!
+	assert entry(attributes, "VisibilityTimeout") == "5"
+	assert entry(attributes, "QueueArn") == "arn:aws:sqs:us-east-1:000000000000:q1"
+	assert entry(attributes, "ApproximateNumberOfMessages") == "0"
+	assert entry(attributes, "MaximumMessageSize") == "1048576"
+	assert attributes.find(a => a[0] == "FifoQueue") == null
+	assert call(g, "SetQueueAttributes", `{"QueueUrl":"${base}q1","Attributes":{"DelaySeconds":"3"}}`).status == 200
+	res = call(g, "GetQueueAttributes", `{"QueueUrl":"${base}q1","AttributeNames":["DelaySeconds"]}`)
+	assert out[api.GetQueueAttributesResult](res).Attributes! == [["DelaySeconds", "3"]]
+	assert call(g, "TagQueue", `{"QueueUrl":"${base}q1","Tags":{"b":"2"}}`).status == 200
+	assert call(g, "UntagQueue", `{"QueueUrl":"${base}q1","TagKeys":["a"]}`).status == 200
+	assert out[api.ListQueueTagsResult](call(g, "ListQueueTags", `{"QueueUrl":"${base}q1"}`)).Tags! == [["b", "2"]]
+	assert call(g, "CreateQueue", `{"QueueName":"q2"}`).status == 200
+	assert call(g, "CreateQueue", `{"QueueName":"r"}`).status == 200
+	assert out[api.ListQueuesResult](call(g, "ListQueues", `{"QueueNamePrefix":"q"}`)).QueueUrls!
+		== [base + "q1", base + "q2"]
+	const first = out[api.ListQueuesResult](call(g, "ListQueues", `{"MaxResults":2}`))
+	assert first.QueueUrls! == [base + "q1", base + "q2"] && first.NextToken != null
+	const next = out[api.ListQueuesResult](call(g, "ListQueues", `{"MaxResults":2,"NextToken":"${first.NextToken!}"}`))
+	assert next.QueueUrls! == [base + "r"] && next.NextToken == null
+	assert call(g, "DeleteQueue", `{"QueueUrl":"${base}q2"}`).status == 200
+	assert fails(call(g, "GetQueueAttributes", `{"QueueUrl":"${base}q2"}`), 400,
+		"AWS.SimpleQueueService.NonExistentQueue")
+	assert fails(call(g, "CreateQueue", `{"QueueName":"q2"}`), 400, "AWS.SimpleQueueService.QueueDeletedRecently")
+	g.close()
+	assert live() == before
+}
+
+test "permissions edit the queue's policy" {
+	const g = gateway()
+	assert call(g, "CreateQueue", `{"QueueName":"q"}`).status == 200
+	const add = `{"QueueUrl":"${base}q","Label":"l1","AWSAccountIds":["111122223333"],"Actions":["SendMessage"]}`
+	assert call(g, "AddPermission", add).status == 200
+	assert fails(call(g, "AddPermission", add), 400, "InvalidParameterValue")
+	const policy = () => {
+		const res = call(g, "GetQueueAttributes", `{"QueueUrl":"${base}q","AttributeNames":["Policy"]}`)
+		return entry(out[api.GetQueueAttributesResult](res).Attributes ?? [], "Policy")
+	}
+	assert policy()
+		== `{"Version":"2012-10-17","Id":"arn:aws:sqs:us-east-1:000000000000:q/SQSDefaultPolicy",`
+		+ `"Statement":[{"Sid":"l1","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},`
+		+ `"Action":"SQS:SendMessage","Resource":"arn:aws:sqs:us-east-1:000000000000:q"}]}`
+	assert call(g, "AddPermission",
+		`{"QueueUrl":"${base}q","Label":"l2","AWSAccountIds":["1","2"],"Actions":["*","GetQueueUrl"]}`).status == 200
+	assert fails(call(g, "AddPermission",
+		`{"QueueUrl":"${base}q","Label":"l3","AWSAccountIds":["1"],"Actions":["Fly"]}`), 400, "InvalidParameterValue")
+	assert call(g, "RemovePermission", `{"QueueUrl":"${base}q","Label":"l1"}`).status == 200
+	assert policy()
+		== `{"Version":"2012-10-17","Id":"arn:aws:sqs:us-east-1:000000000000:q/SQSDefaultPolicy",`
+		+ `"Statement":[{"Sid":"l2","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::1:root","arn:aws:iam::2:root"]},`
+		+ `"Action":["SQS:*","SQS:GetQueueUrl"],"Resource":"arn:aws:sqs:us-east-1:000000000000:q"}]}`
+	assert fails(call(g, "RemovePermission", `{"QueueUrl":"${base}q","Label":"l1"}`), 400, "InvalidParameterValue")
+	assert call(g, "RemovePermission", `{"QueueUrl":"${base}q","Label":"l2"}`).status == 200
+	assert policy() == null
+	g.close()
+}
+
+test "messages: send, receive, delete, with AWS's MD5s" {
+	const g = gateway()
+	assert call(g, "CreateQueue", `{"QueueName":"q","Attributes":{"VisibilityTimeout":"0"}}`).status == 200
+	let res = call(g, "SendMessage",
+		`{"QueueUrl":"${base}q","MessageBody":"hello","MessageAttributes":{`
+		+ `"s":{"DataType":"String","StringValue":"v"},"b":{"DataType":"Binary","BinaryValue":"AQI="}},`
+		+ `"MessageSystemAttributes":{"AWSTraceHeader":{"DataType":"String","StringValue":"Root=1"}}}`)
+	const sent = out[api.SendMessageResult](res)
+	assert sent.MD5OfMessageBody == "5d41402abc4b2a76b9719d911017c592"
+	assert sent.MD5OfMessageAttributes == "6f451067b4012490a723a9773725c99d"
+	assert sent.MD5OfMessageSystemAttributes == "d6619b3d47b81d3fc72c0db005a70eda"
+	assert sent.MessageId!.length == 36 && sent.SequenceNumber == null
+	res = call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","MessageAttributeNames":["All"],"AttributeNames":["All"]}`)
+	const m = out[api.ReceiveMessageResult](res).Messages![0]
+	assert m.MessageId == sent.MessageId && m.Body == "hello" && m.MD5OfBody == sent.MD5OfMessageBody
+	assert m.MD5OfMessageAttributes == sent.MD5OfMessageAttributes
+	assert entry(m.MessageAttributes!, "b")?.BinaryValue == "\x01\x02"
+	assert system(m, "ApproximateReceiveCount") == "1" && system(m, "SenderId") == account
+	assert system(m, "AWSTraceHeader") == "Root=1"
+	res = call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","MessageAttributeNames":["s"]}`)
+	const again = out[api.ReceiveMessageResult](res).Messages![0]
+	// The MD5 of the attributes given.
+	assert again.MessageAttributes!.length == 1 && again.MD5OfMessageAttributes == "f711c779386017be0858627ced765df3"
+	assert again.Attributes == null
+	assert call(g, "DeleteMessage", `{"QueueUrl":"${base}q","ReceiptHandle":"${again.ReceiptHandle!}"}`).status == 200
+	assert call(g, "DeleteMessage", `{"QueueUrl":"${base}q","ReceiptHandle":"${again.ReceiptHandle!}"}`).status == 200
+	assert fails(call(g, "DeleteMessage", `{"QueueUrl":"${base}q","ReceiptHandle":"nonsense"}`), 404,
+		"ReceiptHandleIsInvalid")
+	assert out[api.ReceiveMessageResult](call(g, "ReceiveMessage", `{"QueueUrl":"${base}q"}`)).Messages == null
+	assert fails(call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","MaxNumberOfMessages":11}`), 400,
+		"InvalidParameterValue")
+	assert fails(call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","WaitTimeSeconds":21}`), 400,
+		"InvalidParameterValue")
+	assert fails(call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":""}`), 400, "MissingParameter")
+	assert fails(call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":"\\u0001"}`), 400,
+		"InvalidMessageContents")
+	assert fails(call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":"x","DelaySeconds":901}`), 400,
+		"InvalidParameterValue")
+	assert fails(call(g, "SendMessage",
+		`{"QueueUrl":"${base}q","MessageBody":"x","MessageAttributes":{"n":{"DataType":"Number","StringValue":"x"}}}`),
+		400, "InvalidParameterValue")
+	g.close()
+}
+
+test "batches: limits, and entries that fail alone" {
+	const g = gateway()
+	assert call(g, "CreateQueue", `{"QueueName":"q"}`).status == 200
+	const entries = (n: i32) => {
+		const xs: string[] = []
+		for (let i = 0; i < n; i++) {
+			xs.push(`{"Id":"m${i}","MessageBody":"b${i}"}`)
+		}
+		return `{"QueueUrl":"${base}q","Entries":[${xs.join(",")}]}`
+	}
+	assert fails(call(g, "SendMessageBatch", entries(0)), 400, "AWS.SimpleQueueService.EmptyBatchRequest")
+	assert fails(call(g, "SendMessageBatch", entries(11)), 400, "AWS.SimpleQueueService.TooManyEntriesInBatchRequest")
+	assert fails(call(g, "SendMessageBatch",
+		`{"QueueUrl":"${base}q","Entries":[{"Id":"a","MessageBody":"x"},` + `{"Id":"a","MessageBody":"y"}]}`), 400,
+		"AWS.SimpleQueueService.BatchEntryIdsNotDistinct")
+	assert fails(call(g, "SendMessageBatch", `{"QueueUrl":"${base}q","Entries":[{"Id":"a b","MessageBody":"x"}]}`), 400,
+		"AWS.SimpleQueueService.InvalidBatchEntryId")
+	let r = out[api.SendMessageBatchResult](call(g, "SendMessageBatch",
+		`{"QueueUrl":"${base}q","Entries":[`
+		+ `{"Id":"ok","MessageBody":"x"},{"Id":"bad","MessageBody":"x","DelaySeconds":1000}]}`))
+	assert r.Successful.map(e => e.Id) == ["ok"] && r.Failed.map(e => e.Id) == ["bad"]
+	assert r.Failed[0].Code == "InvalidParameterValue" && r.Failed[0].SenderFault
+	assert out[api.SendMessageBatchResult](call(g, "SendMessageBatch", entries(9))).Successful.length == 9
+	const got = out[api.ReceiveMessageResult](call(g, "ReceiveMessage",
+		`{"QueueUrl":"${base}q","MaxNumberOfMessages":10}`)).Messages!
+	assert bodies(got) == ["x", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"]
+	const deleted = out[api.DeleteMessageBatchResult](call(g, "DeleteMessageBatch",
+		`{"QueueUrl":"${base}q",`
+		+ `"Entries":[{"Id":"a","ReceiptHandle":"${got[0].ReceiptHandle!}"},{"Id":"b","ReceiptHandle":"no"}]}`))
+	assert deleted.Successful.map(e => e.Id) == ["a"] && deleted.Failed[0].Code == "ReceiptHandleIsInvalid"
+	const changed = out[api.ChangeMessageVisibilityBatchResult](call(g, "ChangeMessageVisibilityBatch",
+		`{"QueueUrl":"${base}q","Entries":[{"Id":"a","ReceiptHandle":"${got[1].ReceiptHandle!}","VisibilityTimeout":0}]}`))
+	assert changed.Successful.map(e => e.Id) == ["a"]
+	g.close()
+}
+
+test "visibility, delay and retention, at the instants of the requests" {
+	const c = caller()
+	const u = queue(c, "q", [["VisibilityTimeout", "30"], ["MessageRetentionPeriod", "60"]])
+	const f = () => found(c, u)
+	put(c, u, "a", 0)
+	const r = new api.SendMessageRequest()
+	r.QueueUrl = u
+	r.MessageBody = "late"
+	r.DelaySeconds = 10
+	send(c, r, 0)
+	assert counts(f(), 0) == [1, 0, 1]
+	const got = take(c, u, 0)
+	assert bodies(got) == ["a"] && system(got[0], "ApproximateFirstReceiveTimestamp") == "0"
+	assert counts(f(), 0) == [0, 1, 1]
+	assert take(c, u, 9 * second).length == 0
+	assert bodies(take(c, u, 10 * second)) == ["late"]
+	const again = take(c, u, 30 * second)
+	assert bodies(again) == ["a"] && system(again[0], "ApproximateReceiveCount") == "2"
+	// A stale receipt handle no longer changes the visibility.
+	let stale = false
+	try {
+		changeVisibility(f(), got[0].ReceiptHandle!, 0, 31 * second)
+	} catch (x: Fault) {
+		stale = x.code == "InvalidParameterValue"
+	}
+	assert stale
+	changeVisibility(f(), again[0].ReceiptHandle!, 0, 31 * second)
+	assert bodies(take(c, u, 31 * second, 10, 5)) == ["a"]
+	let notInFlight = false
+	try {
+		changeVisibility(f(), take(c, u, 36 * second)[0].ReceiptHandle!, 5, 70 * second)
+	} catch (x: Fault) {
+		notInFlight = x.code == "MessageNotInflight"
+	}
+	assert notInFlight
+	// Past the retention period of 60 seconds, both are gone.
+	assert take(c, u, 80 * second).length == 0 && counts(f(), 80 * second) == [0, 0, 0]
+	done(c)
+}
+
+test "dead-letter queues take what was received too often" {
+	const c = caller()
+	const dlq = queue(c, "dlq")
+	const policy = `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":"2"}`
+	const u = queue(c, "src", [["RedrivePolicy", policy], ["VisibilityTimeout", "0"]])
+	put(c, u, "poison", 0)
+	assert bodies(take(c, u, 0)) == ["poison"]
+	assert bodies(take(c, u, second)) == ["poison"]
+	assert take(c, u, 2 * second).length == 0
+	const m = take(c, dlq, 2 * second)
+	assert bodies(m) == ["poison"]
+		&& system(m[0], "DeadLetterQueueSourceArn") == "arn:aws:sqs:us-east-1:000000000000:src"
+	let refused = false
+	try {
+		queue(c, "other",
+			[["RedrivePolicy",
+			`{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:none",` + `"maxReceiveCount":1}`]])
+	} catch (x: Fault) {
+		refused = x.code == "InvalidParameterValue"
+	}
+	assert refused
+	done(c)
+}
+
+test "FIFO: in order per group, a group held while in flight, deduplicated for five minutes" {
+	const c = caller()
+	const u = queue(c, "q.fifo", [["FifoQueue", "true"], ["VisibilityTimeout", "30"]])
+	const s1 = put(c, u, "a1", 0, "a", "1")
+	assert put(c, u, "a1 again", minute, "a", "1").MessageId == s1.MessageId
+	put(c, u, "a2", 0, "a", "2")
+	put(c, u, "b1", 0, "b", "3")
+	const first = take(c, u, 0, 1)
+	assert bodies(first) == ["a1"] && system(first[0], "SequenceNumber") == s1.SequenceNumber
+	assert bodies(take(c, u, 0)) == ["b1"]
+	assert take(c, u, 29 * second).length == 0
+	assert bodies(take(c, u, 30 * second)) == ["a1", "a2", "b1"]
+	// Past five minutes, the same deduplication id sends anew.
+	assert put(c, u, "a1", 6 * minute, "a", "1").MessageId != s1.MessageId
+	let refused = false
+	try {
+		put(c, u, "x", 0, null, "9")
+	} catch (x: Fault) {
+		refused = x.code == "MissingParameter"
+	}
+	assert refused
+	done(c)
+}
+
+test "purging, at most once a minute" {
+	const c = caller()
+	const u = queue(c, "q")
+	put(c, u, "a", 0)
+	purge(found(c, u), 0)
+	assert counts(found(c, u), 0) == [0, 0, 0]
+	let refused = false
+	try {
+		purge(found(c, u), 59 * second)
+	} catch (x: Fault) {
+		refused = x.code == "PurgeQueueInProgress"
+	}
+	assert refused
+	purge(found(c, u), minute)
+	done(c)
+}

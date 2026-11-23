@@ -1,0 +1,128 @@
+//! SQS's state in an account's regional tree: its queues by name; their messages by queue, the instant they are next
+//! due and their order, so that a receive reads a queue's head; where each message is, by queue and id; and the
+//! deduplication ids a FIFO queue has seen.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+import { Decodable } from "std/types"
+
+export class Queue {
+	name = ""
+	created: i64 = 0
+	modified: i64 = 0
+	/// In seconds.
+	delay = 0
+	maxSize = 1048576
+	retention = 345600
+	wait = 0
+	visibility = 30
+	/// As given; null if none.
+	policy: string | null = null
+	/// The RedrivePolicy as given, its target and count; null if none.
+	redrive: string | null = null
+	deadLetter = ""
+	maxReceives = 0
+	redriveAllow: string | null = null
+	fifo = false
+	contentDeduplication = false
+	deduplicationScope = "queue"
+	throughputLimit = "perQueue"
+	kmsKey: string | null = null
+	kmsReuse = 300
+	sse = true
+	tags: [string, string][] = []
+	/// The order of the next message sent.
+	next: i64 = 1
+	/// The last PurgeQueue, null if none.
+	purged: i64 | null = null
+}
+
+/// A message attribute: its type, and its value, a string's or, of a Binary type, the bytes in base64.
+export class Attribute {
+	type = ""
+	value = ""
+}
+
+export class Message {
+	id = ""
+	body = ""
+	attributes: [string, Attribute][] = []
+	/// AWSTraceHeader, the one system attribute a sender sets; null if none.
+	trace: string | null = null
+	sender = ""
+	sent: i64 = 0
+	/// The first receive, 0 before; the receives so far.
+	firstReceived: i64 = 0
+	receives = 0
+	/// When it is next visible: after its delay, or after a receive's visibility timeout.
+	visible: i64 = 0
+	/// What its latest receipt handle holds, "" before the first.
+	receipt = ""
+	/// Its order in the queue, and the instant of its key.
+	order: i64 = 0
+	due: i64 = 0
+	group: string | null = null
+	deduplication: string | null = null
+	/// A FIFO queue's sequence number.
+	sequence: string | null = null
+	/// The ARN of the queue it was dead-lettered from.
+	source: string | null = null
+}
+
+/// Where a message is: its key in the messages.
+export class Place {
+	key = ""
+}
+
+/// A deduplication id seen: the message it was sent with and when.
+export class Seen {
+	id = ""
+	sequence: string | null = null
+	at: i64 = 0
+}
+
+/// The tables of an account's regional tree.
+export class Tables {
+	queues: Table[Queue]
+	/// By the queue's name, the instant it was deleted, as at.
+	deleted: Table[Seen]
+	/// By position: the queue's name, the instant it is due as 19 digits and its order as 19.
+	messages: Table[Message]
+	/// By within(queue, id).
+	places: Table[Place]
+	/// By within(queue, scope), the scope the deduplication id, after its group's and a NUL if a queue's scope is its
+	/// groups'.
+	seen: Table[Seen]
+
+	constructor(s: Store) {
+		this.queues = new Table[Queue](s, "sqs/queues")
+		this.deleted = new Table[Seen](s, "sqs/deleted")
+		this.messages = new Table[Message](s, "sqs/messages")
+		this.places = new Table[Place](s, "sqs/places")
+		this.seen = new Table[Seen](s, "sqs/seen")
+	}
+}
+
+/// The key of the record of name, the key of what it belongs to, within it.
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+/// The key of a message of queue, due at the instant due and of order.
+export function position(queue: string, due: i64, order: i64): string {
+	return within(queue, `${digits(due)}\x00${digits(order)}`)
+}
+
+/// n ≥ 0 as 19 digits, so that keys sort by it.
+export function digits(n: i64): string {
+	const s = `${n}`
+	return "0000000000000000000".slice(0, 19 - s.length) + s
+}
+
+/// Puts v at k in t; a record holds no float, the one thing JSON cannot encode.
+export function save[V extends Decodable](t: Table[V], k: string, v: V) throws Fault {
+	try {
+		t.put(k, v)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

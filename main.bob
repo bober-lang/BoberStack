@@ -4,6 +4,8 @@ import { Catalog } from "./services/iam/catalog"
 import * as iam from "./services/iam/iam"
 import { identify } from "./services/iam/identities"
 import * as stsApi from "./services/sts/api"
+import * as sqsApi from "./services/sqs/api"
+import * as sqs from "./services/sqs/sqs"
 import * as sts from "./services/sts/sts"
 import { decode, help } from "std/encoding/optarg"
 import { serve } from "std/http"
@@ -36,8 +38,10 @@ function main(): i32 {
 	g.identify = identify(catalog!)
 	const i = new iam.Handler(catalog!)
 	const s = new sts.Handler()
+	const q = new sqs.Handler()
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
 	try {
 		serve(g.handle, `:${o.port}`)
 	} catch (e: IoError | ParseError) {
