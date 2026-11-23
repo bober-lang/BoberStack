@@ -6,17 +6,22 @@
 //!   shaped as AWS's, each domain's status SUCCESS.
 //! - A requested certificate's PEM, which GetCertificate answers, is self-signed by an Ed25519 key of its own, with no
 //!   chain, whatever its key algorithm and the issuer described; its serial is random, and it is valid for 198 days.
-//! - An imported certificate's PEM framing is checked, not its contents: it has no names, dates or key read from it,
-//!   and is described as RSA_2048 with no domain. It is answered by GetCertificate as given. The messages of a
-//!   malformed import and of a validation option of no name requested are not AWS's verbatim.
-//! - KeyAlgorithm is answered as the model names it, RSA_2048; AWS answers RSA-2048.
-//! - Private certificates, ExportCertificate, RevokeCertificate, SearchCertificates, the ACME operations and those of
-//!   tags by resource are not implemented; RenewCertificate, of private certificates, does nothing.
+//! - An imported certificate is read for what DescribeCertificate answers, its private key for its type: RSA of its
+//!   size or EC of its curve, which must be the certificate's. Whether the key is the certificate's own is not
+//!   checked, nor its signature or chain: std has no RSA or ECDSA. Its subject is written as RFC 2253 writes it.
+//! - The messages of a validation option of no name requested and of a chain that does not parse are not AWS's.
+//! - No certificate is ever exported, so RevokeCertificate refuses each; ExportCertificate refuses all but one
+//!   requested to be exportable, and does not export that one: std has no cipher to encrypt its key with.
+//! - The operations of tags by resource refuse a certificate as AWS does; the wording of TagResource's and
+//!   UntagResource's refusal is ListTagsForResource's.
+//! - Private certificates, SearchCertificates and the ACME operations are not implemented; RenewCertificate, of
+//!   private certificates, does nothing.
 
 import { Fault } from "../../core/fault"
-import { Caller, Unit } from "../../core/service"
+import { Caller, notImplemented, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
+import * as der from "./der"
 import { Account, accounts, Certificate, certificates, Domain, save } from "./records"
 import { selfSigned } from "./x509"
 import { indexOf, stableSort, startsWith } from "std/algo"
@@ -77,7 +82,9 @@ export class Handler {
 		const number = randomBytes(16)
 		const c = { ...new Certificate(), id: id, arn: arn, type: "AMAZON_ISSUED", domain: input.DomainName,
 			method: input.ValidationMethod ?? "EMAIL", keyAlgorithm: input.KeyAlgorithm ?? "RSA_2048",
-			serial: colons(number), token: input.IdempotencyToken, created: t, notAfter: t + validity * day }
+			serial: colons(number), token: input.IdempotencyToken, created: t, notBefore: t,
+			notAfter: t + validity * day, subject: `CN=${input.DomainName}`, issuer: "Amazon" }
+		c.signatureAlgorithm = signature(c.keyAlgorithm)
 		c.body = selfSigned(names, number, t, c.notAfter, randomBytes(32))
 		for (const n of names) {
 			const o = options.find(o => o.DomainName == n)
@@ -115,21 +122,28 @@ export class Handler {
 			c.arn = `arn:aws:acm:${caller.region}:${caller.account}:certificate/${c.id}`
 			caller.allow(c.arn)
 			c.type = "IMPORTED"
-			c.keyAlgorithm = "RSA_2048"
 			c.created = now()
-			c.serial = colons(randomBytes(16))
 			c.tags = tagged([], input.Tags ?? [])
 		}
-		if (pems(input.Certificate, "CERTIFICATE") != 1) {
-			throw api.validationException("The certificate field must contain exactly 1 certificate in PEM format.")
+		const p = read(input.Certificate, input.PrivateKey)
+		if (input.CertificateChain != null) {
+			try {
+				for (const b of blocks(input.CertificateChain!, "CERTIFICATE") ?? [""]) {
+					der.certificate(b)
+				}
+			} catch (e: der.Malformed) {
+				throw api.validationException("The certificate chain is not PEM-encoded or is not valid.")
+			}
 		}
-		if (pems(input.PrivateKey, "PRIVATE KEY") != 1 && pems(input.PrivateKey, "RSA PRIVATE KEY") != 1
-			&& pems(input.PrivateKey, "EC PRIVATE KEY") != 1) {
-			throw api.validationException("The private key is not supported.")
-		}
-		if (input.CertificateChain != null && pems(input.CertificateChain!, "CERTIFICATE") < 1) {
-			throw api.validationException("The certificate chain must contain certificates in PEM format.")
-		}
+		c.keyAlgorithm = p.keyAlgorithm
+		c.signatureAlgorithm = p.signatureAlgorithm
+		c.serial = colons(p.serial)
+		c.subject = p.subject
+		c.issuer = p.issuerName
+		c.notBefore = p.notBefore
+		c.notAfter = p.notAfter
+		c.domain = p.commonName ?? (if (p.names.length > 0) p.names[0] else null)
+		c.domains = p.names.map(n => ({ ...new Domain(), name: n, validation: n }))
 		c.body = input.Certificate
 		c.key = input.PrivateKey
 		c.chain = input.CertificateChain
@@ -220,6 +234,56 @@ export class Handler {
 		return new Unit()
 	}
 
+	listCertificateDomainValidations(caller: Caller,
+		input: api.ListCertificateDomainValidationsRequest): api.ListCertificateDomainValidationsResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		const all = if (c.type == "IMPORTED") [] else c.domains
+		const [from, to, next] = paged(all.length, input.NextToken, input.MaxItems)
+		const r = new api.ListCertificateDomainValidationsResponse()
+		r.DomainValidationSummaryList = all.slice(from, to).map(n => {
+			const v = validation(c, n)
+			const active = { ...new api.ValidationConfiguration(), ValidationMethod: v.ValidationMethod,
+				ValidationStatus: v.ValidationStatus }
+			if (c.method == "DNS") {
+				active.ValidationChallenge = { ...new api.ValidationChallenge$DnsValidationChallenge(),
+					DnsValidationChallenge: { ...new api.DnsValidationChallenge(), ResourceRecord: v.ResourceRecord } }
+			} else {
+				active.ValidationChallenge = { ...new api.ValidationChallenge$EmailValidationChallenge(),
+					EmailValidationChallenge: { ...new api.EmailValidationChallenge(),
+					ValidationEmails: v.ValidationEmails, ValidationDomain: v.ValidationDomain } }
+			}
+			return { ...new api.DomainValidationSummary(), DomainName: n.name, ActiveValidationConfiguration: active }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	revokeCertificate(caller: Caller, input: api.RevokeCertificateRequest): api.RevokeCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		throw api.validationException(`Export not allowed for certificate ${c.arn}`)
+	}
+
+	exportCertificate(caller: Caller, input: api.ExportCertificateRequest): api.ExportCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		if (c.type == "IMPORTED" || c.exportable != "ENABLED") {
+			throw api.validationException(`Certificate ARN: ${c.arn} is not an export enabled certificate`)
+		}
+		throw notImplemented("ExportCertificate")
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		throw certificateResource(caller, "ListTagsForResource", input.ResourceArn, "ListTagsForCertificate")
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): Unit throws Fault {
+		throw certificateResource(caller, "TagResource", input.ResourceArn, "AddTagsToCertificate")
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
+		throw certificateResource(caller, "UntagResource", input.ResourceArn, "RemoveTagsFromCertificate")
+	}
+
 	getAccountConfiguration(caller: Caller, input: Unit): api.GetAccountConfigurationResponse throws Fault {
 		caller.allow("*")
 		const a = accounts(caller.regional()).get("") ?? new Account()
@@ -259,6 +323,17 @@ function found(caller: Caller, arn: string): [Table[Certificate], Certificate] t
 	return [db, c!]
 }
 
+/// The fault of op, an operation of tags by resource, on arn once the caller may act on it: for a certificate AWS's,
+/// naming the operation to use instead; for an ACME resource, not implemented.
+function certificateResource(caller: Caller, op: string, arn: string, instead: string): Fault throws Fault {
+	caller.allow(arn)
+	if (indexOf(arn, ":certificate/") < 0) {
+		return notImplemented(op)
+	}
+	return api.validationException(`${op} only supports non-certificate resource types. Resource ${arn} is a `
+		+ `certificate resource. Use ${instead} API instead.`)
+}
+
 /// Every certificate of db.
 function all(db: Table[Certificate]): Certificate[] {
 	const out: Certificate[] = []
@@ -293,34 +368,70 @@ function named(n: string, member: string) throws Fault {
 	}
 }
 
-/// How many PEM blocks of the label s holds, or -1 if anything else.
-function pems(s: string, label: string): i32 {
+/// The DER of each PEM block of the label in s, "" for one whose base64 does not decode; null if s holds anything
+/// else or nothing.
+function blocks(s: string, label: string): string[] | null {
 	const begin = `-----BEGIN ${label}-----`
 	const end = `-----END ${label}-----`
-	let n = 0
+	const out: string[] = []
 	let rest = s
 	while (true) {
 		const trimmed = trim(rest)
 		if (trimmed == "") {
-			return n
-		}
-		if (!startsWith(trimmed, begin)) {
-			return -1
+			return if (out.length == 0) null else out
 		}
 		const e = indexOf(trimmed, end)
-		if (e < 0) {
-			return -1
+		if (!startsWith(trimmed, begin) || e < 0) {
+			return null
 		}
-		const body = trimmed.slice(begin.length, e)
-		for (let i = 0; i < body.length; i++) {
-			const b = body[i]
-			if (!isAlphanumeric(b) && b != "+"[0] && b != "/"[0] && b != "="[0] && b != "\n"[0] && b != "\r"[0]) {
-				return -1
-			}
+		const body = split(trimmed.slice(begin.length, e), "\n").map(l => trim(l)).join("")
+		try {
+			out.push(base64.decode(body))
+		} catch (x: ParseError) {
+			out.push("")
 		}
-		n++
 		rest = trimmed.slice(e + end.length, trimmed.length)
 	}
+}
+
+/// The certificate of the PEM body, whose private key is the PEM key, checked in AWS's order and words.
+function read(body: string, key: string): der.Parsed throws Fault {
+	const bodies = blocks(body, "CERTIFICATE")
+	if (bodies == null || bodies.length != 1) {
+		throw api.validationException("The certificate field contains more than one certificate. You can specify only "
+			+ "one certificate in this field.")
+	}
+	let p = new der.Parsed()
+	try {
+		p = der.certificate(bodies[0])
+	} catch (e: der.Malformed) {
+		throw api.validationException("The certificate is not PEM-encoded or is not valid.")
+	}
+	if (p.keyAlgorithm == "") {
+		throw api.validationException("Passed PEM was not a private key of a valid type.")
+	}
+	let algorithm: string | null = null
+	for (const label of ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"]) {
+		const keys = blocks(key, label)
+		if (keys != null && keys.length == 1) {
+			try {
+				algorithm = der.privateKey(keys[0], label)
+			} catch (e: der.Malformed) {}
+		}
+	}
+	if (algorithm == null) {
+		throw api.validationException("Passed PEM could not be parsed.")
+	}
+	if (algorithm != p.keyAlgorithm) {
+		throw api.validationException("Key provided does not match the certificate.")
+	}
+	return p
+}
+
+/// A key algorithm as AWS answers it, RSA-2048 for the model's RSA_2048.
+function answered(k: string): string {
+	const i = indexOf(k, "_")
+	return if (i < 0) k else `${k.slice(0, i)}-${k.slice(i + 1, k.length)}`
 }
 
 /// The CertificateDetail of c, as DescribeCertificate answers it.
@@ -331,8 +442,11 @@ function detail(c: Certificate): api.CertificateDetail {
 	d.SubjectAlternativeNames = if (c.domains.length == 0) null else c.domains.map(n => n.name)
 	d.Serial = c.serial
 	d.Status = "ISSUED"
-	d.KeyAlgorithm = c.keyAlgorithm as api.KeyAlgorithm
-	d.SignatureAlgorithm = signature(c.keyAlgorithm)
+	d.KeyAlgorithm = answered(c.keyAlgorithm)
+	d.SignatureAlgorithm = c.signatureAlgorithm
+	d.Subject = c.subject
+	d.Issuer = c.issuer
+	d.NotBefore = c.notBefore
 	d.InUseBy = []
 	d.Type = c.type as api.CertificateType
 	d.RenewalEligibility = "INELIGIBLE"
@@ -345,10 +459,7 @@ function detail(c: Certificate): api.CertificateDetail {
 		d.ImportedAt = c.imported
 		return d
 	}
-	d.Subject = `CN=${c.domain ?? ""}`
-	d.Issuer = "Amazon"
 	d.IssuedAt = c.created
-	d.NotBefore = c.created
 	d.DomainValidationOptions = c.domains.map(n => validation(c, n))
 	d.KeyUsages = [{ ...new api.KeyUsage(), Name: "DIGITAL_SIGNATURE" },
 		{ ...new api.KeyUsage(), Name: "KEY_ENCIPHERMENT" }]
@@ -382,7 +493,8 @@ function summary(c: Certificate): api.CertificateSummary {
 	s.HasAdditionalSubjectAlternativeNames = false
 	s.Status = "ISSUED"
 	s.Type = c.type as api.CertificateType
-	s.KeyAlgorithm = c.keyAlgorithm as api.KeyAlgorithm
+	s.KeyAlgorithm = answered(c.keyAlgorithm)
+	s.NotBefore = c.notBefore
 	s.KeyUsages = []
 	s.ExtendedKeyUsages = []
 	s.ExportOption = c.exportable as api.CertificateExport
@@ -396,7 +508,6 @@ function summary(c: Certificate): api.CertificateSummary {
 		s.ImportedAt = c.imported
 	} else {
 		s.IssuedAt = c.created
-		s.NotBefore = c.created
 	}
 	return s
 }

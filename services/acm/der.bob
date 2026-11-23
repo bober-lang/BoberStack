@@ -1,0 +1,300 @@
+//! Reading X.509 certificates and private keys from DER: the fields DescribeCertificate answers and the key's type.
+
+import * as hex from "std/encoding/hex"
+import { ParseError } from "std/string"
+import { parseRfc3339 } from "std/time"
+
+/// What a certificate says, of what ACM describes.
+export class Parsed {
+	/// The serial number's bytes, without a leading zero.
+	serial = ""
+	/// The subject's and issuer's distinguished names, as RFC 2253 writes them.
+	subject = ""
+	issuer = ""
+	/// The issuer's organization, else its common name.
+	issuerName = ""
+	commonName: string | null = null
+	/// The DNS names of its subject alternative names.
+	names: string[] = []
+	notBefore: i64 = 0
+	notAfter: i64 = 0
+	/// As ACM names it, RSA_2048 or EC_prime256v1, "" for a key it does not take.
+	keyAlgorithm = ""
+	/// As ACM names it, SHA256WITHRSA; "" if unknown.
+	signatureAlgorithm = ""
+}
+
+/// What a reader throws for bytes that are not the DER expected.
+export class Malformed {}
+
+/// An element: its tag and the range of its content.
+class Element {
+	tag: i32
+	start: i32
+	end: i32
+
+	constructor(tag: i32, start: i32, end: i32) {
+		this.tag = tag
+		this.start = start
+		this.end = end
+	}
+}
+
+/// The certificate whose DER is s.
+export function certificate(s: string): Parsed throws Malformed {
+	const top = only(s, 0x30)
+	const parts = children(s, top)
+	if (parts.length != 3 || parts[0].tag != 0x30) {
+		throw new Malformed()
+	}
+	const t = children(s, parts[0])
+	const i = if (t.length > 0 && t[0].tag == 0xa0) 1 else 0
+	if (t.length < i + 6 || t[i].tag != 0x02) {
+		throw new Malformed()
+	}
+	const p = new Parsed()
+	let serial = s.slice(t[i].start, t[i].end)
+	while (serial.length > 1 && serial[0] == 0) {
+		serial = serial.slice(1, serial.length)
+	}
+	p.serial = serial
+	p.signatureAlgorithm = signature(oidOf(s, parts[1]))
+	p.issuer = name(s, t[i + 2])
+	p.issuerName = attribute(s, t[i + 2], "55040a") ?? attribute(s, t[i + 2], "550403") ?? ""
+	const validity = children(s, t[i + 3])
+	if (validity.length != 2) {
+		throw new Malformed()
+	}
+	p.notBefore = time(s, validity[0])
+	p.notAfter = time(s, validity[1])
+	p.subject = name(s, t[i + 4])
+	p.commonName = attribute(s, t[i + 4], "550403")
+	p.keyAlgorithm = publicKey(s, t[i + 5])
+	for (const e of t.slice(i + 6, t.length)) {
+		if (e.tag == 0xa3) {
+			p.names = alternatives(s, e)
+		}
+	}
+	return p
+}
+
+/// The key algorithm of the private key whose DER is s, of its PEM's label, as ACM names it; "" for another.
+export function privateKey(s: string, label: string): string throws Malformed {
+	const parts = children(s, only(s, 0x30))
+	if (label == "RSA PRIVATE KEY") {
+		return rsa(s, parts)
+	}
+	if (label == "EC PRIVATE KEY") {
+		for (const e of parts) {
+			if (e.tag == 0xa0) {
+				return curve(hex.encode(s.slice(e.start, e.end)).slice(4, (e.end - e.start) * 2))
+			}
+		}
+		throw new Malformed()
+	}
+	if (parts.length < 3 || parts[1].tag != 0x30 || parts[2].tag != 0x04) {
+		throw new Malformed()
+	}
+	const alg = children(s, parts[1])
+	const oid = oidOf(s, parts[1])
+	if (oid == "2a864886f70d010101") {
+		const inner = s.slice(parts[2].start, parts[2].end)
+		return rsa(inner, children(inner, only(inner, 0x30)))
+	}
+	if (oid == "2a8648ce3d0201" && alg.length == 2 && alg[1].tag == 0x06) {
+		return curve(hex.encode(s.slice(alg[1].start, alg[1].end)))
+	}
+	return ""
+}
+
+/// The one element of s, of the tag.
+function only(s: string, tag: i32): Element throws Malformed {
+	const e = element(s, 0, s.length)
+	if (e.tag != tag || e.end != s.length) {
+		throw new Malformed()
+	}
+	return e
+}
+
+/// The element starting at of s, ending by end.
+function element(s: string, at: i32, end: i32): Element throws Malformed {
+	if (at + 2 > end) {
+		throw new Malformed()
+	}
+	const tag = s[at] as i32
+	let n = s[at + 1] as i32
+	let start = at + 2
+	if (n >= 0x80) {
+		const bytes = n - 0x80
+		if (bytes < 1 || bytes > 3 || start + bytes > end) {
+			throw new Malformed()
+		}
+		n = 0
+		for (let i = 0; i < bytes; i++) {
+			n = n * 256 + (s[start + i] as i32)
+		}
+		start += bytes
+	}
+	if (start + n > end) {
+		throw new Malformed()
+	}
+	return new Element(tag, start, start + n)
+}
+
+/// The elements of e's content.
+function children(s: string, e: Element): Element[] throws Malformed {
+	const out: Element[] = []
+	let at = e.start
+	while (at < e.end) {
+		const c = element(s, at, e.end)
+		out.push(c)
+		at = c.end
+	}
+	return out
+}
+
+/// The hex of the OID that starts the algorithm identifier e.
+function oidOf(s: string, e: Element): string throws Malformed {
+	const parts = children(s, e)
+	if (parts.length == 0 || parts[0].tag != 0x06) {
+		throw new Malformed()
+	}
+	return hex.encode(s.slice(parts[0].start, parts[0].end))
+}
+
+/// The attributes of the name e, as RFC 2253 writes them: the last first, joined by commas.
+function name(s: string, e: Element): string throws Malformed {
+	const out: string[] = []
+	for (const [oid, value] of attributes(s, e)) {
+		const short = labels.find(l => l[0] == oid)
+		out.push(`${if (short == null) "OID." + oid else short[1]}=${value}`)
+	}
+	out.reverse()
+	return out.join(",")
+}
+
+const labels = [["550403", "CN"], ["550406", "C"], ["550407", "L"], ["550408", "ST"], ["55040a", "O"], ["55040b", "OU"],
+	["2a864886f70d010901", "EMAILADDRESS"]]
+
+/// The value of the attribute oid of the name e, null if none.
+function attribute(s: string, e: Element, oid: string): string | null throws Malformed {
+	let found: string | null = null
+	for (const [o, value] of attributes(s, e)) {
+		if (o == oid) {
+			found = value
+		}
+	}
+	return found
+}
+
+/// The attributes of the name e, each its OID's hex and its value.
+function attributes(s: string, e: Element): [string, string][] throws Malformed {
+	if (e.tag != 0x30) {
+		throw new Malformed()
+	}
+	const out: [string, string][] = []
+	for (const set of children(s, e)) {
+		for (const a of children(s, set)) {
+			const kv = children(s, a)
+			if (kv.length != 2 || kv[0].tag != 0x06) {
+				throw new Malformed()
+			}
+			out.push([hex.encode(s.slice(kv[0].start, kv[0].end)), s.slice(kv[1].start, kv[1].end)])
+		}
+	}
+	return out
+}
+
+/// The instant of the UTCTime or GeneralizedTime e.
+function time(s: string, e: Element): i64 throws Malformed {
+	const v = s.slice(e.start, e.end)
+	const full = if (e.tag == 0x17 && v.length == 13) (if (v < "50") "20" else "19") + v
+		else if (e.tag == 0x18 && v.length == 15) v
+		else ""
+	if (full == "") {
+		throw new Malformed()
+	}
+	try {
+		return parseRfc3339(`${full.slice(0, 4)}-${full.slice(4, 6)}-${full.slice(6, 8)}T${full.slice(8, 10)}:`
+			+ `${full.slice(10, 12)}:${full.slice(12, 15)}`)
+	} catch (x: ParseError) {
+		throw new Malformed()
+	}
+}
+
+/// The key algorithm of the subject public key info e, as ACM names it, "" for one it does not take.
+function publicKey(s: string, e: Element): string throws Malformed {
+	const parts = children(s, e)
+	if (parts.length != 2 || parts[1].tag != 0x03) {
+		throw new Malformed()
+	}
+	const alg = children(s, parts[0])
+	const oid = oidOf(s, parts[0])
+	if (oid == "2a864886f70d010101") {
+		const key = s.slice(parts[1].start + 1, parts[1].end)
+		return rsa(key, children(key, only(key, 0x30)))
+	}
+	if (oid == "2a8648ce3d0201" && alg.length == 2 && alg[1].tag == 0x06) {
+		return curve(hex.encode(s.slice(alg[1].start, alg[1].end)))
+	}
+	return ""
+}
+
+/// The key algorithm of an RSA key of the parts of its sequence, whose modulus is the first integer of more than
+/// one byte: of a public key the first, of a private key the second.
+function rsa(s: string, parts: Element[]): string throws Malformed {
+	for (const p of parts) {
+		if (p.tag != 0x02) {
+			throw new Malformed()
+		}
+		let n = p.end - p.start
+		if (n > 1) {
+			if (s[p.start] == 0) {
+				n--
+			}
+			return `RSA_${n * 8}`
+		}
+	}
+	throw new Malformed()
+}
+
+/// The key algorithm of an EC key on the curve of the OID's hex.
+function curve(oid: string): string {
+	return if (oid == "2a8648ce3d030107") "EC_prime256v1"
+		else if (oid == "2b81040022") "EC_secp384r1"
+		else if (oid == "2b81040023") "EC_secp521r1"
+		else ""
+}
+
+/// The signature algorithm of the OID's hex, as ACM names it.
+function signature(oid: string): string {
+	const known = [["2a864886f70d010105", "SHA1WITHRSA"], ["2a864886f70d01010b", "SHA256WITHRSA"],
+		["2a864886f70d01010c", "SHA384WITHRSA"], ["2a864886f70d01010d", "SHA512WITHRSA"],
+		["2a8648ce3d040302", "SHA256WITHECDSA"], ["2a8648ce3d040303", "SHA384WITHECDSA"],
+		["2a8648ce3d040304", "SHA512WITHECDSA"], ["2b6570", "ED25519"]]
+	const k = known.find(k => k[0] == oid)
+	return if (k == null) "" else k[1]
+}
+
+/// The DNS names of the subject alternative names among the extensions e.
+function alternatives(s: string, e: Element): string[] throws Malformed {
+	const out: string[] = []
+	for (const list of children(s, e)) {
+		for (const ext of children(s, list)) {
+			const parts = children(s, ext)
+			if (parts.length < 2 || parts[0].tag != 0x06) {
+				throw new Malformed()
+			}
+			if (hex.encode(s.slice(parts[0].start, parts[0].end)) == "551d11") {
+				const value = parts[parts.length - 1]
+				const inner = s.slice(value.start, value.end)
+				for (const n of children(inner, only(inner, 0x30))) {
+					if (n.tag == 0x82) {
+						out.push(inner.slice(n.start, n.end))
+					}
+				}
+			}
+		}
+	}
+	return out
+}
