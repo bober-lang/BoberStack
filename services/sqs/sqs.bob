@@ -1,0 +1,1438 @@
+//! Amazon Simple Queue Service: standard and FIFO queues, their messages, dead-letter queues, tags and permissions.
+//!
+//! Nothing runs between requests: delays, visibility, retention, FIFO deduplication and dead-lettering are evaluated
+//! at the instant of the request that looks. A receive does not wait. A message move task completes within its
+//! request, ignoring its rate.
+//!
+//! Where AWS differs on SSE-KMS: the key is used on every send and receive, not once per data key reuse period, and a
+//! receive decrypts the queue's latest data key, not the one each message was sent under.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { random, uuid } from "../../core/random"
+import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import { decryptAs, encryptAs } from "../kms/kms"
+import * as api from "./api"
+import { Attempt, Attribute, digits, Message, Place, position, Queue, Seen, Tables } from "./records"
+import { Task, within } from "./records"
+import { endsWith, indexOf, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { md5, sha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import { codePoint, lower, ParseError, parseInt, split } from "std/string"
+import { millisecond, minute, second } from "std/time"
+import { Decodable } from "std/types"
+
+/// The SenderId of a message that SNS delivers, as AWS shows it.
+const sns = "AIDAIT2UOQQY3AUEKVGXU"
+/// The most bytes of a message, and of a batch's messages together.
+const largest = 1048576
+
+export class Handler {
+	...api.Unimplemented
+
+	createQueue(caller: Caller, input: api.CreateQueueRequest): api.CreateQueueResult throws Fault {
+		return create(caller, input, now())
+	}
+
+	getQueueUrl(caller: Caller, input: api.GetQueueUrlRequest): api.GetQueueUrlResult throws Fault {
+		const account = input.QueueOwnerAWSAccountId ?? caller.account
+		const tree = caller.existing(`${account}/${caller.region}`)
+		const q = if (tree == null) null else new Tables(tree!).queues.get(input.QueueName)
+		if (q == null) {
+			throw missing()
+		}
+		caller.allow(arn(caller, account, q.name), q.policy, resourceTags(q.tags))
+		const r = new api.GetQueueUrlResult()
+		r.QueueUrl = url(caller, account, q.name)
+		return r
+	}
+
+	listQueues(caller: Caller, input: api.ListQueuesRequest): api.ListQueuesResult throws Fault {
+		caller.allow(`arn:aws:sqs:${caller.region}:${caller.account}:`)
+		const [names, next] = page(new Tables(caller.regional()), input.QueueNamePrefix ?? "", input.NextToken,
+			input.MaxResults, q => true)
+		const r = new api.ListQueuesResult()
+		r.QueueUrls = if (names.length == 0) null else names.map(n => url(caller, caller.account, n))
+		r.NextToken = next
+		return r
+	}
+
+	deleteQueue(caller: Caller, input: api.DeleteQueueRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		const name = f.queue.name
+		clear(f.db.messages, within(name, ""))
+		clear(f.db.places, within(name, ""))
+		clear(f.db.seen, within(name, ""))
+		clear(f.db.attempts, within(name, ""))
+		clear(f.db.tasks, within(name, ""))
+		f.db.queues.delete(name)
+		f.db.deleted.put(name, { ...new Seen(), at: now() })
+		return new Unit()
+	}
+
+	getQueueAttributes(caller: Caller,
+		input: api.GetQueueAttributesRequest): api.GetQueueAttributesResult throws Fault {
+		const f = found(caller, input.QueueUrl)
+		const r = new api.GetQueueAttributesResult()
+		const names = input.AttributeNames ?? []
+		if (names.length > 0) {
+			r.Attributes = attributes(f, names, now())
+		}
+		return r
+	}
+
+	setQueueAttributes(caller: Caller, input: api.SetQueueAttributesRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		for (const [k, v] of input.Attributes) {
+			set(caller, f.db, f.queue, k, v, false)
+		}
+		settle(f.queue, input.Attributes)
+		f.queue.modified = now()
+		f.db.queues.put(f.queue.name, f.queue)
+		return new Unit()
+	}
+
+	purgeQueue(caller: Caller, input: api.PurgeQueueRequest): Unit throws Fault {
+		purge(found(caller, input.QueueUrl), now())
+		return new Unit()
+	}
+
+	tagQueue(caller: Caller, input: api.TagQueueRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		f.queue.tags = tagged(f.queue.tags, input.Tags, f.queue.name)
+		f.db.queues.put(f.queue.name, f.queue)
+		return new Unit()
+	}
+
+	untagQueue(caller: Caller, input: api.UntagQueueRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		f.queue.tags = f.queue.tags.filter(t => !input.TagKeys.some(k => k == t[0]))
+		f.db.queues.put(f.queue.name, f.queue)
+		return new Unit()
+	}
+
+	listQueueTags(caller: Caller, input: api.ListQueueTagsRequest): api.ListQueueTagsResult throws Fault {
+		const f = found(caller, input.QueueUrl)
+		const r = new api.ListQueueTagsResult()
+		r.Tags = if (f.queue.tags.length == 0) null else f.queue.tags
+		return r
+	}
+
+	addPermission(caller: Caller, input: api.AddPermissionRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		permit(f, input)
+		f.queue.modified = now()
+		f.db.queues.put(f.queue.name, f.queue)
+		return new Unit()
+	}
+
+	removePermission(caller: Caller, input: api.RemovePermissionRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		const statements = policyOf(f.queue.policy)
+		const kept = statements.filter(s => sid(s) != input.Label)
+		if (kept.length == statements.length) {
+			throw invalid(input.Label, "Label", "can't find label on existing policy.")
+		}
+		f.queue.policy = if (kept.length == 0) null else withStatements(f, kept)
+		f.queue.modified = now()
+		f.db.queues.put(f.queue.name, f.queue)
+		return new Unit()
+	}
+
+	listDeadLetterSourceQueues(caller: Caller,
+		input: api.ListDeadLetterSourceQueuesRequest): api.ListDeadLetterSourceQueuesResult throws Fault {
+		const f = found(caller, input.QueueUrl)
+		const [names, next] = page(f.db, "", input.NextToken, input.MaxResults, q => q.deadLetter == f.arn)
+		const r = new api.ListDeadLetterSourceQueuesResult()
+		r.queueUrls = names.map(n => url(caller, f.account, n))
+		r.NextToken = next
+		return r
+	}
+
+	sendMessage(caller: Caller, input: api.SendMessageRequest): api.SendMessageResult throws Fault {
+		return send(caller, input, now())
+	}
+
+	sendMessageBatch(caller: Caller, input: api.SendMessageBatchRequest): api.SendMessageBatchResult throws Fault {
+		return sendBatch(caller, input, now())
+	}
+
+	receiveMessage(caller: Caller, input: api.ReceiveMessageRequest): api.ReceiveMessageResult throws Fault {
+		return receive(caller, input, now())
+	}
+
+	deleteMessage(caller: Caller, input: api.DeleteMessageRequest): Unit throws Fault {
+		const f = found(caller, input.QueueUrl)
+		remove(f, input.ReceiptHandle)
+		return new Unit()
+	}
+
+	deleteMessageBatch(caller: Caller,
+		input: api.DeleteMessageBatchRequest): api.DeleteMessageBatchResult throws Fault {
+		const f = found(caller, input.QueueUrl)
+		batch(input.Entries.map(e => e.Id), "DeleteMessageBatchRequestEntry")
+		const r = new api.DeleteMessageBatchResult()
+		for (const e of input.Entries) {
+			try {
+				remove(f, e.ReceiptHandle)
+				r.Successful.push({ ...new api.DeleteMessageBatchResultEntry(), Id: e.Id })
+			} catch (x: Fault) {
+				r.Failed.push(failed(e.Id, x))
+			}
+		}
+		return r
+	}
+
+	changeMessageVisibility(caller: Caller, input: api.ChangeMessageVisibilityRequest): Unit throws Fault {
+		changeVisibility(found(caller, input.QueueUrl), input.ReceiptHandle, input.VisibilityTimeout, now())
+		return new Unit()
+	}
+
+	changeMessageVisibilityBatch(caller: Caller,
+		input: api.ChangeMessageVisibilityBatchRequest): api.ChangeMessageVisibilityBatchResult throws Fault {
+		const f = found(caller, input.QueueUrl)
+		batch(input.Entries.map(e => e.Id), "ChangeMessageVisibilityBatchRequestEntry")
+		const t = now()
+		const r = new api.ChangeMessageVisibilityBatchResult()
+		for (const e of input.Entries) {
+			try {
+				changeVisibility(f, e.ReceiptHandle, e.VisibilityTimeout ?? f.queue.visibility, t)
+				r.Successful.push({ ...new api.ChangeMessageVisibilityBatchResultEntry(), Id: e.Id })
+			} catch (x: Fault) {
+				r.Failed.push(failed(e.Id, x))
+			}
+		}
+		return r
+	}
+
+	startMessageMoveTask(caller: Caller,
+		input: api.StartMessageMoveTaskRequest): api.StartMessageMoveTaskResult throws Fault {
+		const f = queueAt(caller, input.SourceArn, "SourceArn")
+		if (page(f.db, "", null, 1, q => q.deadLetter == f.arn)[0].length == 0) {
+			throw invalidParameter("Source queue must be configured as a Dead Letter Queue.")
+		}
+		const rate = input.MaxNumberOfMessagesPerSecond
+		if (rate != null && (rate < 1 || rate > 500)) {
+			throw invalid(`${rate}`, "MaxNumberOfMessagesPerSecond", "Must be between 1 and 500.")
+		}
+		const to = if (input.DestinationArn == null) null else queueAt(caller, input.DestinationArn!, "DestinationArn")
+		const t = now()
+		const task = { ...new Task(), id: uuid(), started: t, destination: input.DestinationArn, rate: rate }
+		const waiting: Message[] = []
+		each(f, m => {
+			if (m.due > t) {
+				return false
+			}
+			if (m.visible <= t && !expired(f.queue, m, t)) {
+				waiting.push(m)
+			}
+			return true
+		})
+		for (const m of waiting) {
+			const into = to ?? (if (m.source == null) null else byArn(caller, m.source!))
+			if (into != null) {
+				unplace(f.db, f.queue.name, m)
+				m.receives = 0
+				m.firstReceived = 0
+				enter(into!, null, m, t)
+				task.moved++
+			}
+		}
+		task.toMove = waiting.length as i64
+		f.db.tasks.put(within(f.queue.name, `${digits(t)}\x00${task.id}`), task)
+		const r = new api.StartMessageMoveTaskResult()
+		r.TaskHandle = base64.encode(`{"taskId":"${task.id}","sourceArn":"${f.arn}"}`)
+		return r
+	}
+
+	listMessageMoveTasks(caller: Caller,
+		input: api.ListMessageMoveTasksRequest): api.ListMessageMoveTasksResult throws Fault {
+		const f = queueAt(caller, input.SourceArn, "SourceArn")
+		const max = input.MaxResults
+		if (max != null && (max < 1 || max > 10)) {
+			throw invalid(`${max}`, "MaxResults", "Must be between 1 and 10.")
+		}
+		const r = new api.ListMessageMoveTasksResult()
+		r.Results = f.db.tasks.scan(null, max ?? 1, within(f.queue.name, ""), true).map(e => listed(f, e[1]))
+		return r
+	}
+
+	cancelMessageMoveTask(caller: Caller,
+		input: api.CancelMessageMoveTaskRequest): api.CancelMessageMoveTaskResult throws Fault {
+		let h = new Handle()
+		try {
+			h = json.decode[Handle](base64.decode(input.TaskHandle))
+		} catch (e: ParseError) {}
+		if (h.taskId == null || h.sourceArn == null) {
+			throw invalidParameter("Value for parameter TaskHandle is invalid.")
+		}
+		queueAt(caller, h.sourceArn!, "SourceArn")
+		throw api.resourceNotFoundException("Task does not exist.")
+	}
+}
+
+function listed(f: Found, t: Task): api.ListMessageMoveTasksResultEntry {
+	const e = new api.ListMessageMoveTasksResultEntry()
+	e.Status = "COMPLETED"
+	e.SourceArn = f.arn
+	e.DestinationArn = t.destination
+	e.MaxNumberOfMessagesPerSecond = t.rate
+	e.ApproximateNumberOfMessagesMoved = t.moved
+	e.ApproximateNumberOfMessagesToMove = t.toMove
+	e.StartedTimestamp = t.started / millisecond
+	return e
+}
+
+class Handle {
+	taskId: string | null = null
+	sourceArn: string | null = null
+}
+
+function queueAt(caller: Caller, a: string, p: string): Found throws Fault {
+	const parts = split(a, ":")
+	if (parts.length != 6 || parts[0] != "arn" || parts[2] != "sqs") {
+		throw invalidParameter(`You must use this format to specify the ${p}: `
+			+ "arn:<partition>:<service>:<region>:<account-id>:<resource-id>")
+	}
+	const f = byArn(caller, a)
+	if (f == null) {
+		throw api.resourceNotFoundException(`The resource that you specified for the ${p} parameter doesn't exist.`)
+	}
+	caller.allow(f.arn, f.queue.policy, resourceTags(f.queue.tags))
+	return f!
+}
+
+export class Found {
+	db: Tables
+	queue: Queue
+	account: string
+	arn: string
+
+	constructor(db: Tables, queue: Queue, account: string, arn: string) {
+		this.db = db
+		this.queue = queue
+		this.account = account
+		this.arn = arn
+	}
+}
+
+/// Found by the last two segments of the URL's path, its account and name, whatever its scheme and host.
+export function found(caller: Caller, u: string): Found throws Fault {
+	const parts = split(u, "/")
+	if (parts.length < 2) {
+		throw missing()
+	}
+	const account = parts[parts.length - 2]
+	if (account.length != 12 || !account.every(isDigit)) {
+		throw missing()
+	}
+	const tree = caller.existing(`${account}/${caller.region}`)
+	const db = if (tree == null) null else new Tables(tree!)
+	const q = db?.queues.get(parts[parts.length - 1]) ?? null
+	if (q == null) {
+		throw missing()
+	}
+	const f = new Found(db!, q, account, arn(caller, account, q.name))
+	caller.allow(f.arn, q.policy, resourceTags(q.tags))
+	return f
+}
+
+/// Creates the queue that input names at the instant now, or finds it if it exists with the attributes given.
+export function create(caller: Caller, input: api.CreateQueueRequest, now: i64): api.CreateQueueResult throws Fault {
+	const name = input.QueueName
+	const given = input.Attributes ?? []
+	const fifo = given.some(a => a[0] == "FifoQueue" && a[1] == "true")
+	if (name == "") {
+		throw invalidParameter("Queue name cannot be empty")
+	}
+	if (fifo && !(endsWith(name, ".fifo") && named(name.slice(0, name.length - 5)) && name.length <= 80)) {
+		const why = "The name of a FIFO queue can only include alphanumeric characters, hyphens, or underscores, must "
+			+ "end with .fifo suffix and be 1 to 80 in length."
+		throw invalidParameter(why)
+	}
+	if (!fifo && !(named(name) && name.length <= 80)) {
+		throw invalidParameter("Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length")
+	}
+	// TagQueue is authorized only of a queue created with tags.
+	const tags = input.tags ?? []
+	caller.actions = if (tags.length == 0) ["sqs:CreateQueue"] else ["sqs:CreateQueue", "sqs:TagQueue"]
+	caller.allow(arn(caller, caller.account, name), null, requestTags(tags))
+	const db = new Tables(caller.regional())
+	const q = new Queue()
+	q.name = name
+	q.created = now
+	q.modified = now
+	q.fifo = fifo
+	for (const [k, v] of given) {
+		set(caller, db, q, k, v, true)
+	}
+	settle(q, given)
+	q.tags = tagged([], tags, name)
+	const r = new api.CreateQueueResult()
+	r.QueueUrl = url(caller, caller.account, name)
+	const existing = db.queues.get(name)
+	if (existing != null) {
+		for (const [k, _] of given) {
+			if (value(existing, k) != value(q, k)) {
+				throw api.queueNameExists(`A queue already exists with the same name and a different value for attribute ${k}`)
+			}
+		}
+		return r
+	}
+	const deleted = db.deleted.get(name)
+	if (deleted != null && now < deleted.at + 60 * second) {
+		const why = "You must wait 60 seconds after deleting a queue before you can create another with the same name."
+		throw api.queueDeletedRecently(why)
+	}
+	db.deleted.delete(name)
+	db.queues.put(name, q)
+	return r
+}
+
+function set(caller: Caller, db: Tables, q: Queue, k: api.QueueAttributeName, v: string, creating: bool) throws Fault {
+	switch (k) {
+		case "DelaySeconds": q.delay = ranged(k, v, 0, 900)
+		case "MaximumMessageSize": q.maxSize = ranged(k, v, 1024, largest)
+		case "MessageRetentionPeriod": q.retention = ranged(k, v, 60, 1209600)
+		case "ReceiveMessageWaitTimeSeconds": q.wait = ranged(k, v, 0, 20)
+		case "VisibilityTimeout": q.visibility = ranged(k, v, 0, 43200)
+		case "KmsDataKeyReusePeriodSeconds": q.kmsReuse = ranged(k, v, 60, 86400)
+		case "Policy": q.policy = if (v == "") null else policy(v)
+		case "RedrivePolicy": redrive(caller, db, q, v)
+		case "RedriveAllowPolicy": q.redriveAllow = if (v == "") null else allowing(v)
+		case "KmsMasterKeyId": q.kmsKey = if (v == "") null else v
+		case "SqsManagedSseEnabled": q.sse = flag(k, v)
+		case "FifoQueue":
+			if (!creating) {
+				throw unknownAttribute(k)
+			}
+			flag(k, v)
+		case "ContentBasedDeduplication":
+			fifoOnly(q, k)
+			q.contentDeduplication = flag(k, v)
+		case "DeduplicationScope":
+			fifoOnly(q, k)
+			if (v != "messageGroup" && v != "queue") {
+				throw invalidValue(k)
+			}
+			q.deduplicationScope = v
+		case "FifoThroughputLimit":
+			fifoOnly(q, k)
+			if (v != "perQueue" && v != "perMessageGroupId") {
+				throw invalidValue(k)
+			}
+			q.throughputLimit = v
+		default: throw unknownAttribute(k)
+	}
+}
+
+/// Settles q's encryption: SSE-KMS or SSE-SQS, the one set last, as AWS, which refuses both at once.
+function settle(q: Queue, given: [api.QueueAttributeName, string][]) throws Fault {
+	const kms = given.some(a => a[0] == "KmsMasterKeyId" && a[1] != "")
+	const managed = given.some(a => a[0] == "SqsManagedSseEnabled" && a[1] == "true")
+	if (kms && managed) {
+		throw api.invalidAttributeName("You can use one type of server-side encryption (SSE) at one time. You can "
+			+ "either enable KMS SSE or SQS SSE.")
+	}
+	if (kms) {
+		q.sse = false
+	}
+	if (managed) {
+		q.kmsKey = null
+	}
+}
+
+/// On sending, kms:GenerateDataKey; on receiving, kms:Decrypt; through SQS, with the queue's ARN as context.
+function sealing(caller: Caller, f: Found, sending: bool) throws Fault {
+	const q = f.queue
+	if (q.kmsKey == null) {
+		return
+	}
+	const k = q.kmsKey!
+	const id = if (startsWith(k, "arn:") || f.account == caller.account) k
+		else `arn:aws:kms:${caller.region}:${f.account}:${if (startsWith(k, "alias/")) k else `key/${k}`}`
+	const context: [string, string][] = [["aws:sqs:arn", f.arn]]
+	try {
+		if (sending || q.dataKey == "") {
+			q.dataKey = base64.encode(encryptAs(caller, "sqs", id, token(), context, "kms:GenerateDataKey"))
+		}
+		if (!sending) {
+			decryptAs(caller, "sqs", sealed(q.dataKey), context)
+		}
+	} catch (e: Fault) {
+		throw if (e.status >= 500) e else kmsFault(e)
+	}
+}
+
+function sealed(b: string): string throws Fault {
+	try {
+		return base64.decode(b)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A queue's data key does not decode")
+	}
+}
+
+function kmsFault(f: Fault): Fault {
+	if (startsWith(f.code, "AccessDenied")) {
+		return api.kmsAccessDenied(f.message)
+	}
+	return switch (f.code) {
+		case "DisabledException": api.kmsDisabled(f.message)
+		case "NotFoundException": api.kmsNotFound(f.message)
+		case "KMSInvalidStateException": api.kmsInvalidState(f.message)
+		case "InvalidKeyUsageException": api.kmsInvalidKeyUsage(f.message)
+		default: f
+	}
+}
+
+function redrive(caller: Caller, db: Tables, q: Queue, v: string) throws Fault {
+	if (v == "") {
+		q.redrive = null
+		q.deadLetter = ""
+		q.maxReceives = 0
+		return
+	}
+	let target = ""
+	let count = ""
+	try {
+		for (const [k, x] of json.decode[json.Keys](v).all) {
+			if (k == "deadLetterTargetArn") {
+				target = json.decode[string](x.text)
+			} else if (k == "maxReceiveCount") {
+				count = if (startsWith(x.text, "\"")) json.decode[string](x.text) else x.text
+			}
+		}
+	} catch (e: ParseError) {
+		const why = "Invalid value for the parameter RedrivePolicy. Reason: Redrive policy is not a valid JSON map."
+		throw api.invalidAttributeValue(why)
+	}
+	if (target == "") {
+		throw invalid(v, "RedrivePolicy", "Redrive policy does not contain mandatory attribute: deadLetterTargetArn.")
+	}
+	if (count == "") {
+		throw invalid(v, "RedrivePolicy", "Redrive policy does not contain mandatory attribute: maxReceiveCount.")
+	}
+	let n = 0
+	try {
+		n = parseInt(count)
+	} catch (e: ParseError) {
+		n = 0
+	}
+	if (n < 1 || n > 1000) {
+		throw invalid(v, "RedrivePolicy",
+			`Invalid value for maxReceiveCount: ${count}, valid values are from 1 to 1000 both inclusive.`)
+	}
+	const dlq = byArn(caller, target)
+	if (dlq == null) {
+		throw invalid(v, "RedrivePolicy", "Dead-letter target does not exist.")
+	}
+	if (dlq.queue.fifo != q.fifo) {
+		throw invalid(v, "RedrivePolicy", "Dead-letter queue must be same type of queue as the source.")
+	}
+	if (!allows(dlq.queue.redriveAllow, arn(caller, caller.account, q.name))) {
+		throw invalid(v, "RedrivePolicy", `Queue ${target} does not allow this queue as its dead-letter source.`)
+	}
+	q.redrive = `{"deadLetterTargetArn":${json.quoted(target)},"maxReceiveCount":${n}}`
+	q.deadLetter = target
+	q.maxReceives = n
+}
+
+function allowing(v: string): string throws Fault {
+	let permission = ""
+	let sources: string[] = []
+	try {
+		for (const [k, x] of json.decode[json.Keys](v).all) {
+			if (k == "redrivePermission") {
+				permission = json.decode[string](x.text)
+			} else if (k == "sourceQueueArns") {
+				sources = json.decode[string[]](x.text)
+			}
+		}
+	} catch (e: ParseError) {
+		throw invalid(v, "RedriveAllowPolicy", "Redrive allow policy is not a valid JSON map.")
+	}
+	if (permission != "allowAll" && permission != "denyAll" && permission != "byQueue") {
+		throw invalid(v, "RedriveAllowPolicy", "Invalid value for redrivePermission.")
+	}
+	if (permission != "byQueue" && sources.length > 0) {
+		throw invalid(v, "RedriveAllowPolicy",
+			"sourceQueueArns can be specified only when redrivePermission is set to byQueue.")
+	}
+	if (permission == "byQueue" && (sources.length == 0 || sources.length > 10)) {
+		throw invalid(v, "RedriveAllowPolicy", "sourceQueueArns must contain 1 to 10 queue ARNs.")
+	}
+	return v
+}
+
+function allows(policy: string | null, source: string): bool {
+	if (policy == null) {
+		return true
+	}
+	let permission = ""
+	let sources: string[] = []
+	try {
+		for (const [k, x] of json.decode[json.Keys](policy).all) {
+			if (k == "redrivePermission") {
+				permission = json.decode[string](x.text)
+			} else if (k == "sourceQueueArns") {
+				sources = json.decode[string[]](x.text)
+			}
+		}
+	} catch (e: ParseError) {}
+	return permission == "allowAll" || permission == "byQueue" && sources.some(s => s == source)
+}
+
+function byArn(caller: Caller, a: string): Found | null throws Fault {
+	const parts = split(a, ":")
+	if (parts.length != 6 || parts[0] != "arn" || parts[2] != "sqs") {
+		return null
+	}
+	const tree = caller.existing(`${parts[4]}/${parts[3]}`)
+	if (tree == null) {
+		return null
+	}
+	const db = new Tables(tree!)
+	const q = db.queues.get(parts[5])
+	return if (q == null) null else new Found(db, q, parts[4], a)
+}
+
+function attributes(f: Found, names: api.QueueAttributeName[],
+	now: i64): [api.QueueAttributeName, string][] throws Fault {
+	const all = names.some(n => n == "All")
+	const out: [api.QueueAttributeName, string][] = []
+	for (const k of everything) {
+		if (all || names.some(n => n == k)) {
+			const v = if (k == "QueueArn") f.arn
+				else if (startsWith(`${k}`, "Approximate")) count(f, k, now)
+				else value(f.queue, k)
+			if (v != null) {
+				out.push([k, v])
+			}
+		}
+	}
+	return out
+}
+
+function value(q: Queue, k: api.QueueAttributeName): string | null {
+	switch (k) {
+		case "Policy": return q.policy
+		case "VisibilityTimeout": return `${q.visibility}`
+		case "MaximumMessageSize": return `${q.maxSize}`
+		case "MessageRetentionPeriod": return `${q.retention}`
+		case "CreatedTimestamp": return `${q.created / second}`
+		case "LastModifiedTimestamp": return `${q.modified / second}`
+		case "DelaySeconds": return `${q.delay}`
+		case "ReceiveMessageWaitTimeSeconds": return `${q.wait}`
+		case "RedrivePolicy": return q.redrive
+		case "RedriveAllowPolicy": return q.redriveAllow
+		case "FifoQueue": return if (q.fifo) "true" else null
+		case "ContentBasedDeduplication": return if (q.fifo) `${q.contentDeduplication}` else null
+		case "DeduplicationScope": return if (q.fifo) q.deduplicationScope else null
+		case "FifoThroughputLimit": return if (q.fifo) q.throughputLimit else null
+		case "KmsMasterKeyId": return q.kmsKey
+		case "KmsDataKeyReusePeriodSeconds": return if (q.kmsKey == null) null else `${q.kmsReuse}`
+		case "SqsManagedSseEnabled": return `${q.sse}`
+		default: return null
+	}
+}
+
+function count(f: Found, k: api.QueueAttributeName, now: i64): string {
+	const [visible, inFlight, delayed] = counts(f, now)
+	const n = if (k == "ApproximateNumberOfMessages") visible
+		else if (k == "ApproximateNumberOfMessagesDelayed") delayed
+		else inFlight
+	return `${n}`
+}
+
+export function counts(f: Found, now: i64): [i32, i32, i32] {
+	let visible = 0
+	let inFlight = 0
+	let delayed = 0
+	each(f, m => {
+		if (expired(f.queue, m, now)) {
+			return true
+		}
+		if (m.visible <= now) {
+			visible++
+		} else if (m.receives > 0) {
+			inFlight++
+		} else {
+			delayed++
+		}
+		return true
+	})
+	return [visible, inFlight, delayed]
+}
+
+function each(f: Found, visit: (m: Message) => bool) {
+	let from: string | null = null
+	const prefix = within(f.queue.name, "")
+	while (true) {
+		const chunk = f.db.messages.scan(from, 100, prefix)
+		for (const [_, m] of chunk) {
+			if (!visit(m)) {
+				return
+			}
+		}
+		if (chunk.length < 100) {
+			return
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+function expired(q: Queue, m: Message, now: i64): bool { return now >= m.sent + (q.retention as i64) * second }
+
+function clear[V extends Decodable](t: Table[V], prefix: string) throws Fault {
+	while (true) {
+		const chunk = t.scan(null, 100, prefix)
+		for (const [k, _] of chunk) {
+			t.delete(k)
+		}
+		if (chunk.length < 100) {
+			return
+		}
+	}
+}
+
+/// Deletes f's messages, at most once a minute.
+export function purge(f: Found, now: i64) throws Fault {
+	const q = f.queue
+	if (q.purged != null && now < q.purged! + minute) {
+		throw api.purgeQueueInProgress(`Only one PurgeQueue operation on ${q.name} is allowed every 60 seconds.`)
+	}
+	clear(f.db.messages, within(q.name, ""))
+	clear(f.db.places, within(q.name, ""))
+	q.purged = now
+	f.db.queues.put(q.name, q)
+}
+
+/// A page of queue names; max is 1 to 1000, all up to 1000 if null, without a token.
+function page(db: Tables, prefix: string, token: string | null, max: i32 | null,
+	keep: (q: Queue) => bool): [string[], string | null] throws Fault {
+	if (max != null && (max < 1 || max > 1000)) {
+		throw invalid(`${max}`, "MaxResults", "MaxResults must be an integer between 1 and 1000.")
+	}
+	let from: string | null = null
+	try {
+		from = if (token == null) null else base64.decode(token)
+	} catch (e: ParseError) {
+		throw invalidParameter("Invalid NextToken value.")
+	}
+	const n = max ?? 1000
+	const out: string[] = []
+	while (true) {
+		const chunk = db.queues.scan(from, 100, prefix)
+		for (const [k, q] of chunk) {
+			if (keep(q)) {
+				if (out.length == n) {
+					return [out, if (max == null) null else base64.encode(out[n - 1])]
+				}
+				out.push(k)
+			}
+		}
+		if (chunk.length < 100) {
+			return [out, null]
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+function tagged(tags: [string, string][], given: [string, string][], name: string): [string, string][] throws Fault {
+	const out = tags.filter(t => !given.some(g => g[0] == t[0]))
+	out.append(given)
+	if (out.length > 50) {
+		throw invalidParameter(`Too many tags added for queue ${name}.`)
+	}
+	return out
+}
+
+function permit(f: Found, input: api.AddPermissionRequest) throws Fault {
+	const label = input.Label
+	if (!named(label) || label.length > 80) {
+		throw invalid(label, "Label",
+			"Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length")
+	}
+	if (input.AWSAccountIds.length == 0) {
+		throw missingParameter("AWSAccountIds")
+	}
+	if (input.Actions.length == 0) {
+		throw missingParameter("Actions")
+	}
+	for (const a of input.Actions) {
+		if (!grantable.some(g => g == a)) {
+			throw invalid(`SQS:${a}`, "ActionName", "Please refer to the appropriate WSDL for a list of valid actions.")
+		}
+	}
+	const statements = policyOf(f.queue.policy)
+	if (statements.some(s => sid(s) == label)) {
+		throw invalid(label, "Label", "Already exists.")
+	}
+	const principals = input.AWSAccountIds.map(a => json.quoted(`arn:aws:iam::${a}:root`))
+	const actions = input.Actions.map(a => json.quoted(`SQS:${a}`))
+	const s = `{"Sid":${json.quoted(label)},"Effect":"Allow","Principal":{"AWS":${one(principals)}},`
+		+ `"Action":${one(actions)},"Resource":${json.quoted(f.arn)}}`
+	statements.push(s)
+	f.queue.policy = withStatements(f, statements)
+}
+
+const grantable = ["*", "SendMessage", "ReceiveMessage", "DeleteMessage", "ChangeMessageVisibility",
+	"GetQueueAttributes", "GetQueueUrl", "ListDeadLetterSourceQueues", "PurgeQueue", "ListQueueTags"]
+
+function one(items: string[]): string { return if (items.length == 1) items[0] else `[${items.join(",")}]` }
+
+function policyOf(p: string | null): string[] {
+	if (p == null) {
+		return []
+	}
+	try {
+		for (const [k, x] of json.decode[json.Keys](p).all) {
+			if (k == "Statement") {
+				return if (startsWith(x.text, "[")) json.decode[json.Keys[]](x.text).map(s => encoded(s)) else [x.text]
+			}
+		}
+	} catch (e: ParseError) {}
+	return []
+}
+
+function encoded(k: json.Keys): string {
+	try {
+		return json.encode(k)
+	} catch (e: json.EncodeError) {
+		return "{}" // its values are JSON already
+	}
+}
+
+function sid(s: string): string {
+	try {
+		for (const [k, x] of json.decode[json.Keys](s).all) {
+			if (k == "Sid") {
+				return json.decode[string](x.text)
+			}
+		}
+	} catch (e: ParseError) {}
+	return ""
+}
+
+/// f's policy with statements, of AWS's Version and Id if it has none.
+function withStatements(f: Found, statements: string[]): string {
+	const members: [string,
+		string][] = [["Version", "\"2012-10-17\""], ["Id", json.quoted(`${f.arn}/SQSDefaultPolicy`)]]
+	if (f.queue.policy != null) {
+		try {
+			for (const [k, x] of json.decode[json.Keys](f.queue.policy!).all) {
+				if (k == "Version" || k == "Id") {
+					members.find(m => m[0] == k)![1] = x.text
+				} else if (k != "Statement") {
+					members.push([k, x.text])
+				}
+			}
+		} catch (e: ParseError) {}
+	}
+	members.push(["Statement", `[${statements.join(",")}]`])
+	return `{${members.map(m => `${json.quoted(m[0])}:${m[1]}`).join(",")}}`
+}
+
+export function send(caller: Caller, input: api.SendMessageRequest, now: i64): api.SendMessageResult throws Fault {
+	const f = found(caller, input.QueueUrl)
+	const r = enqueue(caller, f, input, now)
+	f.db.queues.put(f.queue.name, f.queue)
+	return r
+}
+
+export function sendBatch(caller: Caller, input: api.SendMessageBatchRequest,
+	now: i64): api.SendMessageBatchResult throws Fault {
+	const f = found(caller, input.QueueUrl)
+	batch(input.Entries.map(e => e.Id), "SendMessageBatchRequestEntry")
+	let total = 0
+	for (const e of input.Entries) {
+		total += size(e.MessageBody, e.MessageAttributes ?? [])
+	}
+	if (total > largest) {
+		throw api.batchRequestTooLong(`Batch requests cannot be longer than ${largest} bytes. You have sent ${total} bytes.`)
+	}
+	const r = new api.SendMessageBatchResult()
+	for (const e of input.Entries) {
+		const one = new api.SendMessageRequest()
+		one.QueueUrl = input.QueueUrl
+		one.MessageBody = e.MessageBody
+		one.DelaySeconds = e.DelaySeconds
+		one.MessageAttributes = e.MessageAttributes
+		one.MessageSystemAttributes = e.MessageSystemAttributes
+		one.MessageDeduplicationId = e.MessageDeduplicationId
+		one.MessageGroupId = e.MessageGroupId
+		try {
+			const sent = enqueue(caller, f, one, now)
+			const s = new api.SendMessageBatchResultEntry()
+			s.Id = e.Id
+			s.MessageId = sent.MessageId!
+			s.MD5OfMessageBody = sent.MD5OfMessageBody!
+			s.MD5OfMessageAttributes = sent.MD5OfMessageAttributes
+			s.MD5OfMessageSystemAttributes = sent.MD5OfMessageSystemAttributes
+			s.SequenceNumber = sent.SequenceNumber
+			r.Successful.push(s)
+		} catch (x: Fault) {
+			r.Failed.push(failed(e.Id, x))
+		}
+	}
+	f.db.queues.put(f.queue.name, f.queue)
+	return r
+}
+
+function batch(ids: string[], entry: string) throws Fault {
+	if (ids.length == 0) {
+		throw api.emptyBatchRequest(`There should be at least one ${entry} in the request.`)
+	}
+	if (ids.length > 10) {
+		throw api.tooManyEntriesInBatchRequest(`Maximum number of entries per request are 10. You have sent ${ids.length}.`)
+	}
+	for (let i = 0; i < ids.length; i++) {
+		if (!named(ids[i]) || ids[i].length > 80) {
+			const why = "A batch entry id can only contain alphanumeric characters, hyphens and underscores. It can be at "
+				+ "most 80 letters long."
+			throw api.invalidBatchEntryId(why)
+		}
+		for (let j = 0; j < i; j++) {
+			if (ids[i] == ids[j]) {
+				throw api.batchEntryIdsNotDistinct(`Id ${ids[i]} repeated.`)
+			}
+		}
+	}
+}
+
+function failed(id: string, x: Fault): api.BatchResultErrorEntry {
+	const e = new api.BatchResultErrorEntry()
+	e.Id = id
+	e.SenderFault = x.sender
+	e.Code = x.code
+	e.Message = x.message
+	return e
+}
+
+/// Puts input's message into f's queue at now; f's queue is changed, not saved.
+function enqueue(caller: Caller, f: Found, input: api.SendMessageRequest,
+	now: i64): api.SendMessageResult throws Fault {
+	const q = f.queue
+	const body = input.MessageBody
+	if (body == "") {
+		throw missingParameter("MessageBody")
+	}
+	if (!characters(body)) {
+		const why = "Invalid characters found. Valid unicode characters are #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to "
+			+ "#xFFFD | #x10000 to #x10FFFF"
+		throw api.invalidMessageContents(why)
+	}
+	const delay = input.DelaySeconds
+	if (delay != null && (delay < 0 || delay > 900)) {
+		throw invalid(`${delay}`, "DelaySeconds", "DelaySeconds must be >= 0 and <= 900.")
+	}
+	if (q.fifo && delay != null && delay != 0) {
+		throw invalid(`${delay}`, "DelaySeconds",
+			"The request include parameter that is not valid for this queue type.")
+	}
+	const given = input.MessageAttributes ?? []
+	const attributes = attributed(given)
+	const trace = traced(input.MessageSystemAttributes ?? [])
+	const n = size(body, given)
+	if (n > q.maxSize) {
+		throw invalidParameter(`One or more parameters are invalid. Reason: Message must be shorter than ${q.maxSize} bytes.`)
+	}
+	let dedup: string | null = null
+	if (q.fifo) {
+		if (input.MessageGroupId == null) {
+			throw missingParameter("MessageGroupId")
+		}
+		dedup = input.MessageDeduplicationId
+		if (dedup == null) {
+			if (!q.contentDeduplication) {
+				const why = "The queue should either have ContentBasedDeduplication enabled or MessageDeduplicationId "
+					+ "provided explicitly"
+				throw invalidParameter(why)
+			}
+			dedup = hex.encode(digest(sha256, body))
+		}
+	} else if (input.MessageDeduplicationId != null) {
+		throw invalid(input.MessageDeduplicationId!, "MessageDeduplicationId",
+			"The request includes a parameter that is not valid for this queue type.")
+	}
+	sealing(caller, f, true)
+	const r = new api.SendMessageResult()
+	r.MD5OfMessageBody = hex.encode(digest(md5, body))
+	r.MD5OfMessageAttributes = digested(attributes)
+	r.MD5OfMessageSystemAttributes = if (trace == null) null else hex.encode(digest(md5, traceBytes(trace)))
+	const scope = if (dedup == null) ""
+		else within(q.name, if (q.deduplicationScope == "messageGroup") within(input.MessageGroupId!, dedup) else dedup)
+	if (dedup != null) {
+		const seen = f.db.seen.get(scope)
+		if (seen != null && now < seen.at + 5 * minute) {
+			r.MessageId = seen.id
+			r.SequenceNumber = seen.sequence
+			return r
+		}
+	}
+	const m = new Message()
+	m.id = uuid()
+	m.body = body
+	m.attributes = attributes
+	m.trace = trace
+	m.sender = if (caller.userId == "sns.amazonaws.com") sns else caller.userId
+	m.sent = now
+	m.order = q.next
+	q.next++
+	m.due = now + ((delay ?? q.delay) as i64) * second
+	m.visible = m.due
+	m.group = input.MessageGroupId
+	m.deduplication = dedup
+	m.sequence = if (q.fifo) `1${digits(m.order)}` else null
+	place(f.db, q.name, m)
+	if (dedup != null) {
+		f.db.seen.put(scope, { ...new Seen(), id: m.id, sequence: m.sequence, at: now })
+	}
+	r.MessageId = m.id
+	r.SequenceNumber = m.sequence
+	return r
+}
+
+function place(db: Tables, name: string, m: Message) throws Fault {
+	const k = position(name, m.due, m.order)
+	db.messages.put(k, m)
+	db.places.put(within(name, m.id), { ...new Place(), key: k })
+}
+
+function unplace(db: Tables, name: string, m: Message) throws Fault {
+	db.messages.delete(position(name, m.due, m.order))
+	db.places.delete(within(name, m.id))
+}
+
+function attributed(given: [string, api.MessageAttributeValue][]): [string, Attribute][] throws Fault {
+	if (given.length > 10) {
+		throw invalidParameter(`Number of message attributes [${given.length}] exceeds the allowed maximum [10].`)
+	}
+	const out: [string, Attribute][] = []
+	for (const [name, v] of given) {
+		if (name == "" || name.length > 256 || !name.every(c => isAlphanumeric(c) || indexOf("-_.", chr(c)) >= 0)
+			|| startsWith(name, ".") || endsWith(name, ".") || indexOf(name, "..") >= 0) {
+			throw invalidParameter(`Message (user) attribute name '${name}' is invalid.`)
+		}
+		if (startsWith(lower(name), "aws.") || startsWith(lower(name), "amazon.")) {
+			throw invalidParameter(`Message (user) attribute name '${name}' is reserved for use by SQS.`)
+		}
+		const base = split(v.DataType, ".")[0]
+		if (base != "String" && base != "Number" && base != "Binary" || v.DataType.length > 256) {
+			const why = `The type of message (user) attribute '${name}' is invalid. You must use only the following `
+				+ "supported type prefixes: Binary, Number, String."
+			throw invalidParameter(why)
+		}
+		if (v.StringListValues != null || v.BinaryListValues != null) {
+			throw invalidParameter("Message attribute list values in SendMessage operation are not supported.")
+		}
+		const x = if (base == "Binary") v.BinaryValue else v.StringValue
+		if (x == null || x == "") {
+			const why = `Message (user) attribute '${name}' must contain a non-empty message attribute value for message `
+				+ `attribute type '${base}'.`
+			throw invalidParameter(why)
+		}
+		if (base == "Number" && !numeric(x)) {
+			throw invalidParameter(`Could not cast message attribute '${name}' value to number.`)
+		}
+		const a = new Attribute()
+		a.type = v.DataType
+		a.value = if (base == "Binary") base64.encode(x) else x
+		out.push([name, a])
+	}
+	return out
+}
+
+function numeric(s: string): bool {
+	let digit = false
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		if (isDigit(c)) {
+			digit = true
+		} else if (indexOf("+-.eE", chr(c)) < 0) {
+			return false
+		}
+	}
+	return digit
+}
+
+function traced(given: [api.MessageSystemAttributeNameForSends,
+	api.MessageSystemAttributeValue][]): string | null throws Fault {
+	for (const [_, v] of given) {
+		if (v.DataType != "String" || v.StringValue == null || v.StringValue == "") {
+			throw invalidParameter("Message system attribute 'AWSTraceHeader' must be of type String with a non-empty value.")
+		}
+		return v.StringValue
+	}
+	return null
+}
+
+function size(body: string, attributes: [string, api.MessageAttributeValue][]): i32 {
+	let n = body.length
+	for (const [name, v] of attributes) {
+		n += name.length + v.DataType.length + (v.StringValue ?? v.BinaryValue ?? "").length
+	}
+	return n
+}
+
+/// Whether s holds only the characters a message may: XML's.
+function characters(s: string): bool {
+	let i = 0
+	while (i < s.length) {
+		const [c, end] = codePoint(s, i)
+		if (c == 0xFFFD && end == i + 1) {
+			return false
+		}
+		if (!(c == 9 || c == 10 || c == 13 || c >= 0x20 && c <= 0xD7FF || c >= 0xE000 && c <= 0xFFFD || c >= 0x10000)) {
+			return false
+		}
+		i = end
+	}
+	return true
+}
+
+/// The MD5 of attributes as SQS computes it, in hex: of each by name, its name, type and value each after its length
+/// in 4 bytes, the value after a byte of 1 for a string or 2 for bytes; null if there are none.
+function digested(attributes: [string, Attribute][]): string | null throws Fault {
+	if (attributes.length == 0) {
+		return null
+	}
+	const sorted = attributes.slice(0, attributes.length)
+	sortBy(sorted, (a, b) => a[0] < b[0])
+	let s = ""
+	for (const [name, a] of sorted) {
+		s += field(name) + field(a.type)
+		if (startsWith(a.type, "Binary")) {
+			let b = ""
+			try {
+				b = base64.decode(a.value)
+			} catch (e: ParseError) {}
+			s += "\x02" + field(b)
+		} else {
+			s += "\x01" + field(a.value)
+		}
+	}
+	return hex.encode(digest(md5, s))
+}
+
+function traceBytes(t: string): string { return field("AWSTraceHeader") + field("String") + "\x01" + field(t) }
+
+function field(s: string): string {
+	const n = s.length
+	const b: u8[] = [(n >> 24 & 255) as u8, (n >> 16 & 255) as u8, (n >> 8 & 255) as u8, (n & 255) as u8]
+	return fromBytes(b) + s
+}
+
+function digest(h: (s: string) => string throws CryptoError, s: string): string throws Fault {
+	try {
+		return h(s)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", e.what)
+	}
+}
+
+/// A message received as often as its queue's RedrivePolicy allows is moved to its dead-letter queue instead. A FIFO
+/// receive retried with its ReceiveRequestAttemptId takes the same messages again, under the same receipts.
+export function receive(caller: Caller, input: api.ReceiveMessageRequest,
+	now: i64): api.ReceiveMessageResult throws Fault {
+	const f = found(caller, input.QueueUrl)
+	const q = f.queue
+	const max = input.MaxNumberOfMessages
+	if (max != null && (max < 1 || max > 10)) {
+		throw invalid(`${max}`, "MaxNumberOfMessages", "Must be between 1 and 10, if provided.")
+	}
+	const timeout = input.VisibilityTimeout
+	if (timeout != null && (timeout < 0 || timeout > 43200)) {
+		throw invalid(`${timeout}`, "VisibilityTimeout", "Must be >= 0 and <= 43200, if provided.")
+	}
+	const wait = input.WaitTimeSeconds
+	if (wait != null && (wait < 0 || wait > 20)) {
+		throw invalid(`${wait}`, "WaitTimeSeconds", "Must be >= 0 and <= 20, if provided.")
+	}
+	for (const a of input.AttributeNames ?? []) {
+		if (!system[api.MessageSystemAttributeName](a)) {
+			throw api.invalidAttributeName(`Unknown Attribute ${a}.`)
+		}
+	}
+	const n = max ?? 1
+	const until = now + ((timeout ?? q.visibility) as i64) * second
+	const attempt = if (q.fifo) input.ReceiveRequestAttemptId else null
+	const again = if (attempt == null) null else retried(f, attempt!, now, until)
+	if (again != null) {
+		const r = new api.ReceiveMessageResult()
+		r.Messages = again!.map(m => delivered(f, m, input))
+		return r
+	}
+	const dlq = if (q.deadLetter == "") null else byArn(caller, q.deadLetter)
+	const taken: Message[] = []
+	const gone: Message[] = []
+	const blocked: string[] = []
+	each(f, m => {
+		if (m.due > now || taken.length == n) {
+			return false
+		}
+		if (expired(q, m, now) || dlq != null && m.receives >= q.maxReceives && m.visible <= now) {
+			gone.push(m)
+		} else if (m.visible > now) {
+			if (m.group != null && q.fifo) {
+				blocked.push(m.group!)
+			}
+		} else if (!(q.fifo && blocked.some(g => g == m.group))) {
+			taken.push(m)
+		}
+		return true
+	})
+	if (taken.length > 0) {
+		sealing(caller, f, false)
+	}
+	for (const m of gone) {
+		unplace(f.db, q.name, m)
+		if (!expired(q, m, now)) {
+			enter(dlq!, f.arn, m, now)
+		}
+	}
+	const out: api.Message[] = []
+	for (const m of taken) {
+		unplace(f.db, q.name, m)
+		m.receives++
+		if (m.receives == 1) {
+			m.firstReceived = now
+		}
+		m.visible = until
+		if (!q.fifo) {
+			m.due = until
+		}
+		m.receipt = token()
+		place(f.db, q.name, m)
+		out.push(delivered(f, m, input))
+	}
+	if (attempt != null) {
+		f.db.attempts.put(within(q.name, attempt!),
+			{ ...new Attempt(), at: now, ids: taken.map(m => m.id), receipts: taken.map(m => m.receipt), until: until })
+	}
+	const r = new api.ReceiveMessageResult()
+	r.Messages = if (out.length == 0) null else out
+	return r
+}
+
+/// What f's receive of the attempt id took, if within five minutes and all still in flight under its receipts.
+function retried(f: Found, id: string, now: i64, until: i64): Message[] | null throws Fault {
+	const a = f.db.attempts.get(within(f.queue.name, id))
+	if (a == null || a.ids.length == 0 || now >= a.at + 5 * minute || a.until <= now) {
+		return null
+	}
+	const out: Message[] = []
+	for (let i = 0; i < a.ids.length; i++) {
+		const p = f.db.places.get(within(f.queue.name, a.ids[i]))
+		const m = if (p == null) null else f.db.messages.get(p.key)
+		if (m == null || m.receipt != a.receipts[i] || m.visible != a.until) {
+			return null
+		}
+		out.push(m!)
+	}
+	for (const m of out) {
+		unplace(f.db, f.queue.name, m)
+		m.visible = until
+		place(f.db, f.queue.name, m)
+	}
+	a.until = until
+	f.db.attempts.put(within(f.queue.name, id), a)
+	return out
+}
+
+function enter(into: Found, source: string | null, m: Message, now: i64) throws Fault {
+	const q = into.queue
+	m.order = q.next
+	q.next++
+	m.due = now
+	m.visible = now
+	m.receipt = ""
+	m.source = source
+	if (q.fifo) {
+		m.sequence = `1${digits(m.order)}`
+	}
+	place(into.db, q.name, m)
+	into.db.queues.put(q.name, q)
+}
+
+function delivered(f: Found, m: Message, input: api.ReceiveMessageRequest): api.Message throws Fault {
+	const w = new api.Message()
+	w.MessageId = m.id
+	w.ReceiptHandle = base64.encode(`${f.queue.name}\x00${m.id}\x00${m.receipt}`)
+	w.MD5OfBody = hex.encode(digest(md5, m.body))
+	w.Body = m.body
+	const names: string[] = (input.AttributeNames ?? []).map(n => `${n}`)
+	names.append((input.MessageSystemAttributeNames ?? []).map(n => `${n}`))
+	const system: [api.MessageSystemAttributeName, string][] = []
+	for (const [k, v] of systemOf(m)) {
+		if (names.some(n => n == "All" || n == k)) {
+			system.push([k, v])
+		}
+	}
+	w.Attributes = if (system.length == 0) null else system
+	const wanted = input.MessageAttributeNames ?? []
+	const chosen = m.attributes.filter(a => wanted.some(n => n == "All" || n == ".*" || n == a[0]
+		|| endsWith(n, ".*") && startsWith(a[0], n.slice(0, n.length - 1))))
+	if (chosen.length > 0) {
+		w.MD5OfMessageAttributes = digested(chosen)
+		w.MessageAttributes = chosen.map(a => [a[0], wire(a[1])])
+	}
+	return w
+}
+
+function system[T](a: string): bool {
+	for (const M of T.members) {
+		if (M.kind == "literal" && M.value == a) {
+			return true
+		}
+	}
+	return false
+}
+
+function systemOf(m: Message): [api.MessageSystemAttributeName, string][] {
+	const out: [api.MessageSystemAttributeName, string][] = [["SenderId", m.sender],
+		["SentTimestamp", `${m.sent / millisecond}`], ["ApproximateReceiveCount", `${m.receives}`],
+		["ApproximateFirstReceiveTimestamp", `${m.firstReceived / millisecond}`]]
+	if (m.sequence != null) {
+		out.push(["SequenceNumber", m.sequence!])
+	}
+	if (m.deduplication != null) {
+		out.push(["MessageDeduplicationId", m.deduplication!])
+	}
+	if (m.group != null) {
+		out.push(["MessageGroupId", m.group!])
+	}
+	if (m.trace != null) {
+		out.push(["AWSTraceHeader", m.trace!])
+	}
+	if (m.source != null) {
+		out.push(["DeadLetterQueueSourceArn", m.source!])
+	}
+	return out
+}
+
+function wire(a: Attribute): api.MessageAttributeValue {
+	const v = new api.MessageAttributeValue()
+	v.DataType = a.type
+	if (startsWith(a.type, "Binary")) {
+		try {
+			v.BinaryValue = base64.decode(a.value)
+		} catch (e: ParseError) {}
+	} else {
+		v.StringValue = a.value
+	}
+	return v
+}
+
+function received(f: Found, h: string): [Message | null, string] throws Fault {
+	let parts: string[] = []
+	try {
+		parts = split(base64.decode(h), "\x00")
+	} catch (e: ParseError) {}
+	if (parts.length != 3 || parts[0] != f.queue.name) {
+		throw api.receiptHandleIsInvalid(`The input receipt handle "${h}" is not a valid receipt handle.`)
+	}
+	const p = f.db.places.get(within(f.queue.name, parts[1]))
+	return [if (p == null) null else f.db.messages.get(p.key), parts[2]]
+}
+
+function remove(f: Found, h: string) throws Fault {
+	const [m, _] = received(f, h)
+	if (m != null) {
+		unplace(f.db, f.queue.name, m)
+	}
+}
+
+export function changeVisibility(f: Found, h: string, timeout: i32, now: i64) throws Fault {
+	if (timeout < 0 || timeout > 43200) {
+		throw invalid(`${timeout}`, "VisibilityTimeout", "Must be between 0 and 43200, if provided.")
+	}
+	const [m, receipt] = received(f, h)
+	if (m == null || m.receipt != receipt) {
+		throw invalid(h, "ReceiptHandle", "Message does not exist or is not available for visibility timeout change.")
+	}
+	if (m.visible <= now) {
+		throw api.messageNotInflight()
+	}
+	unplace(f.db, f.queue.name, m)
+	m.visible = now + (timeout as i64) * second
+	if (!f.queue.fifo) {
+		m.due = m.visible
+	}
+	place(f.db, f.queue.name, m)
+}
+
+function arn(caller: Caller, account: string, name: string): string {
+	return `arn:aws:sqs:${caller.region}:${account}:${name}`
+}
+
+function url(caller: Caller, account: string, name: string): string { return `${caller.endpoint}/${account}/${name}` }
+function named(s: string): bool { return s.length > 0 && s.every(c => isAlphanumeric(c) || c == "-"[0] || c == "_"[0]) }
+
+function ranged(k: api.QueueAttributeName, v: string, min: i32, max: i32): i32 throws Fault {
+	let n = 0
+	try {
+		n = parseInt(v)
+	} catch (e: ParseError) {
+		throw invalidValue(k)
+	}
+	if (n < min || n > max) {
+		throw invalidValue(k)
+	}
+	return n
+}
+
+function flag(k: api.QueueAttributeName, v: string): bool throws Fault {
+	if (v != "true" && v != "false") {
+		throw invalidValue(k)
+	}
+	return v == "true"
+}
+
+function policy(v: string): string throws Fault {
+	try {
+		auth.parse(v, "resource")
+	} catch (f: Fault) {
+		throw invalidValue("Policy")
+	}
+	return v
+}
+
+function fifoOnly(q: Queue, k: api.QueueAttributeName) throws Fault {
+	if (!q.fifo) {
+		throw unknownAttribute(k)
+	}
+}
+
+function token(): string throws Fault { return hex.encode(random(16)) }
+function missing(): Fault { return api.queueDoesNotExist("The specified queue does not exist.") }
+function invalidParameter(why: string): Fault { return new Fault(400, "InvalidParameterValue", why) }
+
+function invalid(v: string, p: string, why: string): Fault {
+	return invalidParameter(`Value ${v} for parameter ${p} is invalid. Reason: ${why}`)
+}
+
+function missingParameter(p: string): Fault {
+	return new Fault(400, "MissingParameter", `The request must contain the parameter ${p}.`)
+}
+
+function unknownAttribute(k: api.QueueAttributeName): Fault {
+	return api.invalidAttributeName(`Unknown Attribute ${k}.`)
+}
+
+function invalidValue(k: api.QueueAttributeName): Fault {
+	return api.invalidAttributeValue(`Invalid value for the parameter ${k}.`)
+}
+
+/// In the order AWS gives them.
+const everything: api.QueueAttributeName[] = ["Policy", "VisibilityTimeout", "MaximumMessageSize",
+	"MessageRetentionPeriod", "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
+	"CreatedTimestamp", "LastModifiedTimestamp", "QueueArn", "ApproximateNumberOfMessagesDelayed", "DelaySeconds",
+	"ReceiveMessageWaitTimeSeconds", "RedrivePolicy", "RedriveAllowPolicy", "FifoQueue", "ContentBasedDeduplication",
+	"DeduplicationScope", "FifoThroughputLimit", "KmsMasterKeyId", "KmsDataKeyReusePeriodSeconds",
+	"SqsManagedSseEnabled"]
