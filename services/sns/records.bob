@@ -1,0 +1,73 @@
+//! SNS's state in an account's tree of a region: its topics by name, and their subscriptions by the topic's name, a NUL
+//! and the subscription's id, so that a topic's are together.
+
+import { Store, Table } from "../../core/state/store"
+
+export class Topic {
+	name = ""
+	/// As given, in the order first set.
+	attributes: [string, string][] = []
+	tags: [string, string][] = []
+	/// The messages published to it, the last of which a FIFO topic's sequence numbers count.
+	published: i64 = 0
+}
+
+export class Subscription {
+	id = ""
+	topic = ""
+	protocol = ""
+	endpoint = ""
+	owner = ""
+	principal = ""
+	confirmed = false
+	token = ""
+	attributes: [string, string][] = []
+}
+
+/// A message published to a FIFO topic, by its deduplication id, which another of the id is within five minutes.
+export class Published {
+	id = ""
+	sequence = ""
+	at: i64 = 0
+}
+
+export class Tables {
+	topics: Table[Topic]
+	subscriptions: Table[Subscription]
+	/// By the topic's name and the deduplication id, after the message group's where the topic deduplicates by group.
+	published: Table[Published]
+
+	constructor(s: Store) {
+		this.topics = new Table[Topic](s, "sns/topics")
+		this.subscriptions = new Table[Subscription](s, "sns/subscriptions")
+		this.published = new Table[Published](s, "sns/published")
+	}
+}
+
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+export function attribute(attributes: [string, string][], name: string): string | null {
+	for (const [k, v] of attributes) {
+		if (k == name) {
+			return v
+		}
+	}
+	return null
+}
+
+export function set(attributes: [string, string][], name: string, value: string | null): [string, string][] {
+	const out: [string, string][] = []
+	let found = false
+	for (const [k, v] of attributes) {
+		if (k != name) {
+			out.push([k, v])
+		} else if (value != null) {
+			out.push([k, value!])
+			found = true
+		}
+	}
+	if (!found && value != null) {
+		out.push([name, value!])
+	}
+	return out
+}

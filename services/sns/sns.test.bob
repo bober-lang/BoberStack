@@ -1,0 +1,473 @@
+import { request, text, texts } from "../../core/client.test"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import { live } from "../../core/state/store"
+import * as sqsApi from "../sqs/api"
+import * as api from "./api"
+import { Tables } from "./records"
+import { Handler } from "./sns"
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import * as json from "std/encoding/json"
+import { Keys } from "std/encoding/json"
+import { Response } from "std/http"
+import { escape } from "std/url"
+
+/// SQS as SNS sees it.
+class Queues {
+	...sqsApi.Unimplemented
+
+	sent: sqsApi.SendMessageRequest[] = []
+	callers: Caller[] = []
+	refusing: string[] = []
+
+	sendMessage(caller: Caller, input: sqsApi.SendMessageRequest): sqsApi.SendMessageResult throws Fault {
+		if (this.refusing.includes(input.QueueUrl.slice(lastIndexOf(input.QueueUrl, "/") + 1, input.QueueUrl.length))) {
+			throw new Fault(400, "AWS.SimpleQueueService.NonExistentQueue", "The specified queue does not exist.")
+		}
+		this.sent.push(input)
+		this.callers.push(caller)
+		return new sqsApi.SendMessageResult()
+	}
+
+	to(name: string): i32 {
+		for (let i = 0; i < this.sent.length; i++) {
+			if (endsWith(this.sent[i].QueueUrl, `/${name}`)) {
+				return i
+			}
+		}
+		return -1
+	}
+}
+
+class Envelope {
+	Type = ""
+	MessageId = ""
+	SequenceNumber: string | null = null
+	TopicArn = ""
+	Subject: string | null = null
+	Message = ""
+	Timestamp = ""
+	SignatureVersion: string | null = null
+	Signature: string | null = null
+	SigningCertURL: string | null = null
+	UnsubscribeURL = ""
+	MessageAttributes: Keys | null = null
+}
+
+const account = "000000000000"
+const topicArn = "arn:aws:sns:us-east-1:000000000000:t"
+const queueArn = "arn:aws:sqs:us-east-1:000000000000:q"
+
+function gateway(q: Queues): Gateway {
+	const h = new Handler(q)
+	const g = new Gateway()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, action: string, params: [string, string][] = []): Response {
+	const query = params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	return g.handle(request("sns", "test", "test", `Action=${action}&Version=2010-03-31${query}`))
+}
+
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+}
+
+function attributes(res: Response): [string, string][] {
+	const keys = texts(res, "key")
+	const values = texts(res, "value")
+	const out: [string, string][] = []
+	for (let i = 0; i < keys.length; i++) {
+		out.push([keys[i], values[i]])
+	}
+	return out
+}
+
+function get(attrs: [string, string][], name: string): string | null {
+	for (const [k, v] of attrs) {
+		if (k == name) {
+			return v
+		}
+	}
+	return null
+}
+
+function map(m: string, attrs: [string, string][]): [string, string][] {
+	const out: [string, string][] = []
+	for (let i = 0; i < attrs.length; i++) {
+		out.push([`${m}.entry.${i + 1}.key`, attrs[i][0]])
+		out.push([`${m}.entry.${i + 1}.value`, attrs[i][1]])
+	}
+	return out
+}
+
+function messageAttributes(attrs: [string, string, string][], m = "MessageAttributes"): [string, string][] {
+	const out: [string, string][] = []
+	for (let i = 0; i < attrs.length; i++) {
+		out.push([`${m}.entry.${i + 1}.Name`, attrs[i][0]])
+		out.push([`${m}.entry.${i + 1}.Value.DataType`, attrs[i][1]])
+		const member = if (startsWith(attrs[i][1], "Binary")) "BinaryValue" else "StringValue"
+		out.push([`${m}.entry.${i + 1}.Value.${member}`, attrs[i][2]])
+	}
+	return out
+}
+
+function subscribe(g: Gateway, t: string, name: string, attrs: [string, string][] = []): string {
+	const res = call(g, "Subscribe",
+		[["TopicArn", t], ["Protocol", "sqs"], ["Endpoint", `arn:aws:sqs:us-east-1:000000000000:${name}`],
+		...map("Attributes", attrs)])
+	assert res.status == 200
+	return text(res, "SubscriptionArn")!
+}
+
+function envelope(body: string): Envelope { return json.decode[Envelope](body) }
+
+test "topics: create, idempotent, list, delete" {
+	const before = live()
+	const g = gateway(new Queues())
+	let res = call(g, "CreateTopic", [["Name", "t"]])
+	assert res.status == 200 && text(res, "TopicArn") == topicArn
+	assert text(call(g, "CreateTopic", [["Name", "t"]]), "TopicArn") == topicArn
+	assert fails(call(g, "CreateTopic", [["Name", "t"], ...map("Attributes", [["DisplayName", "x"]])]), 400,
+		"InvalidParameter", "Invalid parameter: Attributes Reason: Topic already exists with different attributes")
+	assert fails(call(g, "CreateTopic", [["Name", "a b"]]), 400, "InvalidParameter", "Invalid parameter: Topic Name")
+	assert fails(call(g, "CreateTopic", [["Name", "x.fifo"]]), 400, "InvalidParameter", "Invalid parameter: Topic Name")
+	assert fails(call(g, "CreateTopic", [["Name", "x"], ...map("Attributes", [["FifoTopic", "true"]])]), 400,
+		"InvalidParameter")
+	assert fails(call(g, "CreateTopic", [["Name", "x"], ...map("Attributes", [["Colour", "red"]])]), 400,
+		"InvalidParameter", "Invalid parameter: AttributeName")
+	assert fails(call(g, "CreateTopic", [["Name", "x"], ...map("Attributes", [["ContentBasedDeduplication", "true"]])]),
+		400, "InvalidParameter")
+	assert call(g, "CreateTopic", [["Name", "f.fifo"], ...map("Attributes", [["FifoTopic", "true"]])]).status == 200
+	for (let i = 0; i < 100; i++) {
+		assert call(g, "CreateTopic", [["Name", `n${1000 + i}`]]).status == 200
+	}
+	res = call(g, "ListTopics")
+	const first = texts(res, "TopicArn")
+	assert first.length == 100 && first[0] == "arn:aws:sns:us-east-1:000000000000:f.fifo"
+	res = call(g, "ListTopics", [["NextToken", text(res, "NextToken")!]])
+	assert texts(res, "TopicArn") == ["arn:aws:sns:us-east-1:000000000000:n1099", topicArn]
+	assert text(res, "NextToken") == null
+	assert fails(call(g, "ListTopics", [["NextToken", "%%%"]]), 400, "InvalidParameter")
+	assert call(g, "DeleteTopic", [["TopicArn", topicArn]]).status == 200
+	assert call(g, "DeleteTopic", [["TopicArn", topicArn]]).status == 200
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", topicArn]]), 404, "NotFound", "Topic does not exist")
+	g.close()
+	assert live() == before
+}
+
+test "topic ARNs, as SNS checks them" {
+	const g = gateway(new Queues())
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", "bad"]]), 400, "InvalidParameter",
+		"Invalid parameter: TopicArn Reason: An ARN must have at least 6 elements, not 1")
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", "arn:aws:sns:us-west-2:000000000000:t"]]), 400,
+		"InvalidParameter", "Invalid parameter: TopicArn")
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", "arn:aws:sqs:us-east-1:000000000000:t"]]), 400,
+		"InvalidParameter", "Invalid parameter: TopicArn")
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", "arn:aws:sns:us-east-1:000000000000:a b"]]), 400,
+		"InvalidParameter", "Invalid parameter: Topic Name")
+	assert fails(call(g, "GetTopicAttributes", [["TopicArn", "arn:aws:sns:us-east-1:12:t"]]), 403,
+		"InvalidClientTokenId")
+	assert fails(call(g, "Publish", [["Message", "hi"]]), 400, "InvalidParameter",
+		"Invalid parameter: TopicArn or TargetArn Reason: no value for required parameter")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["PhoneNumber", "+15555555555"], ["Message", "hi"]]), 400,
+		"InvalidParameter",
+		"Invalid parameter: TopicArn Reason: Both TopicArn and PhoneNumber specified. Use only one or the other.")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["TargetArn", topicArn], ["Message", "hi"]]), 400,
+		"InvalidParameter",
+		"Invalid parameter: TopicArn Reason: Both TopicArn and TargetArn specified. Use only one or the other.")
+	assert fails(call(g, "Publish", [["PhoneNumber", "+15555555555"], ["Message", "hi"]]), 501, "NotImplemented")
+	assert fails(call(g, "Unsubscribe", [["SubscriptionArn", "bad"]]), 400, "InvalidParameter",
+		"Invalid parameter: SubscriptionArn Reason: An ARN must have at least 6 elements, not 1")
+	assert fails(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", topicArn]]), 400, "InvalidParameter",
+		"Invalid parameter: SubscriptionId")
+	assert fails(call(g, "ListTagsForResource", [["ResourceArn", "bad"]]), 400, "InvalidParameter",
+		"Invalid parameter: ResourceArn Reason: An ARN must have at least 6 elements, not 1")
+	g.close()
+}
+
+test "topic attributes, permissions and tags" {
+	const g = gateway(new Queues())
+	assert call(g, "CreateTopic",
+		[["Name", "t"], ...map("Attributes", [["DisplayName", "Tee"]]), ["Tags.member.1.Key", "env"],
+		["Tags.member.1.Value", "dev"]]).status == 200
+	let attrs = attributes(call(g, "GetTopicAttributes", [["TopicArn", topicArn]]))
+	assert get(attrs, "TopicArn") == topicArn && get(attrs, "Owner") == account && get(attrs, "DisplayName") == "Tee"
+	assert get(attrs, "SubscriptionsConfirmed") == "0" && get(attrs, "SubscriptionsPending") == "0"
+	assert get(attrs, "SubscriptionsDeleted") == "0" && indexOf(get(attrs, "EffectiveDeliveryPolicy")!, "\"http\"") > 0
+	const p = get(attrs, "Policy")!
+	assert indexOf(p, "__default_policy_ID") > 0 && indexOf(p, `"AWS:SourceOwner":"${account}"`) > 0
+	assert call(g, "SetTopicAttributes",
+		[["TopicArn", topicArn], ["AttributeName", "DisplayName"], ["AttributeValue", "New"]]).status == 200
+	assert fails(call(g, "SetTopicAttributes",
+		[["TopicArn", topicArn], ["AttributeName", "FifoTopic"], ["AttributeValue", "true"]]), 400, "InvalidParameter",
+		"Invalid parameter: AttributeName")
+	assert fails(call(g, "SetTopicAttributes",
+		[["TopicArn", topicArn], ["AttributeName", "Policy"], ["AttributeValue", "{"]]), 400, "InvalidParameter",
+		"Invalid parameter: Policy")
+	assert get(attributes(call(g, "GetTopicAttributes", [["TopicArn", topicArn]])), "DisplayName") == "New"
+	assert call(g, "AddPermission",
+		[["TopicArn", topicArn], ["Label", "pub"], ["AWSAccountId.member.1", "111122223333"],
+		["ActionName.member.1", "Publish"]]).status == 200
+	assert fails(call(g, "AddPermission",
+		[["TopicArn", topicArn], ["Label", "pub"], ["AWSAccountId.member.1", "111122223333"],
+		["ActionName.member.1", "Publish"]]), 400, "InvalidParameter", "Invalid parameter: Statement already exists")
+	assert fails(call(g, "AddPermission",
+		[["TopicArn", topicArn], ["Label", "x"], ["AWSAccountId.member.1", "111122223333"],
+		["ActionName.member.1", "Fly"]]), 400, "InvalidParameter",
+		"Invalid parameter: Policy statement action out of service scope!")
+	let policy = get(attributes(call(g, "GetTopicAttributes", [["TopicArn", topicArn]])), "Policy")!
+	assert indexOf(policy, "__default_statement_ID") > 0
+	assert indexOf(policy,
+		`{"Sid":"pub","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},`
+		+ `"Action":"SNS:Publish","Resource":"${topicArn}"}`) > 0
+	assert call(g, "RemovePermission", [["TopicArn", topicArn], ["Label", "pub"]]).status == 200
+	policy = get(attributes(call(g, "GetTopicAttributes", [["TopicArn", topicArn]])), "Policy")!
+	assert indexOf(policy, "\"pub\"") < 0 && indexOf(policy, "__default_statement_ID") > 0
+	assert texts(call(g, "ListTagsForResource", [["ResourceArn", topicArn]]), "Key") == ["env"]
+	assert call(g, "TagResource",
+		[["ResourceArn", topicArn], ["Tags.member.1.Key", "env"], ["Tags.member.1.Value", "prod"],
+		["Tags.member.2.Key", "team"], ["Tags.member.2.Value", "a"]]).status == 200
+	let res = call(g, "ListTagsForResource", [["ResourceArn", topicArn]])
+	assert texts(res, "Key") == ["env", "team"] && texts(res, "Value") == ["prod", "a"]
+	assert call(g, "UntagResource", [["ResourceArn", topicArn], ["TagKeys.member.1", "env"]]).status == 200
+	assert texts(call(g, "ListTagsForResource", [["ResourceArn", topicArn]]), "Key") == ["team"]
+	assert fails(call(g, "CreateTopic", [["Name", "t"], ["Tags.member.1.Key", "x"], ["Tags.member.1.Value", "y"]]), 400,
+		"InvalidParameter", "Invalid parameter: Tags Reason: Topic already exists with different tags")
+	assert fails(call(g, "ListTagsForResource", [["ResourceArn", "arn:aws:sns:us-east-1:000000000000:none"]]), 404,
+		"ResourceNotFound", "Resource does not exist")
+	g.close()
+}
+
+test "subscriptions: confirmation by protocol, attributes, listing" {
+	const g = gateway(new Queues())
+	assert call(g, "CreateTopic", [["Name", "t"]]).status == 200
+	assert fails(call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "carrier-pigeon"], ["Endpoint", "x"]]), 400,
+		"InvalidParameter", "Invalid parameter: Amazon SNS does not support this protocol string: carrier-pigeon")
+	assert fails(call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "sqs"], ["Endpoint", "x"]]), 400,
+		"InvalidParameter", "Invalid parameter: SQS endpoint ARN")
+	assert fails(call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "sqs"], ["Endpoint", `${queueArn}.fifo`]]),
+		400, "InvalidParameter",
+		"Invalid parameter: Invalid parameter: Endpoint Reason: FIFO SQS Queues can not be subscribed to standard SNS topics")
+	assert fails(call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "email"], ["Endpoint", "x"]]), 400,
+		"InvalidParameter", "Invalid parameter: Email address")
+	const sub = subscribe(g, topicArn, "q")
+	assert startsWith(sub, `${topicArn}:`) && sub.length == topicArn.length + 37
+	assert subscribe(g, topicArn, "q") == sub
+	let res = call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "email"], ["Endpoint", "a@example.com"]])
+	assert text(res, "SubscriptionArn") == "pending confirmation"
+	res = call(g, "Subscribe",
+		[["TopicArn", topicArn], ["Protocol", "https"], ["Endpoint", "https://example.com"],
+		["ReturnSubscriptionArn", "true"]])
+	const web = text(res, "SubscriptionArn")!
+	assert startsWith(web, `${topicArn}:`)
+	let attrs = attributes(call(g, "GetTopicAttributes", [["TopicArn", topicArn]]))
+	assert get(attrs, "SubscriptionsConfirmed") == "1" && get(attrs, "SubscriptionsPending") == "2"
+	attrs = attributes(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", web]]))
+	assert get(attrs, "PendingConfirmation") == "true" && get(attrs, "Protocol") == "https"
+	assert get(attrs, "EffectiveDeliveryPolicy") != null
+	assert fails(call(g, "ConfirmSubscription", [["TopicArn", topicArn], ["Token", "nope"]]), 400, "InvalidParameter",
+		"Invalid parameter: Token")
+	const id = web.slice(topicArn.length + 1, web.length)
+	const token = new Tables(g.trees.get("000000000000/us-east-1")!).subscriptions.get(`t\x00${id}`)!.token
+	res = call(g, "ConfirmSubscription", [["TopicArn", topicArn], ["Token", token]])
+	assert res.status == 200 && text(res, "SubscriptionArn") == web
+	assert get(attributes(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", web]])), "PendingConfirmation")
+		== "false"
+	res = call(g, "ListSubscriptionsByTopic", [["TopicArn", topicArn]])
+	assert texts(res, "SubscriptionArn").filter(a => a == "PendingConfirmation").length == 1
+	assert texts(res, "Protocol").length == 3 && texts(call(g, "ListSubscriptions"), "Protocol").length == 3
+	attrs = attributes(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", sub]]))
+	assert get(attrs, "RawMessageDelivery") == "false" && get(attrs, "Endpoint") == queueArn
+	assert get(attrs, "Owner") == account && get(attrs, "TopicArn") == topicArn && get(attrs, "SubscriptionArn") == sub
+	assert call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "RawMessageDelivery"], ["AttributeValue", "True"]]).status == 200
+	assert call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "FilterPolicy"], ["AttributeValue", `{"a":["b"]}`]]).status == 200
+	attrs = attributes(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", sub]]))
+	assert get(attrs, "RawMessageDelivery") == "true" && get(attrs, "FilterPolicy") == `{"a":["b"]}`
+	assert get(attrs, "FilterPolicyScope") == "MessageAttributes"
+	assert fails(call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "FilterPolicy"], ["AttributeValue", `{"a":"b"}`]]), 400,
+		"InvalidParameter", `Invalid parameter: FilterPolicy: "a" must be an object or an array`)
+	assert fails(call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "FilterPolicy"], ["AttributeValue", `{"a":{"b":["c"]}}`]]), 400,
+		"InvalidParameter")
+	assert call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "FilterPolicyScope"], ["AttributeValue", "MessageBody"]]).status
+		== 200
+	assert call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "FilterPolicy"], ["AttributeValue", `{"a":{"b":["c"]}}`]]).status
+		== 200
+	assert fails(call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", sub], ["AttributeName", "Colour"], ["AttributeValue", "red"]]), 400, "InvalidParameter",
+		"Invalid parameter: AttributeName")
+	assert call(g, "SetSubscriptionAttributes",
+		[["SubscriptionArn", web], ["AttributeName", "RawMessageDelivery"], ["AttributeValue", "true"]]).status == 200
+	res = call(g, "Subscribe",
+		[["TopicArn", topicArn], ["Protocol", "email"], ["Endpoint", "b@example.com"],
+		...map("Attributes", [["RawMessageDelivery", "true"]])])
+	assert fails(res, 400, "InvalidParameter",
+		"Invalid parameter: Delivery protocol [email] does not support raw message delivery.")
+	assert fails(call(g, "Subscribe",
+		[["TopicArn", topicArn], ["Protocol", "sqs"], ["Endpoint", queueArn],
+		...map("Attributes", [["FilterPolicy", `{"x":["y"]}`]])]), 400, "InvalidParameter",
+		"Invalid parameter: Attributes Reason: Subscription already exists with different attributes")
+	assert call(g, "Unsubscribe", [["SubscriptionArn", sub]]).status == 200
+	assert fails(call(g, "GetSubscriptionAttributes", [["SubscriptionArn", sub]]), 404, "NotFound",
+		"Subscription does not exist")
+	g.close()
+}
+
+test "publish: notifications to queues, raw delivery, filter policies, dead letters" {
+	const q = new Queues()
+	const g = gateway(q)
+	assert call(g, "CreateTopic", [["Name", "t"]]).status == 200
+	const sub = subscribe(g, topicArn, "q")
+	subscribe(g, topicArn, "raw", [["RawMessageDelivery", "true"]])
+	subscribe(g, topicArn, "red", [["FilterPolicy", `{"colour":["red"]}`]])
+	subscribe(g, topicArn, "big",
+		[["FilterPolicy", `{"size":[{"numeric":[">",10]}]}`], ["FilterPolicyScope", "MessageBody"]])
+	subscribe(g, topicArn, "gone",
+		[["RedrivePolicy", `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`]])
+	subscribe(g, topicArn, "lost")
+	q.refusing = ["gone", "lost"]
+	assert call(g, "Subscribe", [["TopicArn", topicArn], ["Protocol", "email"], ["Endpoint", "a@example.com"]]).status
+		== 200
+	let res = call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", `{"size":12}`], ["Subject", "Hi"],
+		...messageAttributes([["colour", "String", "red"], ["n", "Number", "5"], ["b", "Binary", "AQI="]])])
+	assert res.status == 200
+	const id = text(res, "MessageId")!
+	assert id.length == 36 && text(res, "SequenceNumber") == null
+	assert q.sent.length == 5 && ["big", "dlq", "q", "raw", "red"].every(n => q.to(n) >= 0)
+	const plain = q.sent[q.to("q")]
+	assert plain.QueueUrl == "http://localhost:4566/000000000000/q"
+	assert q.callers[q.to("q")].arn == "sns.amazonaws.com" && q.callers[q.to("q")].source == topicArn
+	const body = plain.MessageBody
+	assert startsWith(body,
+		`{"Type":"Notification","MessageId":"${id}","TopicArn":"${topicArn}","Subject":"Hi",`
+		+ `"Message":"{\\"size\\":12}","Timestamp":"`)
+	const e = envelope(body)
+	assert e.Message == `{"size":12}` && e.SignatureVersion == "1" && e.SequenceNumber == null
+	assert e.UnsubscribeURL == `http://localhost:4566/?Action=Unsubscribe&SubscriptionArn=${sub}`
+	assert e.Timestamp.length == 24
+		&& indexOf(body,
+		`"MessageAttributes":{"colour":{"Type":"String","Value":"red"},`
+		+ `"n":{"Type":"Number","Value":"5"},"b":{"Type":"Binary","Value":"AQI="}}}`) > 0
+	const raw = q.sent[q.to("raw")]
+	assert raw.MessageBody == `{"size":12}` && raw.MessageAttributes!.length == 3
+	assert raw.MessageAttributes![2][0] == "b" && raw.MessageAttributes![2][1].BinaryValue == "\x01\x02"
+	assert envelope(q.sent[q.to("dlq")].MessageBody).Message == `{"size":12}`
+	q.sent = []
+	assert call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", `{"size":2}`],
+		...messageAttributes([["colour", "String", "blue"]])]).status == 200
+	assert q.sent.length == 3 && q.to("red") < 0 && q.to("big") < 0
+	q.sent = []
+	assert call(g, "Publish",
+		[["TopicArn", topicArn], ["MessageStructure", "json"],
+		["Message", `{"default":"d","sqs":"{\\"size\\":20}","email":"e"}`]]).status == 200
+	assert q.sent.length == 4 && q.sent.every(s => indexOf(s.MessageBody, "size") >= 0)
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["MessageStructure", "json"], ["Message", "x"]]), 400,
+		"InvalidParameter", "Invalid parameter: Message Structure - No JSON message body is parseable")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["MessageStructure", "json"], ["Message", `{"sqs":"x"}`]]),
+		400, "InvalidParameter", "Invalid parameter: Message Structure - No default entry in JSON message body")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["Message", ""]]), 400, "InvalidParameter",
+		"Invalid parameter: Empty message")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["Message", "x"], ["Subject", "a\nb"]]), 400,
+		"InvalidParameter", "Invalid parameter: Subject")
+	assert fails(call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", "x"], ...messageAttributes([["a", "Foo", "1"]])]), 400,
+		"ParameterValueInvalid",
+		"The message attribute 'a' has an invalid message attribute type, the set of "
+		+ "supported type prefixes is Binary, Number, and String.")
+	assert fails(call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", "x"], ...messageAttributes([["a", "Number", "one"]])]), 400,
+		"ParameterValueInvalid", "Could not cast message attribute 'a' value to number.")
+	assert fails(call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", "x"], ...messageAttributes([["a", "String", ""]])]), 400,
+		"ParameterValueInvalid",
+		"The message attribute 'a' must contain non-empty message attribute value for message attribute type 'String'.")
+	assert fails(call(g, "Publish", [["TopicArn", topicArn], ["Message", "x"], ["MessageDeduplicationId", "d"]]), 400,
+		"InvalidParameter")
+	q.sent = []
+	assert call(g, "Publish",
+		[["TopicArn", topicArn], ["Message", "x"],
+		...messageAttributes([["colour", "String.Array", `["blue","red"]`]])]).status == 200
+	assert q.sent.length == 4 // red too
+	assert fails(call(g, "Publish", [["TopicArn", "arn:aws:sns:us-east-1:000000000000:none"], ["Message", "x"]]), 404,
+		"NotFound", "Topic does not exist")
+	g.close()
+}
+
+test "FIFO topics: groups, deduplication, sequence numbers" {
+	const q = new Queues()
+	const g = gateway(q)
+	const f = "arn:aws:sns:us-east-1:000000000000:f.fifo"
+	assert call(g, "CreateTopic", [["Name", "f.fifo"], ...map("Attributes", [["FifoTopic", "true"]])]).status == 200
+	assert fails(call(g, "Subscribe", [["TopicArn", f], ["Protocol", "email"], ["Endpoint", "a@example.com"]]), 400,
+		"InvalidParameter")
+	subscribe(g, f, "q.fifo")
+	subscribe(g, f, "plain")
+	assert fails(call(g, "Publish", [["TopicArn", f], ["Message", "x"]]), 400, "InvalidParameter",
+		"Invalid parameter: The MessageGroupId parameter is required for FIFO topics")
+	assert fails(call(g, "Publish", [["TopicArn", f], ["Message", "x"], ["MessageGroupId", "g"]]), 400,
+		"InvalidParameter",
+		"Invalid parameter: The topic should either have ContentBasedDeduplication enabled or "
+		+ "MessageDeduplicationId provided explicitly")
+	let res = call(g, "Publish",
+		[["TopicArn", f], ["Message", "x"], ["MessageGroupId", "g"], ["MessageDeduplicationId", "d1"]])
+	const id = text(res, "MessageId")!
+	assert text(res, "SequenceNumber") == "10000000000000000001"
+	const ordered = q.sent[q.to("q.fifo")]
+	const plain = q.sent[q.to("plain")]
+	assert q.sent.length == 2 && ordered.MessageGroupId == "g" && ordered.MessageDeduplicationId == "d1"
+	assert plain.MessageGroupId == null && plain.MessageDeduplicationId == null
+	const e = envelope(ordered.MessageBody)
+	assert e.SequenceNumber == "10000000000000000001" && e.Signature == null && e.SigningCertURL == null
+	assert startsWith(ordered.MessageBody, `{"Type":"Notification","MessageId":"${id}","SequenceNumber":`)
+	res = call(g, "Publish",
+		[["TopicArn", f], ["Message", "y"], ["MessageGroupId", "g"], ["MessageDeduplicationId", "d1"]])
+	assert text(res, "MessageId") == id && text(res, "SequenceNumber") == "10000000000000000001" && q.sent.length == 2
+	assert call(g, "SetTopicAttributes",
+		[["TopicArn", f], ["AttributeName", "ContentBasedDeduplication"], ["AttributeValue", "true"]]).status == 200
+	q.sent = []
+	res = call(g, "Publish", [["TopicArn", f], ["Message", "x"], ["MessageGroupId", "g"]])
+	assert text(res, "SequenceNumber") == "10000000000000000002" && q.sent.length == 2
+	assert q.sent[q.to("q.fifo")].MessageDeduplicationId!.length == 64
+	assert get(attributes(call(g, "GetTopicAttributes", [["TopicArn", f]])), "ContentBasedDeduplication") == "true"
+	g.close()
+}
+
+test "publish batch: limits and entry errors" {
+	const q = new Queues()
+	const g = gateway(q)
+	assert call(g, "CreateTopic", [["Name", "t"]]).status == 200
+	subscribe(g, topicArn, "q")
+	const m = "PublishBatchRequestEntries.member"
+	assert fails(call(g, "PublishBatch", [["TopicArn", topicArn], ["PublishBatchRequestEntries", ""]]), 400,
+		"EmptyBatchRequest")
+	const eleven: [string, string][] = []
+	for (let i = 1; i <= 11; i++) {
+		eleven.push([`${m}.${i}.Id`, `e${i}`])
+		eleven.push([`${m}.${i}.Message`, "x"])
+	}
+	assert fails(call(g, "PublishBatch", [["TopicArn", topicArn], ...eleven]), 400, "TooManyEntriesInBatchRequest")
+	assert fails(call(g, "PublishBatch",
+		[["TopicArn", topicArn], [`${m}.1.Id`, "a"], [`${m}.1.Message`, "x"], [`${m}.2.Id`, "a"],
+		[`${m}.2.Message`, "y"]]), 400, "BatchEntryIdsNotDistinct")
+	assert fails(call(g, "PublishBatch", [["TopicArn", topicArn], [`${m}.1.Id`, "a.b"], [`${m}.1.Message`, "x"]]), 400,
+		"InvalidBatchEntryId")
+	const res = call(g, "PublishBatch",
+		[["TopicArn", topicArn], [`${m}.1.Id`, "a"], [`${m}.1.Message`, "x"], [`${m}.2.Id`, "b"],
+		[`${m}.2.Message`, "y"], [`${m}.2.MessageAttributes.entry.1.Name`, "n"],
+		[`${m}.2.MessageAttributes.entry.1.Value.DataType`, "Number"],
+		[`${m}.2.MessageAttributes.entry.1.Value.StringValue`, "x"]])
+	assert res.status == 200 && texts(res, "Id") == ["a", "b"] && texts(res, "MessageId").length == 1
+	assert text(res, "Code") == "ParameterValueInvalid" && text(res, "SenderFault") == "true"
+	assert q.sent.length == 1 && envelope(q.sent[0].MessageBody).Message == "x"
+	g.close()
+}
