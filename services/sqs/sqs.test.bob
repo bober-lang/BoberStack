@@ -6,6 +6,7 @@ import { Caller } from "../../core/service"
 import { live } from "../../core/state/store"
 import * as api from "./api"
 import { changeVisibility, counts, create, found, Handler, purge, receive, send } from "./sqs"
+import { startsWith } from "std/algo"
 import { Decodable } from "std/types"
 import { Request, Response } from "std/http"
 import { minute, second } from "std/time"
@@ -217,6 +218,28 @@ test "messages: send, receive, delete, with AWS's MD5s" {
 	assert fails(call(g, "SendMessage",
 		`{"QueueUrl":"${base}q","MessageBody":"x","MessageAttributes":{"n":{"DataType":"Number","StringValue":"x"}}}`),
 		400, "InvalidParameterValue")
+	g.close()
+}
+
+test "AttributeNames takes the system attributes' names, and answers others itself" {
+	const g = gateway()
+	assert call(g, "CreateQueue", `{"QueueName":"q"}`).status == 200
+	assert call(g, "SendMessage", `{"QueueUrl":"${base}q","MessageBody":"x"}`).status == 200
+	const res = call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","AttributeNames":["SentTimestamp"]}`)
+	const m = out[api.ReceiveMessageResult](res).Messages![0]
+	assert m.Attributes!.length == 1 && system(m, "SentTimestamp") != null
+	const unknown = call(g, "ReceiveMessage", `{"QueueUrl":"${base}q","AttributeNames":["Colour"]}`)
+	assert fails(unknown, 400, "InvalidAttributeName")
+	assert unknown.body.whole
+		== `{"__type":"com.amazonaws.sqs#InvalidAttributeName","message":"Unknown Attribute Colour."}`
+	g.close()
+}
+
+test "InvalidParameterValue is of coral's __type" {
+	const g = gateway()
+	const res = call(g, "CreateQueue", `{"QueueName":"a b"}`)
+	assert fails(res, 400, "InvalidParameterValue")
+	assert startsWith(res.body.whole ?? "", `{"__type":"com.amazon.coral.service#InvalidParameterValueException",`)
 	g.close()
 }
 

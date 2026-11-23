@@ -17,22 +17,27 @@ export class Valid[Min extends string, Max extends string, P extends string] {}
 /// Tags a list or map member with the number of its items, from Min to Max, either "" for no bound.
 export class Size[Min extends string, Max extends string] {}
 
-/// How a service answers a request breaking its model: the code of the fault, and whether its message quotes the
-/// values.
+/// How a service answers a request breaking its model: the code of the fault, whether its message quotes the values,
+/// and the unions it words on their own: by a union's name, the message where none of its members is set and where
+/// more than one is, answered if the request breaks nothing else.
 export class Validation {
 	code: string
 	quoted: bool
+	unions: [string, string, string][]
 
-	constructor(code: string, quoted: bool = true) {
+	constructor(code: string, quoted: bool = true, unions: [string, string, string][] = []) {
 		this.code = code
 		this.quoted = quoted
+		this.unions = unions
 	}
 }
 
-/// The violations of a request, as decoding it meets them: each the text of AWS's message on it.
+/// The violations of a request, as decoding it meets them: each the text of AWS's message on it; and the first fault
+/// of a union worded on its own.
 export class Violations {
 	validation: Validation
 	found: string[] = []
+	union: Fault | null = null
 
 	constructor(validation: Validation) { this.validation = validation }
 
@@ -52,11 +57,27 @@ export class Violations {
 		return new Fault(400, this.validation.code, detected + this.found.join("; "))
 	}
 
-	/// Throws the fault of the violations noted, if any.
+	/// Throws the fault of the violations noted, if any, else that of a union.
 	check() throws Fault {
 		if (this.found.length > 0) {
 			throw this.fault()
 		}
+		if (this.union != null) {
+			throw this.union!
+		}
+	}
+
+	/// Notes that the union named n has none of its members set if none, else more than one; false if the service does
+	/// not word n on its own.
+	worded(n: string, none: bool): bool {
+		const u = this.validation.unions.find(u => u[0] == n)
+		if (u == null) {
+			return false
+		}
+		if (this.union == null) {
+			this.union = new Fault(400, this.validation.code, if (none) u[1] else u[2])
+		}
+		return true
 	}
 
 	/// Puts the violations of a structure's members, noted from the index from[i] on for its member names[i], in the

@@ -68,6 +68,15 @@ test "a model it cannot express" {
 		{"U": {"target": "a#U"}}}, "a#U": {"type": "document"}}}`
 	assert generate(document, "m.json", "api.bob") throws new ModelError("a#U: a document")
 	const rest = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "traits": {"aws.protocols#restXml": {}}}}}`
-	const why = "a#S: not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
+	const why = "a#S: not an awsQuery service of an XML namespace, an awsJson or restXml one, of sigv4, or has resources"
 	assert generate(rest, "m.json", "api.bob") throws new ModelError(why)
+}
+
+test "protocoltests/restxml is what models/restxml-tests.json generates" {
+	assert fresh("models/restxml-tests.json", "protocoltests/restxml", "184 vectors: 139 tests, 45 skipped")
+}
+
+test "services/s3/api.bob is what models/s3.json generates" {
+	assert generate(readFile("models/s3.json")!, "models/s3.json", "services/s3/api.bob")
+		== readFile("services/s3/api.bob")
 }

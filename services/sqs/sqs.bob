@@ -1030,6 +1030,11 @@ export function receive(caller: Caller, input: api.ReceiveMessageRequest,
 	if (wait != null && (wait < 0 || wait > 20)) {
 		throw invalid(`${wait}`, "WaitTimeSeconds", "Must be >= 0 and <= 20, if provided.")
 	}
+	for (const a of input.AttributeNames ?? []) {
+		if (!system[api.MessageSystemAttributeName](a)) {
+			throw api.invalidAttributeName(`Unknown Attribute ${a}.`)
+		}
+	}
 	const n = max ?? 1
 	const until = now + ((timeout ?? q.visibility) as i64) * second
 	const dlq = if (q.deadLetter == "") null else byArn(caller, q.deadLetter)
@@ -1117,6 +1122,16 @@ function delivered(f: Found, m: Message, input: api.ReceiveMessageRequest): api.
 		w.MessageAttributes = chosen.map(a => [a[0], wire(a[1])])
 	}
 	return w
+}
+
+/// Whether a is a value of T, the system attributes' names.
+function system[T](a: string): bool {
+	for (const M of T.members) {
+		if (M.kind == "literal" && M.value == a) {
+			return true
+		}
+	}
+	return false
 }
 
 /// The system attributes of m.

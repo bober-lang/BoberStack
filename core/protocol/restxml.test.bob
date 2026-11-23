@@ -1,0 +1,98 @@
+import { Fault } from "../fault"
+import { Caller } from "../service"
+import { Request, Response } from "std/http"
+import { call, Header, Label, Name, Payload, Prefix, Query, Route, Service } from "./restxml"
+
+class Get {
+	Bucket: string @Label
+	Key: string @Label
+	Range: string | null @Header["Range"]
+}
+
+class Got {
+	Body: string | null @Payload @Name["Body"]
+	Meta: [string, string][] | null @Prefix["x-amz-meta-"]
+	Length: i64 | null @Header["Content-Length"]
+}
+
+class List {
+	Bucket: string @Label
+	Prefix: string | null @Query["prefix"]
+}
+
+class Listed @Name["ListBucketResult"] {
+	Name: string | null
+	KeyCount: i32 | null
+}
+
+const s3 = new Service("com.amazonaws.s3#AmazonS3", "http://s3.amazonaws.com/doc/2006-03-01/", false)
+
+const routes = [new Route("GetObjectAcl", "GET", "/{Bucket}/{Key+}", ["acl"]),
+	new Route("ListObjectsV2", "GET", "/{Bucket}", ["list-type=2"]),
+	new Route("GetObject", "GET", "/{Bucket}/{Key+}", ["x-id=GetObject"]),
+	new Route("HeadObject", "HEAD", "/{Bucket}/{Key+}")]
+
+function caller(): Caller { return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "R1") }
+
+function get(c: Caller, input: Get): Got throws Fault {
+	if (input.Key != "a/b c.txt") {
+		throw new Fault(404, "NoSuchKey", "The specified key does not exist.")
+	}
+	const out = new Got()
+	out.Body = "hello"
+	out.Meta = [["colour", "blue"]]
+	out.Length = 5
+	return out
+}
+
+function list(c: Caller, input: List): Listed throws Fault {
+	const out = new Listed()
+	out.Name = input.Bucket
+	out.KeyCount = 0
+	return out
+}
+
+/// The answer of the gateway's switch to req.
+function serve(req: Request): Response throws IoError {
+	const c = call(caller(), req, s3, routes)
+	switch (c.operation) {
+		case "GetObject", "HeadObject": return c.serve(get)
+		case "ListObjectsV2": return c.serve(list)
+		default: return c.unknownOperation()
+	}
+}
+
+test "a route needs no x-id, its greedy label takes the rest of the path, unescaped" {
+	const res = serve(new Request("GET", "/bucket/a/b%20c.txt", ""))
+	assert res.status == 200
+	assert res.body.whole == "hello"
+	assert res.headers.get("x-amz-meta-colour") == "blue"
+	assert res.headers.get("x-amz-request-id") == "R1"
+	assert serve(new Request("GET", "/bucket/a/b%20c.txt?x-id=GetObject", "")).status == 200
+}
+
+test "a query literal makes a route more specific, and an output names its root" {
+	const res = serve(new Request("GET", "/bucket?list-type=2&prefix=p", ""))
+	assert res.headers.get("content-type") == "application/xml"
+	const xml = "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name>"
+	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${xml}<KeyCount>0</KeyCount></ListBucketResult>`
+}
+
+test "S3's errors are an Error of the RequestId, and a HEAD's answer has no body" {
+	const res = serve(new Request("GET", "/bucket/missing", ""))
+	assert res.status == 404
+	const body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><RequestId>R1</RequestId></Error>"
+	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${body}`
+	const head = serve(new Request("HEAD", "/bucket/missing", ""))
+	assert head.status == 404
+	assert head.body.whole == ""
+	assert serve(new Request("HEAD", "/bucket/a/b%20c.txt", "")).headers.get("content-length") == "5"
+}
+
+test "a request of no route is MethodNotAllowed" {
+	const res = serve(new Request("DELETE", "/bucket", ""))
+	assert res.status == 405
+	const message = "The specified method is not allowed against this resource."
+	const body = `<Error><Code>MethodNotAllowed</Code><Message>${message}</Message><RequestId>R1</RequestId></Error>`
+	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${body}`
+}

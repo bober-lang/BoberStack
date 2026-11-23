@@ -65,6 +65,15 @@ class Traits {
 	awsJson10: Mark | null @json.Name["aws.protocols#awsJson1_0"]
 	awsJson11: Mark | null @json.Name["aws.protocols#awsJson1_1"]
 	queryCompatible: Mark | null @json.Name["aws.protocols#awsQueryCompatible"]
+	restXml: RestXml | null @json.Name["aws.protocols#restXml"]
+	http: Http | null @json.Name["smithy.api#http"]
+	httpLabel: Mark | null @json.Name["smithy.api#httpLabel"]
+	httpQuery: string | null @json.Name["smithy.api#httpQuery"]
+	httpQueryParams: Mark | null @json.Name["smithy.api#httpQueryParams"]
+	httpHeader: string | null @json.Name["smithy.api#httpHeader"]
+	httpPrefixHeaders: string | null @json.Name["smithy.api#httpPrefixHeaders"]
+	httpPayload: Mark | null @json.Name["smithy.api#httpPayload"]
+	httpResponseCode: Mark | null @json.Name["smithy.api#httpResponseCode"]
 	sigv4: Sigv4 | null @json.Name["aws.auth#sigv4"]
 	service: Service | null @json.Name["aws.api#service"]
 	requestTests: Vector[] @json.Name["smithy.test#httpRequestTests"] = []
@@ -79,6 +88,7 @@ class Vector {
 	appliesTo = ""
 	method = ""
 	uri = ""
+	queryParams: string[] = []
 	headers: [string, string][] @json.Mapping = []
 	body: string | null
 	params = new json.Keys()
@@ -90,7 +100,19 @@ class Mark {}
 
 class Namespace {
 	uri = ""
+	prefix = ""
 	rest: json.Unknown[] @json.Rest = []
+}
+
+class RestXml {
+	noErrorWrapping = false
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Http {
+	method = ""
+	uri = ""
+	code: i32 = 200
 }
 
 class EnumValue {
@@ -173,6 +195,23 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 	["com.amazonaws.sns#AmazonSimpleNotificationService", 403, "AuthorizationError", "reasoned"],
 	["com.amazonaws.eventbridge#AWSEvents", 400, "AccessDeniedException", "reasoned"]]
 
+/// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
+/// with an error of the service's own.
+const strings: [string,
+	string[]][] = [["com.amazonaws.sqs#AmazonSQS", ["com.amazonaws.sqs#ReceiveMessageRequest$AttributeNames"]]]
+
+/// The codes the services below answer with besides the errors their models declare, as AWS did on 2026-11-23: by
+/// their shape ids, each code and its __type.
+const undeclared: [string, [string, string][]][] = [["com.amazonaws.sqs#AmazonSQS",
+	[["InvalidParameterValue", "com.amazon.coral.service#InvalidParameterValueException"]]]]
+
+/// The unions the services below word on their own where none of a union's members is set or more than one, as AWS
+/// did on 2026-11-23: by their shape ids, each union's and its two messages.
+const unions: [string, [string, string, string][]][] = [["com.amazonaws.dynamodb#DynamoDB_20120810",
+	[["com.amazonaws.dynamodb#AttributeValue",
+	"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+	"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"]]]]
+
 class Generator {
 	model: Model
 	/// The structures, unions and enums the operations reach.
@@ -185,10 +224,17 @@ class Generator {
 	aliases: [string, string][] = []
 	modeled = false
 	unchecked: string[] = []
+	/// The members whose enums are strings, and whether the member being typed is one.
+	strings: string[] = []
+	open = false
+	/// Whether the member being typed is a restXml payload, which may be a stream; and the operations the API cannot
+	/// express.
+	payload = false
+	unexpressible: string[] = []
 
 	/// The names declared, the imported ones too, to fail on a second of one.
 	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
-		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle"]
+		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes"]
 
 	/// The service's protocol, awsQuery, awsJson1_0 or awsJson1_1, once api has begun; and its shape id, operations and
 	/// version, once api has run.
@@ -209,13 +255,17 @@ class Generator {
 		this.protocol = if (t.awsQuery != null) "awsQuery"
 			else if (t.awsJson10 != null) "awsJson1_0"
 			else if (t.awsJson11 != null) "awsJson1_1"
+			else if (t.restXml != null) "restXml"
 			else ""
 		const query = this.protocol == "awsQuery"
+		const rest = this.protocol == "restXml"
 		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null || s.resources.length > 0) {
-			const why = "not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
+			const why = "not an awsQuery service of an XML namespace, an awsJson or restXml one, of sigv4, or has resources"
 			throw new ModelError(`${services[0][0]}: ${why}`)
 		}
 		this.validation = validations.find(v => v[0] == services[0][0])
+		const open = strings.find(s => s[0] == services[0][0])
+		this.strings = if (open == null) [] else open[1]
 		const ops = s.operations.map(r => r.target)
 		sortNames(ops)
 		const errors = s.errors.map(r => r.target)
@@ -224,8 +274,20 @@ class Generator {
 		const cases: string[] = []
 		const actions = this.actions(from, t.sigv4!.name)
 		let unit = false
+		const routes: [i32, string][] = [] // by how specific
+		const unserved: string[] = []
 		for (const id of ops) {
 			const op = this.shape(id)
+			if (rest) {
+				routes.push(this.route(id))
+				const why = this.unexpressed(id)
+				if (why != "") {
+					this.unexpressible.push(id)
+					unserved.push(`// ${name(id)}: ${why}`)
+					cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.fail(notImplemented(${json.quoted(name(id))}))`))
+					continue
+				}
+			}
 			errors.push(...op.errors.map(r => r.target))
 			const input = this.structure(op.input)
 			const output = this.structure(op.output)
@@ -236,7 +298,11 @@ class Generator {
 			signatures.push(new Decl("method", signature(head)))
 			unimplemented.push(new Decl("method", method(head, [`\t\tthrow notImplemented(${json.quoted(name(id))})`])))
 			const authorized = actions.find(a => a[0] == name(id))
-			const by = if (authorized == null) "" else `, [${authorized[1].map(a => json.quoted(a)).join(", ")}]`
+			let by = if (authorized == null) "" else `, [${authorized[1].map(a => json.quoted(a)).join(", ")}]`
+			const code = op.traits.http?.code ?? 200
+			if (rest && code != 200) {
+				by = `${if (by == "") ", []" else by}, ${code}`
+			}
 			cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))}${by})`))
 		}
 		sortNames(errors)
@@ -261,24 +327,48 @@ class Generator {
 		sortBy(this.aliases, (a, b) => a[0] < b[0])
 		body.append(this.aliases.map(a => new Decl("type", wrap(a[1]))))
 		body.append(classes)
-		const head: Decl[] = imports(out, query, unit, this.modeled || this.validation != null)
+		const v = this.validation
+		const worded = unions.find(u => u[0] == services[0][0])
+		const validated = v != null || worded != null
+		const codec = this.codec()
+		const head: Decl[] = imports(out, codec, unit, this.modeled || validated)
 		const unchecked = if (this.unchecked.length == 0) []
 			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
+		if (unserved.length > 0) {
+			unchecked.append(["// Operations this cannot express, so not implemented:", ...unserved])
+		}
 		head.push(new Decl("const", [...unchecked, `export const signingName = ${json.quoted(t.sigv4!.name)}`]))
-		const v = this.validation
-		if (v != null) {
-			const quoted = if (v[2]) "" else ", false"
-			const line = `export const validation = new model.Validation(${json.quoted(v[1])}${quoted})`
-			head.push(new Decl("const", [line]))
+		if (validated) {
+			const args = [json.quoted(if (v != null) v[1] else if (query) "ValidationError" else "ValidationException")]
+			if (v != null && !v[2] || worded != null) {
+				args.push(`${v == null || v[2]}`)
+			}
+			if (worded != null) {
+				const listed = worded[1].map(u => `[${[name(u[0]), u[1], u[2]].map(x => json.quoted(x)).join(", ")}]`)
+				args.push(`[${listed.join(", ")}]`)
+			}
+			head.push(new Decl("const", wrap(`export const validation = new model.Validation(${args.join(", ")})`)))
 		}
 		if (query) {
 			head.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
 			head.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
+		} else if (rest) {
+			const ns = json.quoted(t.xmlNamespace?.uri ?? "")
+			const start = `export const service = new restxml.Service(${json.quoted(services[0][0])}, ${ns}`
+			const end = if (validated) ", validation" else ""
+			head.push(new Decl("const", wrap(`${start}, ${!t.restXml!.noErrorWrapping}${end})`)))
+			sortBy(routes, (a, b) => a[0] > b[0] || a[0] == b[0] && a[1] < b[1])
+			const doc = "/// The operations' routes, the most specific first."
+			head.push(new Decl("const", [doc, ...wrap(`export const routes = [${routes.map(r => r[1]).join(", ")}]`)]))
 		} else {
 			const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id)})`)
+			const besides = undeclared.find(u => u[0] == services[0][0])
+			for (const [code, typed] of if (besides == null) [] else besides[1]) {
+				shapes.push(`new json.ErrorShape(${json.quoted(typed)}, "message", ${json.quoted(code)})`)
+			}
 			const version = json.quoted(if (this.protocol == "awsJson1_0") "1.0" else "1.1")
 			const start = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
-			const end = if (v == null) "" else ", validation"
+			const end = if (validated) ", validation" else ""
 			head.push(new Decl("const", wrap(`${start}, ${t.queryCompatible != null}, [${shapes.join(", ")}]${end})`)))
 		}
 		const decls = [...head, ...body]
@@ -292,8 +382,69 @@ class Generator {
 		const denial = denials.find(d => d[0] == services[0][0])
 		const denied = if (denial == null) `403, "AccessDenied", "reasoned"`
 			else `${denial[1]}, ${json.quoted(denial[2])}, ${json.quoted(denial[3])}`
-		decls.push(new Decl("function", handle(handlers, cases, query, v != null, denied)))
+		decls.push(new Decl("function", handle(handlers, cases, codec, validated, denied)))
 		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
+	}
+
+	/// The Route of the operation id, of restXml, and how specific it is: by the literals and required members of the
+	/// query and headers it requires, then by its path's literal segments.
+	route(id: string): [i32, string] throws ModelError {
+		const op = this.shape(id)
+		const http = op.traits.http
+		if (http == null) {
+			throw new ModelError(`${id}: an operation without the http trait`)
+		}
+		const parts = split(http!.uri, "?")
+		const literals = if (parts.length < 2) [] else split(parts[1], "&").filter(l => l != "")
+		const queries: string[] = []
+		const headers: string[] = []
+		for (const m of this.required(id)) {
+			if (m.traits.httpQuery != null) {
+				queries.push(m.traits.httpQuery!)
+			} else if (m.traits.httpHeader != null) {
+				headers.push(lower(m.traits.httpHeader!))
+			}
+		}
+		const args = [json.quoted(name(id)), json.quoted(http!.method), json.quoted(parts[0])]
+		for (const xs of [literals, queries, headers]) {
+			args.push(`[${xs.map(x => json.quoted(x)).join(", ")}]`)
+		}
+		while (args[args.length - 1] == "[]") {
+			args.pop()
+		}
+		const required = literals.filter(l => !startsWith(l, "x-id=")).length + queries.length + headers.length
+		const fixed = split(parts[0], "/").filter(s => s != "" && !startsWith(s, "{")).length
+		return [100 * required + fixed, `new restxml.Route(${args.join(", ")})`]
+	}
+
+	/// Why the API cannot express the restXml operation id, "" if it can: of an event stream, or of the shapes its
+	/// input and output reach.
+	unexpressed(id: string): string throws ModelError {
+		const op = this.shape(id)
+		if (this.streams(op.input) || this.streams(op.output)) {
+			return "an event stream"
+		}
+		const g = new Generator(this.model)
+		g.protocol = this.protocol
+		try {
+			g.structure(op.input)
+			g.structure(op.output)
+			for (const s of g.structures) {
+				g.classOf(s)
+			}
+		} catch (e: ModelError) {
+			return e.what
+		}
+		return ""
+	}
+
+	/// Whether the operation's input or output r holds an event stream.
+	streams(r: Ref | null): bool throws ModelError {
+		if (r == null || r.target == "smithy.api#Unit") {
+			return false
+		}
+		return this.shape(r.target).members.some(m => this.shape(m[1].target).traits.streaming != null
+			&& this.shape(m[1].target).type == "union")
 	}
 
 	/// n, declared at the top level.
@@ -383,30 +534,85 @@ class Generator {
 			return decls
 		}
 		const n = this.declare(name(id))
+		let tags = ""
+		if (this.protocol == "restXml" && s.traits.xmlName != null) {
+			tags += ` @restxml.Name[${json.quoted(s.traits.xmlName!)}]`
+		}
+		if (this.protocol == "restXml" && s.traits.xmlNamespace != null) {
+			tags += ` ${namespace(s.traits.xmlNamespace!)}`
+		}
 		if (s.members.length == 0) {
-			return [new Decl("class", [`export class ${n} {}`])]
+			return [new Decl("class", [`export class ${n}${tags} {}`])]
 		}
 		const fields: Decl[] = []
 		for (const m of s.members) {
 			fields.push(this.field(id, m, m[1].traits.required != null))
 		}
-		const lines = [`export class ${n} {`, ...layout(fields), "}"]
+		const lines = [`export class ${n}${tags} {`, ...layout(fields), "}"]
 		return [new Decl("class", lines)]
+	}
+
+	/// The module of the service's codec, of core/protocol.
+	codec(): string {
+		return if (this.protocol == "awsQuery") "query" else if (this.protocol == "restXml") "restxml" else "json"
+	}
+
+	/// The tag n of the service's codec.
+	tag(n: string): string { return `@${this.codec()}.${n}` }
+
+	/// The tags of restXml that bind the member r to where it is on the wire and shape its XML: of a payload, its
+	/// element's name too.
+	bindings(r: Ref): string[] throws ModelError {
+		const t = r.traits
+		const tags: string[] = []
+		if (t.httpLabel != null) {
+			tags.push("@restxml.Label")
+		}
+		if (t.httpQuery != null) {
+			tags.push(`@restxml.Query[${json.quoted(t.httpQuery!)}]`)
+		}
+		if (t.httpQueryParams != null) {
+			tags.push("@restxml.Params")
+		}
+		if (t.httpHeader != null) {
+			tags.push(`@restxml.Header[${json.quoted(t.httpHeader!)}]`)
+		}
+		if (t.httpPrefixHeaders != null) {
+			tags.push(`@restxml.Prefix[${json.quoted(t.httpPrefixHeaders!)}]`)
+		}
+		if (t.httpResponseCode != null) {
+			tags.push("@restxml.Status")
+		}
+		if (t.httpPayload != null) {
+			tags.push("@restxml.Payload")
+			if (t.xmlName == null) {
+				const s = this.shape(r.target)
+				tags.push(`@restxml.Name[${json.quoted(s.traits.xmlName ?? name(r.target))}]`)
+			}
+		}
+		if (t.xmlAttribute != null) {
+			tags.push("@restxml.Attr")
+		}
+		if (t.xmlNamespace != null) {
+			tags.push(namespace(t.xmlNamespace!))
+		}
+		return tags
 	}
 
 	/// The field of the member m of the shape id, null unless required or of a default.
 	field(id: string, m: [string, Ref], required: bool): Decl throws ModelError {
 		const t = m[1].traits
 		const query = this.protocol == "awsQuery"
+		const rest = this.protocol == "restXml"
 		if (query && t.xmlAttribute != null) {
 			throw new ModelError(`${id}$${m[0]}: an XML attribute`)
 		}
-		const tags: string[] = []
-		if (query && t.xmlName != null) {
-			tags.push(`@query.Name[${json.quoted(t.xmlName!)}]`)
+		const tags = if (rest) this.bindings(m[1]) else []
+		if ((query || rest) && t.xmlName != null) {
+			tags.push(this.tag(`Name[${json.quoted(t.xmlName!)}]`))
 		}
-		if (query && t.xmlFlattened != null) {
-			tags.push("@query.Flat")
+		if ((query || rest) && t.xmlFlattened != null) {
+			tags.push(this.tag("Flat"))
 		}
 		const d = m[1].traits.rest.find(x => x[0] == "smithy.api#default")
 		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
@@ -415,7 +621,11 @@ class Generator {
 			this.modeled = true
 		}
 		const valid = this.valid(m[1])
+		this.open = this.strings.includes(`${id}$${m[0]}`)
+		this.payload = t.httpPayload != null
 		const ty = this.typeOf(m[1], tags, false)
+		this.open = false
+		this.payload = false
 		if (valid != "") {
 			tags.push(valid)
 		}
@@ -426,12 +636,9 @@ class Generator {
 		if (!wide(field) || initial != null || required) {
 			return new Decl("field", [field]) // which bober format leaves as it is
 		}
-		// as bober format breaks a type too wide before its last member
+		// as bober format breaks a type too wide before its last member, unless that does not make it fit
 		const last = `\t\t| null${tagged}`
-		if (wide(last)) {
-			throw new ModelError(`${id}$${m[0]}: a field wider than a line`)
-		}
-		return new Decl("field", [`\t${m[0]}: ${ty}`, last])
+		return new Decl("field", if (wide(last)) [field] else [`\t${m[0]}: ${ty}`, last])
 	}
 
 	/// The value of the member r of the default d, as Smithy's JSON gives it.
@@ -527,10 +734,10 @@ class Generator {
 	typeOf(r: Ref, tags: string[], inner: bool): string throws ModelError {
 		const s = this.shape(r.target)
 		if (enumerates(s)) {
-			return name(r.target)
+			return if (this.open) "string" else name(r.target)
 		}
-		const query = this.protocol == "awsQuery"
-		if (!query && ["timestamp", "document", "list", "map"].includes(s.type)) {
+		const xml = this.protocol == "awsQuery" || this.protocol == "restXml"
+		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
 			return this.jsonType(r, s, tags)
 		}
 		switch (s.type) {
@@ -543,14 +750,17 @@ class Generator {
 			case "float": return "f32"
 			case "double": return "f64"
 			case "timestamp":
-				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? "date-time"
-				tags.push(if (format == "date-time") "@query.Timestamp" else `@query.Timestamp[${json.quoted(format)}]`)
+				// restXml's default is of where the member is bound
+				const otherwise = if (this.protocol == "restXml") "" else "date-time"
+				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? otherwise
+				tags.push(if (format == otherwise) this.tag("Timestamp")
+					else this.tag(`Timestamp[${json.quoted(format)}]`))
 				return "i64"
 			case "blob":
-				if (s.traits.streaming != null) {
+				if (s.traits.streaming != null && !this.payload) {
 					throw new ModelError(`${r.target}: a stream`)
 				}
-				tags.push(if (query) "@query.Blob" else "@json.Blob")
+				tags.push(this.tag("Blob"))
 				return "string"
 			case "list":
 				const m = s.member!
@@ -558,7 +768,7 @@ class Generator {
 					throw new ModelError(`${r.target}: a sparse list, or one within a list or map whose items are named`)
 				}
 				if (m.traits.xmlName != null) {
-					tags.push(`@query.Member[${json.quoted(m.traits.xmlName!)}]`)
+					tags.push(this.tag(`Member[${json.quoted(m.traits.xmlName!)}]`))
 				}
 				return `${this.item(m, tags)}[]`
 			case "map":
@@ -568,10 +778,10 @@ class Generator {
 					throw new ModelError(`${r.target}: a sparse map, or one within a list or map whose keys or values are named`)
 				}
 				if (k.traits.xmlName != null) {
-					tags.push(`@query.Key[${json.quoted(k.traits.xmlName!)}]`)
+					tags.push(this.tag(`Key[${json.quoted(k.traits.xmlName!)}]`))
 				}
 				if (v.traits.xmlName != null) {
-					tags.push(`@query.Value[${json.quoted(v.traits.xmlName!)}]`)
+					tags.push(this.tag(`Value[${json.quoted(v.traits.xmlName!)}]`))
 				}
 				return `[${this.typeOf(k, tags, true)}, ${this.item(v, tags)}][]`
 			case "structure", "union": return name(r.target)
@@ -633,7 +843,7 @@ class Generator {
 		const query = this.protocol == "awsQuery"
 		const status = (if (query) t.queryError?.httpResponseCode else t.httpError) ?? (if (client) 400 else 500)
 		const code = (if (query) t.queryError?.code else null) ?? name(id)
-		const message = query || s.members.some(m => lower(m[0]) == "message")
+		const message = query || this.protocol == "restXml" || s.members.some(m => lower(m[0]) == "message")
 		const others = s.members.filter(m => lower(m[0]) != "message")
 		const decls: Decl[] = []
 		const params: string[] = if (message) ["message: string"] else []
@@ -644,7 +854,7 @@ class Generator {
 			const fields = layout(others.map(m => this.field(id, m, m[1].traits.required != null)))
 			decls.push(new Decl("class", [doc, `export class ${c} {`, ...fields, "}"]))
 			params.push(`members: ${c} = new ${c}()`)
-			members = `, ${client}, ${if (query) "query" else "json"}.members(members)`
+			members = `, ${client}, ${this.codec()}.members(members)`
 		}
 		const sender = if (members != "" || client == (status < 500)) "" else `, ${client}`
 		const head = `export function ${this.declare(lowerCamel(name(id)))}(${params.join(", ")}): Fault {`
@@ -694,6 +904,10 @@ class Generator {
 				} else if (v.appliesTo == "client" || reason != null) {
 					const why = if (reason == null) "for clients only" else reason.slice(1, reason.length).join(": ")
 					skipped.push(`// ${test}: ${why}`)
+				} else if (this.unexpressible.includes(op)) {
+					skipped.push(`// ${test}: of an operation the API cannot express`)
+				} else if (error != null && this.protocol == "restXml" && this.unrequestable(op)) {
+					skipped.push(`// ${test}: of an input whose required members a request of its route lacks`)
 				} else if (error == null) {
 					if (!requested) {
 						const output = this.className(this.shape(op).output)
@@ -722,7 +936,7 @@ class Generator {
 		const up = root(out)
 		const decls = [new Decl("import", [`import { Fault } from "${up}core/fault"`])]
 		decls.push(new Decl("import", [`import { Caller, Unit } from "${up}core/service"`]))
-		const same = if (this.protocol == "awsQuery") "same" else "sameJson"
+		const same = if (this.codec() == "json") "sameJson" else "same"
 		decls.push(new Decl("import", [`import { caller, ${same} } from "${up}tools/smithygen/vectors"`]))
 		decls.push(new Decl("import", [`import * as api from "./${replace(split(out, "/").pop()!, ".bob", "")}"`]))
 		decls.push(new Decl("import", [`import { Request } from "std/http"`]))
@@ -746,16 +960,18 @@ class Generator {
 	request(op: string, v: Vector): string[] throws ModelError | ParseError {
 		const o = this.shape(op)
 		const input = this.className(o.input)
-		if (v.body == null) {
+		const rest = this.protocol == "restXml"
+		if (v.body == null && !rest) {
 			throw new ModelError(`${v.id}: a request without a body`)
 		}
 		const lines = ["\tconst h = new Got()"]
-		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(v.uri)}, ${json.quoted(v.body!)})`
+		const uri = if (v.queryParams.length == 0) v.uri else `${v.uri}?${v.queryParams.join("&")}`
+		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(uri)}, ${json.quoted(v.body ?? "")})`
 		lines.append(wrap(`\tconst req = ${req}`))
 		for (const h of v.headers) {
 			lines.push(`\treq.headers.set(${json.quoted(h[0])}, ${json.quoted(h[1])})`)
 		}
-		if (this.protocol != "awsQuery" && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
+		if (this.protocol != "awsQuery" && !rest && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
 			lines.push(this.target(op))
 		}
 		lines.append([`\tapi.handle(h, caller(""), req)`, `\tconst want = new ${input}()`])
@@ -777,7 +993,7 @@ class Generator {
 			if (query && given == null) {
 				throw new ModelError(`${v.id}: an error without a Message, which the awsQuery codec writes`)
 			}
-			let text = if (message == null && !query) ""
+			let text = if (message == null && !query && this.protocol != "restXml") ""
 				else if (given == null) "\"\""
 				else this.literal(message![1], given[1])
 			const others = v.params.all.filter(p => message == null || p[0] != message[0])
@@ -808,6 +1024,11 @@ class Generator {
 			const id = if (has(body, "<RequestId>")) split(split(body, "<RequestId>")[1], "</RequestId>")[0] else ""
 			const req = `new Request("POST", "/", ${json.quoted(`Action=${name(op)}&Version=${this.version}`)})`
 			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), ${req})`))
+		} else if (this.protocol == "restXml") {
+			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
+			const id = if (header == null) "" else header[1]
+			lines.append(this.routed(op))
+			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), req)`))
 		} else {
 			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
 			const id = if (header == null) "" else header[1]
@@ -824,12 +1045,46 @@ class Generator {
 				throw new ModelError(`${v.id}: a body that a template literal cannot hold as it is`)
 			}
 			const want = (if (verbatim) `\`${body}\`` else json.quoted(body)) + ")"
-			const same = if (query) "same" else "sameJson"
+			const same = if (this.codec() == "json") "sameJson" else "same"
 			const line = `\tassert ${same}(res, ${want}`
 			// as bober format breaks it, a body of several lines measured as if of one
 			lines.append(if (wide(line)) [`\tassert ${same}(res,`, `\t\t${want}`] else [line])
 		}
 		return lines
+	}
+
+	/// The statements making req, a request of the restXml operation op's route: each label and required query
+	/// parameter or header of it "a".
+	routed(op: string): string[] throws ModelError {
+		const http = this.shape(op).traits.http!
+		const parts = split(http.uri, "?")
+		const segments = split(parts[0], "/").map(s => if (startsWith(s, "{")) "a" else s)
+		const query = if (parts.length < 2) [] else split(parts[1], "&").filter(l => l != "")
+		const headers: string[] = []
+		for (const m of this.required(op)) {
+			if (m.traits.httpQuery != null) {
+				query.push(`${m.traits.httpQuery!}=a`)
+			} else if (m.traits.httpHeader != null) {
+				headers.push(`\treq.headers.set(${json.quoted(m.traits.httpHeader!)}, "a")`)
+			}
+		}
+		const uri = segments.join("/") + (if (query.length == 0) "" else `?${query.join("&")}`)
+		return [...wrap(`\tconst req = new Request(${json.quoted(http.method)}, ${json.quoted(uri)}, "")`), ...headers]
+	}
+
+	/// The required members of the input of operation op.
+	required(op: string): Ref[] throws ModelError {
+		const input = this.shape(op).input
+		if (input == null || input.target == "smithy.api#Unit") {
+			return []
+		}
+		return this.shape(input.target).members.filter(m => m[1].traits.required != null).map(m => m[1])
+	}
+
+	/// Whether a request of the restXml operation op's route, as routed makes it, lacks a member its input requires.
+	unrequestable(op: string): bool throws ModelError {
+		return this.required(op).some(m => m.traits.httpLabel == null && m.traits.httpQuery == null
+			&& m.traits.httpHeader == null)
 	}
 
 	/// The statement setting the X-Amz-Target of req to name the operation op.
@@ -950,12 +1205,10 @@ function root(out: string): string {
 	return up
 }
 
-/// The imports of the file out, of the awsQuery codec if query, else of the awsJson one, of Unit if unit, and of the
-/// codecs' model if modeled.
-function imports(out: string, query: bool, unit: bool, modeled: bool): Decl[] {
+/// The imports of the file out, of the codec, of Unit if unit, and of the codecs' model if modeled.
+function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
-	const codec = if (query) "query" else "json"
 	decls.push(new Decl("import", [`import * as ${codec} from "${up}core/protocol/${codec}"`]))
 	if (modeled) {
 		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))
@@ -967,20 +1220,22 @@ function imports(out: string, query: bool, unit: bool, modeled: bool): Decl[] {
 	return decls
 }
 
-/// The function serving a request by a handler of the interface handlers, by the cases of its operations, of awsQuery
-/// if query, else of awsJson; of the service's validation if validated; IAM's denials answered as denied says, its
+/// The function serving a request by a handler of the interface handlers, by the cases of its operations, of the codec
+/// query, json or restxml; of the service's validation if validated; IAM's denials answered as denied says, its
 /// status, code and wording as 403, "AccessDenied", "reasoned".
-function handle(handlers: string, cases: string[], query: bool, validated: bool, denied: string): string[] {
+function handle(handlers: string, cases: string[], codec: string, validated: bool, denied: string): string[] {
 	const lines = ["/// The answer of h to req."]
 	const head = `export function handle(h: ${handlers}, caller: Caller, req: Request)`
 	lines.append(signature(`${head}: Response throws IoError {`))
 	lines.push(`\tcaller.denied = [${denied}]`)
-	if (query) {
+	if (codec == "query") {
 		const call = `\tconst c = query.call(caller, req, version, ns${if (validated) ", validation" else ""})`
 		lines.append([call, "\tswitch (c.action) {", ...cases])
 		lines.push("\t\tdefault: return c.invalidAction()")
 	} else {
-		lines.append(["\tconst c = json.call(caller, req, service)", "\tswitch (c.operation) {", ...cases])
+		const call = if (codec == "json") "json.call(caller, req, service)"
+			else "restxml.call(caller, req, service, routes)"
+		lines.append([`\tconst c = ${call}`, "\tswitch (c.operation) {", ...cases])
 		lines.push("\t\tdefault: return c.unknownOperation()")
 	}
 	lines.append(["\t}", "}"])
@@ -1128,6 +1383,12 @@ function tabs(line: string): i32 {
 		n++
 	}
 	return n
+}
+
+/// The restXml tag of the XML namespace ns.
+function namespace(ns: Namespace): string {
+	const prefix = if (ns.prefix == "") "" else `, ${json.quoted(ns.prefix)}`
+	return `@restxml.Namespace[${json.quoted(ns.uri)}${prefix}]`
 }
 
 /// Whether s has sub in it.

@@ -1,6 +1,7 @@
 import { Fault } from "../fault"
 import { Caller, notImplemented, Unit } from "../service"
 import { Blob, Call, decode, Document, ErrorShape, error, result, Service, Timestamp } from "./json"
+import { Valid, Validation } from "./model"
 import { Request } from "std/http"
 
 // The inputs, outputs and bodies are after the Smithy awsJson specs' and protocol tests' examples.
@@ -120,6 +121,22 @@ test "a union" {
 	assert result(r) == `{"One":{"Ids":["x"]}}`
 }
 
+class Choosings {
+	Short: string @Valid["3", "", ""]
+	Many: [string, Choice][] = []
+}
+
+test "a union the service words on its own" {
+	const worded = new Validation("ValidationException", true, [["Choosing", "empty", "several"]])
+	assert decode[Choosing](`{"One": {}}`, worded) throws new Fault(400, "ValidationException", "empty")
+	const both = `{"Short": "abc", "Many": {"a": {"Name": "a", "Ids": []}, "b": {}}}`
+	assert decode[Choosings](both, worded) throws new Fault(400, "ValidationException", "several")
+	// after the other violations
+	const short = message("Value 'ab' at 'short' failed to satisfy constraint: Member must have length greater than or equal to 3")
+	assert decode[Choosings](`{"Short": "ab", "Many": {"b": {}}}`,
+		worded) throws new Fault(400, "ValidationException", short)
+}
+
 class Output {
 	binary: string @Blob = "value"
 	epoch: i64 @Timestamp = 1515531081_123_456_789
@@ -154,7 +171,8 @@ const json10 = new Service("smithy.example#Greeter", "1.0", false,
 	[new ErrorShape("smithy.example#Denied", "Message", "")])
 
 const compatible = new Service("smithy.example#Greeter", "1.0", true,
-	[new ErrorShape("smithy.example#Denied", "message", "AWS.Denied"), new ErrorShape("smithy.example#Bare", "", "")])
+	[new ErrorShape("smithy.example#Denied", "message", "AWS.Denied"), new ErrorShape("smithy.example#Bare", "", ""),
+	new ErrorShape("aws.other#InvalidException", "message", "Invalid")])
 
 const json11 = new Service("smithy.example#Greeter", "1.1", false, [])
 
@@ -219,4 +237,7 @@ test "awsQuery compatibility" {
 	assert other.headers.get("x-amzn-query-error") == "Thrown;Receiver"
 	assert other.body.whole == `{"__type":"aws.other#Thrown","message":"x"}`
 	assert error(json10, new Fault(400, "Denied", "no"), "id").headers.get("x-amzn-query-error") == null
+	const listed = error(compatible, new Fault(400, "Invalid", "x"), "id")
+	assert listed.headers.get("x-amzn-query-error") == "Invalid;Sender"
+	assert listed.body.whole == `{"__type":"aws.other#InvalidException","message":"x"}`
 }

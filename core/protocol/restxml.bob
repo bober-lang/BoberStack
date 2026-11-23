@@ -1,0 +1,902 @@
+//! The restXml protocol: an operation is a method and a path of labels, and its input's and output's members are bound
+//! to the path, the query, headers, the status or the body, the body an XML document of the members bound to nothing
+//! else, or one member as its payload. An operation's input and output are classes whose fields are its members, read
+//! and written by reflection under the tags below: a list is a T[], a map a [K, V][], a union a union of classes of one
+//! field each, its member the field set, and a member whose type does not take null is required.
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Attribute, Node, parse, serialize } from "std/encoding/xml"
+import { parseFloat } from "std/float"
+import { Body, Request, Response } from "std/http"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { unescape } from "std/url"
+import { Fault } from "../fault"
+import { Caller, Unit } from "../service"
+import { check, Default, path, Validation, Violations } from "./model"
+import { choice, instant, stamp } from "./query"
+
+/// Tags a member bound to the path's label of its name.
+export class Label {}
+/// Tags a member bound to the query parameter K.
+export class Query[K extends string] {}
+/// Tags a map member bound to every query parameter.
+export class Params {}
+/// Tags a member bound to the header K.
+export class Header[K extends string] {}
+/// Tags a map member bound to the headers whose names start with P, by the rest of their names, lowered.
+export class Prefix[P extends string] {}
+/// Tags the member that is the body: a string as it is, a structure or union as the document of its element.
+export class Payload {}
+/// Tags an i32 member of an output bound to the status.
+export class Status {}
+/// Tags a member, or a structure as a document's root, to be named K on the wire, as Smithy's xmlName.
+export class Name[K extends string] {}
+/// Tags a scalar member to be an attribute of its structure's element.
+export class Attr {}
+/// Tags a list or map member to repeat its items in place of a wrapper, as Smithy's xmlFlattened.
+export class Flat {}
+/// Tags a member, or a structure as a document's root, with the XML namespace U, of the prefix P if not "".
+export class Namespace[U extends string, P extends string = ""] {}
+/// Tags a list member whose items are named K, not member.
+export class Member[K extends string] {}
+/// Tags a map member whose keys are named K, not key.
+export class Key[K extends string] {}
+/// Tags a map member whose values are named K, not value.
+export class Value[K extends string] {}
+/// Tags an i64 member, or its items, as a timestamp in ns since 1970, on the wire in the format F: date-time,
+/// epoch-seconds or http-date, or if "" that of where it is bound: http-date in a header, date-time elsewhere.
+export class Timestamp[F extends string = ""] {}
+/// Tags a string member, or its items, as bytes: base64 on the wire, but as they are in a payload.
+export class Blob {}
+
+/// A service of the shape id, its documents in the XML namespace ns, "" for none, its errors in an ErrorResponse
+/// if wrapped, and how it answers a request breaking its model.
+export class Service {
+	id: string
+	ns: string
+	wrapped: bool
+	validation: Validation
+
+	constructor(id: string, ns: string, wrapped: bool, validation: Validation = new Validation("ValidationException")) {
+		this.id = id
+		this.ns = ns
+		this.wrapped = wrapped
+		this.validation = validation
+	}
+}
+
+/// Where a request is the operation named operation: of method, the path pattern path, of labels {L} and a last
+/// greedy one {L+}, and the query literals, each k or k=v; and of the query parameters and headers that its required
+/// members are bound to, which tell it from another of the same path. An x-id literal, which clients may leave out,
+/// is required only of a request that has an x-id, which then decides alone.
+export class Route {
+	operation: string
+	method: string
+	path: string
+	literals: string[]
+	queries: string[]
+	headers: string[]
+
+	constructor(operation: string, method: string, path: string, literals: string[] = [], queries: string[] = [],
+		headers: string[] = []) {
+		this.operation = operation
+		this.method = method
+		this.path = path
+		this.literals = literals
+		this.queries = queries
+		this.headers = headers
+	}
+
+	/// The labels of req's path if req is of this route, else null.
+	match(req: Request): [string, string][] | null {
+		if (req.method != this.method) {
+			return null
+		}
+		const q = req.url.query
+		const id = q.get("x-id")
+		for (const l of this.literals) {
+			const [k,
+				v] = if (indexOf(l, "=") < 0) [l, ""] else [split(l, "=")[0], l.slice(indexOf(l, "=") + 1, l.length)]
+			if (k == "x-id" && (id == null || id == v)) {
+				continue
+			}
+			if (!q.has(k) || v != "" && q.get(k) != v) {
+				return null
+			}
+		}
+		if (id == null && (this.queries.some(k => !q.has(k)) || this.headers.some(h => !req.headers.has(h)))) {
+			return null
+		}
+		return labels(this.path, req.url.path)
+	}
+}
+
+/// A request from caller to service, of body.
+export class Call {
+	caller: Caller
+	service: Service
+	req: Request
+	body: string
+	/// The operation of the first route the request is of, "" if none, and the labels of its path.
+	operation = ""
+	labels: [string, string][] = []
+
+	constructor(caller: Caller, service: Service, req: Request, body: string, routes: Route[]) {
+		this.caller = caller
+		this.service = service
+		this.req = req
+		this.body = body
+		for (const r of routes) {
+			const found = r.match(req)
+			if (found != null) {
+				this.operation = r.operation
+				this.labels = found!
+				break
+			}
+		}
+	}
+
+	/// The answer by h, the handler of its operation, which IAM authorizes by actions: h's output, of the status code
+	/// unless it binds one, or the Fault that h or decoding its input throws.
+	serve[I extends Decodable,
+		O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = [], code: i32 = 200): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			const input = decode[I](this.req, this.body, this.labels, this.service.validation)
+			return this.headless(reply(this.service, h(this.caller, input), id, code))
+		} catch (f: Fault) {
+			return this.fail(f)
+		}
+	}
+
+	/// The answer of the fault f.
+	fail(f: Fault): Response { return this.headless(error(this.service, f, this.caller.requestId)) }
+
+	/// The answer where it is of no route.
+	unknownOperation(): Response {
+		return this.fail(new Fault(405, "MethodNotAllowed",
+			"The specified method is not allowed against this resource."))
+	}
+
+	/// res, without its body if it answers a HEAD.
+	private headless(res: Response): Response {
+		if (this.req.method == "HEAD") {
+			res.body = new Body()
+		}
+		return res
+	}
+}
+
+/// The call of req from caller to service, of the first of routes that req is of.
+export function call(caller: Caller, req: Request, service: Service, routes: Route[]): Call throws IoError {
+	return new Call(caller, service, req, req.body.text(), routes)
+}
+
+/// The labels of the path p, by the pattern's, each unescaped; null if p is not of the pattern. A path may end in a /
+/// that the pattern does not.
+export function labels(pattern: string, p: string): [string, string][] | null {
+	const ps = split(pattern.slice(1, pattern.length), "/")
+	const xs = split(p.slice(1, p.length), "/")
+	const out: [string, string][] = []
+	let j = 0
+	for (let i = 0; i < ps.length; i++) {
+		const s = ps[i]
+		if (startsWith(s, "{") && endsWith(s, "+}")) {
+			const end = xs.length - (ps.length - i - 1)
+			const v = if (end <= j) "" else xs.slice(j, end).join("/")
+			if (v == "") {
+				return null
+			}
+			out.push([s.slice(1, s.length - 2), unescape(v, "path")])
+			j = end
+		} else if (startsWith(s, "{")) {
+			if (j >= xs.length || xs[j] == "") {
+				return null
+			}
+			out.push([s.slice(1, s.length - 1), unescape(xs[j], "path")])
+			j++
+		} else {
+			if (j >= xs.length || xs[j] != s) {
+				return null
+			}
+			j++
+		}
+	}
+	return if (j == xs.length || j == xs.length - 1 && xs[j] == "") out else null
+}
+
+/// The T, a class, whose members req holds, of the body and the path's labels, answered by validation where they break
+/// T's model: where a required member is missing, a value is outside its constraints or not of its type.
+export function decode[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	validation: Validation = new Validation("ValidationException")): T throws Fault {
+	const v = new Violations(validation)
+	const r = input[T](req, body, labels, v)
+	v.check()
+	return r
+}
+
+function input[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "class":
+			const r = new T()
+			let doc: Node | null = null
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const at = path("", f.name)
+				let found = true
+				if (has(f.tags, Label)) {
+					const l = labels.find(l => l[0] == f.name)
+					found = l != null
+					if (found) {
+						r[f.name] = texts[f.type]([l![1]], at, f.tags, "date-time", v)
+					}
+				} else if (has(f.tags, Query)) {
+					const all = req.url.query.all(tag(f.tags, Query, ""))
+					found = all.length > 0
+					if (found) {
+						r[f.name] = texts[f.type](all, at, f.tags, "date-time", v)
+					}
+				} else if (has(f.tags, Params)) {
+					const all = req.url.query.entries
+					found = all.length > 0
+					if (found) {
+						r[f.name] = pairs[f.type](all, at, f.tags, v)
+					}
+				} else if (has(f.tags, Header)) {
+					const h = req.headers.get(tag(f.tags, Header, ""))
+					found = h != null
+					if (found) {
+						r[f.name] = texts[f.type](items[f.type](h!, f.tags), at, f.tags, "http-date", v)
+					}
+				} else if (has(f.tags, Prefix)) {
+					const p = lower(tag(f.tags, Prefix, ""))
+					const all: [string, string][] = []
+					for (const [k, x] of req.headers.entries) {
+						if (startsWith(lower(k), p)) {
+							all.push([lower(k).slice(p.length, k.length), x])
+						}
+					}
+					found = all.length > 0
+					if (found) {
+						r[f.name] = pairs[f.type](all, at, f.tags, v)
+					}
+				} else if (has(f.tags, Payload)) {
+					found = body != ""
+					if (found) {
+						r[f.name] = payload[f.type](body, at, f.tags, v)
+					}
+				} else if (!has(f.tags, Status)) {
+					if (doc == null && body != "") {
+						doc = root(body)
+					}
+					const n = tag(f.tags, Name, f.name)
+					if (has(f.tags, Attr)) {
+						const a = if (doc == null) null else doc!.attr(n)
+						found = a != null
+						if (found) {
+							r[f.name] = texts[f.type]([a!], at, f.tags, "date-time", v)
+						}
+					} else {
+						const el = if (doc == null) null else member(doc!, n, f.tags)
+						found = el != null
+						if (found) {
+							r[f.name] = read[f.type](el!, n, at, f.tags, v)
+						}
+					}
+				}
+				if (!found && !nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, at, "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		default: throw new Fault(500, "InternalFailure", `An input of ${T.name}, not of a class`)
+	}
+}
+
+/// The root element of the document s.
+function root(s: string): Node throws Fault {
+	try {
+		const els = parse(s).children.filter(c => c.kind == "element")
+		if (els.length == 1) {
+			return els[0]
+		}
+	} catch (e: ParseError) {}
+	throw new Fault(400, "MalformedXML",
+		"The XML you provided was not well-formed or did not validate against our published schema")
+}
+
+/// The element of el's member named n, of tags: of a flattened list or map, one holding each of its items.
+function member(el: Node, n: string, tags: Type[]): Node | null {
+	const named = el.children.filter(c => c.kind == "element" && c.name == n)
+	if (!has(tags, Flat) || named.length == 0) {
+		return if (named.length == 0) null else named[0]
+	}
+	const box = new Node("element", n)
+	box.children = named
+	return box
+}
+
+/// The child elements of el named n.
+function elements(el: Node, n: string): Node[] { return el.children.filter(c => c.kind == "element" && c.name == n) }
+
+/// The T of the payload s, of a member tagged tags.
+function payload[T extends Decodable](s: string, at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				const el = root(s)
+				return read[T](el, el.name, at, tags, v)
+			}
+			if (enumerated(T)) {
+				return texts[T]([s], at, tags, "date-time", v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return payload[M](s, at, tags, v)
+				}
+			}
+			throw v.fault(s, at, `Member must be a ${T.name}`)
+		case "string": return s
+		case "class":
+			const el = root(s)
+			return read[T](el, el.name, at, tags, v)
+		default: return texts[T]([s], at, tags, "date-time", v)
+	}
+}
+
+/// The T that the element el, named n, of a member tagged tags holds, at the member path at; the violations of its
+/// model noted into v.
+function read[T extends Decodable](el: Node, n: string, at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return variant[T](el, at, v)
+			}
+			if (enumerated(T)) {
+				return texts[T]([el.text()], at, tags, "date-time", v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return read[M](el, n, at, tags, v)
+				}
+			}
+			throw v.fault(el.text(), at, `Member must be a ${T.name}`)
+		case "array":
+			const xs: T = []
+			const flat = has(tags, Flat)
+			if (T.elem.kind == "tuple") {
+				// a map's entries, each of a key and a value
+				let i = 0
+				for (const entry of elements(el, if (flat) n else "entry")) {
+					i++
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						const key = f.name == "0"
+						const c = elements(entry, if (key) tag(tags, Key, "key") else tag(tags, Value, "value"))
+						if (c.length == 0) {
+							throw v.fault(null, `${at}.${i}`, "Member must have a key and a value")
+						}
+						e[f.name] = read[f.type](c[0], c[0].name, `${at}.${if (key) "key" else "value"}`,
+							if (key) [] else inner(tags), v)
+					}
+					xs.push(e)
+				}
+			} else {
+				const item = if (flat) n else tag(tags, Member, "member")
+				const all = elements(el, item)
+				for (let i = 0; i < all.length; i++) {
+					xs.push(read[T.elem](all[i], item, `${at}.${i + 1}.member`, inner(tags), v))
+				}
+			}
+			check(xs, at, tags, v)
+			return xs
+		case "class":
+			const r = new T()
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const m = tag(f.tags, Name, f.name)
+				let found = false
+				if (has(f.tags, Attr)) {
+					const a = el.attr(m)
+					found = a != null
+					if (found) {
+						r[f.name] = texts[f.type]([a!], path(at, f.name), f.tags, "date-time", v)
+					}
+				} else {
+					const c = member(el, m, f.tags)
+					found = c != null
+					if (found) {
+						r[f.name] = read[f.type](c!, m, path(at, f.name), f.tags, v)
+					}
+				}
+				if (!found && !nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, path(at, f.name), "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		default: return texts[T]([el.text()], at, tags, "date-time", v)
+	}
+}
+
+/// The T, a union, of the one member that el holds.
+function variant[T extends Decodable](el: Node, at: string, v: Violations): T throws Fault {
+	const set = el.children.filter(c => c.kind == "element")
+	for (const M of T.members) {
+		if (M.kind != "class") {
+			continue
+		}
+		const n = tag(M.fields[0].tags, Name, M.fields[0].name)
+		if (set.length == 1 && set[0].name == n) {
+			return read[M](el, el.name, at, [], v)
+		}
+	}
+	throw v.fault(null, at, "Member must have exactly one member set")
+}
+
+/// The T, a map of strings or of lists of strings, of the pairs all, of a member tagged tags.
+function pairs[T extends Decodable](all: [string, string][], at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return pairs[M](all, at, tags, v)
+				}
+			}
+			throw v.fault(null, at, `Member must be a ${T.name}`)
+		case "array":
+			const xs: T = []
+			const keys: string[] = []
+			for (const [k, _] of all) {
+				if (!keys.includes(k)) {
+					keys.push(k)
+				}
+			}
+			if (T.elem.kind == "tuple") {
+				for (const k of keys) {
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						e[f.name] = if (f.name == "0") texts[f.type]([k], at, [], "", v)
+							else texts[f.type](all.filter(p => p[0] == k).map(p => p[1]), `${at}.${k}`, tags, "", v)
+					}
+					xs.push(e)
+				}
+			}
+			check(xs, at, tags, v)
+			return xs
+		default: throw v.fault(null, at, `Member must be a map, not a ${T.name}`)
+	}
+}
+
+/// The values of the header h, of a member of type T tagged tags: of a list, its items, each of which may be quoted;
+/// of an http-date, which holds a comma, the halves of each pair of them.
+function items[T](h: string, tags: Type[]): string[] {
+	if (!isList[T]()) {
+		return [h]
+	}
+	const out: string[] = []
+	let quoted = false
+	let at = 0
+	let s = ""
+	for (let i = 0; i <= h.length; i++) {
+		const c = if (i < h.length) h.slice(i, i + 1) else ","
+		if (quoted && c == "\\" && i + 1 < h.length) {
+			s += h.slice(i + 1, i + 2)
+			i++
+		} else if (c == "\"" && trim(s) == "" && !quoted) {
+			quoted = true
+			s = ""
+		} else if (c == "\"" && quoted) {
+			quoted = false
+			at = 1
+		} else if (c == "," && !quoted) {
+			out.push(if (at == 1) s else trim(s))
+			s = ""
+			at = 0
+		} else if (at == 0) {
+			s += c
+		}
+	}
+	if (tag(tags, Timestamp, "") == "" || tag(tags, Timestamp, "") == "http-date") {
+		if (dates[T]()) {
+			const joined: string[] = []
+			for (let i = 0; i + 1 < out.length; i += 2) {
+				joined.push(`${out[i]}, ${out[i + 1]}`)
+			}
+			return joined
+		}
+	}
+	return out
+}
+
+/// Whether T, or what it is of null, is a list.
+function isList[T](): bool {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind == "array") {
+					return true
+				}
+			}
+			return false
+		case "array": return true
+		default: return false
+	}
+}
+
+/// Whether T, or what it is of null, is a list of i64s, timestamps if so tagged.
+function dates[T](): bool {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind == "array" && M.elem == i64) {
+					return true
+				}
+			}
+			return false
+		case "array": return T.elem == i64
+		default: return false
+	}
+}
+
+/// The T of the texts xs, one but of a list, of a member tagged tags, a timestamp of the format at its location
+/// otherwise unless tagged with one.
+function texts[T extends Decodable](xs: string[], at: string, tags: Type[], otherwise: string,
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "array":
+			const out: T = []
+			for (let i = 0; i < xs.length; i++) {
+				out.push(texts[T.elem]([xs[i]], `${at}.${i + 1}.member`, tags, otherwise, v))
+			}
+			check(out, at, tags, v)
+			return out
+		case "union":
+			if (enumerated(T)) {
+				return choice[T](xs[0], at, v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return texts[M](xs, at, tags, otherwise, v)
+				}
+			}
+			throw v.fault(xs[0], at, `Member must be a ${T.name}`)
+		case "literal": return choice[T](xs[0], at, v)
+		case "string":
+			if (!has(tags, Blob)) {
+				check(xs[0], at, tags, v)
+				return xs[0]
+			}
+			let b = ""
+			try {
+				b = base64.decode(xs[0])
+			} catch (e: ParseError) {
+				throw v.fault(xs[0], at, "Member must be base64")
+			}
+			check(b, at, tags, v, true)
+			return b
+		case "bool":
+			const s = trim(xs[0])
+			if (s == "true" || s == "false") {
+				return s == "true"
+			}
+			throw v.fault(s, at, "Member must be true or false")
+		case "int":
+			const s = trim(xs[0])
+			let n: T = 0
+			try {
+				if (T == i64 && has(tags, Timestamp)) {
+					const format = tag(tags, Timestamp, "")
+					return instant(s, if (format == "") otherwise else format)
+				}
+				n = parseInt[T](s)
+			} catch (e: ParseError) {
+				throw v.fault(s, at, `Member must be ${if (has(tags, Timestamp)) "a timestamp" else "an integer"}`)
+			}
+			check(n, at, tags, v)
+			return n
+		case "float":
+			const s = trim(xs[0])
+			const zero: T = 0.0
+			switch (s) {
+				case "NaN": return zero / zero
+				case "Infinity": return 1.0 / zero
+				case "-Infinity": return -1.0 / zero
+			}
+			let x: T = 0.0
+			try {
+				x = parseFloat[T](s)
+			} catch (e: ParseError) {
+				throw v.fault(s, at, "Member must be a number")
+			}
+			check(x, at, tags, v)
+			return x
+		default: throw v.fault(xs[0], at, `Member must be a ${T.name}`)
+	}
+}
+
+/// The tags of a list's items or a map's values, of those of their member: without its flattening and namespace.
+function inner(tags: Type[]): Type[] { return tags.filter(t => t.base != Flat && t.base != Namespace) }
+/// Whether t is an enum, of null or not.
+function enumerated(t: Type): bool { return t.members.every(M => M.kind == "literal" || M.kind == "null") }
+
+/// Whether t takes null.
+function nullable(t: Type): bool {
+	return t.kind == "null" || t.kind == "union" && t.members.some(M => M.kind == "null")
+}
+
+/// The answer of out, from service, to the request requestId: its members bound to the status, else code, headers and
+/// body.
+export function reply[O](service: Service, out: O, requestId: string, code: i32 = 200): Response {
+	const res = new Response(code, "")
+	let body = ""
+	let doc: Node | null = null
+	let kind = ""
+	if (O != Unit) {
+		switch (O.kind) {
+			case "class": for (const f of O.fields) {
+				if (has(f.tags, Status)) {
+					res.status = status(out[f.name], res.status)
+				} else if (has(f.tags, Header)) {
+					bound(res, tag(f.tags, Header, ""), out[f.name], f.tags, false)
+				} else if (has(f.tags, Prefix)) {
+					bound(res, tag(f.tags, Prefix, ""), out[f.name], f.tags, true)
+				} else if (has(f.tags, Payload)) {
+					const [s, k, el] = written(service, out[f.name], f.tags)
+					body = s
+					kind = k
+					doc = el
+				} else {
+					// of the body, as an output's other bindings are ignored
+					if (doc == null) {
+						doc = new Node("element", tag(O.tags, Name, O.name))
+						namespace(doc!, O.tags, service.ns)
+					}
+					if (has(f.tags, Attr)) {
+						const s = format(out[f.name], f.tags)
+						if (s != "") {
+							doc!.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
+						}
+					} else {
+						put(doc!, tag(f.tags, Name, f.name), out[f.name], f.tags)
+					}
+				}
+			}
+			default: {}
+		}
+	}
+	if (doc != null) {
+		body = `<?xml version="1.0" encoding="UTF-8"?>\n${serialize(doc!)}`
+		kind = "application/xml"
+	}
+	res.body = new Body(body)
+	if (kind != "" && !res.headers.has("content-type")) {
+		res.headers.set("content-type", kind)
+	}
+	res.headers.set(if (service.wrapped) "x-amzn-requestid" else "x-amz-request-id", requestId)
+	return res
+}
+
+/// The status x is, if set, else otherwise.
+function status[T](x: T, otherwise: i32): i32 {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return status(x, otherwise)
+				}
+			}
+			return otherwise
+		case "int": return x as i32
+		default: return otherwise
+	}
+}
+
+/// Sets on res the header k of x, of a member tagged tags, if set; of a map, if prefixed, the header of each entry,
+/// k its name's prefix.
+function bound[T](res: Response, k: string, x: T, tags: Type[], prefixed: bool): void {
+	switch (T.kind) {
+		case "null": return
+		case "union": for (const M of T.members) {
+			if (M.kind != "null" && x instanceof M) {
+				bound(res, k, x, tags, prefixed)
+			}
+		}
+		case "array": if (prefixed) {
+			for (const e of x) {
+				bound(res, k, e, tags, true)
+			}
+		} else {
+			res.headers.set(k, header(x, tags))
+		}
+		case "tuple":
+			// an entry, of the rest of the header's name and its value
+			let name = k
+			for (const f of T.fields) {
+				if (f.name == "0") {
+					name = `${k}${x[f.name]}`
+				} else {
+					bound(res, name, x[f.name], tags, false)
+				}
+			}
+		default: res.headers.set(k, header(x, tags))
+	}
+}
+
+/// The body that the payload x of a member tagged tags is, its media type, and the element of it if a document.
+function written[T](service: Service, x: T, tags: Type[]): [string, string, Node | null] {
+	switch (T.kind) {
+		case "null": return ["", "", null]
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return ["", "", document(service, x, tags)]
+			}
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return written(service, x, tags)
+				}
+			}
+			return ["", "", null]
+		case "string": return [x, if (has(tags, Blob)) "application/octet-stream" else "text/plain", null]
+		case "class": return ["", "", document(service, x, tags)]
+		default: return [header(x, tags), "text/plain", null]
+	}
+}
+
+/// The element of the payload x, a structure or union, of a member tagged tags.
+function document[T](service: Service, x: T, tags: Type[]): Node {
+	const holder = new Node("element", "")
+	put(holder, tag(tags, Name, ""), x, tags)
+	const el = holder.children[0]
+	if (!has(tags, Namespace)) {
+		namespace(el, if (T.kind == "class") T.tags else [], service.ns)
+	}
+	return el
+}
+
+/// Gives el the namespace of the tags or, of none there, ns if not "".
+function namespace(el: Node, tags: Type[], ns: string) {
+	for (const t of tags) {
+		if (t.base == Namespace) {
+			const p = t.args[1].value as string
+			el.attrs.push(new Attribute(if (p == "") "xmlns" else `xmlns:${p}`, t.args[0].value as string))
+			return
+		}
+	}
+	if (ns != "") {
+		el.attrs.push(new Attribute("xmlns", ns))
+	}
+}
+
+/// The header's value of x, of a member tagged tags: of a list, its items between commas, quoted where they hold a
+/// comma or quote.
+function header[T](x: T, tags: Type[]): string {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return header(x, tags)
+				}
+			}
+			return ""
+		case "array":
+			const out: string[] = []
+			for (const i of x) {
+				const s = header(i, tags)
+				out.push(if (T.elem == string && (indexOf(s, ",") >= 0 || indexOf(s, "\"") >= 0)) `"${replace(replace(s, "\\", "\\\\"), "\"", "\\\"")}"`
+					else s)
+			}
+			return out.join(", ")
+		default: return format(x, tags, "http-date")
+	}
+}
+
+/// The text of the scalar v of a member tagged tags, a timestamp of the format otherwise unless tagged with one.
+function format[T](v: T, tags: Type[], otherwise: string = "date-time"): string {
+	if (T.kind == "union") {
+		for (const M of T.members) {
+			if (M.kind != "null" && v instanceof M) {
+				return format(v, tags, otherwise)
+			}
+		}
+		return ""
+	}
+	if (T == i64 && has(tags, Timestamp)) {
+		const f = tag(tags, Timestamp, "")
+		return stamp(v, if (f == "") otherwise else f)
+	}
+	if (T == string && has(tags, Blob)) {
+		return base64.encode(v)
+	}
+	return `${v}`
+}
+
+/// Into el, the element named n of v, of a member tagged tags: none for null, one per item for a flattened list or
+/// map.
+function put[T](el: Node, n: string, v: T, tags: Type[]): void {
+	switch (T.kind) {
+		case "null": return
+		case "union": for (const M of T.members) {
+			if (v instanceof M) {
+				put(el, n, v, tags)
+			}
+		}
+		case "array":
+			const flat = has(tags, Flat)
+			const box = if (flat) el else child(el, n, tags)
+			const item = if (flat) n else if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
+			for (const x of v) {
+				put(box, item, x, if (flat && T.elem.kind == "tuple") tags else inner(tags))
+			}
+		case "tuple":
+			const e = child(el, n, if (has(tags, Flat)) tags else []) // a map's entry
+			for (const f of T.fields) {
+				const key = f.name == "0"
+				put(e, if (key) tag(tags, Key, "key") else tag(tags, Value, "value"), v[f.name],
+					if (key) [] else inner(tags))
+			}
+		case "class", "object":
+			const c = child(el, n, tags)
+			for (const f of T.fields) {
+				if (has(f.tags, Attr)) {
+					const s = format(v[f.name], f.tags)
+					if (s != "") {
+						c.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
+					}
+				} else {
+					put(c, tag(f.tags, Name, f.name), v[f.name], f.tags)
+				}
+			}
+		default: child(el, n, tags).insert(new Node("text", "", format(v, tags)))
+	}
+}
+
+/// A new element named n, el's last child, of the namespace that tags give.
+function child(el: Node, n: string, tags: Type[]): Node {
+	const c = new Node("element", n)
+	namespace(c, tags, "")
+	el.insert(c)
+	return c
+}
+
+/// The answer of the fault f from service to the request requestId: of an Error in an ErrorResponse if the service
+/// wraps its errors, else of an Error alone that holds the RequestId.
+export function error(service: Service, f: Fault, requestId: string): Response {
+	const e = new Node("element", "Error")
+	if (service.wrapped) {
+		text(e, "Type", if (f.sender) "Sender" else "Receiver")
+	}
+	text(e, "Code", f.code)
+	text(e, "Message", f.message)
+	let xml = serialize(e)
+	const end = indexOf(xml, "</Error>") // after the message, whose text cannot hold it
+	const id = serialize(text(new Node("element", ""), "RequestId", requestId))
+	xml = if (service.wrapped) `<ErrorResponse>${xml.slice(0, end)}${f.members}</Error>${id}</ErrorResponse>`
+		else `${xml.slice(0, end)}${f.members}${id}</Error>`
+	const res = new Response(f.status, `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`)
+	res.headers.set("content-type", "application/xml")
+	res.headers.set(if (service.wrapped) "x-amzn-requestid" else "x-amz-request-id", requestId)
+	return res
+}
+
+/// The element named n of the text s, el's last child.
+function text(el: Node, n: string, s: string): Node {
+	const c = child(el, n, [])
+	c.insert(new Node("text", "", s))
+	return c
+}
+
+/// The elements of the fields of v, an error's members besides its message, as an error holds them.
+export function members[T](v: T): string {
+	const el = new Node("element", "Error")
+	put(el, "Error", v, [])
+	const xml = serialize(el.children[0])
+	return xml.slice(indexOf(xml, ">") + 1, lastIndexOf(xml, "<"))
+}

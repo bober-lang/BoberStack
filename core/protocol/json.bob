@@ -24,8 +24,8 @@ export class Blob {}
 /// Tags a string member, or its items, as a document: the JSON text of any value, "" for none.
 export class Document {}
 
-/// An error that a service's model declares: its shape id, the member that holds its message, "" if none, and its code
-/// under awsQuery, "" if it has none of its own.
+/// An error that a service's model declares, or that the service answers with besides: its shape id, the member that
+/// holds its message, "" if none, and its code under awsQuery, "" if it has none of its own.
 export class ErrorShape {
 	id: string
 	message: string
@@ -126,11 +126,11 @@ export function reply(service: Service, body: string, requestId: string, status:
 	return res
 }
 
-/// The answer of the fault f from service. Its __type is the shape id of the error that f's code names, in 1.1 the
-/// name alone; a code the service does not declare is taken for a name in its namespace. If service is compatible with
-/// awsQuery, x-amzn-query-error holds the error's code there and who is at fault.
+/// The answer of the fault f from service. Its __type is the shape id of the error that f's code names, or whose code
+/// under awsQuery it is, in 1.1 the name alone; a code the service does not list is taken for a name in its namespace.
+/// If service is compatible with awsQuery, x-amzn-query-error holds the error's code there and who is at fault.
 export function error(service: Service, f: Fault, requestId: string): Response {
-	const declared = service.errors.find(e => name(e.id) == f.code)
+	const declared = service.errors.find(e => name(e.id) == f.code) ?? service.errors.find(e => e.query == f.code)
 	const id = if (declared != null) declared.id
 		else if (indexOf(f.code, "#") >= 0) f.code
 		else `${split(service.id, "#")[0]}#${f.code}`
@@ -272,14 +272,19 @@ function value[T extends Decodable](s: string, k: string, at: string, tags: Type
 	}
 }
 
-/// The T, a union, of the one member that the JSON object s sets, its __type aside.
+/// The T, a union, of the one member that the JSON object s sets, its __type aside; of none or several, a union the
+/// service words on its own is noted into v, as its first member unset.
 function variant[T extends Decodable](s: string, k: string, at: string, v: Violations): T throws Fault {
 	const set = object(s, k).filter(e => e[0] != "__type" && e[1] != "null")
-	if (set.length == 1) {
-		for (const M of T.members) {
-			if (M.kind == "class" && M.fields[0].name == set[0][0]) {
-				return value[M](s, k, at, [], v)
-			}
+	for (const M of T.members) {
+		if (M.kind != "class") {
+			continue
+		}
+		if (set.length == 1 && M.fields[0].name == set[0][0]) {
+			return value[M](s, k, at, [], v)
+		}
+		if (set.length != 1 && v.worded(split(M.name, "$")[0], set.length == 0)) {
+			return value[M]("{}", k, at, [], new Violations(v.validation))
 		}
 	}
 	throw v.fault(null, at, "Member must have exactly one member set")
