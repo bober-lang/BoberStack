@@ -1,0 +1,286 @@
+//! What the codecs apply of a service's model besides its members' types: timestamps, blobs, defaults and constraints,
+//! under the tags below, and AWS's wording of a request that breaks them: "Value 'x' at 'path' failed to satisfy
+//! constraint: why", all of a request's in one fault, a structure's members in the order of a Java HashMap of their
+//! names.
+
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { parseFloat } from "std/float"
+import { round } from "std/math"
+import { compile, Regex } from "std/regex"
+import { lower, ParseError } from "std/string"
+import { httpDate, millisecond, parseHttpDate, parseRfc3339, rfc3339, second } from "std/time"
+import { has, tag } from "std/types"
+import { Fault } from "../fault"
+
+/// Tags an i64 member, or its items, as a timestamp in ns since 1970, on the wire in the format F: date-time,
+/// epoch-seconds or http-date; if "", that of where it is: epoch-seconds in JSON, http-date in a header, else date-time.
+export class Timestamp[F extends string = ""] {}
+/// Tags a string member, or its items, as bytes: base64 on the wire, but as they are in a REST payload.
+export class Blob {}
+/// Tags a member that takes its initial value when a request leaves it out, as Smithy's default.
+export class Default {}
+/// Tags a member, or its items, with its shape's constraints, each "" where it has none: a string's length in
+/// characters, a blob's in bytes or a number's value, from Min to Max, and a string's pattern P.
+export class Valid[Min extends string, Max extends string, P extends string] {}
+/// As Valid, of a pattern P that std/regex cannot run (a lookaround, or Java's spelling): Run matches the same strings.
+export class Rewritten[Min extends string, Max extends string, P extends string, Run extends string] {}
+/// Tags a list or map member with the number of its items, from Min to Max, either "" for no bound.
+export class Size[Min extends string, Max extends string] {}
+/// Tags a member, or its items, whose values AWS does not quote in a message on their constraints, as a blob's.
+export class Sensitive {}
+/// Tags a member of an input that AWS's messages on its constraints name N, otherwise than the model.
+export class Named[N extends string] {}
+
+/// How a service answers a request breaking its model: the code of the fault, whether its message quotes the values,
+/// and the unions it words on their own: by a union's name, the message where none of its members is set and where
+/// more than one is, answered if the request breaks nothing else; and what it calls a value it does not quote.
+export class Validation {
+	code: string
+	quoted: bool
+	unions: [string, string, string][]
+	unquoted: string
+
+	constructor(code: string, quoted: bool = true, unions: [string, string, string][] = [],
+		unquoted: string = "Value") {
+		this.code = code
+		this.quoted = quoted
+		this.unions = unions
+		this.unquoted = unquoted
+	}
+}
+
+/// The violations of a request, each as AWS's message words it, and the first fault of a union worded on its own.
+export class Violations {
+	validation: Validation
+	found: string[] = []
+	union: Fault | null = null
+
+	constructor(validation: Validation) { this.validation = validation }
+
+	note(v: string | null, at: string, why: string, hidden: bool = false) {
+		const value = if (!this.validation.quoted || hidden) this.validation.unquoted
+			else if (v == null) "Value null"
+			else `Value '${v}'`
+		this.found.push(`${value} at '${at}' failed to satisfy constraint: ${why}`)
+	}
+
+	fault(v: string | null = null, at: string = "", why: string = ""): Fault {
+		if (why != "") {
+			this.note(v, at, why)
+		}
+		const n = this.found.length
+		const detected = `${n} validation error${if (n == 1) "" else "s"} detected: `
+		return new Fault(400, this.validation.code, detected + this.found.join("; "))
+	}
+
+	check() throws Fault {
+		if (this.found.length > 0) {
+			throw this.fault()
+		}
+		if (this.union != null) {
+			throw this.union!
+		}
+	}
+
+	/// Notes that the union named n has none (or several) of its members set; false if the service does not word n.
+	worded(n: string, none: bool): bool {
+		const u = this.validation.unions.find(u => u[0] == n)
+		if (u == null) {
+			return false
+		}
+		if (this.union == null) {
+			this.union = new Fault(400, this.validation.code, if (none) u[1] else u[2])
+		}
+		return true
+	}
+
+	/// Puts a structure's members' violations, noted from from[i] on for names[i], in the order AWS lists them.
+	order(names: string[], from: i32[]) {
+		const runs: [i32, i32, string[]][] = [] // a member's bucket, its place and its violations
+		for (let i = 0; i < names.length; i++) {
+			const to = if (i + 1 < names.length) from[i + 1] else this.found.length
+			runs.push([bucket(names[i], names.length), i, this.found.slice(from[i], to)])
+		}
+		sortBy(runs, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+		this.found = this.found.slice(0, if (names.length == 0) this.found.length else from[0])
+		for (const r of runs) {
+			this.found.append(r[2])
+		}
+	}
+}
+
+/// The bucket of the key k in a Java HashMap, made empty, of n keys: as String.hashCode spreads it, in a table of 16
+/// slots doubled while n is more than 3/4 of them.
+function bucket(k: string, n: i32): i32 {
+	const h = hash(k)
+	let slots: i64 = 16
+	while ((n as i64) * 4 > slots * 3) {
+		slots *= 2
+	}
+	return ((h ^ (h >> 16)) & (slots - 1)) as i32
+}
+
+/// The String.hashCode of s, of its bytes, unsigned.
+function hash(s: string): i64 {
+	let h: i64 = 0
+	for (const c of s) {
+		h = (31 * h + (c as i64)) & 4294967295
+	}
+	return h
+}
+
+/// The format of the timestamp tags tag, otherwise where it leaves it to where it is.
+export function dated(tags: Type[], otherwise: string): string {
+	const f = tag(tags, Timestamp, "")
+	return if (f == "") otherwise else f
+}
+
+/// The instant that the timestamp s in format names.
+export function instant(s: string, format: string): i64 throws ParseError {
+	switch (format) {
+		case "epoch-seconds": return (round(parseFloat[f64](s) * 1000.0) as i64) * millisecond
+		case "http-date": return parseHttpDate(s)
+		default: return parseRfc3339(s)
+	}
+}
+
+/// The instant t, to the millisecond, as a timestamp in format.
+export function stamp(t: i64, format: string): string {
+	const ms = t - t % millisecond
+	switch (format) {
+		case "epoch-seconds":
+			const frac = ms % second / millisecond
+			const digits = `${1000 + frac}`.slice(1, 4)
+			return if (frac == 0) `${ms / second}` else `${ms / second}.${digits}`
+		case "http-date": return httpDate(t)
+		default: return rfc3339(ms)
+	}
+}
+
+/// Whether t takes null.
+export function nullable(t: Type): bool {
+	return t.kind == "null" || t.kind == "union" && t.members.some(M => M.kind == "null")
+}
+
+export function named(n: string, tags: Type[]): string { return if (has(tags, Named)) tag(tags, Named, "") else n }
+
+/// The member path at, of a structure's member named n, as AWS gives it: n lowered at its start.
+export function path(at: string, n: string): string {
+	const m = lower(n.slice(0, 1)) + n.slice(1, n.length)
+	return if (at == "") m else `${at}.${m}`
+}
+
+/// Notes into v how x, at the member path at, breaks its tags' constraints; of a blob's length in bytes if bytes.
+export function check[T](x: T, at: string, tags: Type[], v: Violations, bytes: bool = false) {
+	const hidden = bytes || has(tags, Sensitive)
+	for (const t of tags) {
+		const size = t.base == Size
+		const rewritten = t.base == Rewritten
+		if (t.base != Valid && !size && !rewritten) {
+			continue
+		}
+		const min = t.args[0].value as string
+		const max = t.args[1].value as string
+		if (size != (T.kind == "array")) {
+			continue // a list's count, on its items, or their constraints, on the list
+		}
+		let n = 0.0
+		let what = "length"
+		switch (T.kind) {
+			case "string": n = (if (bytes) x.length else characters(x)) as f64
+			case "int", "float":
+				n = x as f64
+				what = "value"
+			case "array": n = x.length as f64
+			default: continue
+		}
+		if (min != "" && n < number(min)) {
+			v.note(text(x), at, `Member must have ${what} greater than or equal to ${min}`, hidden)
+		} else if (max != "" && n > number(max)) {
+			v.note(text(x), at, `Member must have ${what} less than or equal to ${max}`, hidden)
+		}
+		const p = if (size) "" else t.args[2].value as string
+		if (T.kind == "string" && p != "") {
+			const r = regex(if (rewritten) t.args[3].value as string else p)
+			if (r != null && !r!.test(x)) {
+				const shown = p.slice(if (startsWith(p, "^")) 1 else 0, p.length - (if (endsWith(p, "$")) 1 else 0))
+				v.note(text(x), at, `Member must satisfy regular expression pattern: ${shown}`, hidden)
+			}
+		}
+	}
+}
+
+/// The values of the enum T, a union of literals, as AWS lists them: by the low five bits of their String.hashCode, as
+/// AWS did for each enum observed on 2026-11-23.
+export function values[T](): string {
+	if (T.kind == "literal") {
+		return `[${T.value}]`
+	}
+	const all: [i64, i32, string][] = [] // a value's bits, its place and it
+	for (const M of T.members) {
+		if (M.kind == "literal") {
+			all.push([hash(`${M.value}`) & 31, all.length, `${M.value}`])
+		}
+	}
+	sortBy(all, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+	return `[${all.map(a => a[2]).join(", ")}]`
+}
+
+/// The value of the enum T that s names; if none, its first, with a violation noted into v.
+export function choice[T](s: string, at: string, v: Violations): T {
+	if (T.kind == "literal") {
+		if (s != T.value) {
+			v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
+		}
+		return T.value
+	}
+	for (const M of T.members) {
+		if (M.kind == "literal" && s == M.value) {
+			return M.value
+		}
+	}
+	v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
+	for (const M of T.members) {
+		if (M.kind == "literal") {
+			return M.value
+		}
+	}
+	return T.value
+}
+
+function text[T](x: T): string {
+	if (T.kind == "array") {
+		const items: string[] = []
+		for (const i of x) {
+			items.push(text(i))
+		}
+		return `[${items.join(", ")}]`
+	}
+	return `${x}`
+}
+
+function characters(s: string): i32 {
+	let n = 0
+	for (const c of s) {
+		if ((c & 192) != 128) {
+			n++
+		}
+	}
+	return n
+}
+
+function number(s: string): f64 {
+	try {
+		return parseFloat[f64](s)
+	} catch (e: ParseError) {
+		return 0.0 // the generator writes only numbers
+	}
+}
+
+function regex(p: string): Regex | null {
+	try {
+		return compile(p)
+	} catch (e: ParseError) {
+		return null
+	}
+}

@@ -1,0 +1,219 @@
+//! The restJson1 protocol: members are bound as ./rest binds them, the rest a JSON object written as ./json writes
+//! one, or one member as the payload. An error is a JSON object of its members, its code in X-Amzn-Errortype.
+
+import * as std from "std/encoding/json"
+import { Body, Request, Response } from "std/http"
+import { split } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { Fault } from "../fault"
+import { Caller, Unit } from "../service"
+import * as json from "./json"
+import { Blob, Default, nullable, path, Validation, Violations } from "./model"
+
+import { answers, bound, enumerated, header, headless, http, Payload, present, respond, Route, routed, Status,
+	texts } from "./rest"
+
+export class Service {
+	id: string
+	errors: json.ErrorShape[]
+	validation: Validation
+
+	constructor(id: string, errors: json.ErrorShape[], validation: Validation = new Validation("ValidationException")) {
+		this.id = id
+		this.errors = errors
+		this.validation = validation
+	}
+}
+
+export class Call {
+	caller: Caller
+	service: Service
+	req: Request
+	body: string
+	operation: string
+	labels: [string, string][]
+
+	constructor(caller: Caller, service: Service, req: Request, body: string, routes: Route[]) {
+		this.caller = caller
+		this.service = service
+		this.req = req
+		this.body = body
+		const [operation, labels] = routed(req, routes)
+		this.operation = operation
+		this.labels = labels
+	}
+
+	/// The answer by h, the handler of its operation, which IAM authorizes as actions: h's output or the Fault it throws.
+	serve[I extends Decodable,
+		O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = [], code: i32 = 200): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			const input = decode[I](this.req, this.body, this.labels, this.service.validation)
+			return headless(this.req, reply(h(this.caller, input), id, code))
+		} catch (f: Fault) {
+			return this.fail(f)
+		}
+	}
+
+	fail(f: Fault): Response { return headless(this.req, error(this.service, f, this.caller.requestId)) }
+	unknownOperation(): Response { return this.fail(new Fault(404, "UnknownOperationException", "")) }
+}
+
+export function call(caller: Caller, req: Request, service: Service, routes: Route[]): Call throws IoError {
+	return new Call(caller, service, req, req.body.text(), routes)
+}
+
+/// The T whose members req holds; a body not of T's JSON is a SerializationException, one breaking T's model
+/// validation's fault.
+export function decode[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	validation: Validation = new Validation("ValidationException")): T throws Fault {
+	const v = new Violations(validation)
+	const r = input[T](req, body, labels, v)
+	v.check()
+	return r
+}
+
+function input[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "class":
+			const r = new T()
+			let members: std.Unknown[] | null = null
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const at = path("", f.name)
+				let found = true
+				if (bound(f.tags)) {
+					found = present(req, labels, f.name, f.tags)
+					if (found) {
+						r[f.name] = http[f.type](req, labels, f.name, at, f.tags, v)
+					}
+				} else if (has(f.tags, Payload)) {
+					found = body != ""
+					if (found) {
+						r[f.name] = payload[f.type](body, at, f.tags, v)
+					}
+				} else if (!has(f.tags, Status)) {
+					if (members == null) {
+						members = json.object(if (body == "") "{}" else body, "")
+					}
+					const n = tag(f.tags, json.Name, f.name)
+					const x = members!.find(e => e[0] == n)
+					found = x != null && x[1].text != "null"
+					if (found) {
+						r[f.name] = json.value[f.type](x![1].text, n, at, f.tags, v)
+					}
+				}
+				if (!found && !nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, at, "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		default: throw new Fault(500, "InternalFailure", `An input of ${T.name}, not of a class`)
+	}
+}
+
+/// The T of the payload s: a string or blob as it is, an enum as its value, a structure or union as its JSON.
+function payload[T extends Decodable](s: string, at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return json.value[T](s, "", at, tags, v)
+			}
+			if (enumerated(T)) {
+				return texts[T]([s], at, tags, "date-time", v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return payload[M](s, at, tags, v)
+				}
+			}
+			throw v.fault(s, at, `Member must be a ${T.name}`)
+		case "string": return s
+		default: return json.value[T](s, "", at, tags, v)
+	}
+}
+
+export function reply[O](out: O, requestId: string, code: i32 = 200): Response {
+	const res = new Response(code, "")
+	const members: string[] = []
+	let body: [string, string] | null = null // a payload's, and its media type
+	if (O != Unit) {
+		switch (O.kind) {
+			case "class": for (const f of O.fields) {
+				if (answers(f.tags)) {
+					respond(res, out[f.name], f.tags)
+				} else if (has(f.tags, Payload)) {
+					body = written(out[f.name], f.tags)
+				} else {
+					const x = out[f.name]
+					if (x != null) {
+						members.push(`${std.quoted(tag(f.tags, json.Name, f.name))}:${json.put(x, f.tags)}`)
+					}
+				}
+			}
+			default: {}
+		}
+	}
+	const [s, kind] = body ?? [`{${members.join(",")}}`, "application/json"]
+	res.body = new Body(s)
+	if (kind != "" && !res.headers.has("content-type")) {
+		res.headers.set("content-type", kind)
+	}
+	res.headers.set("x-amzn-requestid", requestId)
+	return res
+}
+
+function written[T](x: T, tags: Type[]): [string, string] {
+	switch (T.kind) {
+		case "null": return ["", ""]
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return written(x, tags)
+				}
+			}
+			return ["", ""]
+		case "string": return [x, if (has(tags, Blob)) "application/octet-stream" else "text/plain"]
+		case "class": return [json.put(x, tags), "application/json"]
+		default: return [header(x, tags), "text/plain"]
+	}
+}
+
+/// The answer of the fault f: an object of its message, under the member its error holds it in ("message" if the
+/// service does not list it), and its other members.
+export function error(service: Service, f: Fault, requestId: string): Response {
+	const declared = service.errors.find(e => name(e.id) == f.code)
+	const key = if (declared == null) "message" else declared.message
+	const message = if (key == "") "" else `,${std.quoted(key)}:${std.quoted(f.message)}`
+	const all = `${message}${f.members}`
+	const res = new Response(f.status, `{${all.slice(if (all == "") 0 else 1, all.length)}}`)
+	res.headers.set("content-type", "application/json")
+	res.headers.set("x-amzn-errortype", f.code)
+	res.headers.set("x-amzn-requestid", requestId)
+	for (const [k, v] of f.headers) {
+		res.headers.set(k, v)
+	}
+	return res
+}
+
+/// v's members, an error's besides its message, as its object holds them after the message.
+export function members[T](v: T): string {
+	switch (T.kind) {
+		case "class":
+			let all = ""
+			for (const f of T.fields) {
+				const x = v[f.name]
+				if (!bound(f.tags) && !answers(f.tags) && x != null) {
+					all += `,${std.quoted(tag(f.tags, json.Name, f.name))}:${json.put(x, f.tags)}`
+				}
+			}
+			return all
+		default: return ""
+	}
+}
+
+function name(id: string): string { return split(id, "#").pop()! }

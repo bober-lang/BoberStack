@@ -1,0 +1,361 @@
+//! The restXml protocol: members are bound as ./rest binds them, the rest an XML document of the members bound to
+//! nothing else, read and written as ./xml reads and writes one, or one member as the payload. An error is an Error in
+//! an ErrorResponse, or as S3 answers, alone and of S3's request and host ids.
+
+import { indexOf } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Attribute, Node, serialize } from "std/encoding/xml"
+import { Body, Request, Response } from "std/http"
+import { lower } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { Fault } from "../fault"
+import { Caller, Unit } from "../service"
+import { Blob, Default, named, nullable, path, Validation, Violations } from "./model"
+
+import { answers, bound, enumerated, header, headless, http, Payload, present, respond, Route, routed, Status,
+	texts } from "./rest"
+
+import * as xml from "./xml"
+
+/// Tags an output whose one member of the body is the text of the document's root, as S3's GetBucketLocation's.
+export class Unwrapped {}
+/// Tags a member that orders the flattened lists of items named A and B, written as one list: a bool[] of whether
+/// each item is a B.
+export class Interleave[A extends string, B extends string] {}
+
+/// A service; wrapped puts its errors in an ErrorResponse, milliseconds writes date-times to the millisecond.
+export class Service {
+	id: string
+	ns: string
+	wrapped: bool
+	style: xml.Style
+	validation: Validation
+
+	constructor(id: string, ns: string, wrapped: bool, milliseconds: bool = false,
+		validation: Validation = new Validation("ValidationException")) {
+		this.id = id
+		this.ns = ns
+		this.wrapped = wrapped
+		this.style = new xml.Style(false, milliseconds)
+		this.validation = validation
+	}
+}
+
+/// That of an error's members, written where the service is not known.
+const plain = new xml.Style(false, false)
+
+export class Call {
+	caller: Caller
+	service: Service
+	req: Request
+	body: string
+	operation = ""
+	labels: [string, string][] = []
+
+	constructor(caller: Caller, service: Service, req: Request, body: string, routes: Route[]) {
+		this.caller = caller
+		this.service = service
+		this.req = req
+		this.body = body
+		const [operation, labels] = routed(req, routes)
+		this.operation = operation
+		this.labels = labels
+	}
+
+	/// The answer by h, the handler of its operation, which IAM authorizes as actions: h's output or the Fault it throws.
+	serve[I extends Decodable,
+		O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = [], code: i32 = 200): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			const input = decode[I](this.req, this.body, this.labels, this.service.validation)
+			return headless(this.req, reply(this.service, h(this.caller, input), id, code))
+		} catch (f: Fault) {
+			return this.fail(f)
+		}
+	}
+
+	fail(f: Fault): Response { return headless(this.req, error(this.service, f, this.caller.requestId)) }
+
+	unknownOperation(): Response {
+		return this.fail(new Fault(405, "MethodNotAllowed",
+			"The specified method is not allowed against this resource."))
+	}
+}
+
+export function call(caller: Caller, req: Request, service: Service, routes: Route[]): Call throws IoError {
+	return new Call(caller, service, req, req.body.text(), routes)
+}
+
+/// The T whose members req holds, or validation's fault where they break T's model.
+export function decode[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	validation: Validation = new Validation("ValidationException")): T throws Fault {
+	const v = new Violations(validation)
+	const r = input[T](req, body, labels, v)
+	v.check()
+	return r
+}
+
+function input[T extends Decodable](req: Request, body: string, labels: [string, string][],
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "class":
+			const r = new T()
+			let doc: Node | null = null
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const at = path("", named(f.name, f.tags))
+				let found = true
+				if (bound(f.tags)) {
+					found = present(req, labels, f.name, f.tags)
+					if (found) {
+						r[f.name] = http[f.type](req, labels, f.name, at, f.tags, v)
+					}
+				} else if (has(f.tags, Payload)) {
+					found = body != ""
+					if (found) {
+						r[f.name] = payload[f.type](body, at, f.tags, v)
+					}
+				} else if (!has(f.tags, Status)) {
+					if (doc == null && body != "") {
+						doc = xml.root(body)
+					}
+					const n = tag(f.tags, xml.Name, f.name)
+					if (has(f.tags, xml.Attr)) {
+						const a = if (doc == null) null else doc!.attr(n)
+						found = a != null
+						if (found) {
+							r[f.name] = texts[f.type]([a!], at, f.tags, "date-time", v)
+						}
+					} else {
+						const el = if (doc == null) null else xml.member(doc!, n, f.tags)
+						found = el != null
+						if (found) {
+							r[f.name] = xml.read[f.type](el!, n, at, f.tags, v)
+						}
+					}
+				}
+				if (!found && !nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, at, "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		default: throw new Fault(500, "InternalFailure", `An input of ${T.name}, not of a class`)
+	}
+}
+
+function payload[T extends Decodable](s: string, at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				const el = xml.root(s)
+				return xml.read[T](el, el.name, at, tags, v)
+			}
+			if (enumerated(T)) {
+				return texts[T]([s], at, tags, "date-time", v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return payload[M](s, at, tags, v)
+				}
+			}
+			throw v.fault(s, at, `Member must be a ${T.name}`)
+		case "string": return s
+		case "class":
+			const el = xml.root(s)
+			return xml.read[T](el, el.name, at, tags, v)
+		default: return texts[T]([s], at, tags, "date-time", v)
+	}
+}
+
+export function reply[O](service: Service, out: O, requestId: string, code: i32 = 200): Response {
+	const res = new Response(code, "")
+	let body = ""
+	let doc: Node | null = null
+	let kind = ""
+	let order: bool[] | null = null
+	let merged = ["", ""]
+	if (O != Unit) {
+		switch (O.kind) {
+			case "class": for (const f of O.fields) {
+				if (answers(f.tags)) {
+					respond(res, out[f.name], f.tags)
+				} else if (has(f.tags, Payload)) {
+					const [s, k, el] = written(service, out[f.name], f.tags)
+					body = s
+					kind = k
+					doc = el
+				} else if (has(f.tags, Interleave)) {
+					order = flags(out[f.name])
+					for (const t of f.tags) {
+						if (t.base == Interleave) {
+							merged = [t.args[0].value as string, t.args[1].value as string]
+						}
+					}
+				} else {
+					// of the body, as an output's other bindings are ignored
+					if (doc == null) {
+						doc = new Node("element", tag(O.tags, xml.Name, O.name))
+						xml.namespace(doc!, O.tags, service.ns)
+					}
+					if (has(f.tags, xml.Attr)) {
+						const s = xml.text(out[f.name], f.tags, service.style)
+						if (s != "") {
+							doc!.attrs.push(new Attribute(tag(f.tags, xml.Name, f.name), s))
+						}
+					} else if (has(O.tags, Unwrapped)) {
+						doc!.insert(new Node("text", "", xml.text(out[f.name], f.tags, service.style)))
+					} else {
+						xml.put(doc!, tag(f.tags, xml.Name, f.name), out[f.name], f.tags, service.style)
+					}
+				}
+			}
+			default: {}
+		}
+	}
+	if (doc != null && order != null) {
+		interleave(doc!, merged[0], merged[1], order!)
+	}
+	if (doc != null) {
+		body = `<?xml version="1.0" encoding="UTF-8"?>\n${serialize(doc!)}`
+		kind = "application/xml"
+	}
+	res.body = new Body(body)
+	if (kind != "" && !res.headers.has("content-type")) {
+		res.headers.set("content-type", kind)
+	}
+	identify(res, service, requestId)
+	return res
+}
+
+/// Sets on res the headers of the request requestId to service: x-amzn-requestid if it wraps its errors, else S3's
+/// x-amz-request-id and x-amz-id-2, its host id.
+function identify(res: Response, service: Service, requestId: string) {
+	if (service.wrapped) {
+		res.headers.set("x-amzn-requestid", requestId)
+	} else {
+		res.headers.set("x-amz-request-id", shortened(requestId))
+		res.headers.set("x-amz-id-2", hostId(requestId))
+	}
+}
+
+/// The request id requestId as S3 writes one: of a UUID, its first 16 hex digits, upper case.
+function shortened(requestId: string): string {
+	if (requestId.length != 36) {
+		return requestId
+	}
+	let s = ""
+	for (let i = 0; i < requestId.length && s.length < 16; i++) {
+		const at = indexOf("0123456789abcdef", lower(requestId.slice(i, i + 1)))
+		if (at >= 0) {
+			s += "0123456789ABCDEF".slice(at, at + 1)
+		}
+	}
+	return s
+}
+
+/// S3's HostId, here of the request id alone.
+function hostId(requestId: string): string { return base64.encode(shortened(requestId)) }
+
+function flags[T](x: T): bool[] | null {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return flags(x)
+				}
+			}
+			return null
+		case "array": return if (T == bool[]) x else null
+		default: return null
+	}
+}
+
+function interleave(el: Node, a: string, b: string, order: bool[]) {
+	const as = xml.elements(el, a)
+	const bs = xml.elements(el, b)
+	if (as.length + bs.length == 0) {
+		return
+	}
+	const last = if (bs.length > 0) bs[bs.length - 1] else as[as.length - 1]
+	const i = el.children.indexOf(last)
+	const after = if (i + 1 < el.children.length) el.children[i + 1] else null
+	let j = 0
+	let k = 0
+	for (const isB of order) {
+		if (isB && k < bs.length) {
+			el.insert(bs[k], after)
+			k++
+		} else if (!isB && j < as.length) {
+			el.insert(as[j], after)
+			j++
+		}
+	}
+}
+
+function written[T](service: Service, x: T, tags: Type[]): [string, string, Node | null] {
+	switch (T.kind) {
+		case "null": return ["", "", null]
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return ["", "", document(service, x, tags)]
+			}
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return written(service, x, tags)
+				}
+			}
+			return ["", "", null]
+		case "string": return [x, if (has(tags, Blob)) "application/octet-stream" else "text/plain", null]
+		case "class": return ["", "", document(service, x, tags)]
+		default: return [header(x, tags), "text/plain", null]
+	}
+}
+
+function document[T](service: Service, x: T, tags: Type[]): Node {
+	const holder = new Node("element", "")
+	xml.put(holder, tag(tags, xml.Name, ""), x, tags, service.style)
+	const el = holder.children[0]
+	if (!has(tags, xml.Namespace)) {
+		xml.namespace(el, if (T.kind == "class") T.tags else [], service.ns)
+	}
+	return el
+}
+
+/// The answer of the fault f from service to the request requestId: of an Error in an ErrorResponse if the service
+/// wraps its errors, else of an Error alone that holds the RequestId and HostId.
+export function error(service: Service, f: Fault, requestId: string): Response {
+	const e = new Node("element", "Error")
+	if (service.wrapped) {
+		text(e, "Type", if (f.sender) "Sender" else "Receiver")
+	}
+	text(e, "Code", f.code)
+	text(e, "Message", f.message)
+	let xml = serialize(e)
+	const end = indexOf(xml, "</Error>") // after the message, whose text cannot hold it
+	const id = serialize(text(new Node("element", ""), "RequestId",
+		if (service.wrapped) requestId else shortened(requestId)))
+	const host = serialize(text(new Node("element", ""), "HostId", hostId(requestId)))
+	xml = if (service.wrapped) `<ErrorResponse>${xml.slice(0, end)}${f.members}</Error>${id}</ErrorResponse>`
+		else `${xml.slice(0, end)}${f.members}${id}${host}</Error>`
+	const res = new Response(f.status, if (f.status == 304) "" else `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`)
+	if (f.status != 304) {
+		res.headers.set("content-type", "application/xml")
+	}
+	for (const [k, v] of f.headers) {
+		res.headers.set(k, v)
+	}
+	identify(res, service, requestId)
+	return res
+}
+
+function text(el: Node, n: string, s: string): Node {
+	const c = xml.child(el, n, [])
+	c.insert(new Node("text", "", s))
+	return c
+}
+
+/// The XML of v's fields, an error's members besides its message; none if none is set.
+export function members[T](v: T): string { return xml.members(v, plain) }

@@ -1,0 +1,349 @@
+//! The awsJson 1.0 and 1.1 protocols: a request names its operation in X-Amz-Target, and its input, output and errors
+//! are JSON objects, read and written by reflection over classes as awsQuery's are; a sparse list is a (T | null)[].
+
+import { indexOf } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import * as std from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { isFinite } from "std/math"
+import { ParseError, split } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { Fault } from "../fault"
+import { Caller, Unit } from "../service"
+
+import { Blob, check, choice, dated, Default, instant, nullable, path, stamp, Timestamp, Validation,
+	Violations } from "./model"
+
+/// Tags a string member, or its items, as a document: the JSON text of any value, "" for none.
+export class Document {}
+/// Tags a member to be named K on the wire, as Smithy's jsonName, which restJson1 reads and awsJson does not.
+export class Name[K extends string] {}
+
+/// An error a service's model declares, or that it answers with besides: its shape id, the member holding its message
+/// ("" if none), and its awsQuery code ("" if none of its own).
+export class ErrorShape {
+	id: string
+	message: string
+	query: string
+
+	constructor(id: string, message: string, query: string) {
+		this.id = id
+		this.message = message
+		this.query = query
+	}
+}
+
+export class Service {
+	id: string
+	version: "1.0" | "1.1"
+	queryCompatible: bool
+	errors: ErrorShape[]
+	validation: Validation
+
+	constructor(id: string, version: "1.0" | "1.1", queryCompatible: bool, errors: ErrorShape[],
+		validation: Validation = new Validation("ValidationException")) {
+		this.id = id
+		this.version = version
+		this.queryCompatible = queryCompatible
+		this.errors = errors
+		this.validation = validation
+	}
+}
+
+export class Call {
+	caller: Caller
+	service: Service
+	body: string
+	/// Its X-Amz-Target, and the operation that names, "" if not one of the service's.
+	target: string
+	operation: string
+
+	constructor(caller: Caller, service: Service, target: string, body: string) {
+		this.caller = caller
+		this.service = service
+		this.body = body
+		this.target = target
+		const prefix = `${name(service.id)}.`
+		this.operation = if (indexOf(target, prefix) == 0) target.slice(prefix.length, target.length) else ""
+	}
+
+	/// The answer by h, the handler of its operation, which IAM authorizes as actions: h's output or the Fault it throws.
+	serve[I extends Decodable, O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = []): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			return reply(this.service, result(h(this.caller, decode[I](this.body, this.service.validation))), id)
+		} catch (f: Fault) {
+			return error(this.service, f, id)
+		}
+	}
+
+	unknownOperation(): Response {
+		const f = new Fault(400, "UnknownOperationException", `Unknown operation ${this.target}`)
+		return error(this.service, f, this.caller.requestId)
+	}
+}
+
+export function call(caller: Caller, req: Request, service: Service): Call throws IoError {
+	return new Call(caller, service, req.headers.get("x-amz-target") ?? "", req.body.text())
+}
+
+/// The T the JSON object s holds, none if s is empty; s not of T's JSON is a SerializationException, s breaking T's
+/// model validation's fault.
+export function decode[T extends Decodable](s: string,
+	validation: Validation = new Validation("ValidationException")): T throws Fault {
+	const v = new Violations(validation)
+	const r = value[T](if (s == "") "{}" else s, "", "", [], v)
+	v.check()
+	return r
+}
+
+/// v's members, an error's besides its message, as its object holds them after __type.
+export function members[T](v: T): string {
+	const all = put(v, [])
+	return if (all == "{}") "" else `,${all.slice(1, all.length - 1)}`
+}
+
+export function result[O](out: O): string { return if (O == Unit) "" else put(out, []) }
+
+export function reply(service: Service, body: string, requestId: string, status: i32 = 200): Response {
+	const res = new Response(status, body)
+	res.headers.set("content-type", `application/x-amz-json-${service.version}`)
+	res.headers.set("x-amzn-requestid", requestId)
+	return res
+}
+
+/// The answer of the fault f from service. Its __type is the shape id of the error that f's code names, or whose code
+/// under awsQuery it is, in 1.1 the name alone; a code the service does not list is taken for a name in its namespace.
+/// If service is compatible with awsQuery, x-amzn-query-error holds the error's code there and who is at fault.
+export function error(service: Service, f: Fault, requestId: string): Response {
+	const declared = service.errors.find(e => name(e.id) == f.code) ?? service.errors.find(e => e.query == f.code)
+	const id = if (declared != null) declared.id
+		else if (indexOf(f.code, "#") >= 0) f.code
+		else `${split(service.id, "#")[0]}#${f.code}`
+	const key = if (declared == null) "message" else declared.message
+	const message = if (key == "") "" else `,${std.quoted(key)}:${std.quoted(f.message)}`
+	const typed = std.quoted(if (service.version == "1.0") id else name(id))
+	const res = reply(service, `{"__type":${typed}${message}${f.members}}`, requestId, f.status)
+	if (service.queryCompatible) {
+		const code = if (declared == null || declared.query == "") name(f.code) else declared.query
+		res.headers.set("x-amzn-query-error", `${code};${if (f.sender) "Sender" else "Receiver"}`)
+	}
+	return res
+}
+
+function malformed(s: string, k: string, what: string): Fault {
+	const at = if (k == "") "the body" else `'${k}'`
+	return new Fault(400, "SerializationException", `Expected ${what} at ${at}, not ${s}`)
+}
+
+/// The T that the JSON s holds, at k on the wire and the member path at, of a member tagged tags.
+export function value[T extends Decodable](s: string, k: string, at: string, tags: Type[],
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "null":
+			if (s == "null") {
+				return null
+			}
+			throw malformed(s, k, "null")
+		case "union":
+			if (s != "null" && T.members.filter(M => M.kind == "class").length > 1) {
+				return variant[T](s, k, at, v)
+			}
+			if (s != "null" && T.members.every(M => M.kind == "literal" || M.kind == "null")) {
+				return choice[T](scalar[string](s, k, "a string"), at, v)
+			}
+			let last = malformed(s, k, "a value")
+			for (const M of T.members) {
+				try {
+					return value[M](s, k, at, tags, v)
+				} catch (f: Fault) {
+					last = if (M.kind == "null") last else f
+				}
+			}
+			throw last
+		case "literal": return choice[T](scalar[string](s, k, "a string"), at, v)
+		case "array":
+			const xs: T = []
+			if (T.elem.kind == "tuple") {
+				for (const [key, x] of object(s, k)) {
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						e[f.name] = if (f.name == "0") value[f.type](std.quoted(key), k, at, [], v)
+							else value[f.type](x.text, `${k}.${key}`, `${at}.${key}`, tags, v)
+					}
+					xs.push(e)
+				}
+				check(xs, at, tags, v)
+				return xs
+			}
+			let items: std.Raw[] = []
+			try {
+				items = std.decode[std.Raw[]](s)
+			} catch (e: ParseError) {
+				throw malformed(s, k, "a list")
+			}
+			for (let i = 0; i < items.length; i++) {
+				xs.push(value[T.elem](items[i].text, `${k}.${i + 1}`, `${at}.${i + 1}.member`, tags, v))
+			}
+			check(xs, at, tags, v)
+			return xs
+		case "class":
+			const r = new T()
+			const members = object(s, k)
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const n = tag(f.tags, Name, f.name)
+				const m = if (k == "") n else `${k}.${n}`
+				const x = members.find(e => e[0] == n)
+				if (x != null && x[1].text != "null") {
+					r[f.name] = value[f.type](x[1].text, m, path(at, f.name), f.tags, v)
+				} else if (!nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, path(at, f.name), "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		case "string":
+			if (has(tags, Document)) {
+				return s
+			}
+			const x = scalar[string](s, k, "a string")
+			if (!has(tags, Blob)) {
+				check(x, at, tags, v)
+				return x
+			}
+			let b = ""
+			try {
+				b = base64.decode(x)
+			} catch (e: ParseError) {
+				throw v.fault(x, at, "Member must be base64")
+			}
+			check(b, at, tags, v, true)
+			return b
+		case "bool": return scalar[bool](s, k, "a boolean")
+		case "int":
+			if (T == i64 && has(tags, Timestamp)) {
+				const format = dated(tags, "epoch-seconds")
+				const x = if (format == "epoch-seconds") s else scalar[string](s, k, "a timestamp")
+				try {
+					return instant(x, format)
+				} catch (e: ParseError) {
+					throw malformed(s, k, "a timestamp")
+				}
+			}
+			const n = scalar[T](s, k, "an integer")
+			check(n, at, tags, v)
+			return n
+		case "float":
+			const zero: T = 0.0
+			let f: T = zero
+			try {
+				f = std.decode[T](s)
+			} catch (e: ParseError) {
+				switch (scalar[string](s, k, "a number")) {
+					case "NaN": return zero / zero
+					case "Infinity": return 1.0 / zero
+					case "-Infinity": return -1.0 / zero
+					default: throw malformed(s, k, "a number")
+				}
+			}
+			check(f, at, tags, v)
+			return f
+		default: throw malformed(s, k, `a ${T.name}`)
+	}
+}
+
+/// The T, a union, of the one member that the JSON object s sets, its __type aside; of none or several, a union the
+/// service words on its own is noted into v, as its first member unset.
+function variant[T extends Decodable](s: string, k: string, at: string, v: Violations): T throws Fault {
+	const set = object(s, k).filter(e => e[0] != "__type" && e[1].text != "null")
+	for (const M of T.members) {
+		if (M.kind != "class") {
+			continue
+		}
+		if (set.length == 1 && tag(M.fields[0].tags, Name, M.fields[0].name) == set[0][0]) {
+			return value[M](s, k, at, [], v)
+		}
+		if (set.length != 1 && v.worded(split(M.name, "$")[0], set.length == 0)) {
+			return value[M]("{}", k, at, [], new Violations(v.validation))
+		}
+	}
+	throw v.fault(null, at, "Member must have exactly one member set")
+}
+
+export function object(s: string, k: string): std.Unknown[] throws Fault {
+	try {
+		return std.decode[std.Keys](s).all
+	} catch (e: ParseError) {
+		throw malformed(s, k, "an object")
+	}
+}
+
+function scalar[T extends Decodable](s: string, k: string, what: string): T throws Fault {
+	try {
+		return std.decode[T](s)
+	} catch (e: ParseError) {
+		throw malformed(s, k, what)
+	}
+}
+
+/// The JSON of v, of a member tagged tags; a structure's null members are left out.
+export function put[T](v: T, tags: Type[]): string {
+	switch (T.kind) {
+		case "null": return "null"
+		case "union":
+			for (const M of T.members) {
+				if (v instanceof M) {
+					return put(v, tags)
+				}
+			}
+			return "null"
+		case "literal": return std.quoted(`${v}`)
+		case "array":
+			const items: string[] = []
+			if (T.elem.kind == "tuple") {
+				for (const e of v) {
+					const kv: string[] = []
+					for (const f of T.elem.fields) {
+						kv.push(if (f.name == "0") std.quoted(`${e[f.name]}`) else put(e[f.name], tags))
+					}
+					items.push(kv.join(":"))
+				}
+				return `{${items.join(",")}}`
+			}
+			for (const x of v) {
+				items.push(put(x, tags))
+			}
+			return `[${items.join(",")}]`
+		case "class", "object":
+			const members: string[] = []
+			for (const f of T.fields) {
+				const x = v[f.name]
+				if (x != null) {
+					members.push(`${std.quoted(tag(f.tags, Name, f.name))}:${put(x, f.tags)}`)
+				}
+			}
+			return `{${members.join(",")}}`
+		case "string":
+			if (has(tags, Document)) {
+				return if (v == "") "null" else v
+			}
+			return std.quoted(if (has(tags, Blob)) base64.encode(v) else v)
+		case "int":
+			if (T == i64 && has(tags, Timestamp)) {
+				const format = dated(tags, "epoch-seconds")
+				return if (format == "epoch-seconds") stamp(v, format) else std.quoted(stamp(v, format))
+			}
+			return `${v}`
+		case "float":
+			if (!isFinite(v)) {
+				return if (v != v) "\"NaN\"" else if (v > 0.0) "\"Infinity\"" else "\"-Infinity\""
+			}
+			return `${v}`
+		default: return `${v}`
+	}
+}
+
+function name(id: string): string { return split(id, "#").pop()! }

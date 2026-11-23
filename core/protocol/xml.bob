@@ -1,0 +1,249 @@
+//! The XML of awsQuery's and restXml's documents: a structure an element of an element per member, named and nested
+//! under the tags below, read and written by reflection as ./json reads and writes JSON. awsQuery only writes it, its
+//! requests being form parameters.
+
+import { indexOf, lastIndexOf } from "std/algo"
+import { Attribute, Node, parse, serialize } from "std/encoding/xml"
+import { isFinite } from "std/math"
+import { ParseError } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { Fault } from "../fault"
+import { check, Default, nullable, path, Violations } from "./model"
+import { enumerated, format, texts } from "./rest"
+
+/// Tags a member, or a structure as a document's root, to be named K on the wire, as Smithy's xmlName.
+export class Name[K extends string] {}
+/// Tags a scalar member to be an attribute of its structure's element.
+export class Attr {}
+/// Tags a list or map member to repeat its items in place of a wrapper, as Smithy's xmlFlattened.
+export class Flat {}
+/// Tags a member, or a structure as a document's root, with the XML namespace U, of the prefix P if not "".
+export class Namespace[U extends string, P extends string = ""] {}
+/// Tags a list member whose items are named K, not member.
+export class Member[K extends string] {}
+/// Tags a map member whose keys are named K, not key.
+export class Key[K extends string] {}
+/// Tags a map member whose values are named K, not value.
+export class Value[K extends string] {}
+
+/// How a protocol writes what the tags leave open: pointed writes a whole float as 1.0, as awsQuery does, not 1;
+/// milliseconds a date-time to the millisecond, as some restXml services do.
+export class Style {
+	pointed: bool
+	milliseconds: bool
+
+	constructor(pointed: bool, milliseconds: bool) {
+		this.pointed = pointed
+		this.milliseconds = milliseconds
+	}
+
+	dates(): string { return if (this.milliseconds) "milliseconds" else "date-time" }
+}
+
+/// Into el, the element named n of v, of a member tagged tags: none for null, one per item for a flattened list.
+export function put[T](el: Node, n: string, v: T, tags: Type[], style: Style): void {
+	switch (T.kind) {
+		case "null": return
+		case "union": for (const M of T.members) {
+			if (v instanceof M) {
+				put(el, n, v, tags, style)
+			}
+		}
+		case "array":
+			const flat = has(tags, Flat)
+			const box = if (flat) el else child(el, n, tags)
+			const item = if (flat) n else if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
+			for (const x of v) {
+				put(box, item, x, if (flat && T.elem.kind == "tuple") tags else inner(tags), style)
+			}
+		case "tuple":
+			const e = child(el, n, if (has(tags, Flat)) tags else []) // a map's entry
+			for (const f of T.fields) {
+				const key = f.name == "0"
+				put(e, if (key) tag(tags, Key, "key") else tag(tags, Value, "value"), v[f.name],
+					if (key) [] else inner(tags), style)
+			}
+		case "class", "object":
+			const c = child(el, n, tags)
+			for (const f of T.fields) {
+				if (has(f.tags, Attr)) {
+					const s = text(v[f.name], f.tags, style)
+					if (s != "") {
+						c.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
+					}
+				} else {
+					put(c, tag(f.tags, Name, f.name), v[f.name], f.tags, style)
+				}
+			}
+		default: child(el, n, tags).insert(new Node("text", "", text(v, tags, style)))
+	}
+}
+
+/// The text of the scalar v of a member tagged tags, "" for null.
+export function text[T](v: T, tags: Type[], style: Style): string {
+	if (T.kind == "union") {
+		for (const M of T.members) {
+			if (M.kind != "null" && v instanceof M) {
+				return text(v, tags, style)
+			}
+		}
+		return ""
+	}
+	const s = format(v, tags, style.dates()) // a float's NaN and infinities as awsQuery has them too
+	if (style.pointed && (T == f64 || T == f32) && isFinite(v as f64) && indexOf(s, ".") < 0 && indexOf(s, "e") < 0) {
+		return `${s}.0` // a whole number as AWS writes it
+	}
+	return s
+}
+
+/// A new element named n, el's last child, in the namespace that tags give it.
+export function child(el: Node, n: string, tags: Type[]): Node {
+	const c = new Node("element", n)
+	namespace(c, tags, "")
+	el.insert(c)
+	return c
+}
+
+/// Declares on el the namespace that tags give it, else ns if not "".
+export function namespace(el: Node, tags: Type[], ns: string) {
+	for (const t of tags) {
+		if (t.base == Namespace) {
+			const p = t.args[1].value as string
+			el.attrs.push(new Attribute(if (p == "") "xmlns" else `xmlns:${p}`, t.args[0].value as string))
+			return
+		}
+	}
+	if (ns != "") {
+		el.attrs.push(new Attribute("xmlns", ns))
+	}
+}
+
+/// The XML of v's fields, an error's members besides its message; none if none is set.
+export function members[T](v: T, style: Style): string {
+	const el = new Node("element", "Error")
+	put(el, "Error", v, [], style)
+	const e = el.children[0]
+	if (e.children.length == 0) {
+		return "" // all null, an empty element without a closing tag
+	}
+	const xml = serialize(e)
+	return xml.slice(indexOf(xml, ">") + 1, lastIndexOf(xml, "<"))
+}
+
+export function root(s: string): Node throws Fault {
+	try {
+		const els = parse(s).children.filter(c => c.kind == "element")
+		if (els.length == 1) {
+			return els[0]
+		}
+	} catch (e: ParseError) {}
+	throw new Fault(400, "MalformedXML",
+		"The XML you provided was not well-formed or did not validate against our published schema")
+}
+
+/// The element of el of the member named n and tagged tags; of a flattened list, one holding all its items.
+export function member(el: Node, n: string, tags: Type[]): Node | null {
+	const named = el.children.filter(c => c.kind == "element" && c.name == n)
+	if (!has(tags, Flat) || named.length == 0) {
+		return if (named.length == 0) null else named[0]
+	}
+	const box = new Node("element", n)
+	box.children = named
+	return box
+}
+
+export function elements(el: Node, n: string): Node[] {
+	return el.children.filter(c => c.kind == "element" && c.name == n)
+}
+
+/// The T that the element el, named n, of a member tagged tags holds, at the member path at.
+export function read[T extends Decodable](el: Node, n: string, at: string, tags: Type[],
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			if (T.members.filter(M => M.kind == "class").length > 1) {
+				return variant[T](el, at, v)
+			}
+			if (enumerated(T)) {
+				return texts[T]([el.text()], at, tags, "date-time", v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return read[M](el, n, at, tags, v)
+				}
+			}
+			throw v.fault(el.text(), at, `Member must be a ${T.name}`)
+		case "array":
+			const xs: T = []
+			const flat = has(tags, Flat)
+			if (T.elem.kind == "tuple") {
+				let i = 0
+				for (const entry of elements(el, if (flat) n else "entry")) {
+					i++
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						const key = f.name == "0"
+						const c = elements(entry, if (key) tag(tags, Key, "key") else tag(tags, Value, "value"))
+						if (c.length == 0) {
+							throw v.fault(null, `${at}.${i}`, "Member must have a key and a value")
+						}
+						e[f.name] = read[f.type](c[0], c[0].name, `${at}.${if (key) "key" else "value"}`,
+							if (key) [] else inner(tags), v)
+					}
+					xs.push(e)
+				}
+			} else {
+				const item = if (flat) n else tag(tags, Member, "member")
+				const all = elements(el, item)
+				for (let i = 0; i < all.length; i++) {
+					xs.push(read[T.elem](all[i], item, `${at}.${i + 1}.member`, inner(tags), v))
+				}
+			}
+			check(xs, at, tags, v)
+			return xs
+		case "class":
+			const r = new T()
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const m = tag(f.tags, Name, f.name)
+				let found = false
+				if (has(f.tags, Attr)) {
+					const a = el.attr(m)
+					found = a != null
+					if (found) {
+						r[f.name] = texts[f.type]([a!], path(at, f.name), f.tags, "date-time", v)
+					}
+				} else {
+					const c = member(el, m, f.tags)
+					found = c != null
+					if (found) {
+						r[f.name] = read[f.type](c!, m, path(at, f.name), f.tags, v)
+					}
+				}
+				if (!found && !nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, path(at, f.name), "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		default: return texts[T]([el.text()], at, tags, "date-time", v)
+	}
+}
+
+function variant[T extends Decodable](el: Node, at: string, v: Violations): T throws Fault {
+	const set = el.children.filter(c => c.kind == "element")
+	for (const M of T.members) {
+		if (M.kind != "class") {
+			continue
+		}
+		const n = tag(M.fields[0].tags, Name, M.fields[0].name)
+		if (set.length == 1 && set[0].name == n) {
+			return read[M](el, el.name, at, [], v)
+		}
+	}
+	throw v.fault(null, at, "Member must have exactly one member set")
+}
+
+/// The tags of a list's items or a map's values, of those of their member: without its flattening and namespace.
+function inner(tags: Type[]): Type[] { return tags.filter(t => t.base != Flat && t.base != Namespace) }

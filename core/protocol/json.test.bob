@@ -1,0 +1,259 @@
+import { Fault } from "../fault"
+import { Caller, notImplemented, Unit } from "../service"
+import { Call, decode, Document, ErrorShape, error, result, Service } from "./json"
+import { Blob, Sensitive, Timestamp, Valid, Validation } from "./model"
+import { Request } from "std/http"
+
+// The inputs, outputs and bodies are after the Smithy awsJson specs' and protocol tests' examples.
+class GreetingStruct {
+	hi: string | null
+}
+
+class Scalars {
+	Name: string
+	Count: i32 | null
+	Big: i64 | null
+	Ratio: f64 | null
+	On: bool | null
+	Data: string | null @Blob
+	Epoch: i64 | null @Timestamp
+	At: i64 | null @Timestamp["date-time"]
+	Http: i64 | null @Timestamp["http-date"]
+	Mode: "fast" | "safe" | null
+	Doc: string | null @Document
+}
+
+class Collections {
+	Strings: string[] | null
+	Structs: GreetingStruct[] | null
+	Lists: string[][] | null
+	Maps: [string, string][][] | null
+	Map: [string, GreetingStruct][] | null
+	MapOfLists: [string, string[]][] | null
+	Sparse: (string | null)[] | null
+	SparseMap: [string, string | null][] | null
+	Stamps: i64[] | null @Timestamp
+}
+
+function message(why: string): string { return `1 validation error detected: ${why}` }
+
+test "scalars" {
+	const v = decode[Scalars](`{"Name": "n", "Count": -3, "Big": 1234567890123456789, "Ratio": 2.5, "On": true,
+		"Data": "dmFsdWU=", "Epoch": 1515531081.123, "At": "2020-01-05T20:13:26.5Z",
+		"Http": "Tue, 29 Apr 2014 18:30:38 GMT", "Mode": "safe", "Doc": {"a": [1, {"b": null}]}, "Unknown": 1}`)
+	assert v.Name == "n" && v.Count == -3 && v.Big == 1234567890123456789 && v.Ratio == 2.5 && v.On == true
+	assert v.Data == "value" && v.Mode == "safe" && v.Doc == `{"a": [1, {"b": null}]}`
+	assert v.Epoch == 1515531081_123_000_000 && v.At == 1578255206_500_000_000 && v.Http == 1398796238_000_000_000
+	const none = decode[Scalars](`{"Name": "", "Count": null}`)
+	assert none.Name == "" && none.Count == null && none.Epoch == null && none.Mode == null && none.Doc == null
+	const nan = decode[Scalars](`{"Name": "", "Ratio": "NaN"}`).Ratio!
+	assert nan != nan
+	assert decode[Scalars](`{"Name": "", "Ratio": "-Infinity"}`).Ratio == -1.0 / 0.0
+}
+
+test "collections" {
+	const v = decode[Collections](`{"Strings": ["a", "b"], "Structs": [{"hi": "x"}, {}], "Lists": [["a"], [], ["b", "c"]],
+		"Maps": [{"k": "v"}], "Map": {"one": {"hi": "y"}}, "MapOfLists": {"k": ["a", "b"]}, "Sparse": ["a", null],
+		"SparseMap": {"a": null, "b": "c"}, "Stamps": [1, 2.5]}`)
+	assert v.Strings == ["a", "b"] && v.Structs!.map(g => g.hi) == ["x", null] && v.Lists == [["a"], [], ["b", "c"]]
+	assert v.Maps == [[["k", "v"]]] && v.Map!.map(e => `${e[0]}=${e[1].hi}`) == ["one=y"]
+	assert v.MapOfLists == [["k", ["a", "b"]]] && v.Sparse == ["a", null] && v.SparseMap == [["a", null], ["b", "c"]]
+	assert v.Stamps == [1_000_000_000, 2_500_000_000]
+	const empty = decode[Collections]("")
+	assert empty.Strings == null && empty.Map == null
+}
+
+test "a missing required member" {
+	const why = message("Value null at 'name' failed to satisfy constraint: Member must not be null")
+	assert decode[Scalars](`{"Count": 1}`) throws new Fault(400, "ValidationException", why)
+	assert decode[Scalars](`{"Name": null}`) throws new Fault(400, "ValidationException", why)
+	const nested = message("Value null at 'items.2.member.name' failed to satisfy constraint: Member must not be null")
+	assert decode[Nested](`{"Items": [{"Name": "a"}, {"Count": 1}]}`) throws new Fault(400, "ValidationException",
+		nested)
+}
+
+class Nested {
+	Items: Scalars[] = []
+}
+
+function malformed(what: string, at: string, s: string): Fault {
+	return new Fault(400, "SerializationException", `Expected ${what} at ${at}, not ${s}`)
+}
+
+test "a value not of its type" {
+	const count = malformed("an integer", "'Count'", `"1"`)
+	assert decode[Scalars](`{"Name": "", "Count": "1"}`) throws count
+	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [safe, fast]")
+	assert decode[Scalars](`{"Name": "", "Mode": "slow"}`) throws new Fault(400, "ValidationException", mode)
+	const only = message("Value 'two' at 'only' failed to satisfy constraint: Member must satisfy enum value set: [one]")
+	assert decode[Single](`{"Only": "two"}`) throws new Fault(400, "ValidationException", only)
+	assert decode[Single](`{"Only": "one"}`).Only == "one"
+	assert decode[Collections](`{"Sparse": [1]}`) throws malformed("a string", "'Sparse.1'", "1")
+	assert decode[Collections](`{"Strings": ["a", null]}`) throws malformed("a string", "'Strings.2'", "null")
+	assert decode[Scalars]("{") throws malformed("an object", "the body", "{")
+}
+
+class Single {
+	Only: "one" = "one"
+}
+
+class Choosing$Name {
+	Name = ""
+}
+
+class Choosing$Ids {
+	Ids: string[] = []
+}
+
+type Choice = Choosing$Name | Choosing$Ids
+
+class Choosing {
+	One: Choice | null
+}
+
+test "a union" {
+	const name = decode[Choosing](`{"One": {"Name": "a"}}`).One
+	assert name instanceof Choosing$Name && name.Name == "a"
+	const ids = decode[Choosing](`{"One": {"__type": "Choice", "Ids": ["x", "y"], "Name": null}}`).One
+	assert ids instanceof Choosing$Ids && ids.Ids == ["x", "y"]
+	assert decode[Choosing](`{}`).One == null
+	const why = message("Value null at 'one' failed to satisfy constraint: Member must have exactly one member set")
+	assert decode[Choosing](`{"One": {"Name": "a", "Ids": []}}`) throws new Fault(400, "ValidationException", why)
+	assert decode[Choosing](`{"One": {"Other": "c"}}`) throws new Fault(400, "ValidationException", why)
+	const r = new Choosing()
+	const i = new Choosing$Ids()
+	i.Ids = ["x"]
+	r.One = i
+	assert result(r) == `{"One":{"Ids":["x"]}}`
+}
+
+class Choosings {
+	Short: string @Valid["3", "", ""]
+	Many: [string, Choice][] = []
+}
+
+test "a union the service words on its own" {
+	const worded = new Validation("ValidationException", true, [["Choosing", "empty", "several"]])
+	assert decode[Choosing](`{"One": {}}`, worded) throws new Fault(400, "ValidationException", "empty")
+	const both = `{"Short": "abc", "Many": {"a": {"Name": "a", "Ids": []}, "b": {}}}`
+	assert decode[Choosings](both, worded) throws new Fault(400, "ValidationException", "several")
+	// after the other violations
+	const short = message("Value 'ab' at 'short' failed to satisfy constraint: Member must have length greater than or equal to 3")
+	assert decode[Choosings](`{"Short": "ab", "Many": {"b": {}}}`,
+		worded) throws new Fault(400, "ValidationException", short)
+}
+
+class Secrets {
+	Plaintext: string | null @Blob @Valid["", "2", ""]
+	Token: string | null @Valid["4", "", ""] @Sensitive
+}
+
+test "values not quoted" {
+	const plaintext = message("Value at 'plaintext' failed to satisfy constraint: Member must have length less than or equal to 2")
+	assert decode[Secrets](`{"Plaintext": "YWJj"}`) throws new Fault(400, "ValidationException", plaintext)
+	const token = message("Value at 'token' failed to satisfy constraint: Member must have length greater than or equal to 4")
+	assert decode[Secrets](`{"Token": "abc"}`) throws new Fault(400, "ValidationException", token)
+}
+
+class Output {
+	binary: string @Blob = "value"
+	epoch: i64 @Timestamp = 1515531081_123_456_789
+	whole: i64 @Timestamp = 1398796238_000_000_000
+	date: i64 @Timestamp["date-time"] = 1578255206_520_000_000
+	http: i64 @Timestamp["http-date"] = 1398796238_000_000_000
+	n: i32 = 7
+	on = true
+	inf: f64 = 1.0 / 0.0
+	ratio: f32 = 1234.5
+	mode: "fast" | "safe" = "fast"
+	doc: string @Document = `{"a": [1]}`
+	none: string | null
+	nested = new GreetingStruct()
+	list: (string | null)[] = ["a", null]
+	map: [string, i32][] = [["k", 1]]
+	empty: [string, string][] = []
+}
+
+test "an output" {
+	assert result(new Output())
+		== `{"binary":"dmFsdWU=","epoch":1515531081.123,"whole":1398796238,`
+		+ `"date":"2020-01-05T20:13:26.52Z","http":"Tue, 29 Apr 2014 18:30:38 GMT","n":7,"on":true,"inf":"Infinity",`
+		+ `"ratio":1234.5,"mode":"fast","doc":{"a": [1]},"nested":{},"list":["a",null],"map":{"k":1},"empty":{}}`
+	assert result(new Unit()) == ""
+}
+
+function caller(): Caller { return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "id") }
+
+const json10 = new Service("smithy.example#Greeter", "1.0", false,
+	[new ErrorShape("smithy.example#Denied", "Message", "")])
+
+const compatible = new Service("smithy.example#Greeter", "1.0", true,
+	[new ErrorShape("smithy.example#Denied", "message", "AWS.Denied"), new ErrorShape("smithy.example#Bare", "", ""),
+	new ErrorShape("aws.other#InvalidException", "message", "Invalid")])
+
+const json11 = new Service("smithy.example#Greeter", "1.1", false, [])
+
+function call(service: Service, body: string, target: string = "Greeter.Greet"): Call {
+	return new Call(caller(), service, target, body)
+}
+
+test "serve" {
+	const unimplemented = call(json10, "{}").serve((c: Caller, input: GreetingStruct): GreetingStruct => {
+		throw notImplemented("Greet")
+	})
+	assert unimplemented.status == 501 && unimplemented.headers.get("content-type") == "application/x-amz-json-1.0"
+	const why = "The operation Greet is not implemented"
+	assert unimplemented.body.whole == `{"__type":"smithy.example#NotImplemented","message":"${why}"}`
+	const h = (c: Caller, input: GreetingStruct): GreetingStruct => {
+		if (input.hi == "no") {
+			throw new Fault(403, "Denied", "no")
+		}
+		return input
+	}
+	const ok = call(json10, `{"hi": "there"}`).serve(h)
+	assert ok.status == 200 && ok.headers.get("x-amzn-requestid") == "id" && ok.body.whole == `{"hi":"there"}`
+	const denied = call(json10, `{"hi": "no"}`).serve(h)
+	assert denied.status == 403 && denied.body.whole == `{"__type":"smithy.example#Denied","Message":"no"}`
+	const eleven = call(json11, `{"hi": "no"}`).serve(h)
+	assert eleven.headers.get("content-type") == "application/x-amz-json-1.1"
+	assert eleven.body.whole == `{"__type":"Denied","message":"no"}`
+	const malformed = call(json11, "[]").serve(h)
+	assert malformed.status == 400
+		&& malformed.body.whole
+		== `{"__type":"SerializationException","message":"Expected an object at the body, not []"}`
+}
+
+test "an empty input and output" {
+	let got: Unit | null = null
+	const res = call(json10, "").serve((c: Caller, input: Unit) => {
+		got = input
+		return input
+	})
+	assert got != null && res.status == 200 && res.body.whole == ""
+	assert res.headers.get("content-type") == "application/x-amz-json-1.0"
+}
+
+test "an unknown operation" {
+	const c = call(json10, "{}", "Other.Greet")
+	assert c.operation == "" && call(json10, "{}").operation == "Greet"
+	const res = c.unknownOperation()
+	assert res.status == 400
+	assert res.body.whole
+		== `{"__type":"smithy.example#UnknownOperationException","message":"Unknown operation Other.Greet"}`
+}
+
+test "awsQuery compatibility" {
+	const denied = error(compatible, new Fault(400, "Denied", "no"), "id")
+	assert denied.headers.get("x-amzn-query-error") == "AWS.Denied;Sender"
+	assert denied.body.whole == `{"__type":"smithy.example#Denied","message":"no"}`
+	const bare = error(compatible, new Fault(500, "Bare", "lost"), "id")
+	assert bare.headers.get("x-amzn-query-error") == "Bare;Receiver"
+		&& bare.body.whole == `{"__type":"smithy.example#Bare"}`
+	const other = error(compatible, new Fault(400, "aws.other#Thrown", "x", false), "id")
+	assert other.headers.get("x-amzn-query-error") == "Thrown;Receiver"
+	assert other.body.whole == `{"__type":"aws.other#Thrown","message":"x"}`
+	assert error(json10, new Fault(400, "Denied", "no"), "id").headers.get("x-amzn-query-error") == null
+	const listed = error(compatible, new Fault(400, "Invalid", "x"), "id")
+	assert listed.headers.get("x-amzn-query-error") == "Invalid;Sender"
+	assert listed.body.whole == `{"__type":"aws.other#InvalidException","message":"x"}`
+}
