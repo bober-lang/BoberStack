@@ -1,13 +1,17 @@
-//! AWS KMS: symmetric encryption keys and HMAC keys, their aliases, tags, key policies, grants, rotation and scheduled
-//! deletion; Encrypt, Decrypt, ReEncrypt and data keys under a real cipher (./ciphertext), GenerateMac and VerifyMac,
-//! GenerateRandom. Where AWS differs:
+//! AWS KMS: symmetric encryption keys, HMAC keys and Ed25519 signing keys, their aliases, tags, key policies, grants,
+//! rotation and scheduled deletion; Encrypt, Decrypt, ReEncrypt and data keys under a real cipher (./ciphertext),
+//! GenerateMac and VerifyMac, Sign, Verify and GetPublicKey, GenerateRandom. Where AWS differs:
 //!
 //! - Nothing runs between requests: a key scheduled for deletion stays pending, and unusable, but is never deleted;
 //!   automatic rotation never happens, though its NextRotationDate passes; on-demand rotation completes at once.
 //! - A ciphertext blob is BoberStack's own, sealed by XChaCha20-Poly1305, not AES-GCM, which std does not have.
-//! - Asymmetric keys, HMAC_224 and HMAC_384 (std has neither SHA-224 nor SHA-384), imported key material, custom key
-//!   stores and multi-Region replicas are not implemented: CreateKey answers NotImplemented for them. A multi-Region
-//!   key is only marked so.
+//! - Of asymmetric keys only ECC_NIST_EDWARDS25519 for SIGN_VERIFY is implemented, and of its algorithms only
+//!   ED25519_SHA_512: Sign and Verify answer NotImplemented for ED25519_PH_SHA_512, as std's Ed25519 has no prehash.
+//!   RSA, the NIST and SECG curves, SM2, ML-DSA and ML-KEM keys (std has none of their algorithms), HMAC_224 and
+//!   HMAC_384 (nor SHA-224 or SHA-384), imported key material, custom key stores and multi-Region replicas are not
+//!   implemented: CreateKey answers NotImplemented for them. A multi-Region key is only marked so.
+//! - The message of a signing algorithm used with a MessageType it does not take is not AWS's; those of CreateKey's
+//!   KeyUsage for an Ed25519 key are AWS's as seen.
 //! - Grants take effect at once; a grant token is not needed and not checked. ListRetirableGrants lists those of the
 //!   caller's account's keys only.
 //! - The AWS managed keys are those of the services listed below, made on first use of their alias by any operation
@@ -26,6 +30,8 @@ import { Blob, mac, open, parse, random, seal } from "./ciphertext"
 import { Alias, aliases, Grant, Key, keys, Material, save, saveAlias } from "./records"
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { isHexDigit } from "std/ascii"
+import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "std/crypto/curve25519"
+import { CryptoError } from "std/crypto/error"
 import { equal } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
@@ -35,6 +41,8 @@ import { day } from "std/time"
 /// The most plaintext Encrypt takes, and the on-demand rotations a key may have.
 const most = 4096
 const onDemand = 25
+/// The DER of an Ed25519 SubjectPublicKeyInfo up to its key's 32 bytes.
+const spki = "\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00"
 
 /// The AWS managed keys every account has in every region, made on first use: the last part of the alias, alias/aws/…;
 /// the signing name of the service that may use it; the service's name and what the key protects, as AWS words them.
@@ -58,6 +66,14 @@ export class Handler {
 		const expected = if (startsWith(spec, "HMAC_")) "GENERATE_VERIFY_MAC" else "ENCRYPT_DECRYPT"
 		const usage = input.KeyUsage ?? expected
 		const symmetric = spec == "SYMMETRIC_DEFAULT" || spec == "HMAC_256" || spec == "HMAC_512"
+		const edwards = spec == "ECC_NIST_EDWARDS25519"
+		if (edwards && input.KeyUsage == null) {
+			throw new Fault(400, "ValidationException",
+				"You must specify a KeyUsage value for all KMS keys except for symmetric encryption keys.")
+		}
+		if (edwards && usage != "SIGN_VERIFY") {
+			throw new Fault(400, "ValidationException", `KeyUsage ${usage} is not compatible with KeySpec ${spec}`)
+		}
 		if (symmetric && usage != expected) {
 			throw new Fault(400, "ValidationException",
 				`The operation failed because the KeyUsage value of the CMK is `
@@ -67,7 +83,7 @@ export class Handler {
 		if (origin != "AWS_KMS" || input.CustomKeyStoreId != null) {
 			throw notImplemented(`CreateKey of Origin ${origin}`)
 		}
-		if (!symmetric) {
+		if (!symmetric && !edwards) {
 			throw notImplemented(`CreateKey of KeySpec ${spec}`)
 		}
 		const tags = (input.Tags ?? []).map(t => [t.TagKey, t.TagValue] as [string, string])
@@ -474,6 +490,59 @@ export class Handler {
 		r.KeyId = f.key.arn
 		r.MacValid = true
 		r.MacAlgorithm = input.MacAlgorithm
+		return r
+	}
+
+	sign(caller: Caller, input: api.SignRequest): api.SignResponse throws Fault {
+		const kind = input.MessageType ?? "RAW"
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, signing(input.SigningAlgorithm, kind))
+		const seed = signer(f.key, "Sign", input.SigningAlgorithm, kind)
+		const r = new api.SignResponse()
+		try {
+			r.Signature = ed25519Sign(seed, input.Message)
+		} catch (e: CryptoError) {
+			throw new Fault(500, "InternalFailure", "A key's material does not sign")
+		}
+		r.KeyId = f.key.arn
+		r.SigningAlgorithm = input.SigningAlgorithm
+		return r
+	}
+
+	verify(caller: Caller, input: api.VerifyRequest): api.VerifyResponse throws Fault {
+		const kind = input.MessageType ?? "RAW"
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, signing(input.SigningAlgorithm, kind))
+		const pub = publicOf(signer(f.key, "Verify", input.SigningAlgorithm, kind))
+		let valid = false
+		try {
+			valid = input.Signature.length == 64 && ed25519Verify(pub, input.Message, input.Signature)
+		} catch (e: CryptoError) {}
+		if (!valid) {
+			throw api.kmsInvalidSignatureException("")
+		}
+		const r = new api.VerifyResponse()
+		r.KeyId = f.key.arn
+		r.SignatureValid = true
+		r.SigningAlgorithm = input.SigningAlgorithm
+		return r
+	}
+
+	getPublicKey(caller: Caller, input: api.GetPublicKeyRequest): api.GetPublicKeyResponse throws Fault {
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f)
+		usable(f.key)
+		if (f.key.usage != "SIGN_VERIFY") {
+			throw api.unsupportedOperationException(`${f.key.arn} key spec ${f.key.spec} does not have a public key.`)
+		}
+		const m = metadata(f.key)
+		const r = new api.GetPublicKeyResponse()
+		r.KeyId = f.key.arn
+		r.PublicKey = spki + publicOf(secretOf(current(f.key)))
+		r.CustomerMasterKeySpec = m.CustomerMasterKeySpec
+		r.KeySpec = m.KeySpec
+		r.KeyUsage = m.KeyUsage
+		r.SigningAlgorithms = m.SigningAlgorithms
 		return r
 	}
 
@@ -923,6 +992,41 @@ function macKey(k: Key, op: string, algorithm: string): string throws Fault {
 	return secretOf(current(k))
 }
 
+/// The context keys of a signature by the algorithm of a message of the kind.
+function signing(algorithm: api.SigningAlgorithmSpec, kind: api.MessageType): Context {
+	return [["kms:SigningAlgorithm", algorithm], ["kms:MessageType", kind]]
+}
+
+/// The current seed of the signing key k, as op uses it by the algorithm on a message of the kind: else the fault AWS
+/// answers. ED25519_SHA_512 takes a RAW message only, ED25519_PH_SHA_512 a RAW one or its SHA-512 DIGEST; EXTERNAL_MU
+/// is ML-DSA's.
+function signer(k: Key, op: string, algorithm: api.SigningAlgorithmSpec, kind: api.MessageType): string throws Fault {
+	usable(k)
+	if (k.usage != "SIGN_VERIFY") {
+		throw api.invalidKeyUsageException(`${k.arn} key usage is ${k.usage} which is not valid for ${op}.`)
+	}
+	if (algorithm != "ED25519_SHA_512" && algorithm != "ED25519_PH_SHA_512") {
+		throw api.invalidKeyUsageException(`Algorithm ${algorithm} is incompatible with key spec ${k.spec}.`)
+	}
+	if (kind == "EXTERNAL_MU" || algorithm == "ED25519_SHA_512" && kind == "DIGEST") {
+		throw new Fault(400, "ValidationException",
+			`MessageType ${kind} is not compatible with signing algorithm ${algorithm}.`)
+	}
+	if (algorithm == "ED25519_PH_SHA_512") {
+		throw notImplemented(`${op} of ED25519_PH_SHA_512`)
+	}
+	return secretOf(current(k))
+}
+
+/// The Ed25519 public key of seed.
+function publicOf(seed: string): string throws Fault {
+	try {
+		return ed25519PublicKey(seed)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", "A key's material is not an Ed25519 seed")
+	}
+}
+
 /// Throws unless k's material can rotate: only a symmetric encryption key's can.
 function rotatable(k: Key) throws Fault {
 	if (k.spec != "SYMMETRIC_DEFAULT") {
@@ -988,16 +1092,20 @@ function material(spec: string, t: i64, rotation: string): Material throws Fault
 		rotation: rotation }
 }
 
-/// The metadata of k, as DescribeKey gives it.
+/// The metadata of k, as DescribeKey gives it; the deprecated CustomerMasterKeySpec, of no Ed25519 value, only of the
+/// specs it names.
 function metadata(k: Key): api.KeyMetadata {
 	const m = { ...new api.KeyMetadata(), AWSAccountId: k.account, KeyId: k.id, Arn: k.arn, CreationDate: k.created,
 		Enabled: k.state == "Enabled", Description: k.description, KeyUsage: k.usage as api.KeyUsageType,
 		KeyState: k.state as api.KeyState, Origin: "AWS_KMS", KeyManager: k.manager as api.KeyManagerType,
-		CustomerMasterKeySpec: k.spec as api.CustomerMasterKeySpec, KeySpec: k.spec as api.KeySpec,
-		MultiRegion: k.multiRegion, DeletionDate: k.deleting, PendingDeletionWindowInDays: k.window }
+		CustomerMasterKeySpec: if (k.spec == "ECC_NIST_EDWARDS25519") null else k.spec as api.CustomerMasterKeySpec,
+		KeySpec: k.spec as api.KeySpec, MultiRegion: k.multiRegion, DeletionDate: k.deleting,
+		PendingDeletionWindowInDays: k.window }
 	if (k.usage == "ENCRYPT_DECRYPT") {
 		m.EncryptionAlgorithms = ["SYMMETRIC_DEFAULT"]
 		m.CurrentKeyMaterialId = current(k).id
+	} else if (k.usage == "SIGN_VERIFY") {
+		m.SigningAlgorithms = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
 	} else {
 		m.MacAlgorithms = [`HMAC_SHA_${k.spec.slice(5, k.spec.length)}` as api.MacAlgorithmSpec]
 	}

@@ -255,6 +255,31 @@ test "certificates: imported, read from their DER, and re-imported onto their AR
 		"Passed PEM could not be parsed.")
 }
 
+test "certificates searched by a tree of filter statements, sorted and paged" {
+	const g = gateway()
+	const a = request(g, `{"DomainName":"a.example.org","ValidationMethod":"DNS"}`)
+	const b = out[api.ImportCertificateResponse](call(g, "ImportCertificate", imported(pem, key))).CertificateArn!
+	const search = (body: string) => out[api.SearchCertificatesResponse](call(g, "SearchCertificates", body))
+	const both = search(`{"SortBy":"NOT_AFTER","SortOrder":"DESCENDING"}`).Results!
+	assert both.length == 2 && both[0].CertificateArn == b
+	const x = both[0].X509Attributes!
+	assert x.Subject!.CommonName == "rsa.example.com" && x.Subject!.Organization == "Example Org"
+	assert x.Issuer!.Country == "US" && x.KeyAlgorithm == "RSA_2048" && x.SubjectAlternativeNames!.length == 2
+	const m = (both[0].CertificateMetadata as api.CertificateMetadata$AcmCertificateMetadata).AcmCertificateMetadata
+	assert m.Type == "IMPORTED" && m.Status == "ISSUED" && m.CertificateKeyPairOrigin == "CUSTOMER_PROVIDED"
+	const page = search(`{"MaxResults":1}`)
+	assert page.Results!.length == 1 && page.NextToken != null
+	assert search(`{"NextToken":"${page.NextToken!}"}`).Results![0].CertificateArn != page.Results![0].CertificateArn
+	const dns = search(`{"FilterStatement":{"And":[{"Filter":{"X509AttributeFilter":{"SubjectAlternativeName":`
+		+ `{"DnsName":{"Value":"www.","ComparisonOperator":"CONTAINS"}}}}},{"Not":{"Filter":{"AcmCertificateMetadataFilter":`
+		+ `{"Type":"AMAZON_ISSUED"}}}}]}}`).Results!
+	assert dns.length == 1 && dns[0].CertificateArn == b
+	const either = search(`{"FilterStatement":{"Or":[{"Filter":{"CertificateArn":"${a}"}},{"Filter":{"X509AttributeFilter":`
+		+ `{"Subject":{"CommonName":{"Value":"rsa.example","ComparisonOperator":"EQUALS"}}}}}]}}`).Results!
+	assert either.length == 1 && either[0].CertificateArn == a
+	assert search(`{"FilterStatement":{"Filter":{"AcmCertificateMetadataFilter":{"InUse":true}}}}`).Results!.length == 0
+}
+
 test "account configuration: 45 days unless put" {
 	const g = gateway()
 	const read = () => out[api.GetAccountConfigurationResponse](call(g, "GetAccountConfiguration", `{}`))

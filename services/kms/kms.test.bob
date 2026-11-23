@@ -8,6 +8,7 @@ import { stack } from "../../stack"
 import * as api from "./api"
 import { decryptAs, encryptAs, Handler, keyArn } from "./kms"
 import { indexOf, startsWith } from "std/algo"
+import { ed25519Verify } from "std/crypto/curve25519"
 import { replace } from "std/string"
 import * as base64 from "std/encoding/base64"
 import { Request, Response } from "std/http"
@@ -222,6 +223,54 @@ test "HMAC keys generate and verify MACs, and are refused for encryption" {
 		`{"KeyId":"${h.KeyId}","Message":"${b64("hi")}","MacAlgorithm":"HMAC_SHA_256"}`), "InvalidKeyUsageException")
 	assert fails(call(g, "Encrypt", `{"KeyId":"${h.KeyId}","Plaintext":"${b64("x")}"}`), "InvalidKeyUsageException")
 	assert fails(call(g, "EnableKeyRotation", `{"KeyId":"${h.KeyId}"}`), "UnsupportedOperationException")
+}
+
+test "Ed25519 keys sign and verify, give their public key, and are refused what they do not do" {
+	const g = stack(new Catalog(0, 0))
+	assert fails(call(g, "CreateKey", `{"KeySpec":"ECC_NIST_EDWARDS25519"}`), "ValidationException",
+		"You must specify a KeyUsage value for all KMS keys except for symmetric encryption keys.")
+	assert fails(call(g, "CreateKey", `{"KeySpec":"ECC_NIST_EDWARDS25519","KeyUsage":"KEY_AGREEMENT"}`),
+		"ValidationException", "KeyUsage KEY_AGREEMENT is not compatible with KeySpec ECC_NIST_EDWARDS25519")
+	const k = key(g, `{"KeySpec":"ECC_NIST_EDWARDS25519","KeyUsage":"SIGN_VERIFY"}`)
+	assert k.KeySpec == "ECC_NIST_EDWARDS25519" && k.KeyUsage == "SIGN_VERIFY" && k.EncryptionAlgorithms == null
+	assert k.SigningAlgorithms!.length == 2 && k.SigningAlgorithms![1] == "ED25519_PH_SHA_512"
+	const msg = `"KeyId":"${k.KeyId}","Message":"${b64("hello")}"`
+	const s = out[api.SignResponse](call(g, "Sign", `{${msg},"SigningAlgorithm":"ED25519_SHA_512"}`)).Signature!
+	const pub = out[api.GetPublicKeyResponse](call(g, "GetPublicKey", `{"KeyId":"${k.KeyId}"}`))
+	assert pub.PublicKey!.length == 44 && pub.SigningAlgorithms!.length == 2 && pub.KeyUsage == "SIGN_VERIFY"
+	assert ed25519Verify(pub.PublicKey!.slice(12, 44), "hello", s)
+	assert out[api.VerifyResponse](call(g, "Verify",
+		`{${msg},"MessageType":"RAW","SigningAlgorithm":"ED25519_SHA_512","Signature":"${b64(s)}"}`)).SignatureValid
+	assert fails(call(g, "Verify",
+		`{"KeyId":"${k.KeyId}","Message":"${b64("hellO")}",`
+		+ `"SigningAlgorithm":"ED25519_SHA_512","Signature":"${b64(s)}"}`), "KMSInvalidSignatureException")
+	assert fails(call(g, "Sign", `{${msg},"MessageType":"DIGEST","SigningAlgorithm":"ED25519_SHA_512"}`),
+		"ValidationException")
+	assert fails(call(g, "Sign", `{${msg},"SigningAlgorithm":"ECDSA_SHA_256"}`), "InvalidKeyUsageException")
+	assert call(g, "Sign", `{${msg},"SigningAlgorithm":"ED25519_PH_SHA_512"}`).status == 501
+	assert fails(call(g, "Encrypt", `{"KeyId":"${k.KeyId}","Plaintext":"${b64("x")}"}`), "InvalidKeyUsageException",
+		"key usage is SIGN_VERIFY which is not valid for Encrypt.")
+	assert fails(call(g, "EnableKeyRotation", `{"KeyId":"${k.KeyId}"}`), "UnsupportedOperationException")
+	const sym = key(g)
+	assert fails(call(g, "Sign",
+		`{"KeyId":"${sym.KeyId}","Message":"${b64("x")}","SigningAlgorithm":"ED25519_SHA_512"}`),
+		"InvalidKeyUsageException", "key usage is ENCRYPT_DECRYPT which is not valid for Sign.")
+	assert fails(call(g, "GetPublicKey", `{"KeyId":"${sym.KeyId}"}`), "UnsupportedOperationException")
+	// alice may sign RAW messages only, of kms:MessageType; bob may verify by a grant.
+	const alice = user(g, "alice",
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:Sign",`
+		+ `"Resource":"*","Condition":{"StringEquals":{"kms:MessageType":"RAW","kms:SigningAlgorithm":"ED25519_SHA_512"}}}]}`)
+	assert call(g, "Sign", `{${msg},"SigningAlgorithm":"ED25519_SHA_512"}`, alice).status == 200
+	assert fails(call(g, "Sign", `{${msg},"MessageType":"DIGEST","SigningAlgorithm":"ED25519_SHA_512"}`, alice),
+		"AccessDeniedException", "kms:Sign")
+	const bob = user(g, "bob")
+	const verify = `{${msg},"SigningAlgorithm":"ED25519_SHA_512","Signature":"${b64(s)}"}`
+	assert fails(call(g, "Verify", verify, bob), "AccessDeniedException")
+	assert call(g, "CreateGrant",
+		`{"KeyId":"${k.KeyId}","GranteePrincipal":"arn:aws:iam::000000000000:user/bob",`
+		+ `"Operations":["Verify"]}`).status == 200
+	assert call(g, "Verify", verify, bob).status == 200
+	assert fails(call(g, "Sign", `{${msg},"SigningAlgorithm":"ED25519_SHA_512"}`, bob), "AccessDeniedException")
 }
 
 test "key policies and grants decide who may use a key, of its condition keys" {

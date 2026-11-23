@@ -14,8 +14,12 @@
 //!   requested to be exportable, and does not export that one: std has no cipher to encrypt its key with.
 //! - The operations of tags by resource refuse a certificate as AWS does; the wording of TagResource's and
 //!   UntagResource's refusal is ListTagsForResource's.
-//! - Private certificates, SearchCertificates and the ACME operations are not implemented; RenewCertificate, of
-//!   private certificates, does nothing.
+//! - SearchCertificates finds no certificate by key usage, extended key usage, renewal status, managing service, ACME
+//!   or private hierarchy, as none has them; CONTAINS compares case-sensitively; a requested certificate's issuer is
+//!   O=Amazon, and a distinguished name answers only its common name, organization and unit, country, state and
+//!   locality.
+//! - Private certificates and the ACME operations are not implemented; RenewCertificate, of private certificates, does
+//!   nothing.
 
 import { Fault } from "../../core/fault"
 import { Caller, notImplemented, Unit } from "../../core/service"
@@ -83,7 +87,7 @@ export class Handler {
 		const c = { ...new Certificate(), id: id, arn: arn, type: "AMAZON_ISSUED", domain: input.DomainName,
 			method: input.ValidationMethod ?? "EMAIL", keyAlgorithm: input.KeyAlgorithm ?? "RSA_2048",
 			serial: colons(number), token: input.IdempotencyToken, created: t, notBefore: t,
-			notAfter: t + validity * day, subject: `CN=${input.DomainName}`, issuer: "Amazon" }
+			notAfter: t + validity * day, subject: `CN=${input.DomainName}`, issuer: "Amazon", issuedBy: "O=Amazon" }
 		c.signatureAlgorithm = signature(c.keyAlgorithm)
 		c.body = selfSigned(names, number, t, c.notAfter, randomBytes(32))
 		for (const n of names) {
@@ -140,6 +144,7 @@ export class Handler {
 		c.serial = colons(p.serial)
 		c.subject = p.subject
 		c.issuer = p.issuerName
+		c.issuedBy = p.issuer
 		c.notBefore = p.notBefore
 		c.notAfter = p.notAfter
 		c.domain = p.commonName ?? (if (p.names.length > 0) p.names[0] else null)
@@ -282,6 +287,23 @@ export class Handler {
 
 	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
 		throw certificateResource(caller, "UntagResource", input.ResourceArn, "RemoveTagsFromCertificate")
+	}
+
+	searchCertificates(caller: Caller,
+		input: api.SearchCertificatesRequest): api.SearchCertificatesResponse throws Fault {
+		caller.allow("*")
+		const cs = all(certificates(caller.regional())).filter(c => input.FilterStatement == null
+			|| matches(c, input.FilterStatement!))
+		const descending = input.SortOrder == "DESCENDING"
+		const by = if (input.SortBy == "NOT_AFTER") (c: Certificate) => c.notAfter
+			else if (input.SortBy == "CREATED_AT") (c: Certificate) => c.created
+			else (c: Certificate) => 0 as i64
+		stableSort(cs, (a, b) => if (descending) by(a) > by(b) else by(a) < by(b))
+		const [from, to, next] = paged(cs.length, input.NextToken, input.MaxResults)
+		const r = new api.SearchCertificatesResponse()
+		r.Results = cs.slice(from, to).map(c => searched(c))
+		r.NextToken = next
+		return r
 	}
 
 	getAccountConfiguration(caller: Caller, input: Unit): api.GetAccountConfigurationResponse throws Fault {
@@ -510,6 +532,134 @@ function summary(c: Certificate): api.CertificateSummary {
 		s.IssuedAt = c.created
 	}
 	return s
+}
+
+/// Whether c meets the filter statement s.
+function matches(c: Certificate, s: api.CertificateFilterStatement): bool {
+	if (s instanceof api.CertificateFilterStatement$And) {
+		return s.And.every(x => matches(c, x))
+	}
+	if (s instanceof api.CertificateFilterStatement$Or) {
+		return s.Or.some(x => matches(c, x))
+	}
+	if (s instanceof api.CertificateFilterStatement$Not) {
+		return !matches(c, s.Not)
+	}
+	const f = (s as api.CertificateFilterStatement$Filter).Filter
+	if (f instanceof api.CertificateFilter$CertificateArn) {
+		return f.CertificateArn == c.arn
+	}
+	if (f instanceof api.CertificateFilter$X509AttributeFilter) {
+		return x509Matches(c, f.X509AttributeFilter)
+	}
+	return metadataMatches(c, (f as api.CertificateFilter$AcmCertificateMetadataFilter).AcmCertificateMetadataFilter)
+}
+
+/// Whether c's X.509 attributes meet f; it has no key usages and no extended key usages.
+function x509Matches(c: Certificate, f: api.X509AttributeFilter): bool {
+	if (f instanceof api.X509AttributeFilter$Subject) {
+		const cn = (f.Subject as api.SubjectFilter$CommonName).CommonName
+		return compared(distinguished(c.subject).CommonName ?? "", cn.ComparisonOperator, cn.Value)
+	}
+	if (f instanceof api.X509AttributeFilter$SubjectAlternativeName) {
+		const dns = (f.SubjectAlternativeName as api.SubjectAlternativeNameFilter$DnsName).DnsName
+		return c.domains.some(n => compared(n.name, dns.ComparisonOperator, dns.Value))
+	}
+	if (f instanceof api.X509AttributeFilter$KeyAlgorithm) {
+		return f.KeyAlgorithm == c.keyAlgorithm
+	}
+	if (f instanceof api.X509AttributeFilter$SerialNumber) {
+		return f.SerialNumber == c.serial
+	}
+	if (f instanceof api.X509AttributeFilter$NotAfter) {
+		return within(c.notAfter, f.NotAfter)
+	}
+	if (f instanceof api.X509AttributeFilter$NotBefore) {
+		return within(c.notBefore, f.NotBefore)
+	}
+	return false
+}
+
+/// Whether c's metadata meets f: it is issued, neither in use nor exported, managed by no service and renews by no
+/// ACME or private hierarchy.
+function metadataMatches(c: Certificate, f: api.AcmCertificateMetadataFilter): bool {
+	return if (f instanceof api.AcmCertificateMetadataFilter$Status) f.Status == "ISSUED"
+		else if (f instanceof api.AcmCertificateMetadataFilter$Type) f.Type == c.type
+		else if (f instanceof api.AcmCertificateMetadataFilter$InUse) !f.InUse
+		else if (f instanceof api.AcmCertificateMetadataFilter$Exported) !f.Exported
+		else if (f instanceof api.AcmCertificateMetadataFilter$ExportOption) f.ExportOption == c.exportable
+		else if (f instanceof api.AcmCertificateMetadataFilter$ValidationMethod) f.ValidationMethod == c.method
+		else if (f instanceof api.AcmCertificateMetadataFilter$CertificateKeyPairOrigin) f.CertificateKeyPairOrigin
+		== origin(c)
+		else false
+}
+
+/// Whether value meets the comparison with operand.
+function compared(value: string, operator: api.ComparisonOperator, operand: string): bool {
+	return if (operator == "EQUALS") value == operand else indexOf(value, operand) >= 0
+}
+
+/// Whether t is in the range, either end open if not given.
+function within(t: i64, r: api.TimestampRange): bool {
+	return (r.Start == null || t >= r.Start!) && (r.End == null || t <= r.End!)
+}
+
+/// The attributes of the distinguished name dn as RFC 2253 writes it, each its label and value.
+function attributes(dn: string): [string, string][] {
+	const out: [string, string][] = []
+	for (const part of split(dn, ",")) {
+		const eq = indexOf(part, "=")
+		if (eq > 0) {
+			out.push([part.slice(0, eq), part.slice(eq + 1, part.length)])
+		}
+	}
+	return out
+}
+
+/// The distinguished name dn as SearchCertificates answers it, of the attributes it has.
+function distinguished(dn: string): api.DistinguishedName {
+	const n = new api.DistinguishedName()
+	for (const [label, value] of attributes(dn)) {
+		if (label == "CN") {
+			n.CommonName = value
+		} else if (label == "O") {
+			n.Organization = value
+		} else if (label == "OU") {
+			n.OrganizationalUnit = value
+		} else if (label == "C") {
+			n.Country = value
+		} else if (label == "ST") {
+			n.State = value
+		} else if (label == "L") {
+			n.Locality = value
+		}
+	}
+	return n
+}
+
+/// c as SearchCertificates answers it.
+function searched(c: Certificate): api.CertificateSearchResult {
+	const x = { ...new api.X509Attributes(), Subject: distinguished(c.subject), Issuer: distinguished(c.issuedBy),
+		ExtendedKeyUsages: [], KeyUsages: [], KeyAlgorithm: c.keyAlgorithm as api.KeyAlgorithm, SerialNumber: c.serial,
+		NotBefore: c.notBefore, NotAfter: c.notAfter }
+	if (c.domains.length > 0) {
+		x.SubjectAlternativeNames = c.domains.map(n => {
+			const g: api.GeneralName = { ...new api.GeneralName$DnsName(), DnsName: n.name }
+			return g
+		})
+	}
+	const m = { ...new api.AcmCertificateMetadata(), CreatedAt: c.created, Exported: false, InUse: false,
+		RenewalEligibility: "INELIGIBLE", Status: "ISSUED", Type: c.type as api.CertificateType,
+		ExportOption: c.exportable as api.CertificateExport,
+		CertificateKeyPairOrigin: origin(c) as api.CertificateKeyPairOrigin }
+	if (c.type == "IMPORTED") {
+		m.ImportedAt = c.imported
+	} else {
+		m.IssuedAt = c.created
+		m.ValidationMethod = c.method as api.ValidationMethod
+	}
+	return { ...new api.CertificateSearchResult(), CertificateArn: c.arn, X509Attributes: x,
+		CertificateMetadata: { ...new api.CertificateMetadata$AcmCertificateMetadata(), AcmCertificateMetadata: m } }
 }
 
 /// Where the key pair of c comes from.
