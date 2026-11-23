@@ -5,8 +5,10 @@
 //! SetAlarmState, whose state holds to the end of the alarm's period, its actions are delivered within the request, if
 //! enabled, by a direct call of SNS's Publish as the principal cloudwatch.amazonaws.com on behalf of the alarm's ARN,
 //! so that the topic's policy decides, the message CloudWatch's alarm JSON. A dashboard's body is checked for what AWS
-//! requires of it, an object of widgets each of a type, and kept as given. Composite alarms, anomaly detectors, insight
-//! rules, metric streams and the rest are not implemented. Where AWS differs:
+//! requires of it, an object of widgets each of a type, and kept as given. A composite alarm is evaluated with its
+//! children, and again whenever one of them changes state; it can be ALARM or OK only. An anomaly detector of a single
+//! metric is stored as put, and never trained: it stays PENDING_TRAINING, and no alarm uses its band. Detectors of
+//! metric math, insight rules, metric streams and the rest are not implemented. Where AWS differs:
 //!
 //! - Retention is of the request's time: data older than 15 months is not read, nor that of a period under 5 minutes
 //!   older than 15 days or under an hour older than 63 days; a metric without data put in two weeks is not listed.
@@ -19,20 +21,22 @@
 //!   period of the request's first metric. GetMetricData answers in one page, MaxDatapoints aside.
 //! - Only alarms of a single metric are evaluated; one of metric math stays as it is but by SetAlarmState. Only actions
 //!   of SNS are delivered; an alarm message's Region is the region's code, its reason in short words, and the alarm's
-//!   StateReasonData is not given. An alarm has no CreationId, which the model lacks, and its Threshold is written as
-//!   the codec writes a number, 1 where AWS writes 1.0.
+//!   StateReasonData is not given.
+//! - A composite alarm's rule knows TRUE, FALSE, NOT, AND, OR and the three states; AT_LEAST is a syntax error. The
+//!   reason of a change a child makes is worded more briefly than AWS words it.
 //! - DescribeAlarmHistory answers in one page, MaxRecords aside.
 //! - A dashboard's body is checked for its widgets' types only, and its Size is the body's length, where AWS counts
 //!   more.
 
 import { Fault } from "../../core/fault"
-import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
+import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as snsApi from "../sns/api"
 import * as api from "./api"
+import { holds, names, parse, Rule, SyntaxError } from "./rule"
 
-import { Alarm, alarms, Dashboard, dashboards, History, history, key, padded, Sample, samples, save, Series,
-	series } from "./records"
+import { Alarm, alarms, Dashboard, dashboards, Detector, detectors, History, history, key, padded, Sample, samples,
+	save, Series, series } from "./records"
 
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
@@ -349,7 +353,8 @@ export class Handler {
 			}
 		}
 		const t = now()
-		const a = found ?? { ...new Alarm(), stateUpdated: t, transitioned: t }
+		const a = found
+			?? { ...new Alarm(), stateUpdated: t, transitioned: t, creationId: `${caller.requestId}/${t / 1_000_000}` }
 		a.name = input.AlarmName
 		a.description = input.AlarmDescription
 		a.actionsEnabled = input.ActionsEnabled ?? true
@@ -442,6 +447,107 @@ export class Handler {
 		return new api.DeleteDashboardsOutput()
 	}
 
+	putAnomalyDetector(caller: Caller, input: api.PutAnomalyDetectorInput): api.PutAnomalyDetectorOutput throws Fault {
+		const d = detectorOf(input.SingleMetricAnomalyDetector, input.MetricMathAnomalyDetector != null,
+			input.Namespace, input.MetricName, input.Dimensions, input.Stat)
+		d.configuration = input.Configuration
+		save(detectors(caller.regional()), detectorKey(d), d)
+		return new api.PutAnomalyDetectorOutput()
+	}
+
+	describeAnomalyDetectors(caller: Caller,
+		input: api.DescribeAnomalyDetectorsInput): api.DescribeAnomalyDetectorsOutput throws Fault {
+		const out = new api.DescribeAnomalyDetectorsOutput()
+		out.AnomalyDetectors = []
+		const types = input.AnomalyDetectorTypes ?? ["SINGLE_METRIC"]
+		if (!types.includes("SINGLE_METRIC")) {
+			return out
+		}
+		const filters = dimensionsOf(input.Dimensions ?? [], "Dimensions")
+		for (const [_, d] of detectors(caller.regional()).scan()) {
+			if ((input.Namespace == null || input.Namespace == d.namespace)
+				&& (input.MetricName == null || input.MetricName == d.name)
+				&& filters.every(f => d.dimensions.some(x => x[0] == f[0] && x[1] == f[1]))) {
+				const dims = d.dimensions.map(x => ({ ...new api.Dimension(), Name: x[0], Value: x[1] }))
+				const a = new api.AnomalyDetector()
+				a.Namespace = d.namespace
+				a.MetricName = d.name
+				a.Dimensions = dims
+				a.Stat = d.stat
+				a.Configuration = d.configuration
+					?? { ...new api.AnomalyDetectorConfiguration(), ExcludedTimeRanges: [] }
+				a.StateValue = "PENDING_TRAINING"
+				a.SingleMetricAnomalyDetector = { ...new api.SingleMetricAnomalyDetector(), Namespace: d.namespace,
+					MetricName: d.name, Dimensions: dims, Stat: d.stat }
+				out.AnomalyDetectors!.push(a)
+			}
+		}
+		return out
+	}
+
+	deleteAnomalyDetector(caller: Caller,
+		input: api.DeleteAnomalyDetectorInput): api.DeleteAnomalyDetectorOutput throws Fault {
+		const d = detectorOf(input.SingleMetricAnomalyDetector, input.MetricMathAnomalyDetector != null,
+			input.Namespace, input.MetricName, input.Dimensions, input.Stat)
+		if (!detectors(caller.regional()).delete(detectorKey(d))) {
+			throw api.resourceNotFoundException("This anomaly detection model does not exist")
+		}
+		return new api.DeleteAnomalyDetectorOutput()
+	}
+
+	putCompositeAlarm(caller: Caller, input: api.PutCompositeAlarmInput): Unit throws Fault {
+		const tags: [string, string][] = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		caller.actions = caller.actions.filter(a => a == "cloudwatch:PutCompositeAlarm" || tags.length > 0)
+		const name = input.AlarmName
+		const db = alarms(caller.regional())
+		const found = db.get(name)
+		const context = requestTags(tags)
+		if (found != null) {
+			context.append(resourceTags(found!.tags))
+		}
+		caller.allow(alarmArn(caller, name), null, context)
+		const children = names(ruleOf(input.AlarmRule))
+		if (children.includes(name) || children.some(c => this.reaches(db, c, name, 0))) {
+			throw api.validationException("A composite alarm cannot have a child relation with itself via its AlarmRule, "
+				+ "as it would introduce a circular dependency")
+		}
+		const missing = children.filter(c => db.get(c) == null)
+		if (missing.length > 0) {
+			throw api.validationException(`Could not save the composite alarm as alarms `
+				+ `[${missing.map(c => alarmArn(caller, c)).join(", ")}] in the alarm rule do not exist`)
+		}
+		for (const a of [...input.OKActions ?? [], ...input.AlarmActions ?? [],
+			...input.InsufficientDataActions ?? []]) {
+			if (!startsWith(a, "arn:")) {
+				throw api.validationException(`Invalid arn syntax: ${a}`)
+			}
+		}
+		const t = now()
+		const a = found
+			?? { ...new Alarm(), stateUpdated: t, transitioned: t, creationId: `${caller.requestId}/${t / 1_000_000}` }
+		a.name = name
+		a.description = input.AlarmDescription
+		a.actionsEnabled = input.ActionsEnabled ?? true
+		a.ok = input.OKActions ?? []
+		a.alarm = input.AlarmActions ?? []
+		a.insufficient = input.InsufficientDataActions ?? []
+		a.rule = input.AlarmRule
+		a.children = children
+		a.updated = t
+		for (const [k, v] of tags) {
+			a.tags = a.tags.filter(x => x[0] != k)
+			a.tags.push([k, v])
+		}
+		save(db, name, a)
+		const verb = if (found == null) "created" else "updated"
+		note(caller, name, "ConfigurationUpdate", `Alarm "${name}" ${verb}`, "", t)
+		const state = this.ruled(caller, a, t)
+		a.reasonData = this.triggering(caller, a)
+		this.change(caller, a, state, `${alarmArn(caller, name)} was ${verb} and its alarm rule evaluates to ${state}`,
+			t, found == null)
+		return new Unit()
+	}
+
 	describeAlarms(caller: Caller, input: api.DescribeAlarmsInput): api.DescribeAlarmsOutput throws Fault {
 		caller.allow("*")
 		const most = input.MaxRecords ?? 50
@@ -454,12 +560,53 @@ export class Handler {
 		out.MetricAlarms = []
 		out.CompositeAlarms = []
 		out.LogAlarms = []
-		if (!types.includes("MetricAlarm")) {
+		const t = now()
+		const db = alarms(caller.regional())
+		const related = input.ChildrenOfAlarmName ?? input.ParentsOfAlarmName
+		if (related != null) {
+			const by = if (input.ChildrenOfAlarmName != null) "ChildrenOfAlarmName" else "ParentsOfAlarmName"
+			if (input.ActionPrefix != null || input.AlarmNamePrefix != null || input.AlarmNames != null
+				|| input.AlarmTypes != null || input.StateValue != null) {
+				throw api.validationException(`${by} requests cannot be used with the following parameters: ActionPrefix, `
+					+ "AlarmNamePrefix, AlarmNames, AlarmTypes, StateValue")
+			}
+			const of = db.get(related!)
+			const kin: Alarm[] = []
+			if (by == "ParentsOfAlarmName") {
+				for (const [_, p] of db.scan()) {
+					if (p.children.includes(related!)) {
+						kin.push(p)
+					}
+				}
+			} else if (of != null) {
+				for (const c of of!.children) {
+					const a = db.get(c)
+					if (a != null) {
+						kin.push(a!)
+					}
+				}
+			}
+			for (const found of kin) {
+				const a = this.evaluate(caller, found, t)
+				if (a.rule == null) {
+					out.MetricAlarms!.push({ ...new api.MetricAlarm(), AlarmName: a.name,
+						AlarmArn: alarmArn(caller, a.name), StateValue: a.state as api.StateValue,
+						StateUpdatedTimestamp: a.stateUpdated, StateTransitionedTimestamp: a.transitioned })
+				} else {
+					out.CompositeAlarms!.push({ ...new api.CompositeAlarm(), AlarmName: a.name,
+						AlarmArn: alarmArn(caller, a.name), StateValue: a.state as api.StateValue,
+						StateUpdatedTimestamp: a.stateUpdated, StateTransitionedTimestamp: a.transitioned })
+				}
+			}
 			return out
 		}
-		const t = now()
 		const names = input.AlarmNames ?? []
-		for (const [_, found] of alarms(caller.regional()).scan(input.NextToken)) {
+		let shown = 0
+		let last = ""
+		for (const [_, found] of db.scan(input.NextToken)) {
+			if (!types.includes(if (found.rule == null) "MetricAlarm" else "CompositeAlarm")) {
+				continue
+			}
 			const a = this.evaluate(caller, found, t)
 			const named = names.length == 0 || names.includes(a.name)
 			const prefixed = input.AlarmNamePrefix == null || startsWith(a.name, input.AlarmNamePrefix!)
@@ -467,11 +614,17 @@ export class Handler {
 			const action = input.ActionPrefix == null
 				|| [...a.ok, ...a.alarm, ...a.insufficient].some(x => startsWith(x, input.ActionPrefix!))
 			if (named && prefixed && state && action) {
-				if (out.MetricAlarms!.length == most) {
-					out.NextToken = out.MetricAlarms![most - 1].AlarmName
+				if (shown == most) {
+					out.NextToken = last
 					return out
 				}
-				out.MetricAlarms!.push(described(caller, a))
+				if (a.rule == null) {
+					out.MetricAlarms!.push(described(caller, a))
+				} else {
+					out.CompositeAlarms!.push(composite(caller, a))
+				}
+				shown++
+				last = a.name
 			}
 		}
 		return out
@@ -508,6 +661,15 @@ export class Handler {
 		const db = caller.regional()
 		for (const name of input.AlarmNames) {
 			caller.allow(alarmArn(caller, name))
+		}
+		for (const [_, p] of alarms(db).scan()) {
+			for (const c of p.children) {
+				if (input.AlarmNames.includes(c) && !input.AlarmNames.includes(p.name)) {
+					throw api.validationException(`Cannot delete ${c} as there are composite alarm(s) depending on it.`)
+				}
+			}
+		}
+		for (const name of input.AlarmNames) {
 			if (alarms(db).delete(name)) {
 				for (const [k, _] of history(db).scan(null, 1000000, `${name}\x00`)) {
 					history(db).delete(k)
@@ -640,6 +802,16 @@ export class Handler {
 
 	/// a evaluated at t, its state changed if its data say so.
 	private evaluate(caller: Caller, a: Alarm, t: i64): Alarm throws Fault {
+		if (a.rule != null && t >= a.held) {
+			const state = this.ruled(caller, a, t)
+			const now = alarms(caller.regional()).get(a.name) ?? a
+			if (state == now.state) {
+				return now
+			}
+			now.reasonData = this.triggering(caller, now)
+			return this.change(caller, now, state, `${alarmArn(caller, a.name)} alarm rule evaluates to ${state}`, t,
+				false)
+		}
 		if (a.metric == null || a.period <= 0 || t < a.held) {
 			return a
 		}
@@ -686,6 +858,47 @@ export class Handler {
 		return this.change(caller, a, "OK", why, t, false)
 	}
 
+	/// The state the rule of the composite alarm a gives at t, its children evaluated first.
+	private ruled(caller: Caller, a: Alarm, t: i64): string throws Fault {
+		const db = alarms(caller.regional())
+		const states: [string, string][] = []
+		for (const n of a.children) {
+			const c = db.get(n)
+			if (c != null) {
+				states.push([n, this.evaluate(caller, c!, t).state])
+			}
+		}
+		const r = ruleOf(a.rule ?? "FALSE")
+		const of = (n: string): string => {
+			const f = states.find(x => x[0] == n)
+			return if (f == null) "" else f[1]
+		}
+		return if (holds(r, of)) "ALARM" else "OK"
+	}
+
+	/// The data of the reason of the composite alarm a: its children's states.
+	private triggering(caller: Caller, a: Alarm): string {
+		const db = alarms(caller.regional())
+		const items: string[] = []
+		for (const n of a.children) {
+			const c = db.get(n)
+			if (c != null) {
+				items.push(`{"arn":${json.quoted(alarmArn(caller, n))},"state":{"value":${json.quoted(c!.state)},`
+					+ `"timestamp":${json.quoted(stamped(c!.stateUpdated))}}}`)
+			}
+		}
+		return `{"triggeringAlarms":[${items.join(",")}]}`
+	}
+
+	/// Whether the alarm from names, or one its rule names, at depth, is target.
+	private reaches(db: Table[Alarm], from: string, target: string, depth: i32): bool {
+		const a = db.get(from)
+		if (a == null || depth > 100) {
+			return false
+		}
+		return a!.children.includes(target) || a!.children.some(c => this.reaches(db, c, target, depth + 1))
+	}
+
 	/// a in state, for reason, at t, saved, its history noted and its actions delivered if it changes, or if forced.
 	private change(caller: Caller, a: Alarm, state: string, reason: string, t: i64, forced = true): Alarm throws Fault {
 		if (a.state == state && !forced) {
@@ -704,6 +917,13 @@ export class Handler {
 		const data = `{"version":"1.0","oldState":{"stateValue":${json.quoted(old)},"stateReason":${json.quoted(was)}},`
 			+ `"newState":{"stateValue":${json.quoted(state)},"stateReason":${json.quoted(reason)}}}`
 		note(caller, a.name, "StateUpdate", `Alarm updated from ${old} to ${state}`, data, t)
+		if (changed) {
+			for (const [_, p] of alarms(caller.regional()).scan()) {
+				if (p.children.includes(a.name)) {
+					this.evaluate(caller, p, t)
+				}
+			}
+		}
 		if (!a.actionsEnabled) {
 			return a
 		}
@@ -1238,6 +1458,27 @@ function dimensionsOf(ds: api.Dimension[], at: string): [string, string][] throw
 	return out
 }
 
+/// The detector that single, or else the members of the request before it, name; one of metric math is not implemented.
+function detectorOf(single: api.SingleMetricAnomalyDetector | null, math: bool, namespace: string | null,
+	name: string | null, dimensions: api.Dimension[] | null, stat: string | null): Detector throws Fault {
+	if (math) {
+		throw notImplemented("MetricMathAnomalyDetector")
+	}
+	const d = new Detector()
+	d.namespace = single?.Namespace ?? namespace ?? ""
+	d.name = single?.MetricName ?? name ?? ""
+	d.dimensions = dimensionsOf(single?.Dimensions ?? dimensions ?? [], "Dimensions")
+	d.stat = single?.Stat ?? stat ?? ""
+	for (const [member, v] of [["Namespace", d.namespace], ["MetricName", d.name], ["Stat", d.stat]]) {
+		if (v == "") {
+			throw api.missingRequiredParameterException(`The parameter ${member} is required.`)
+		}
+	}
+	return d
+}
+
+function detectorKey(d: Detector): string { return `${key(d.namespace, d.name, d.dimensions)}\x01${d.stat}` }
+
 /// The ARN of the dashboard name, which names no region.
 function dashboardArn(caller: Caller, name: string): string {
 	return `arn:aws:cloudwatch::${caller.account}:dashboard/${name}`
@@ -1458,6 +1699,36 @@ function stamped(t: i64): string {
 	return `${rfc3339(t - t % second).slice(0, 19)}.${"000".slice(0, 3 - ms.length)}${ms}+0000`
 }
 
+/// The rule s spells, answered as AWS answers one that does not parse.
+function ruleOf(s: string): Rule throws Fault {
+	try {
+		return parse(s)
+	} catch (e: SyntaxError) {
+		throw api.validationException(e.message)
+	}
+}
+
+/// The composite alarm a as DescribeAlarms answers it.
+function composite(caller: Caller, a: Alarm): api.CompositeAlarm {
+	const c = new api.CompositeAlarm()
+	c.AlarmName = a.name
+	c.AlarmArn = alarmArn(caller, a.name)
+	c.CreationId = a.creationId
+	c.AlarmDescription = a.description
+	c.AlarmRule = a.rule
+	c.AlarmConfigurationUpdatedTimestamp = a.updated
+	c.ActionsEnabled = a.actionsEnabled
+	c.OKActions = a.ok
+	c.AlarmActions = a.alarm
+	c.InsufficientDataActions = a.insufficient
+	c.StateValue = a.state as api.StateValue
+	c.StateReason = a.reason
+	c.StateReasonData = a.reasonData
+	c.StateUpdatedTimestamp = a.stateUpdated
+	c.StateTransitionedTimestamp = a.transitioned
+	return c
+}
+
 /// The ARN of the alarm named name.
 function alarmArn(caller: Caller, name: string): string {
 	return `arn:aws:cloudwatch:${caller.region}:${caller.account}:alarm:${name}`
@@ -1485,6 +1756,7 @@ function described(caller: Caller, a: Alarm): api.MetricAlarm {
 	const m = new api.MetricAlarm()
 	m.AlarmName = a.name
 	m.AlarmArn = alarmArn(caller, a.name)
+	m.CreationId = a.creationId
 	m.AlarmDescription = a.description
 	m.AlarmConfigurationUpdatedTimestamp = a.updated
 	m.ActionsEnabled = a.actionsEnabled

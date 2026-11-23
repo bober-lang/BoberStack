@@ -1,0 +1,310 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"CreationId"
+	],
+	"ignored": [
+		"StateUpdatedTimestamp",
+		"AlarmConfigurationUpdatedTimestamp",
+		"StateTransitionedTimestamp",
+		"Timestamp",
+		"StateReasonData"
+	],
+	"steps": [
+		{
+			"name": "put a child",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-a",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold",
+				"ActionsEnabled": "false"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutMetricAlarmResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutMetricAlarmResponse>\n"
+			}
+		},
+		{
+			"name": "put a composite",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-c",
+				"AlarmRule": "ALARM(\"${prefix}-a\") OR (NOT OK(${prefix}-a) AND FALSE)",
+				"ActionsEnabled": "false"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutCompositeAlarmResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutCompositeAlarmResponse>\n"
+			}
+		},
+		{
+			"name": "describe it",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-c",
+				"AlarmTypes.member.1": "CompositeAlarm"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms>\n      <member>\n        <AlarmConfigurationUpdatedTimestamp>x-x-x:x:x.x</AlarmConfigurationUpdatedTimestamp>\n        <StateValue>OK</StateValue>\n        <AlarmName>boberstack-ab-00000000-c</AlarmName>\n        <StateReason>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-c was created and its alarm rule evaluates to OK</StateReason>\n        <InsufficientDataActions/>\n        <StateReasonData>{&quot;triggeringAlarms&quot;:[{&quot;arn&quot;:&quot;arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-a&quot;,&quot;state&quot;:{&quot;value&quot;:&quot;INSUFFICIENT_DATA&quot;,&quot;timestamp&quot;:&quot;2026-11-23T03:41:18.109+0000&quot;}}]}</StateReasonData>\n        <ActionsEnabled>false</ActionsEnabled>\n        <AlarmRule>ALARM(&quot;boberstack-ab-00000000-a&quot;) OR (NOT OK(boberstack-ab-00000000-a) AND FALSE)</AlarmRule>\n        <StateTransitionedTimestamp>x-x-x:x:x.x</StateTransitionedTimestamp>\n        <CreationId>x-x-x-x-x</CreationId>\n        <OKActions/>\n        <AlarmActions/>\n        <AlarmArn>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-c</AlarmArn>\n        <StateUpdatedTimestamp>x-x-x:x:x.x</StateUpdatedTimestamp>\n      </member>\n    </CompositeAlarms>\n    <MetricAlarms/>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "describe it as a metric alarm",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-c"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms/>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "its children",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"ChildrenOfAlarmName": "${prefix}-c",
+				"AlarmTypes.member.1": "CompositeAlarm",
+				"AlarmTypes.member.2": "MetricAlarm"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>ChildrenOfAlarmName requests cannot be used with the following parameters: ActionPrefix, AlarmNamePrefix, AlarmNames, AlarmTypes, StateValue</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the child's parents",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"ParentsOfAlarmName": "${prefix}-a",
+				"AlarmTypes.member.1": "CompositeAlarm"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>ParentsOfAlarmName requests cannot be used with the following parameters: ActionPrefix, AlarmNamePrefix, AlarmNames, AlarmTypes, StateValue</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "children without types",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"ChildrenOfAlarmName": "${prefix}-c"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms>\n      <member>\n        <StateValue>INSUFFICIENT_DATA</StateValue>\n        <StateTransitionedTimestamp>x-x-x:x:x.x</StateTransitionedTimestamp>\n        <StateUpdatedTimestamp>x-x-x:x:x.x</StateUpdatedTimestamp>\n        <AlarmName>boberstack-ab-00000000-a</AlarmName>\n        <AlarmArn>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-a</AlarmArn>\n      </member>\n    </MetricAlarms>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "a rule unclosed",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-d",
+				"AlarmRule": "ALARM(${prefix}-a"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Error in AlarmRule [Unsupported token '&lt;EOF&gt;' at char 30]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "a rule of an unknown function",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-d",
+				"AlarmRule": "RED(${prefix}-a)"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Error in AlarmRule [Unsupported token 'RED' at char 0, must be: '(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "a rule of a missing alarm",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-d",
+				"AlarmRule": "ALARM(${prefix}-none)"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Could not save the composite alarm as alarms [arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-none] in the alarm rule do not exist</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "a rule of a dangling operator",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-d",
+				"AlarmRule": "ALARM(${prefix}-a) AND"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Error in AlarmRule [Unsupported token '&lt;EOF&gt;' at char 35, must be: '(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "a composite of itself",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutCompositeAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-c",
+				"AlarmRule": "ALARM(${prefix}-c)"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>A composite alarm cannot have a child relation with itself via its AlarmRule, as it would introduce a circular dependency</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the child",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Cannot delete boberstack-ab-00000000-a as there are composite alarm(s) depending on it.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the composite",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-c"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "delete the child now",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the composites",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-c",
+				"AlarmNames.member.2": "${prefix}-d"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "delete the child",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		}
+	]
+}

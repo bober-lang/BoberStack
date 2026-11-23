@@ -216,3 +216,20 @@ test "PutMetricAlarm checks its period and comparison, and alarms are tagged" {
 	assert call(g, "ListTagsForResource", [["ResourceARN", `${arn}x`]]).status == 404
 	assert fails(call(g, "DescribeAlarms", [["MaxRecords", "0"]]), 400, "ValidationError")
 }
+
+test "anomaly detectors are stored, of either form of request, and deleted" {
+	const g = gateway(new Topics())
+	assert call(g, "PutAnomalyDetector", [...metric, ["Stat", "Average"]]).status == 200
+	const single: [string, string][] = [["SingleMetricAnomalyDetector.Namespace", "n"],
+		["SingleMetricAnomalyDetector.MetricName", "m"], ["SingleMetricAnomalyDetector.Stat", "Maximum"]]
+	assert call(g, "PutAnomalyDetector", single).status == 200
+	const found = call(g, "DescribeAnomalyDetectors", [["Namespace", "n"]])
+	assert texts(found, "Stat") == ["Average", "Average", "Maximum", "Maximum"]
+	assert texts(found, "StateValue") == ["PENDING_TRAINING", "PENDING_TRAINING"]
+	assert texts(call(g, "DescribeAnomalyDetectors",
+		[["Dimensions.member.1.Name", "D"], ["Dimensions.member.1.Value", "v"]]), "Stat") == ["Average", "Average"]
+	assert fails(call(g, "PutAnomalyDetector", [["Namespace", "n"], ["MetricName", "m"]]), 400, "MissingParameter")
+	assert call(g, "DeleteAnomalyDetector", single).status == 200
+	assert fails(call(g, "DeleteAnomalyDetector", single), 404, "ResourceNotFoundException")
+	assert texts(call(g, "DescribeAnomalyDetectors"), "Stat") == ["Average", "Average"]
+}

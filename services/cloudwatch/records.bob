@@ -1,7 +1,8 @@
 //! CloudWatch's state in an account's regional tree: its metrics by their key, the namespace, a NUL, the name and each
 //! dimension's name and value after a NUL, sorted by name; each metric's samples by its key, 0x01, the sample's
 //! timestamp in 20 digits and its request's id and place, so that a time range is a range of keys; its alarms by name,
-//! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence; its dashboards by name.
+//! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence; its dashboards by name;
+//! its anomaly detectors by their metric's key, 0x01 and the statistic.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -32,6 +33,8 @@ export class Sample {
 
 export class Alarm {
 	name = ""
+	/// The id of its creation: its request's id, a slash and the time in ms.
+	creationId = ""
 	description: string | null = null
 	actionsEnabled = true
 	ok: string[] = []
@@ -61,6 +64,10 @@ export class Alarm {
 	transitioned: i64 = 0
 	/// Until when a state set by SetAlarmState holds: the end of the period it was set in.
 	held: i64 = 0
+	/// Of a composite alarm its rule, else null; the alarms the rule names; and the data of its state's reason.
+	rule: string | null = null
+	children: string[] = []
+	reasonData: string | null = null
 }
 
 export class History {
@@ -75,11 +82,21 @@ export class Dashboard {
 	modified: i64 = 0
 }
 
+/// An anomaly detector of a single metric, by its metric's key, 0x01 and its statistic; it is stored, never trained.
+export class Detector {
+	namespace = ""
+	name = ""
+	dimensions: [string, string][] = []
+	stat = ""
+	configuration: api.AnomalyDetectorConfiguration | null = null
+}
+
 export function series(s: Store): Table[Series] { return new Table[Series](s, "cloudwatch/series") }
 export function samples(s: Store): Table[Sample] { return new Table[Sample](s, "cloudwatch/samples") }
 export function alarms(s: Store): Table[Alarm] { return new Table[Alarm](s, "cloudwatch/alarms") }
 export function history(s: Store): Table[History] { return new Table[History](s, "cloudwatch/history") }
 export function dashboards(s: Store): Table[Dashboard] { return new Table[Dashboard](s, "cloudwatch/dashboards") }
+export function detectors(s: Store): Table[Detector] { return new Table[Detector](s, "cloudwatch/detectors") }
 
 /// The key of the metric of namespace, name and dimensions, which it sorts.
 export function key(namespace: string, name: string, dimensions: [string, string][]): string {

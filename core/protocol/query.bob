@@ -8,7 +8,7 @@ import * as base64 from "std/encoding/base64"
 import { Attr, Attribute, encode, Node, OmitEmpty, serialize } from "std/encoding/xml"
 import { parseFloat } from "std/float"
 import { Request, Response } from "std/http"
-import { round } from "std/math"
+import { isFinite, round } from "std/math"
 import { ParseError, parseInt } from "std/string"
 import { httpDate, millisecond, parseHttpDate, parseRfc3339, rfc3339, second } from "std/time"
 import { Decodable, has, tag } from "std/types"
@@ -365,7 +365,11 @@ function format[T](v: T, tags: Type[]): string {
 	if (T == string && has(tags, Blob)) {
 		return base64.encode(v)
 	}
-	return `${v}` // a float's NaN and infinities as awsQuery has them too
+	const s = `${v}` // a float's NaN and infinities as awsQuery has them too
+	if ((T == f64 || T == f32) && isFinite(v as f64) && indexOf(s, ".") < 0 && indexOf(s, "e") < 0) {
+		return `${s}.0` // a whole number as AWS writes it
+	}
+	return s
 }
 
 /// A new element named n, el's last child.

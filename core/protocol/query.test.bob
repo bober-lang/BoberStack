@@ -198,6 +198,8 @@ class Struct {
 	n: i32 = 7
 	on = true
 	inf: f64 = 1.0 / 0.0
+	whole = 1.0
+	half = 0.5
 	mode: "fast" | "safe" = "fast"
 	nested = new GreetingStruct()
 }
@@ -205,8 +207,8 @@ class Struct {
 test "scalars in a response" {
 	const xml = "<binary>dmFsdWU=</binary>"
 		+ "<date>2020-01-05T20:13:26Z</date><fine>2020-01-05T20:13:26.52Z</fine><epoch>1515531081.123</epoch>"
-		+ "<http>Tue, 29 Apr 2014 18:30:38 GMT</http><n>7</n><on>true</on><inf>Infinity</inf><mode>fast</mode>"
-		+ "<nested/>"
+		+ "<http>Tue, 29 Apr 2014 18:30:38 GMT</http><n>7</n><on>true</on><inf>Infinity</inf><whole>1.0</whole>"
+		+ "<half>0.5</half><mode>fast</mode>" + "<nested/>"
 	assert result("Struct", ns, id, new Struct()) == response("Struct", xml)
 }
 
@@ -243,6 +245,10 @@ test "serve" {
 	assert ok.body.whole == response("XmlTest", "<testValue>Hello!</testValue>")
 	const denied = call("Custom=no").serve(h)
 	assert denied.status == 403 && denied.body.whole == error("Denied", "no")
+	const bare = call("Custom=").serve(h)
+	assert bare.body.whole
+		== `<ErrorResponse xmlns="${ns}"><Error><Type>Sender</Type><Code>Denied</Code></Error>`
+		+ `<RequestId>${id}</RequestId></ErrorResponse>`
 }
 
 test "an action of another version" {

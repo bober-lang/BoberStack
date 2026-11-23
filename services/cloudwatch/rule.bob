@@ -1,0 +1,195 @@
+//! A composite alarm's rule: ALARM(name), OK(name) and INSUFFICIENT_DATA(name), each of an alarm's name or ARN, bare or
+//! quoted; TRUE and FALSE; NOT, AND and OR, binding in that order; and parentheses. Its syntax errors are worded as
+//! AWS words them, AT_LEAST, which AWS knows, being one.
+
+import { indexOf, lastIndexOf } from "std/algo"
+import { isSpace } from "std/ascii"
+import { trim } from "std/string"
+
+/// A rule, or a part of one: of kind "state", true of the alarm named name in the state value; "TRUE" or "FALSE";
+/// or "NOT", "AND" or "OR" of its operands.
+export class Rule {
+	kind = ""
+	value = ""
+	name = ""
+	operands: Rule[] = []
+}
+
+/// Why a rule does not parse, in AWS's words.
+export class SyntaxError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+const expected = ", must be: '(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA"
+
+/// The rule that s spells.
+export function parse(s: string): Rule throws SyntaxError {
+	const p = new Parser(s)
+	const r = p.or()
+	p.skip()
+	if (p.at < s.length) {
+		throw p.unsupported("")
+	}
+	return r
+}
+
+/// The names of the alarms that r names, each once, in order.
+export function names(r: Rule): string[] {
+	const out: string[] = []
+	collect(r, out)
+	return out
+}
+
+function collect(r: Rule, out: string[]): void {
+	if (r.kind == "state" && !out.includes(r.name)) {
+		out.push(r.name)
+	}
+	for (const o of r.operands) {
+		collect(o, out)
+	}
+}
+
+/// Whether r holds where state gives each alarm's state by name, "" for one that does not exist.
+export function holds(r: Rule, state: (name: string) => string): bool {
+	switch (r.kind) {
+		case "state": return state(r.name) == r.value
+		case "TRUE": return true
+		case "FALSE": return false
+		case "NOT": return !holds(r.operands[0], state)
+		case "AND": return r.operands.every(o => holds(o, state))
+		default: return r.operands.some(o => holds(o, state))
+	}
+}
+
+class Parser {
+	s: string
+	at = 0
+
+	constructor(s: string) { this.s = s }
+
+	or(): Rule throws SyntaxError {
+		const first = this.and()
+		if (!this.keyword("OR")) {
+			return first
+		}
+		const r = { ...new Rule(), kind: "OR", operands: [first, this.and()] }
+		while (this.keyword("OR")) {
+			r.operands.push(this.and())
+		}
+		return r
+	}
+
+	and(): Rule throws SyntaxError {
+		const first = this.unary()
+		if (!this.keyword("AND")) {
+			return first
+		}
+		const r = { ...new Rule(), kind: "AND", operands: [first, this.unary()] }
+		while (this.keyword("AND")) {
+			r.operands.push(this.unary())
+		}
+		return r
+	}
+
+	unary(): Rule throws SyntaxError {
+		if (this.keyword("NOT")) {
+			return { ...new Rule(), kind: "NOT", operands: [this.unary()] }
+		}
+		this.skip()
+		if (this.at < this.s.length && this.s[this.at] == 40) {
+			this.at++
+			const r = this.or()
+			this.close()
+			return r
+		}
+		const start = this.at
+		const w = this.word()
+		switch (w) {
+			case "TRUE", "FALSE": return { ...new Rule(), kind: w }
+			case "ALARM", "OK", "INSUFFICIENT_DATA":
+				this.skip()
+				if (this.at >= this.s.length || this.s[this.at] != 40) {
+					throw this.unsupported("")
+				}
+				this.at++
+				const r = { ...new Rule(), kind: "state", value: w, name: this.name() }
+				this.close()
+				return r
+		}
+		this.at = start
+		throw this.unsupported(expected)
+	}
+
+	/// The name of an alarm within parentheses, quoted or bare, of an ARN its last part.
+	name(): string throws SyntaxError {
+		this.skip()
+		let n = ""
+		if (this.at < this.s.length && this.s[this.at] == 34) {
+			const end = indexOf(this.s, "\"", this.at + 1)
+			if (end < 0) {
+				this.at = this.s.length
+				throw this.unsupported("")
+			}
+			n = this.s.slice(this.at + 1, end)
+			this.at = end + 1
+		} else {
+			const end = indexOf(this.s, ")", this.at)
+			if (end < 0) {
+				this.at = this.s.length
+				throw this.unsupported("")
+			}
+			n = trim(this.s.slice(this.at, end))
+			this.at = end
+		}
+		const colon = lastIndexOf(n, ":alarm:")
+		return if (colon >= 0) n.slice(colon + 7, n.length) else n
+	}
+
+	close() throws SyntaxError {
+		this.skip()
+		if (this.at >= this.s.length || this.s[this.at] != 41) {
+			throw this.unsupported("")
+		}
+		this.at++
+	}
+
+	/// Whether the next word is k, which it then takes.
+	keyword(k: string): bool {
+		this.skip()
+		const start = this.at
+		if (this.word() == k) {
+			return true
+		}
+		this.at = start
+		return false
+	}
+
+	/// The run of characters up to a space or parenthesis.
+	word(): string {
+		const start = this.at
+		while (this.at < this.s.length && !isSpace(this.s[this.at]) && this.s[this.at] != 40 && this.s[this.at] != 41) {
+			this.at++
+		}
+		if (this.at == start && this.at < this.s.length) {
+			this.at++
+		}
+		return this.s.slice(start, this.at)
+	}
+
+	skip() {
+		while (this.at < this.s.length && isSpace(this.s[this.at])) {
+			this.at++
+		}
+	}
+
+	/// The error of the token at the position, followed by more.
+	unsupported(more: string): SyntaxError {
+		this.skip()
+		const start = this.at
+		const w = if (this.at < this.s.length) this.word() else "<EOF>"
+		this.at = start
+		return new SyntaxError(`Error in AlarmRule [Unsupported token '${w}' at char ${start}${more}]`)
+	}
+}
