@@ -2,11 +2,13 @@ import { Gateway } from "./core/gateway"
 import { Fault } from "./core/fault"
 import { Catalog } from "./services/iam/catalog"
 import { stack } from "./stack"
-import { decode, help, Short } from "std/encoding/optarg"
+import { decode, help, Name, Short } from "std/encoding/optarg"
+import { readFile } from "std/fs"
 import { Server } from "std/http"
 import { stderr } from "std/io"
 import { name } from "std/process"
 import { ParseError } from "std/string"
+import * as tls from "std/tls"
 import { second, sleep } from "std/time"
 import managed from "./models/iam-managed-policies.jsonl" @Embed["deflate"]
 
@@ -16,6 +18,12 @@ class Options {
 	host = ""
 	/// The port to listen on.
 	port: u16 = 4566
+	/// The PEM certificate chain to serve HTTPS with, on its own port; with --key.
+	cert = ""
+	/// The PEM private key of --cert.
+	key = ""
+	/// The port to serve HTTPS on, given --cert and --key.
+	httpsPort: u16 @Name["https-port"] = 4567
 	/// Refuse no request for lack of permission or trust: a role looked up only to check either need not exist.
 	lenient: bool = false
 	/// Print this help.
@@ -44,18 +52,40 @@ function main(): i32 {
 		complain(program, `the AWS managed policies do not parse at byte ${e.at}`)
 		return 1
 	}
-	const server = new Server()
-	server.addr = `${o.host}:${o.port}`
+	if ((o.cert == "") != (o.key == "")) {
+		complain(program, `--cert and --key go together\n${usage(program)}`)
+		return 2
+	}
+	const plain = new Server()
+	plain.addr = `${o.host}:${o.port}`
+	const servers = [plain]
+	if (o.cert != "") {
+		const secure = new Server()
+		secure.addr = `${o.host}:${o.httpsPort}`
+		secure.tls = new tls.Config()
+		try {
+			secure.tls!.cert = readFile(o.cert)
+			secure.tls!.key = readFile(o.key)
+		} catch (e: IoError) {
+			complain(program, e.message())
+			return 1
+		}
+		servers.push(secure)
+	}
 	const g = stack(catalog!)
 	g.lenient = o.lenient
+	let at = plain.addr
 	try {
-		server.listen()
+		for (const s of servers) {
+			at = s.addr
+			s.listen()
+		}
 		// The line LocalStack prints once it serves, which the tools that start it wait for.
 		print("Ready.")
 		const ticking = async tick(program, g)
-		server.serve(g.handle)
+		await ...servers.map(s => async s.serve(g.handle))
 	} catch (e: IoError | ParseError) {
-		complain(program, if (e instanceof IoError) e.message() else `cannot listen on ${server.addr}: not an address`)
+		complain(program, if (e instanceof IoError) e.message() else `cannot listen on ${at}: not an address`)
 		return 1
 	}
 	return 0
