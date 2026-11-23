@@ -1,5 +1,6 @@
 //! Route 53's state in an account's tree: its hosted zones by id, each with its record sets; the caller references
-//! that made them; the changes submitted, by id; and the health checks by id, with the caller references that made them.
+//! that made them; the changes submitted, by id; the health checks by id, with the caller references that made them;
+//! the reusable delegation sets by id; and the CIDR collections by id.
 
 import { Store, Table } from "../../core/state/store"
 import * as api from "./api"
@@ -14,6 +15,8 @@ export class Zone {
 	/// The VPCs of a private zone: each its region and id.
 	vpcs: [string, string][] = []
 	nameServers: string[] = []
+	/// The id of the reusable delegation set it was made of, "" if none.
+	delegationSet = ""
 	records: Record[] = []
 	tags: [string, string][] = []
 	created: i64 = 0
@@ -70,6 +73,22 @@ export class CheckReference {
 	check = ""
 }
 
+/// A reusable delegation set: the caller reference that made it and its four name servers.
+export class DelegationSet {
+	id = ""
+	reference = ""
+	nameServers: string[] = []
+}
+
+/// A CIDR collection: its blocks, each its location's name and the block.
+export class Collection {
+	id = ""
+	name = ""
+	reference = ""
+	version: i64 = 1
+	blocks: [string, string][] = []
+}
+
 /// Route 53's tables in the account's tree s.
 export class Tables {
 	zones: Table[Zone]
@@ -77,6 +96,8 @@ export class Tables {
 	changes: Table[Change]
 	checks: Table[Check]
 	checkReferences: Table[CheckReference]
+	sets: Table[DelegationSet]
+	collections: Table[Collection]
 
 	constructor(s: Store) {
 		this.zones = new Table[Zone](s, "route53/zones")
@@ -84,5 +105,7 @@ export class Tables {
 		this.changes = new Table[Change](s, "route53/changes")
 		this.checks = new Table[Check](s, "route53/healthchecks")
 		this.checkReferences = new Table[CheckReference](s, "route53/healthcheckreferences")
+		this.sets = new Table[DelegationSet](s, "route53/delegationsets")
+		this.collections = new Table[Collection](s, "route53/cidrcollections")
 	}
 }

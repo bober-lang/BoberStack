@@ -315,6 +315,24 @@ const amendments: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_2014
 	"com.amazonaws.cloudwatch#CompositeAlarm": {"type": "structure", "members": {
 		"CreationId": {"target": "smithy.api#String"}}}}}`]]
 
+/// The names that the validation of the services below gives members where AWS names them otherwise than their models,
+/// as on 2026-11-23: by their shape ids, each member's and its name.
+const named: [string, [string, string][]][] = [["com.amazonaws.route53#AWSDnsV20130401",
+	[["com.amazonaws.route53#GetHostedZoneRequest$Id", "resourceId"],
+	["com.amazonaws.route53#DeleteHostedZoneRequest$Id", "resourceId"],
+	["com.amazonaws.route53#UpdateHostedZoneCommentRequest$Id", "resourceId"],
+	["com.amazonaws.route53#ListResourceRecordSetsRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#ChangeResourceRecordSetsRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#AssociateVPCWithHostedZoneRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#DisassociateVPCFromHostedZoneRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#GetChangeRequest$Id", "resourceId"],
+	["com.amazonaws.route53#GetReusableDelegationSetRequest$Id", "resourceId"],
+	["com.amazonaws.route53#DeleteReusableDelegationSetRequest$Id", "resourceId"],
+	["com.amazonaws.route53#GetHostedZoneLimitRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#GetReusableDelegationSetLimitRequest$DelegationSetId", "resourceId"],
+	["com.amazonaws.route53#TestDNSAnswerRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#ListCidrBlocksRequest$CollectionId", "id"]]]]
+
 /// The members of the services below whose models' constraints AWS does not check, by their shape ids: their
 /// handlers answer as AWS does.
 const unconstrained: [string, string[]][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328",
@@ -350,6 +368,8 @@ class Generator {
 	unchecked: string[] = []
 	/// The members whose constraints, and their items', go unchecked, and whether the member being typed is one.
 	unconstrained: string[] = []
+	/// The members that validation names otherwise, and their names.
+	named: [string, string][] = []
 	exempt = false
 	/// The members whose enums are strings, or whether all are, and whether the member being typed is one.
 	strings: string[] = []
@@ -408,6 +428,8 @@ class Generator {
 		this.validation = validations.find(v => v[0] == services[0][0])
 		const exempt = unconstrained.find(u => u[0] == services[0][0])
 		this.unconstrained = if (exempt == null) [] else exempt[1]
+		const called = named.find(n => n[0] == services[0][0])
+		this.named = if (called == null) [] else called[1]
 		const open = strings.find(s => s[0] == services[0][0])
 		this.strings = if (open == null) [] else open[1]
 		const lax = optional.find(o => o[0] == services[0][0])
@@ -867,6 +889,11 @@ class Generator {
 		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
 		if (initial != null) {
 			tags.push("@model.Default")
+			this.modeled = true
+		}
+		const called = this.named.find(n => n[0] == `${id}$${m[0]}`)
+		if (called != null) {
+			tags.push(`@model.Named[${json.quoted(called[1])}]`)
 			this.modeled = true
 		}
 		this.exempt = this.unconstrained.includes(`${id}$${m[0]}`)

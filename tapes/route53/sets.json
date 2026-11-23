@@ -1,0 +1,238 @@
+{
+	"volatile": [
+		"RequestId",
+		"SubmittedAt",
+		"Id"
+	],
+	"ignored": [
+		"NameServer"
+	],
+	"steps": [
+		{
+			"name": "create a delegation set",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/delegationset",
+			"body": "<CreateReusableDelegationSetRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-d</CallerReference></CreateReusableDelegationSetRequest>",
+			"capture": {
+				"set": "last:DelegationSet/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateReusableDelegationSetResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><DelegationSet><Id>x</Id><CallerReference>boberstack-ab-00000000-d</CallerReference><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet></CreateReusableDelegationSetResponse>"
+			}
+		},
+		{
+			"name": "create it again of the same reference",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/delegationset",
+			"body": "<CreateReusableDelegationSetRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-d</CallerReference></CreateReusableDelegationSetRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>DelegationSetAlreadyCreated</Code><Message>A delegation set has already been created with the specified caller reference.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "get it",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/delegationset/${set}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetReusableDelegationSetResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><DelegationSet><Id>x</Id><CallerReference>boberstack-ab-00000000-d</CallerReference><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet></GetReusableDelegationSetResponse>"
+			}
+		},
+		{
+			"name": "get one that is not",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/delegationset/NNOPE123",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchDelegationSet</Code><Message>NNOPE123</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "its limit of zones",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/reusabledelegationsetlimit/${set}/MAX_ZONES_BY_REUSABLE_DELEGATION_SET",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetReusableDelegationSetLimitResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Limit><Type>MAX_ZONES_BY_REUSABLE_DELEGATION_SET</Type><Value>100</Value></Limit><Count>0</Count></GetReusableDelegationSetLimitResponse>"
+			}
+		},
+		{
+			"name": "create a zone of it",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-z</CallerReference><DelegationSetId>${set}</DelegationSetId></CreateHostedZoneRequest>",
+			"capture": {
+				"zone": "last:HostedZone/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>x</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-z</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><Id>x</Id><CallerReference>boberstack-ab-00000000-d</CallerReference><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "get the zone",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzone/${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>x</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-z</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><DelegationSet><Id>x</Id><CallerReference>boberstack-ab-00000000-d</CallerReference><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet><HostedZoneDeletionProtectionEnabled>false</HostedZoneDeletionProtectionEnabled></GetHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "its limit of zones, one used",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/reusabledelegationsetlimit/${set}/MAX_ZONES_BY_REUSABLE_DELEGATION_SET",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetReusableDelegationSetLimitResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Limit><Type>MAX_ZONES_BY_REUSABLE_DELEGATION_SET</Type><Value>100</Value></Limit><Count>1</Count></GetReusableDelegationSetLimitResponse>"
+			}
+		},
+		{
+			"name": "delete the set a zone uses",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/delegationset/${set}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>DelegationSetInUse</Code><Message>The specified delegation set contains associated hosted zones.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create a zone of a set that is not",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-y</CallerReference><DelegationSetId>NNOPE123</DelegationSetId></CreateHostedZoneRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchDelegationSet</Code><Message>NNOPE123</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/hostedzone/${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></DeleteHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "delete the set",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/delegationset/${set}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteReusableDelegationSetResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></DeleteReusableDelegationSetResponse>"
+			}
+		},
+		{
+			"name": "get the deleted set",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/delegationset/${set}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchDelegationSet</Code><Message>${set}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the deleted set",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/delegationset/${set}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchDelegationSet</Code><Message>${set}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/hostedzone/${zone}",
+			"ignored": [
+				"Message"
+			],
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>x x x x x x: x</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the set",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/delegationset/${set}",
+			"ignored": [
+				"Message"
+			],
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchDelegationSet</Code><Message>${set}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	]
+}

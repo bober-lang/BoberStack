@@ -7,7 +7,7 @@ import { endsWith, sortBy, startsWith } from "std/algo"
 import { parseFloat } from "std/float"
 import { compile, Regex } from "std/regex"
 import { lower, ParseError } from "std/string"
-import { has } from "std/types"
+import { has, tag } from "std/types"
 import { Fault } from "../fault"
 
 /// Tags a member that takes its initial value when a request leaves it out, as Smithy's default.
@@ -19,6 +19,8 @@ export class Valid[Min extends string, Max extends string, P extends string] {}
 export class Size[Min extends string, Max extends string] {}
 /// Tags a member, or its items, whose values AWS does not quote in a message on their constraints, as a blob's.
 export class Sensitive {}
+/// Tags a member of an input that AWS's messages on its constraints name N, otherwise than the model.
+export class Named[N extends string] {}
 
 /// How a service answers a request breaking its model: the code of the fault, whether its message quotes the values,
 /// and the unions it words on their own: by a union's name, the message where none of its members is set and where
@@ -118,6 +120,9 @@ function hash(s: string): i64 {
 	}
 	return h
 }
+
+/// The name of the member n, tagged tags, in AWS's messages on its constraints.
+export function named(n: string, tags: Type[]): string { return if (has(tags, Named)) tag(tags, Named, "") else n }
 
 /// The member path at, of a structure's member named n, as AWS gives it: n lowered at its start.
 export function path(at: string, n: string): string {

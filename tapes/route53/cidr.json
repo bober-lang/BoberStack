@@ -1,0 +1,293 @@
+{
+	"volatile": [
+		"RequestId",
+		"Id"
+	],
+	"steps": [
+		{
+			"name": "create a collection",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection",
+			"body": "<CreateCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}</Name><CallerReference>${prefix}-c</CallerReference></CreateCidrCollectionRequest>",
+			"capture": {
+				"c": "Collection/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Collection><Arn>arn:aws:route53:::cidrcollection/${c}</Arn><Id>${c}</Id><Name>boberstack-ab-00000000</Name><Version>1</Version></Collection></CreateCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "create it again of the same reference",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection",
+			"body": "<CreateCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}</Name><CallerReference>${prefix}-c</CallerReference></CreateCidrCollectionRequest>",
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Collection><Arn>arn:aws:route53:::cidrcollection/${c}</Arn><Id>${c}</Id><Name>boberstack-ab-00000000</Name><Version>1</Version></Collection></CreateCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "create one of the same name",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection",
+			"body": "<CreateCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}</Name><CallerReference>${prefix}-d</CallerReference></CreateCidrCollectionRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>CidrCollectionAlreadyExistsException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "put blocks",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CollectionVersion>1</CollectionVersion><Changes><member><LocationName>one</LocationName><Action>PUT</Action><CidrList><Cidr>192.0.2.0/24</Cidr><Cidr>198.51.100.0/24</Cidr></CidrList></member><member><LocationName>two</LocationName><Action>PUT</Action><CidrList><Cidr>203.0.113.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Id>x_x-x_x_x_x-x-x-x</Id></ChangeCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "put of a version not its",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CollectionVersion>1</CollectionVersion><Changes><member><LocationName>one</LocationName><Action>PUT</Action><CidrList><Cidr>192.0.2.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>CidrCollectionVersionMismatchException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "put a block of another location",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Changes><member><LocationName>two</LocationName><Action>PUT</Action><CidrList><Cidr>192.0.2.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>CidrBlockInUseException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "list its locations",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListCidrLocationsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CidrLocations><member><LocationName>one</LocationName></member><member><LocationName>two</LocationName></member></CidrLocations></ListCidrLocationsResponse>"
+			}
+		},
+		{
+			"name": "list its blocks",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}/cidrblocks",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListCidrBlocksResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CidrBlocks><member><CidrBlock>192.0.2.0/24</CidrBlock><LocationName>one</LocationName></member><member><CidrBlock>198.51.100.0/24</CidrBlock><LocationName>one</LocationName></member><member><CidrBlock>203.0.113.0/24</CidrBlock><LocationName>two</LocationName></member></CidrBlocks></ListCidrBlocksResponse>"
+			}
+		},
+		{
+			"name": "list a location's blocks",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}/cidrblocks",
+			"params": {
+				"location": "one"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListCidrBlocksResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CidrBlocks><member><CidrBlock>192.0.2.0/24</CidrBlock><LocationName>one</LocationName></member><member><CidrBlock>198.51.100.0/24</CidrBlock><LocationName>one</LocationName></member></CidrBlocks></ListCidrBlocksResponse>"
+			}
+		},
+		{
+			"name": "list a location that is not",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}/cidrblocks",
+			"params": {
+				"location": "nope"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListCidrBlocksResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CidrBlocks/></ListCidrBlocksResponse>"
+			}
+		},
+		{
+			"name": "delete a block",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Changes><member><LocationName>one</LocationName><Action>DELETE_IF_EXISTS</Action><CidrList><Cidr>192.0.2.0/24</Cidr><Cidr>198.18.0.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Id>x_x_x-x-x_x-x_x_x_x_x_x</Id></ChangeCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "list its blocks after",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}/cidrblocks",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListCidrBlocksResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CidrBlocks><member><CidrBlock>198.51.100.0/24</CidrBlock><LocationName>one</LocationName></member><member><CidrBlock>203.0.113.0/24</CidrBlock><LocationName>two</LocationName></member></CidrBlocks></ListCidrBlocksResponse>"
+			}
+		},
+		{
+			"name": "delete a collection with blocks",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>CidrCollectionInUseException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the blocks",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Changes><member><LocationName>one</LocationName><Action>DELETE_IF_EXISTS</Action><CidrList><Cidr>192.0.2.0/24</Cidr><Cidr>198.51.100.0/24</Cidr></CidrList></member><member><LocationName>two</LocationName><Action>DELETE_IF_EXISTS</Action><CidrList><Cidr>203.0.113.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Id>x_x_-x-x-x_x-x-x</Id></ChangeCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "delete the collection",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteCidrCollectionResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></DeleteCidrCollectionResponse>"
+			}
+		},
+		{
+			"name": "list the blocks of the deleted collection",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/cidrcollection/${c}/cidrblocks",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchCidrCollectionException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete it again",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchCidrCollectionException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the blocks",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"body": "<ChangeCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Changes><member><LocationName>one</LocationName><Action>DELETE_IF_EXISTS</Action><CidrList><Cidr>192.0.2.0/24</Cidr><Cidr>198.51.100.0/24</Cidr></CidrList></member><member><LocationName>two</LocationName><Action>DELETE_IF_EXISTS</Action><CidrList><Cidr>203.0.113.0/24</Cidr></CidrList></member></Changes></ChangeCidrCollectionRequest>",
+			"ignored": [
+				"Id"
+			],
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchCidrCollectionException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the collection",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/cidrcollection/${c}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchCidrCollectionException</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	]
+}

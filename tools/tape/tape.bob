@@ -39,7 +39,8 @@
 //! multipart upload's parts are described rather than written out. A request to S3 is signed over all its headers
 //! and X-Amz-Content-Sha256, the body's hash unless the step sets it; not at all if `anonymous`; or in a presigned
 //! URL valid for `presign` seconds, signed `age` seconds before it is sent, whose query parameters `tamper` then
-//! changes. A path `header:<name>` captures a header of the answer.
+//! changes. A path `header:<name>` captures a header of the answer, and `last:<path>` what follows the last / of the
+//! text at path, as a bare id.
 //!
 //! A tape holds nothing of the account: recording makes its id 000000000000, the caller's identity the account's
 //! root, which a replay sends as, the prefix `boberstack-ab-00000000`, a value captured `${name}` wherever it is, S3's
@@ -352,10 +353,19 @@ export function find(body: string, path: string): string | null throws ParseErro
 	return if (t!.leaf) t!.text else null
 }
 
-/// What path captures of res, whose body is body: the header it names after header:, else the text at it in the
-/// body; null if there is none.
+/// What path captures of res, whose body is body: the header it names after header:, what follows the last / of
+/// what the path after last: captures, else the text at it in the body; null if there is none.
 export function captured(res: Response, body: string, path: string): string | null throws ParseError {
 	const header = "header:"
+	const last = "last:"
+	if (startsWith(path, last)) {
+		const v = captured(res, body, path.slice(last.length, path.length))
+		if (v == null) {
+			return null
+		}
+		const parts = split(v!, "/")
+		return parts[parts.length - 1]
+	}
 	return if (startsWith(path, header)) res.headers.get(path.slice(header.length, path.length)) else find(body, path)
 }
 

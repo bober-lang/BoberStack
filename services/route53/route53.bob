@@ -1,25 +1,31 @@
-//! Amazon Route 53: public and private hosted zones, their record sets, changes and tags.
+//! Amazon Route 53: public and private hosted zones, their record sets, changes and tags; health checks, reusable
+//! delegation sets, CIDR collections and limits.
 //!
 //! Route 53 is global: requests are signed for us-east-1 and its state is in the account's tree. A zone is made with
-//! its NS and SOA record sets and a delegation set of four name servers, one of each of AWS's top-level domains. A
-//! change is answered PENDING, as AWS answers it, and so to its first GetChange, as AWS answers one right after it; it
-//! is INSYNC from then on, where AWS's takes some seconds: nothing runs between requests, and nothing propagates. There is no DNS server: record sets are stored and validated, never served, and
-//! routing policies, alias targets and health checks route nothing. Private zones take any VPC id, which AWS checks
-//! with EC2. A request's XML is decoded by the model, not by Route 53's schema: an element out of order is taken, and a
-//! missing one is answered by the model's validation, not by the schema's message; validation names the model's
-//! members, where AWS names some otherwise, as resourceId for an Id.
+//! its NS and SOA record sets and a delegation set of four name servers, one of each of AWS's top-level domains, or
+//! those of the reusable delegation set it names. A change is answered PENDING, as AWS answers it, and so to its first
+//! GetChange, as AWS answers one right after it; it is INSYNC from then on, where AWS's takes some seconds: nothing
+//! runs between requests, and nothing propagates. There is no DNS server: record sets are stored and validated, never
+//! served, and routing policies, alias targets, health checks and CIDR collections route nothing; TestDNSAnswer is
+//! answered REFUSED, as AWS answers it of a zone that no parent delegates to, and a zone here has none. Private zones
+//! take any VPC id, which AWS checks with EC2. A request's XML is decoded by the model, not by Route 53's schema: an
+//! element out of order is taken, and a missing one is answered by the model's validation, not by the schema's message.
 //!
 //! Health checks are stored and validated as AWS validates them, never checked: every checker of an endpoint reports
 //! success, and none a last failure. A record set may name a health check that does not exist, and a health check
-//! may be deleted while a record set names it, as AWS allows. Health checks of a CloudWatch alarm or a recovery
-//! control, delegation sets, traffic policies, DNSSEC, query logging and the rest are not implemented.
+//! may be deleted while a record set names it, as AWS allows. Limits are AWS's defaults, as of 2026-11-23. Health
+//! checks of a CloudWatch alarm or a recovery control, traffic policies, DNSSEC, query logging and the rest are not
+//! implemented.
 
 import { Fault } from "../../core/fault"
 import * as rest from "../../core/protocol/rest"
 import * as restxml from "../../core/protocol/restxml"
 import { Caller } from "../../core/service"
 import * as api from "./api"
-import { Alias, Change, Check, CheckReference, Record, Reference, Tables, Zone } from "./records"
+
+import { Alias, Change, Check, CheckReference, Collection, DelegationSet, Record, Reference, Tables,
+	Zone } from "./records"
+
 import { endsWith, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
 import { bytes } from "std/crypto/random"
@@ -57,7 +63,13 @@ export class Handler {
 			z.isPrivate = true
 			z.vpcs = [[input.VPC!.VPCRegion ?? "", input.VPC!.VPCId ?? ""]]
 		}
-		z.nameServers = nameServers()
+		if (input.DelegationSetId != null) {
+			const d = set(t, input.DelegationSetId!)
+			z.delegationSet = d.id
+			z.nameServers = d.nameServers
+		} else {
+			z.nameServers = nameServers()
+		}
 		const ns = new Record()
 		ns.name = name
 		ns.type = "NS"
@@ -78,7 +90,7 @@ export class Handler {
 		const out = new api.CreateHostedZoneResponse()
 		out.HostedZone = zoneOf(z)
 		out.ChangeInfo = submit(t, null)
-		out.DelegationSet = delegation(z) ?? new api.DelegationSet()
+		out.DelegationSet = delegation(t, z) ?? new api.DelegationSet()
 		if (z.isPrivate) {
 			out.VPC = input.VPC
 		}
@@ -88,10 +100,11 @@ export class Handler {
 
 	getHostedZone(caller: Caller, input: api.GetHostedZoneRequest): api.GetHostedZoneResponse throws Fault {
 		caller.allow(arn(input.Id))
-		const z = zone(new Tables(caller.store()), input.Id)
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
 		const out = new api.GetHostedZoneResponse()
 		out.HostedZone = zoneOf(z)
-		out.DelegationSet = delegation(z)
+		out.DelegationSet = delegation(t, z)
 		if (z.isPrivate) {
 			out.VPCs = z.vpcs.map(v => vpc(v))
 		}
@@ -105,6 +118,239 @@ export class Handler {
 		const out = new api.GetHostedZoneCountResponse()
 		out.HostedZoneCount = all(new Tables(caller.store())).length
 		return out
+	}
+
+	getHostedZoneLimit(caller: Caller,
+		input: api.GetHostedZoneLimitRequest): api.GetHostedZoneLimitResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const z = zone(new Tables(caller.store()), input.HostedZoneId)
+		const out = new api.GetHostedZoneLimitResponse()
+		out.Limit.Type = input.Type
+		const rrsets = input.Type == "MAX_RRSETS_BY_ZONE"
+		out.Limit.Value = if (rrsets) 10000 else 300
+		out.Count = if (rrsets) z.records.length else z.vpcs.length
+		return out
+	}
+
+	getAccountLimit(caller: Caller, input: api.GetAccountLimitRequest): api.GetAccountLimitResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const out = new api.GetAccountLimitResponse()
+		out.Limit.Type = input.Type
+		switch (input.Type) {
+			case "MAX_HOSTED_ZONES_BY_OWNER":
+				out.Limit.Value = 500
+				out.Count = all(t).length
+			case "MAX_HEALTH_CHECKS_BY_OWNER":
+				out.Limit.Value = 200
+				out.Count = checks(t).length
+			case "MAX_REUSABLE_DELEGATION_SETS_BY_OWNER": out.Limit.Value = 100
+			case "MAX_TRAFFIC_POLICIES_BY_OWNER": out.Limit.Value = 50
+			default: out.Limit.Value = 5 // of health check sources and traffic policy instances
+		}
+		return out
+	}
+
+	testDNSAnswer(caller: Caller, input: api.TestDNSAnswerRequest): api.TestDNSAnswerResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		zone(new Tables(caller.store()), input.HostedZoneId)
+		const out = new api.TestDNSAnswerResponse()
+		out.Nameserver = "127.0.0.1"
+		const name = input.RecordName
+		out.RecordName = if (endsWith(name, ".") && name != ".") name.slice(0, name.length - 1) else name
+		out.RecordType = input.RecordType
+		out.ResponseCode = "REFUSED"
+		out.Protocol = "UDP"
+		return out
+	}
+
+	createReusableDelegationSet(caller: Caller,
+		input: api.CreateReusableDelegationSetRequest): api.CreateReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		if (t.sets.scan(null, 1000000).some(e => e[1].reference == input.CallerReference)) {
+			throw api.delegationSetAlreadyCreated("A delegation set has already been created with the specified caller "
+				+ "reference.")
+		}
+		const d = new DelegationSet()
+		d.id = id("N")
+		d.reference = input.CallerReference
+		d.nameServers = if (input.HostedZoneId == null) nameServers() else zone(t, input.HostedZoneId!).nameServers
+		try {
+			t.sets.put(d.id, d)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `${e}`)
+		}
+		const out = new api.CreateReusableDelegationSetResponse()
+		out.DelegationSet = setOf(d)
+		out.Location = `${caller.endpoint}/2013-04-01/delegationset/${d.id}`
+		return out
+	}
+
+	getReusableDelegationSet(caller: Caller,
+		input: api.GetReusableDelegationSetRequest): api.GetReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetReusableDelegationSetResponse()
+		out.DelegationSet = setOf(set(new Tables(caller.store()), input.Id))
+		return out
+	}
+
+	listReusableDelegationSets(caller: Caller,
+		input: api.ListReusableDelegationSetsRequest): api.ListReusableDelegationSetsResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const ds = new Tables(caller.store()).sets.scan(null,
+			1000000).map(e => e[1]).filter(d => input.Marker == null || d.id >= input.Marker!)
+		const out = new api.ListReusableDelegationSetsResponse()
+		out.DelegationSets = ds.slice(0, min(max, ds.length)).map(d => setOf(d))
+		out.Marker = input.Marker ?? ""
+		out.MaxItems = max
+		if (ds.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = ds[max].id
+		}
+		return out
+	}
+
+	getReusableDelegationSetLimit(caller: Caller,
+		input: api.GetReusableDelegationSetLimitRequest): api.GetReusableDelegationSetLimitResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const d = set(t, input.DelegationSetId)
+		const out = new api.GetReusableDelegationSetLimitResponse()
+		out.Limit.Type = input.Type
+		out.Limit.Value = 100
+		out.Count = all(t).filter(z => z.delegationSet == d.id).length
+		return out
+	}
+
+	deleteReusableDelegationSet(caller: Caller,
+		input: api.DeleteReusableDelegationSetRequest): api.DeleteReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const d = set(t, input.Id)
+		if (all(t).some(z => z.delegationSet == d.id)) {
+			throw api.delegationSetInUse("The specified delegation set contains associated hosted zones.")
+		}
+		t.sets.delete(d.id)
+		return new api.DeleteReusableDelegationSetResponse()
+	}
+
+	createCidrCollection(caller: Caller,
+		input: api.CreateCidrCollectionRequest): api.CreateCidrCollectionResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const cs = collections(t)
+		let c = cs.find(c => c.reference == input.CallerReference)
+		if (c == null) {
+			if (cs.some(c => c.name == input.Name)) {
+				throw api.cidrCollectionAlreadyExistsException("")
+			}
+			const made = new Collection()
+			made.id = uuid()
+			made.name = input.Name
+			made.reference = input.CallerReference
+			save(t, made)
+			c = made
+		}
+		const out = new api.CreateCidrCollectionResponse()
+		out.Collection = collectionOf(c!)
+		out.Location = `${caller.endpoint}/2013-04-01/cidrcollection/${c!.id}`
+		return out
+	}
+
+	changeCidrCollection(caller: Caller,
+		input: api.ChangeCidrCollectionRequest): api.ChangeCidrCollectionResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.Id}`)
+		const t = new Tables(caller.store())
+		const c = collection(t, input.Id)
+		if (input.CollectionVersion != null && input.CollectionVersion! != c.version) {
+			throw api.cidrCollectionVersionMismatchException("")
+		}
+		for (const ch of input.Changes) {
+			for (const b of ch.CidrList) {
+				const slash = split(b, "/")
+				if (slash.length == 2 && split(b, ":").length == 1 && parseIntOr(slash[1]) > 24) {
+					throw api.invalidInput(`IPv4 cidr block ${b} has network prefix length greater than account limit of 24`)
+				}
+				const held = c.blocks.find(k => k[1] == b)
+				if (ch.Action == "PUT") {
+					if (held != null && held![0] != ch.LocationName) {
+						throw api.cidrBlockInUseException("")
+					}
+					if (held == null) {
+						c.blocks.push([ch.LocationName, b])
+					}
+				} else {
+					c.blocks = c.blocks.filter(k => k[1] != b || k[0] != ch.LocationName)
+				}
+			}
+		}
+		sortBy(c.blocks, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+		c.version++
+		save(t, c)
+		const out = new api.ChangeCidrCollectionResponse()
+		out.Id = uuid()
+		return out
+	}
+
+	listCidrCollections(caller: Caller,
+		input: api.ListCidrCollectionsRequest): api.ListCidrCollectionsResponse throws Fault {
+		caller.allow("*")
+		const out = new api.ListCidrCollectionsResponse()
+		out.CidrCollections = collections(new Tables(caller.store())).map(c => {
+			const s = new api.CollectionSummary()
+			const full = collectionOf(c)
+			s.Arn = full.Arn
+			s.Id = full.Id
+			s.Name = full.Name
+			s.Version = full.Version
+			return s
+		})
+		return out
+	}
+
+	listCidrLocations(caller: Caller, input: api.ListCidrLocationsRequest): api.ListCidrLocationsResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.CollectionId}`)
+		const c = collection(new Tables(caller.store()), input.CollectionId)
+		const out = new api.ListCidrLocationsResponse()
+		const names: string[] = []
+		for (const b of c.blocks) {
+			if (!names.includes(b[0])) {
+				names.push(b[0])
+			}
+		}
+		out.CidrLocations = names.map(n => {
+			const l = new api.LocationSummary()
+			l.LocationName = n
+			return l
+		})
+		return out
+	}
+
+	listCidrBlocks(caller: Caller, input: api.ListCidrBlocksRequest): api.ListCidrBlocksResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.CollectionId}`)
+		const c = collection(new Tables(caller.store()), input.CollectionId)
+		const out = new api.ListCidrBlocksResponse()
+		out.CidrBlocks = c.blocks.filter(b => input.LocationName == null || b[0] == input.LocationName!).map(b => {
+			const s = new api.CidrBlockSummary()
+			s.CidrBlock = b[1]
+			s.LocationName = b[0]
+			return s
+		})
+		return out
+	}
+
+	deleteCidrCollection(caller: Caller,
+		input: api.DeleteCidrCollectionRequest): api.DeleteCidrCollectionResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.Id}`)
+		const t = new Tables(caller.store())
+		const c = collection(t, input.Id)
+		if (c.blocks.length > 0) {
+			throw api.cidrCollectionInUseException("")
+		}
+		t.collections.delete(c.id)
+		return new api.DeleteCidrCollectionResponse()
 	}
 
 	listHostedZones(caller: Caller, input: api.ListHostedZonesRequest): api.ListHostedZonesResponse throws Fault {
@@ -676,14 +922,63 @@ function zoneOf(z: Zone): api.HostedZone {
 	return h
 }
 
-/// The delegation set of z, null for a private zone.
-function delegation(z: Zone): api.DelegationSet | null {
+/// The delegation set of z, in t, null for a private zone.
+function delegation(t: Tables, z: Zone): api.DelegationSet | null {
 	if (z.isPrivate) {
 		return null
 	}
-	const d = new api.DelegationSet()
-	d.NameServers = z.nameServers
-	return d
+	const d = t.sets.get(z.delegationSet)
+	if (d != null) {
+		return setOf(d!)
+	}
+	const out = new api.DelegationSet()
+	out.NameServers = z.nameServers
+	return out
+}
+
+function collections(t: Tables): Collection[] { return t.collections.scan(null, 1000000).map(e => e[1]) }
+
+/// The CIDR collection of id, else NoSuchCidrCollectionException.
+function collection(t: Tables, id: string): Collection throws Fault {
+	const c = t.collections.get(id)
+	if (c == null) {
+		throw api.noSuchCidrCollectionException("")
+	}
+	return c!
+}
+
+function save(t: Tables, c: Collection) throws Fault {
+	try {
+		t.collections.put(c.id, c)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `${e}`)
+	}
+}
+
+function collectionOf(c: Collection): api.CidrCollection {
+	const out = new api.CidrCollection()
+	out.Arn = `arn:aws:route53:::cidrcollection/${c.id}`
+	out.Id = c.id
+	out.Name = c.name
+	out.Version = c.version
+	return out
+}
+
+/// The reusable delegation set of id, else NoSuchDelegationSet.
+function set(t: Tables, id: string): DelegationSet throws Fault {
+	const d = t.sets.get(if (startsWith(id, "/delegationset/")) id.slice(15, id.length) else id)
+	if (d == null) {
+		throw api.noSuchDelegationSet(id)
+	}
+	return d!
+}
+
+function setOf(d: DelegationSet): api.DelegationSet {
+	const out = new api.DelegationSet()
+	out.Id = `/delegationset/${d.id}`
+	out.CallerReference = d.reference
+	out.NameServers = d.nameServers
+	return out
 }
 
 function vpc(v: [string, string]): api.VPC {
@@ -1046,7 +1341,7 @@ function checked(c: Check): api.HealthCheckConfig throws Fault {
 	return c.config
 }
 
-/// A random UUID, as a health check's id.
+/// A random UUID, as a health check's or a CIDR collection's id.
 function uuid(): string throws Fault {
 	let h = ""
 	try {
