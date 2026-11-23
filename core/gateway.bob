@@ -1,6 +1,8 @@
-//! The HTTP handler in front of every service: it authenticates a request by SigV4 and hands it to the service its
-//! credential scope names, in a transaction over the state.
+//! The HTTP handler in front of every service: it authenticates a request by SigV4, in its Authorization header or
+//! its query, decodes an aws-chunked body, and hands it to the service its credential scope names, in a transaction
+//! over the state.
 
+import * as chunked from "./auth/chunked"
 import { accountOf, authenticate, credentials } from "./auth/credentials"
 import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
@@ -17,12 +19,20 @@ import { ParseError } from "std/string"
 
 /// A service's answer to a request, its body whole, from caller.
 export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
+/// A service's answer to a fault of the gateway's, in its protocol, under a request id.
+export type Faulted = (f: Fault, requestId: string) => Response
 
 /// One request at a time reads and writes the state: each in a transaction of the trees it opens, which commit together
 /// if it answers 2xx and are dropped if not, so that a request that fails leaves no trace.
 export class Gateway {
 	/// By signing name.
 	services = new HashMap[string, Service]()
+	/// How a service answers the faults the gateway finds once it knows the service, by signing name; in awsQuery's XML
+	/// for one not here, and before the service is known.
+	faults = new HashMap[string, Faulted]()
+	/// The signing name of the service that requests with no authentication at all go to, as S3 serves public objects;
+	/// null for none, when they are answered MissingAuthenticationToken. Its caller's account is "" and its ARN "*".
+	anonymous: string | null = null
 	/// The committed state: each account's tree, from the first request that opens it, and the global one by "", which
 	/// holds the credentials issued. Access keys of none are taken, unchecked, for the root of accountOf's account.
 	trees = new HashMap[string, Store]()
@@ -34,14 +44,20 @@ export class Gateway {
 
 	handle(req: Request): Response throws IoError | ParseError {
 		const id = requestId()
-		const auth = sigv4.parse(req.headers.get("authorization") ?? "")
-		if (auth == null) {
+		let auth: sigv4.Authorization | null = null
+		try {
+			auth = sigv4.authorization(req)
+		} catch (f: Fault) {
+			return query.error(f, id)
+		}
+		const name = auth?.service ?? this.anonymous
+		const service = if (name == null) null else this.services.get(name!)
+		if (auth == null && service == null) {
 			const why = "Request is missing Authentication Token"
 			return query.error(new Fault(403, "MissingAuthenticationToken", why), id)
 		}
-		const service = this.services.get(auth.service)
 		if (service == null) {
-			return query.error(new Fault(501, "NotImplemented", `The service ${auth.service} is not implemented`), id)
+			return query.error(new Fault(501, "NotImplemented", `The service ${name} is not implemented`), id)
 		}
 		const body = req.body.text()
 		req.body = new Body(body)
@@ -50,7 +66,7 @@ export class Gateway {
 		}
 		this.busy = true
 		try {
-			return this.serve(service, req, body, auth, id)
+			return this.serve(name!, service!, req, body, auth, id)
 		} finally {
 			this.busy = false
 			this.freed.wake()
@@ -65,26 +81,34 @@ export class Gateway {
 		this.trees = new HashMap[string, Store]()
 	}
 
-	/// The answer to req, with body, by service, holding the lock: the credential of its access key is checked, and the
-	/// trees it opens committed if it succeeds, else closed.
-	private serve(service: Service, req: Request, body: string, auth: sigv4.Authorization,
+	/// The answer to req, with body, by service, named name, holding the lock: the credential of its access key is
+	/// checked, an aws-chunked body decoded, and the trees it opens committed if it succeeds, else closed. Without auth
+	/// the caller is anonymous.
+	private serve(name: string, service: Service, req: Request, body: string, auth: sigv4.Authorization | null,
 		id: string): Response throws IoError | ParseError {
 		const global = this.trees.get("")
-		const known = if (global == null) null else credentials(global).get(auth.accessKey)
-		if (known != null) {
-			let why: Fault | null = null
-			try {
-				why = authenticate(known, req, body, auth, now())
-			} catch (e: CryptoError) {
-				why = new Fault(500, "InternalFailure", e.what)
+		const known = if (global == null || auth == null) null else credentials(global).get(auth.accessKey)
+		let why: Fault | null = null
+		try {
+			if (known != null) {
+				why = authenticate(known, req, body, auth!, now())
 			}
-			if (why != null) {
-				return query.error(why, id)
+			if (why == null && auth != null && chunked.chunked(req)) {
+				req.body = new Body(chunked.decode(req, body, auth!, known?.secret))
 			}
+		} catch (e: CryptoError | Fault) {
+			why = if (e instanceof Fault) e else new Fault(500, "InternalFailure", e.what)
 		}
-		const account = if (known == null) accountOf(auth.accessKey) else known.account
-		const arn = if (known == null) `arn:aws:iam::${account}:root` else known.arn
-		const caller = new Caller(account, auth.region, arn, id, known?.userId ?? account, this.trees)
+		if (why != null) {
+			const faulted = this.faults.get(name)
+			return if (faulted == null) query.error(why!, id) else faulted!(why!, id)
+		}
+		let caller = new Caller("", auth?.region ?? "us-east-1", "*", id, "anonymous", this.trees)
+		if (auth != null) {
+			const account = if (known == null) accountOf(auth.accessKey) else known.account
+			const arn = if (known == null) `arn:aws:iam::${account}:root` else known.arn
+			caller = new Caller(account, auth.region, arn, id, known?.userId ?? account, this.trees)
+		}
 		caller.endpoint = `http://${req.headers.get("host") ?? "localhost:4566"}`
 		caller.credential = known
 		caller.userAgent = req.headers.get("user-agent") ?? ""

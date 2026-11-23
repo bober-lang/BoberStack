@@ -1,5 +1,5 @@
 import { Fault } from "../fault"
-import { Store, Table, failAllocation, live } from "./store"
+import { Blob, BlobWriter, Store, Table, failAllocation, live } from "./store"
 import { indexOf } from "std/algo"
 
 /// The key of i, padded so that byte order is numeric order.
@@ -100,7 +100,7 @@ test "clones are isolated both ways" {
 }
 
 test "clones of clones free everything once closed" {
-	const [records, trees] = live()
+	const before = live()
 	const stores = [new Store()]
 	let seed: i64 = 1
 	const next = (n: i32) => {
@@ -117,14 +117,14 @@ test "clones of clones free everything once closed" {
 			s.put(k(next(3000)), `${i}`)
 		}
 	}
-	assert live()[1] == trees + (stores.length as i64) && live()[0] > records
+	assert live()[1] == before[1] + (stores.length as i64) && live()[0] > before[0]
 	while (stores.length > 0) {
 		const i = next(stores.length)
 		stores[i].close()
 		stores[i] = stores[stores.length - 1]
 		stores.pop()
 	}
-	assert live() == [records, trees]
+	assert live() == before
 }
 
 class Tag {
@@ -203,7 +203,7 @@ function fails[T](n: i32, f: () => T throws Fault): bool {
 }
 
 test "out of memory throws and changes nothing" {
-	const [records, trees] = live()
+	const before = live()
 	const a = new Store()
 	for (const i of 0 ... 999) {
 		a.put(k(i), "a")
@@ -219,5 +219,151 @@ test "out of memory throws and changes nothing" {
 	assert b.get("new") == "b" && a.get("new") == null
 	a.close()
 	b.close()
-	assert live() == [records, trees]
+	assert live() == before
+}
+
+test "a descending scan pages back through a prefix" {
+	const s = new Store()
+	for (const key of ["b", "a\xff", "a", "a\x00", "ab", "a/2", "a/10", "", "c", "\xff", "\xff\xff", "\xff\x00"]) {
+		s.put(key, `v${key}`)
+	}
+	assert s.scan("a", null, 1000, true).map(e => e[0]) == ["a\xff", "ab", "a/2", "a/10", "a\x00", "a"]
+	assert s.scan("a/", null, 1000, true).map(e => e[0]) == ["a/2", "a/10"] && s.scan("ba", null, 1000, true) == []
+	assert s.scan("", null, 2, true).map(e => e[0]) == ["\xff\xff", "\xff\x00"] && s.scan("", null, 0, true) == []
+	assert s.scan("\xff", null, 1000, true).map(e => e[0]) == ["\xff\xff", "\xff\x00", "\xff"]
+	assert s.scan("a", "ab", 2, true) == [["a/2", "va/2"], ["a/10", "va/10"]]
+	assert s.scan("a", "zz", 1000, true) == s.scan("a", null, 1000, true) && s.scan("a", "a", 1000, true) == []
+	assert s.scan("a", "\x00", 1000, true) == [] && s.scan("a", "a\xff\xff", 1, true)[0][0] == "a\xff"
+	let seen: string[] = []
+	let before: string | null = null
+	while (true) {
+		const page = s.scan("", before, 5, true)
+		seen = [...seen, ...page.map(e => e[0])]
+		if (page.length < 5) {
+			break
+		}
+		before = page[page.length - 1][0]
+	}
+	assert seen == s.scan("").map(e => e[0]).reverse()
+	const t = new Table[Limits](s, "t")
+	for (const key of ["x1", "x2", "y"]) {
+		t.put(key, new Limits())
+	}
+	assert t.scan(null, 1000, "x", true).map(e => e[0]) == ["x2", "x1"] && t.scan("y", 1, "", true)[0][0] == "x2"
+	s.close()
+}
+
+/// size bytes of a pattern that differs from one offset to the next within 251 bytes.
+function bytes(size: i32): string {
+	const b: u8[] = []
+	for (const i of 0 ... size - 1) {
+		b.push((i % 251) as u8)
+	}
+	return fromBytes(b)
+}
+
+/// A blob of s, written in pieces of n bytes.
+function blob(s: string, n: i32 = 1000): Blob throws Fault {
+	const w = new BlobWriter()
+	for (let i = 0; i < s.length; i += n) {
+		w.write(s.slice(i, if (i + n < s.length) i + n else s.length))
+	}
+	return w.finish()
+}
+
+test "a blob larger than a chunk, written in pieces, read in ranges" {
+	const before = live()
+	const s = bytes(9 << 20)
+	const b = blob(s, 300007)
+	assert b.size() == (s.length as i64) && live()[2] == before[2] + 1 && live()[3] == before[3] + 3
+	assert b.read() == s && b.read(4194300, 10) == s.slice(4194300, 4194310) && b.read(5, 0) == ""
+	assert b.read((s.length as i64) - 3) == s.slice(s.length - 3, s.length) && b.read(s.length as i64, 5) == ""
+	const body = b.body(4194000, 5000000)
+	let got = ""
+	while (true) {
+		const piece = body.read(1 << 20)
+		if (piece == null) {
+			break
+		}
+		assert piece.length <= 1 << 20
+		got += piece
+	}
+	assert body.length == 5000000 && got == s.slice(4194000, 9194000)
+	b.close()
+	assert live()[2] == before[2] + 1 // the body's own handle
+	body.close()
+	b.close()
+	const empty = new BlobWriter().finish()
+	const nothing = empty.body()
+	assert empty.size() == 0 && empty.read() == "" && nothing.read(10) == null && nothing.length == 0
+	nothing.close()
+	empty.close()
+	assert live() == before
+}
+
+test "an entry holds its blob, which clones share and overwrites and deletes free" {
+	const before = live()
+	const a = new Store()
+	const b = blob("hello")
+	a.put("k", "meta", b)
+	b.close()
+	assert a.get("k") == "meta" && a.blob("missing") == null
+	a.put("plain", "v")
+	assert a.blob("plain") == null
+	const c = a.clone()
+	const held = c.blob("k")!
+	assert held.read() == "hello"
+	held.close()
+	c.put("k", "meta")
+	assert c.blob("k") == null && live()[2] == before[2] + 1
+	const again = a.blob("k")!
+	assert again.read(1, 3) == "ell"
+	again.close()
+	assert a.delete("k") && live()[2] == before[2] && live()[3] == before[3]
+	const d = blob("bye")
+	c.put("other", "", d)
+	d.close()
+	c.close()
+	a.close()
+	assert live() == before
+}
+
+test "joined blobs and one held under two keys share their chunks" {
+	const before = live()
+	const s = new Store()
+	const parts = [blob("first,"), blob(bytes(5 << 20)), blob(""), blob("last")]
+	const chunks = live()[3]
+	const whole = Blob.join(parts)
+	for (const p of parts) {
+		p.close()
+	}
+	assert live()[3] == chunks && whole.size() == ((6 + (5 << 20) + 4) as i64)
+	assert whole.read() == "first," + bytes(5 << 20) + "last" && whole.read((5 << 20) + 6) == "last"
+	s.put("a", "", whole)
+	s.put("b", "", whole)
+	whole.close()
+	const kept = s.blob("b")!
+	assert s.delete("a") && kept.read(0, 6) == "first," && live()[3] == chunks
+	kept.close()
+	s.close()
+	assert live() == before
+}
+
+test "out of memory writing a blob throws and leaves nothing" {
+	const before = live()
+	assert fails(1, () => new BlobWriter())
+	const w = new BlobWriter()
+	assert fails(1, () => w.write("x")) // its file
+	w.write("abc")
+	// Its spans, its chunk, and with the spans grown, the blob.
+	assert fails(1, () => w.finish()) && fails(2, () => w.finish()) && fails(2, () => w.finish())
+	w.close()
+	w.close()
+	const b = blob("abc")
+	assert fails(1, () => Blob.join([b, b]))
+	const s = new Store()
+	assert fails(1, () => s.put("k", "", b)) && s.blob("k") == null
+	s.close()
+	b.close()
+	assert live() == before
 }

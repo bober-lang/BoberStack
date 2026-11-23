@@ -1,0 +1,90 @@
+import { Fault } from "../fault"
+import { chunked, decode } from "./chunked"
+import { authorization, verify } from "./sigv4"
+import { Request } from "std/http"
+import { parseIso8601Basic } from "std/time"
+
+// AWS's worked examples of S3's chunked uploads, of signed chunks, and of signed chunks with a signed trailer.
+const secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+const at = "20130524T000000Z"
+
+/// n bytes of a.
+function as(n: i32): string {
+	const b: u8[] = []
+	for (const i of 1 ... n) {
+		b.push(0x61)
+	}
+	return fromBytes(b)
+}
+
+/// The examples' PUT of chunkObject.txt in the mode given, with headers and signed as given.
+function put(mode: string, signed: string, seed: string, headers: [string, string][]): Request {
+	const req = new Request("PUT", "http://s3.amazonaws.com/examplebucket/chunkObject.txt")
+	const all: [string, string][] = [["host", "s3.amazonaws.com"], ["x-amz-date", at],
+		["x-amz-storage-class", "REDUCED_REDUNDANCY"], ["content-encoding", "aws-chunked"],
+		["x-amz-content-sha256", mode], ["x-amz-decoded-content-length", "66560"]]
+	for (const [k, v] of [...all, ...headers]) {
+		req.headers.set(k, v)
+	}
+	req.headers.set("authorization",
+		"AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/"
+		+ `aws4_request, SignedHeaders=${signed}, Signature=${seed}`)
+	return req
+}
+
+/// The code of what decode throws for req with body, "" if nothing.
+function fails(req: Request, body: string, key: string | null = secret): string {
+	try {
+		decode(req, body, authorization(req)!, key)
+	} catch (f: Fault) {
+		return f.code
+	}
+	return ""
+}
+
+test "signed chunks" {
+	const body = "10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n"
+		+ as(65536) + "\r\n400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n"
+		+ as(1024) + "\r\n0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n"
+	const signed = "content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;"
+		+ "x-amz-storage-class"
+	const req = () => put("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", signed,
+		"4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9", [["content-length", "66824"]])
+	const r = req()
+	assert body.length == 66824 && chunked(r) && !chunked(new Request("GET", "http://localhost/"))
+	assert verify(r, body, authorization(r)!, secret, parseIso8601Basic(at)) == null
+	assert decode(r, body, authorization(r)!, secret) == as(66560) && !r.headers.has("content-encoding")
+	const forged = body.slice(0, 22) + "bd" + body.slice(24, body.length)
+	assert fails(req(), forged) == "SignatureDoesNotMatch" && fails(req(), forged, null) == ""
+	assert fails(req(), body.slice(0, 66000)) == "IncompleteBody"
+		&& fails(req(), body.slice(0, 66822)) == "IncompleteBody"
+	const short = req()
+	short.headers.set("x-amz-decoded-content-length", "66561")
+	assert fails(short, body) == "IncompleteBody"
+}
+
+test "signed chunks with a signed trailer, and unsigned ones" {
+	const body = "10000;chunk-signature=b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2\r\n"
+		+ as(65536) + "\r\n400;chunk-signature=1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7\r\n"
+		+ as(1024) + "\r\n0;chunk-signature=2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992\r\n"
+		+ "x-amz-checksum-crc32c:sOO8/Q==\r\n"
+		+ "x-amz-trailer-signature:d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435\r\n\r\n"
+	const signed = "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;"
+		+ "x-amz-storage-class;x-amz-trailer"
+	const req = () => put("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", signed,
+		"106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
+		[["x-amz-trailer", "x-amz-checksum-crc32c"]])
+	const r = req()
+	assert verify(r, body, authorization(r)!, secret, parseIso8601Basic(at)) == null
+	assert decode(r, body, authorization(r)!, secret) == as(66560)
+		&& r.headers.get("x-amz-checksum-crc32c") == "sOO8/Q=="
+	const forged = body.slice(0, body.length - 10) + "x" + body.slice(body.length - 9, body.length)
+	assert fails(req(), forged) == "SignatureDoesNotMatch"
+	const unsigned = put("STREAMING-UNSIGNED-PAYLOAD-TRAILER", signed, "00",
+		[["x-amz-trailer", "x-amz-checksum-crc32"], ["x-amz-decoded-content-length", "5"],
+		["content-encoding", "gzip, aws-chunked"]])
+	const plain = "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n"
+	assert decode(unsigned, plain, authorization(unsigned)!, secret) == "hello"
+	assert unsigned.headers.get("x-amz-checksum-crc32") == "NhCmhg=="
+		&& unsigned.headers.get("content-encoding") == "gzip"
+}

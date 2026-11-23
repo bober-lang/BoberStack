@@ -1,6 +1,7 @@
 import { Request } from "std/http"
-import { minute, parseRfc3339, second } from "std/time"
-import { Authorization, canonicalRequest, parse, signature, verify } from "./sigv4"
+import { Fault } from "../fault"
+import { minute, parseIso8601Basic, parseRfc3339, second } from "std/time"
+import { Authorization, authorization, canonicalRequest, parse, signature, verify } from "./sigv4"
 
 // The cases' signatures are botocore's SigV4Auth's; get-vanilla's is the aws-sig-v4-test-suite's too.
 const secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
@@ -32,14 +33,14 @@ test "get-vanilla" {
 	const a = auth("service", "host;x-amz-date", "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
 	const canonical = ["GET", "/", "", "host:example.amazonaws.com", "x-amz-date:20150830T123600Z", "",
 		"host;x-amz-date", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
-	assert canonicalRequest(req, "", a.signedHeaders) == canonical.join("\n")
+	assert canonicalRequest(req, canonical[7], a) == canonical.join("\n")
 	assert signature(req, "", a, secret) == a.signature
 }
 
 test "get-vanilla-query-order-key-case" {
 	const req = request("GET", "https://example.amazonaws.com/?Param2=value2&Param1=value1")
 	const a = auth("service", "host;x-amz-date", "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500")
-	assert canonicalRequest(req, "", a.signedHeaders).slice(0, 34) == "GET\n/\nParam1=value1&Param2=value2\n"
+	assert canonicalRequest(req, "", a).slice(0, 34) == "GET\n/\nParam1=value1&Param2=value2\n"
 	assert signature(req, "", a, secret) == a.signature
 }
 
@@ -75,4 +76,88 @@ test "a signed X-Amz-Content-Sha256 does not stand for another body" {
 	const mismatch = "The request signature we calculated does not match the signature you provided. Check your AWS "
 		+ "Secret Access Key and signing method. Consult the service documentation for details."
 	assert verify(req, "Action=GetSessionToken&Version=2011-06-15", a, secret, at) == mismatch
+}
+
+/// What verify answers req, whose body is body, signed by secret, at stamp, as 20150830T123600Z: "" if it is signed, an
+/// AccessDenied's or a SignatureDoesNotMatch's code.
+function verdict(req: Request, body: string, stamp: string): string {
+	const why = verify(req, body, authorization(req)!, secret, parseIso8601Basic(stamp))
+	return if (why == null) "" else if (why instanceof Fault) why.code else "SignatureDoesNotMatch"
+}
+
+/// The code of the fault authorization throws for req, "" if none.
+function malformed(req: Request): string {
+	try {
+		authorization(req)
+	} catch (f: Fault) {
+		return f.code
+	}
+	return ""
+}
+
+// The URLs are aws s3 presign's (aws-cli 2.42.1), the headers' signatures curl --aws-sigv4's (curl 8.18.0).
+test "a presigned URL" {
+	const url = "http://localhost:4566/my-bucket/dir/a%20key%2Bx.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential="
+		+ "AKIDEXAMPLE%2F20261123%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261123T011655Z&X-Amz-Expires=600&"
+		+ "X-Amz-SignedHeaders=host&X-Amz-Signature=33ca722d56d53a79d276e72b1751412748a5dfaa7f2acd33e3dfc1e95f892b79"
+	const req = new Request("GET", url)
+	req.headers.set("host", "localhost:4566")
+	const a = authorization(req)!
+	assert a.accessKey == "AKIDEXAMPLE" && a.service == "s3" && a.region == "us-east-1" && a.expires == 600
+	assert verdict(req, "", "20261123T011655Z") == "" && verdict(req, "", "20261123T012655Z") == ""
+	assert verdict(req, "", "20261123T012656Z") == "AccessDenied"
+	const other = new Request("GET", url.slice(0, 31) + "b" + url.slice(32, url.length))
+	other.headers.set("host", "localhost:4566")
+	assert verdict(other, "", "20261123T011655Z") == "SignatureDoesNotMatch"
+	const token = new Request("GET",
+		"http://localhost:4566/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential="
+		+ "AKIDEXAMPLE%2F20261123%2Feu-west-1%2Fs3%2Faws4_request&X-Amz-Date=20261123T011656Z&X-Amz-Expires=3600&"
+		+ "X-Amz-SignedHeaders=host&X-Amz-Security-Token=tok%2Fen%2B1%3D&X-Amz-Signature="
+		+ "fccffed605cbfa1249399ca877db9e1eba757363bad7835313758998e4e25e73")
+	token.headers.set("host", "localhost:4566")
+	assert verdict(token, "", "20261123T021656Z") == "" && verdict(token, "", "20261123T021657Z") == "AccessDenied"
+	const bad = "http://localhost:4566/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=A%2F20261123%2Fus-east-1"
+		+ "%2Fs3%2Faws4_request&X-Amz-Date=20261123T011656Z&X-Amz-SignedHeaders=host&X-Amz-Signature=00"
+	assert malformed(new Request("GET", bad)) == "AuthorizationQueryParametersError"
+	assert malformed(new Request("GET", bad + "&X-Amz-Expires=604801")) == "AuthorizationQueryParametersError"
+	assert malformed(new Request("GET", bad + "&X-Amz-Expires=604800")) == ""
+	assert malformed(new Request("GET", "http://localhost/?X-Amz-Algorithm=HMAC"))
+		== "AuthorizationQueryParametersError"
+	const header = new Request("GET", "http://localhost/")
+	header.headers.set("authorization", "AWS4-HMAC-SHA256 Signature=00")
+	assert malformed(header) == "IncompleteSignature" && authorization(new Request("GET", "http://localhost/")) == null
+}
+
+/// A request as curl sends it, signed at stamp in the scope and with the signature after the credential's date.
+function curl(method: string, url: string, body: string, stamp: string, signed: string,
+	headers: [string, string][]): Request {
+	const req = new Request(method, url, body)
+	req.headers.set("host", `${req.url.host}:${req.url.port}`)
+	req.headers.set("x-amz-date", stamp)
+	req.headers.set("authorization", `AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/${stamp.slice(0, 8)}/${signed}`)
+	for (const [k, v] of headers) {
+		req.headers.set(k, v)
+	}
+	return req
+}
+
+test "S3's paths, payload hashes and unsigned payloads" {
+	const put = curl("PUT", "http://localhost:18765/bucket/my%20key?tagging=&x=a%20b", "hello world",
+		"20261123T011701Z",
+		"us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, "
+		+ "Signature=c9bacf5da4283ddef7384895e9ae0165eddc15fac89cc41feb2545a10089f297",
+		[["content-type", "text/plain"],
+		["x-amz-content-sha256", "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"]])
+	assert verdict(put, "hello world", "20261123T011701Z") == ""
+	assert verdict(put, "hello world!", "20261123T011701Z") == "SignatureDoesNotMatch"
+	const unsigned = curl("PUT", "http://localhost:18766/bucket/k", "hello world", "20261123T011710Z",
+		"us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+		+ "Signature=950435bd5ba815c65458b2bd916b238336b95eeeb129478da861ce43b453a5b5",
+		[["x-amz-content-sha256", "UNSIGNED-PAYLOAD"]])
+	assert verdict(unsigned, "hello world", "20261123T011710Z") == "" && verdict(unsigned, "", "20261123T011710Z") == ""
+	const sqs = curl("POST", "http://localhost:18767/", "Action=ListQueues", "20261123T011713Z",
+		"us-east-1/sqs/aws4_request, SignedHeaders=content-type;host;x-amz-date, "
+		+ "Signature=96faac9e309ce22007bbff0a2326a8b60a31d6c4250532b0dfb124e56e1f68cf",
+		[["content-type", "application/x-www-form-urlencoded"]])
+	assert verdict(sqs, "Action=ListQueues", "20261123T011713Z") == ""
 }
