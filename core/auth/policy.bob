@@ -1,7 +1,8 @@
 //! IAM policies: documents parsed once into statements, and AWS's evaluation of a request against the policies that
 //! apply to it, as IAM's policy evaluation logic has it: an explicit deny in any policy wins; within an account either
 //! an identity-based policy or a resource-based policy that names the principal allows, the permissions boundary and
-//! the session policies limiting what the former allows; across accounts both sides must allow.
+//! the session policies limiting what the former allows, unless the resource policy is exclusive, as a KMS key policy,
+//! and does not allow the account; across accounts both sides must allow.
 
 import { indexOf, startsWith } from "std/algo"
 
@@ -93,6 +94,9 @@ export class Policies {
 	boundary: Policy | null = null
 	/// None if the principal is not a session with session policies.
 	session: Policy[] = []
+	/// Whether the resource policy alone gives access within its account, as a KMS key policy does: the root and the
+	/// identity-based policies allow only where it allows the account.
+	exclusive = false
 }
 
 export type Effect = "allowed" | "implicitDeny" | "explicitDeny"
@@ -179,6 +183,9 @@ export function evaluate(r: Request, p: Policies): Decision {
 	if (who.account == r.owner) {
 		if (grant == "principal" || grant == "role" && boundary && session) {
 			return new Decision("allowed", rk)
+		}
+		if (p.exclusive && grant != "account") {
+			return new Decision("implicitDeny", rk)
 		}
 		return if (identity && boundary && session) new Decision("allowed", "identity")
 			else new Decision("implicitDeny", limited)

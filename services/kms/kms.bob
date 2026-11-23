@@ -8,11 +8,12 @@
 //! - Asymmetric keys, HMAC_224 and HMAC_384 (std has neither SHA-224 nor SHA-384), imported key material, custom key
 //!   stores and multi-Region replicas are not implemented: CreateKey answers NotImplemented for them. A multi-Region
 //!   key is only marked so.
-//! - A key policy is evaluated as IAM evaluates a resource policy, so within its account a key policy that does not
-//!   give the account access still lets identity-based policies allow, and the account's root is always allowed.
 //! - Grants take effect at once; a grant token is not needed and not checked. ListRetirableGrants lists those of the
 //!   caller's account's keys only.
-//! - There are no AWS managed keys (alias/aws/…).
+//! - The AWS managed keys are those of the services listed below, made on first use of their alias by any operation
+//!   that succeeds. Their key policies merge AWS's two statements of use through the service into one, and their
+//!   descriptions are as near AWS's as known; nothing manages them but their key policy, so the account is refused
+//!   managing them with an AccessDeniedException of the key policy.
 //! - The messages of validation and of keys and aliases not found are AWS's as seen; those of a key's state, of
 //!   grants and of the lockout safety check are as near as AWS's documentation tells.
 
@@ -23,7 +24,7 @@ import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { Blob, mac, open, parse, random, seal } from "./ciphertext"
 import { Alias, aliases, Grant, Key, keys, Material, save, saveAlias } from "./records"
-import { indexOf, startsWith } from "std/algo"
+import { indexOf, sortBy, startsWith } from "std/algo"
 import { isHexDigit } from "std/ascii"
 import { equal } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
@@ -34,6 +35,19 @@ import { day } from "std/time"
 /// The most plaintext Encrypt takes, and the on-demand rotations a key may have.
 const most = 4096
 const onDemand = 25
+
+/// The AWS managed keys every account has in every region, made on first use: the last part of the alias, alias/aws/…;
+/// the signing name of the service that may use it; the service's name and what the key protects, as AWS words them.
+const predefined: [string, string, string, string][] = [["dynamodb", "dynamodb", "Amazon DynamoDB", "DynamoDB tables"],
+	["ebs", "ec2", "EBS", "EBS volumes"],
+	["elasticfilesystem", "elasticfilesystem", "Amazon Elastic File System", "Elastic File Systems"],
+	["es", "es", "Amazon OpenSearch Service", "OpenSearch domains"],
+	["kinesis", "kinesis", "Amazon Kinesis", "Kinesis streams"], ["lambda", "lambda", "AWS Lambda", "Lambda functions"],
+	["rds", "rds", "RDS", "RDS database volumes"], ["redshift", "redshift", "Amazon Redshift", "Redshift clusters"],
+	["s3", "s3", "S3", "S3 objects"],
+	["secretsmanager", "secretsmanager", "AWS Secrets Manager", "Secrets Manager data"],
+	["sns", "sns", "Amazon SNS", "SNS topics"], ["sqs", "sqs", "Amazon SQS", "SQS messages"],
+	["ssm", "ssm", "AWS Systems Manager", "SSM parameters"]]
 
 /// The service, of the operations implemented.
 export class Handler {
@@ -325,11 +339,26 @@ export class Handler {
 		}
 		caller.allow("*", null, base(caller))
 		const all = everyAlias(aliases(caller.regional())).filter(a => of == null || a.target == of)
+		if (of == null) {
+			for (const p of predefined) {
+				const name = `alias/aws/${p[0]}`
+				if (!all.some(a => a.name == name)) {
+					all.push({ ...new Alias(), name: name })
+				}
+			}
+			sortBy(all, (a, b) => a.name < b.name)
+		}
 		const [from, to, next] = paged(all.length, input.Marker, input.Limit, 50)
 		const r = new api.ListAliasesResponse()
-		r.Aliases = all.slice(from, to).map(a => ({ ...new api.AliasListEntry(), AliasName: a.name,
-			AliasArn: aliasArn(caller, a.name), TargetKeyId: a.target, CreationDate: a.created,
-			LastUpdatedDate: a.updated }))
+		r.Aliases = all.slice(from, to).map(a => {
+			const e = { ...new api.AliasListEntry(), AliasName: a.name, AliasArn: aliasArn(caller, a.name) }
+			if (a.target != "") {
+				e.TargetKeyId = a.target
+				e.CreationDate = a.created
+				e.LastUpdatedDate = a.updated
+			}
+			return e
+		})
 		r.NextMarker = next
 		r.Truncated = next != null
 		return r
@@ -612,24 +641,31 @@ export class Found {
 export function keyArn(caller: Caller, service: string, id: string): string throws Fault {
 	const actions = caller.actions
 	caller.actions = ["kms:DescribeKey"]
-	const f = resolve(caller, id, true)
-	authorize(caller, f, via(caller, service))
-	caller.actions = actions
-	return f.key.arn
+	try {
+		const f = resolve(caller, id, true)
+		authorize(caller, f, via(caller, service))
+		return f.key.arn
+	} finally {
+		caller.actions = actions
+	}
 }
 
 /// plain encrypted by the key id names, any way Encrypt takes, with the encryption context, as the caller may encrypt
-/// through service, by its signing name: the ciphertext blob. As AWS's services do, the caller is the one whose request
-/// the service serves, so the key policy and the caller's policies decide, of kms:ViaService.
-export function encryptAs(caller: Caller, service: string, id: string, plain: string,
-	context: [string, string][]): string throws Fault {
+/// through service, by its signing name, of the action: kms:Encrypt, or kms:GenerateDataKey for a service that
+/// encrypts by a data key. As AWS's services do, the caller is the one whose request the service serves, so the key
+/// policy and the caller's policies decide, of kms:ViaService: the ciphertext blob.
+export function encryptAs(caller: Caller, service: string, id: string, plain: string, context: [string, string][],
+	action = "kms:Encrypt"): string throws Fault {
 	const actions = caller.actions
-	caller.actions = ["kms:Encrypt"]
-	const f = resolve(caller, id, true)
-	authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
-	encrypting(f.key, "Encrypt", null)
-	caller.actions = actions
-	return sealed(f.key, plain, context)
+	caller.actions = [action]
+	try {
+		const f = resolve(caller, id, true)
+		authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		encrypting(f.key, "Encrypt", null)
+		return sealed(f.key, plain, context)
+	} finally {
+		caller.actions = actions
+	}
 }
 
 /// The plaintext of the ciphertext blob, sealed with the encryption context, as the caller may decrypt it through
@@ -638,11 +674,14 @@ export function decryptAs(caller: Caller, service: string, blob: string,
 	context: [string, string][]): [string, string] throws Fault {
 	const actions = caller.actions
 	caller.actions = ["kms:Decrypt"]
-	const [f, b] = sealedBy(caller, blob, null)
-	authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
-	encrypting(f.key, "Decrypt", null)
-	caller.actions = actions
-	return [opened(f.key, b, context)[0], f.key.arn]
+	try {
+		const [f, b] = sealedBy(caller, blob, null)
+		authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		encrypting(f.key, "Decrypt", null)
+		return [opened(f.key, b, context)[0], f.key.arn]
+	} finally {
+		caller.actions = actions
+	}
 }
 
 /// The key that id names: by its id or key ARN, or, if aliases, by an alias's name or ARN; else the fault AWS answers.
@@ -677,7 +716,10 @@ function resolve(caller: Caller, id: string, byAlias: bool): Found throws Fault 
 	const store = if (account == caller.account) caller.regional() else caller.existing(`${account}/${caller.region}`)
 	let target = name
 	if (alias) {
-		const a = if (store == null) null else aliases(store!).get(name)
+		let a = if (store == null) null else aliases(store!).get(name)
+		if (a == null && account == caller.account) {
+			a = made(caller, name)
+		}
 		if (a == null) {
 			throw absent(caller, account, `Alias arn:aws:kms:${caller.region}:${account}:${name} is not found.`)
 		}
@@ -757,7 +799,7 @@ function authorize(caller: Caller, f: Found, context: Context = []) throws Fault
 		all.push(["kms:ResourceAliases", names])
 	}
 	try {
-		caller.allow(k.arn, k.policy, all)
+		caller.allow(k.arn, k.policy, all, null, null, true)
 	} catch (denied: Fault) {
 		if (denied.code != "AccessDeniedException" || indexOf(denied.message, "explicit deny") >= 0
 			|| !granted(caller, k, context)) {
@@ -930,7 +972,7 @@ function material(spec: string, t: i64, rotation: string): Material throws Fault
 function metadata(k: Key): api.KeyMetadata {
 	const m = { ...new api.KeyMetadata(), AWSAccountId: k.account, KeyId: k.id, Arn: k.arn, CreationDate: k.created,
 		Enabled: k.state == "Enabled", Description: k.description, KeyUsage: k.usage as api.KeyUsageType,
-		KeyState: k.state as api.KeyState, Origin: "AWS_KMS", KeyManager: "CUSTOMER",
+		KeyState: k.state as api.KeyState, Origin: "AWS_KMS", KeyManager: k.manager as api.KeyManagerType,
 		CustomerMasterKeySpec: k.spec as api.CustomerMasterKeySpec, KeySpec: k.spec as api.KeySpec,
 		MultiRegion: k.multiRegion, DeletionDate: k.deleting, PendingDeletionWindowInDays: k.window }
 	if (k.usage == "ENCRYPT_DECRYPT") {
@@ -978,12 +1020,50 @@ function lockout(caller: Caller, k: Key, document: string, bypass: bool) throws 
 	const actions = caller.actions
 	caller.actions = ["kms:PutKeyPolicy"]
 	try {
-		caller.allow(k.arn, document, base(caller))
+		caller.allow(k.arn, document, base(caller), null, null, true)
 	} catch (f: Fault) {
 		throw api.malformedPolicyDocumentException("The new key policy will not allow you to update the key policy in "
 			+ "the future.")
 	}
 	caller.actions = actions
+}
+
+/// The alias name of an AWS managed key of the caller's account and region, its key made now, as AWS makes it on
+/// first use; null if name is none.
+function made(caller: Caller, name: string): Alias | null throws Fault {
+	for (const [service, signing, title, what] of predefined) {
+		if (name == `alias/aws/${service}`) {
+			const id = uuid()
+			const t = now()
+			const k = { ...new Key(), id: id, arn: `arn:aws:kms:${caller.region}:${caller.account}:key/${id}`,
+				account: caller.account, created: t, manager: "AWS", usage: "ENCRYPT_DECRYPT",
+				spec: "SYMMETRIC_DEFAULT",
+				description: `Default key that protects my ${what} when no other key is defined`, rotates: true,
+				period: 365, since: t }
+			k.policy = managedPolicy(caller, service, signing, title)
+			k.materials.push(material(k.spec, t, ""))
+			save(keys(caller.regional()), k)
+			const a = { ...new Alias(), name: name, target: id, created: t, updated: t }
+			saveAlias(aliases(caller.regional()), a)
+			return a
+		}
+	}
+	return null
+}
+
+/// The key policy of the AWS managed key alias/aws/<service> of the caller's account and region: the principals of
+/// the account may use it through the service, of its signing name and title, and read it directly.
+function managedPolicy(caller: Caller, service: string, signing: string, title: string): string {
+	const who = `all principals in the account that are authorized to use ${title}`
+	return `{\n  "Version" : "2012-10-17",\n  "Id" : "auto-${service}-2",\n  "Statement" : [ {\n`
+		+ `    "Sid" : "Allow access through ${title} for ${who}",\n    "Effect" : "Allow",\n`
+		+ `    "Principal" : {\n      "AWS" : "*"\n    },\n    "Action" : [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", `
+		+ `"kms:GenerateDataKey*", "kms:CreateGrant", "kms:DescribeKey" ],\n    "Resource" : "*",\n`
+		+ `    "Condition" : {\n      "StringEquals" : {\n        "kms:CallerAccount" : "${caller.account}",\n`
+		+ `        "kms:ViaService" : "${signing}.${caller.region}.amazonaws.com"\n      }\n    }\n  }, {\n`
+		+ `    "Sid" : "Allow direct access to key metadata to the account",\n    "Effect" : "Allow",\n`
+		+ `    "Principal" : {\n      "AWS" : "arn:aws:iam::${caller.account}:root"\n    },\n`
+		+ `    "Action" : [ "kms:Describe*", "kms:Get*", "kms:List*", "kms:RevokeGrant" ],\n    "Resource" : "*"\n  } ]\n}`
 }
 
 /// The key policy AWS gives a key created without one: its account may use it as IAM allows.

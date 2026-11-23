@@ -584,3 +584,129 @@ test "S3 answers a CORS preflight by its bucket's rules, and names them on an an
 	assert res.status == 200 && res.headers.get("access-control-allow-methods") == "GET"
 	g.close()
 }
+
+/// The answer of g to the operation op of KMS, Secrets Manager or SSM, of JSON 1.1, with body, signed by k.
+function json11(g: Gateway, service: string, op: string, body: string, k: Key = root()): Response {
+	const target = switch (service) {
+		case "kms": "TrentService"
+		case "secretsmanager": "secretsmanager"
+		default: "AmazonSSM"
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// The string member name of the JSON answer res, the first; "" if none.
+function member(res: Response, name: string): string {
+	const body = res.body.whole ?? ""
+	const at = indexOf(body, `"${name}":"`)
+	if (at < 0) {
+		return ""
+	}
+	const from = at + name.length + 4
+	return body.slice(from, indexOf(body, "\"", from))
+}
+
+/// A new KMS key of g, of the key policy if not "", by root; its id.
+function kmsKey(g: Gateway, document = ""): string {
+	const body = if (document == "") "{}"
+		else `{"Policy":${json.quoted(document)},"BypassPolicyLockoutSafetyCheck":true}`
+	const res = json11(g, "kms", "CreateKey", body)
+	assert res.status == 200
+	return member(res, "KeyId")
+}
+
+test "a key policy that does not give the account access refuses its users and root, whatever their policies" {
+	const g = gateway()
+	const bob = user(g, "bob", policy([statement("Allow", `"kms:*"`, "*")]))
+	const alice = user(g, "alice")
+	const carol = user(g, "carol")
+	const only = kmsKey(g,
+		policy([statement("Allow", `"kms:*"`, "*", `{"AWS":"arn:aws:iam::000000000000:user/alice"}`)]))
+	const plain = `{"KeyId":"${only}","Plaintext":"eA=="}`
+	assert fails(json11(g, "kms", "Encrypt", plain, bob), 400, "AccessDeniedException",
+		"because no resource-based policy allows the kms:Encrypt action")
+	assert fails(json11(g, "kms", "DescribeKey", `{"KeyId":"${only}"}`), 400, "AccessDeniedException")
+	assert json11(g, "kms", "Encrypt", plain, alice).status == 200
+	const open = kmsKey(g)
+	assert json11(g, "kms", "Encrypt", `{"KeyId":"${open}","Plaintext":"eA=="}`, bob).status == 200
+	assert fails(json11(g, "kms", "Encrypt", `{"KeyId":"${open}","Plaintext":"eA=="}`, carol), 400,
+		"AccessDeniedException", "because no identity-based policy allows the kms:Encrypt action")
+	g.close()
+}
+
+test "AWS managed keys: predefined, made on first use, used only through their service" {
+	const g = gateway()
+	let res = json11(g, "kms", "ListAliases", "{}")
+	assert indexOf(res.body.whole ?? "",
+		`{"AliasName":"alias/aws/ssm","AliasArn":"arn:aws:kms:us-east-1:000000000000:alias/aws/ssm"}`) >= 0
+	res = json11(g, "kms", "DescribeKey", `{"KeyId":"alias/aws/ssm"}`)
+	assert res.status == 200 && member(res, "KeyManager") == "AWS"
+	const id = member(res, "KeyId")
+	assert member(json11(g, "kms", "DescribeKey", `{"KeyId":"alias/aws/ssm"}`), "KeyId") == id
+	assert member(json11(g, "kms", "ListAliases", `{"KeyId":"${id}"}`), "AliasName") == "alias/aws/ssm"
+	assert indexOf(json11(g, "kms", "GetKeyRotationStatus", `{"KeyId":"${id}"}`).body.whole ?? "",
+		`"KeyRotationEnabled":true`) >= 0
+	for (const op of ["DisableKey", "ScheduleKeyDeletion", "EnableKeyRotation"]) {
+		assert fails(json11(g, "kms", op, `{"KeyId":"${id}"}`), 400, "AccessDeniedException")
+	}
+	assert fails(json11(g, "kms", "Encrypt", `{"KeyId":"alias/aws/ssm","Plaintext":"eA=="}`), 400,
+		"AccessDeniedException")
+	assert fails(json11(g, "kms", "DeleteAlias", `{"AliasName":"alias/aws/ssm"}`), 400, "AccessDeniedException")
+	g.close()
+}
+
+test "Secrets Manager encrypts under the secret's key, decrypting as the caller" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const other = kmsKey(g)
+	const writer = user(g, "writer", policy([statement("Allow", `["secretsmanager:*","kms:*"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"secretsmanager:GetSecretValue"`, "*")]))
+	assert json11(g, "secretsmanager", "CreateSecret", `{"Name":"mine","KmsKeyId":"${key}","SecretString":"s1"}`,
+		writer).status == 200
+	assert json11(g, "secretsmanager", "CreateSecret", `{"Name":"plain","SecretString":"s0"}`, writer).status == 200
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), "SecretString") == "s1"
+	assert fails(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, reader), 400,
+		"AccessDeniedException", "Access to KMS is not allowed")
+	// The AWS managed key lets any principal of the account that may read the secret decrypt it.
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"plain"}`, reader), "SecretString") == "s0"
+	assert fails(json11(g, "secretsmanager", "CreateSecret",
+		`{"Name":"none","KmsKeyId":"alias/none","SecretString":"x"}`, writer), 400, "EncryptionFailure")
+	// UpdateSecret re-encrypts the current versions under the new key.
+	assert json11(g, "secretsmanager", "UpdateSecret", `{"SecretId":"mine","KmsKeyId":"${other}"}`, writer).status
+		== 200
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), "SecretString") == "s1"
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${other}"}`).status == 200
+	assert fails(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), 400, "DecryptionFailure")
+	assert fails(json11(g, "secretsmanager", "PutSecretValue", `{"SecretId":"mine","SecretString":"s2"}`, writer), 400,
+		"EncryptionFailure")
+	g.close()
+}
+
+test "SSM encrypts a SecureString under its key, decrypting it only WithDecryption, as the caller" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const writer = user(g, "writer", policy([statement("Allow", `["ssm:*","kms:*"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"ssm:GetParameter"`, "*")]))
+	assert json11(g, "ssm", "PutParameter", `{"Name":"/mine","Type":"SecureString","KeyId":"${key}","Value":"v1"}`,
+		writer).status == 200
+	assert json11(g, "ssm", "PutParameter", `{"Name":"/plain","Type":"SecureString","Value":"v0"}`, writer).status
+		== 200
+	const sealed = member(json11(g, "ssm", "GetParameter", `{"Name":"/mine"}`, reader), "Value")
+	assert sealed != "" && sealed != "v1"
+	assert member(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, writer), "Value") == "v1"
+	assert fails(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, reader), 400,
+		"AccessDeniedException", "kms:Decrypt")
+	assert member(json11(g, "ssm", "GetParameter", `{"Name":"/plain","WithDecryption":true}`, reader), "Value") == "v0"
+	assert fails(json11(g, "ssm", "PutParameter",
+		`{"Name":"/x","Type":"SecureString","KeyId":"alias/none","Value":"v"}`, writer), 400, "InvalidKeyId",
+		"Alias arn:aws:kms:us-east-1:000000000000:alias/none is not found.")
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, writer), 400,
+		"InvalidKeyId", "DisabledException")
+	g.close()
+}

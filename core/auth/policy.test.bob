@@ -258,6 +258,34 @@ test "NotPrincipal" {
 	assert is(evaluate(r, p), "allowed", "identity")
 }
 
+// An exclusive resource policy, as a KMS key policy, lets identity-based policies and the root allow only where it
+// allows the account (KMS Developer Guide, "Default key policy").
+test "an exclusive resource policy" {
+	const key = "arn:aws:kms:us-east-1:111122223333:key/k"
+	const r = request("user", "arn:aws:iam::111122223333:user/alice", "111122223333", "kms:Encrypt", key,
+		"111122223333")
+	const root = request("root", "arn:aws:iam::111122223333:root", "111122223333", "kms:Encrypt", key, "111122223333")
+	const named = (who: string) => policy(`{"Effect":"Allow","Principal":{"AWS":"${who}"},"Action":"kms:*",`
+		+ `"Resource":"*"}`, "resource")
+	const p = new Policies()
+	p.exclusive = true
+	p.identity = [policy(`{"Effect":"Allow","Action":"kms:*","Resource":"*"}`)]
+	p.resource = named("arn:aws:iam::111122223333:user/bob")
+	assert is(evaluate(r, p), "implicitDeny", "resource")
+	assert is(evaluate(root, p), "implicitDeny", "resource")
+	p.exclusive = false
+	assert is(evaluate(r, p), "allowed", "identity")
+	assert is(evaluate(root, p), "allowed", "identity")
+	p.exclusive = true
+	p.resource = named("arn:aws:iam::111122223333:root")
+	assert is(evaluate(r, p), "allowed", "identity")
+	assert is(evaluate(root, p), "allowed", "resource")
+	p.identity = []
+	assert is(evaluate(r, p), "implicitDeny", "identity")
+	p.resource = named("arn:aws:iam::111122223333:user/alice")
+	assert is(evaluate(r, p), "allowed", "resource")
+}
+
 test "messages" {
 	const r = request("user", "arn:aws:iam::123456789012:user/John", "123456789012", "codecommit:ListRepositories", "*",
 		"123456789012")

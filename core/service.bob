@@ -75,9 +75,10 @@ export class Caller {
 	/// of context. The root of an account has no identity-based policies to allow it; a service, a caller made by
 	/// internal, none at all, nor an anonymous caller, of account "". The resource policy of sts:AssumeRole is the
 	/// role's trust policy. The message names the resource as shown, if not null, as IAM names some. The resource is of
-	/// the account of, if not null, else of the account its ARN names, as an S3 bucket's names none.
+	/// the account of, if not null, else of the account its ARN names, as an S3 bucket's names none. An exclusive
+	/// policy, as a KMS key policy, lets the root and identity-based policies allow only where it allows the account.
 	allow(resource: string, policy: string | null = null, context: Context = [], shown: string | null = null,
-		of: string | null = null) throws Fault {
+		of: string | null = null, exclusive = false) throws Fault {
 		const r = new auth.Request()
 		r.resource = resource
 		const named = owner(resource)
@@ -108,6 +109,7 @@ export class Caller {
 			this.describe(r.principal, r.context)
 		}
 		r.context.append(context)
+		ps.exclusive = exclusive
 		if (policy != null) {
 			const trust = this.actions.length > 0 && startsWith(this.actions[0], "sts:AssumeRole")
 			try {

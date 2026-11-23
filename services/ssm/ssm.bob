@@ -1,9 +1,8 @@
 //! AWS Systems Manager Parameter Store: String, StringList and SecureString parameters, their hierarchy, versions,
 //! labels and selectors, filters and tags. The rest of Systems Manager is not implemented. Where AWS differs:
 //!
-//! - There is no KMS: a SecureString is stored as given, with its key id. It is answered in plain with
-//!   WithDecryption, and without as a placeholder ciphertext, base64 of a digest of its key id and value, that nothing
-//!   decrypts.
+//! - A SecureString is encrypted by KMS directly, as AWS encrypts one of the standard tier, an advanced one too. The
+//!   faults of a key that is missing, disabled or not allowed give KMS's message as SSM is known to, of KMS's words.
 //! - Nothing runs between requests: parameter policies are stored and listed, Pending, but an expiration never
 //!   deletes a parameter nor a notification fires; Intelligent-Tiering picks a tier only at PutParameter.
 //! - A Label filter matches a parameter of which any version has the label, and the parameter is answered at its
@@ -14,12 +13,11 @@ import { Fault } from "../../core/fault"
 import { Violations, Validation } from "../../core/protocol/model"
 import { Caller } from "../../core/service"
 import { Table } from "../../core/state/store"
+import { decryptAs, encryptAs } from "../kms/kms"
 import * as api from "./api"
 import { Parameter, parameters, save, Version } from "./records"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit, lbracket } from "std/ascii"
-import { CryptoError } from "std/crypto/error"
-import { sha256 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { compile, Regex } from "std/regex"
@@ -84,11 +82,19 @@ export class Handler {
 			p.versions = p.versions.slice(1, p.versions.length)
 		}
 		const secure = kind == "SecureString"
-		const keyId = if (!secure) null else input.KeyId ?? (if (last?.type == "SecureString") last?.keyId else null)
-		const v = { ...new Version(), version: (last?.version ?? 0) + 1, value: input.Value, type: kind,
-			description: input.Description ?? last?.description, keyId: if (secure) keyId ?? "alias/aws/ssm" else null,
-			allowedPattern: pattern, tier: tier, policies: input.Policies ?? last?.policies, dataType: dataType,
-			modified: now(), user: caller.arn }
+		const keyId = if (!secure) null
+			else input.KeyId ?? (if (last?.type == "SecureString") last?.keyId else null) ?? "alias/aws/ssm"
+		let value = input.Value
+		if (secure) {
+			try {
+				value = base64.encode(encryptAs(caller, "ssm", keyId!, value, [["PARAMETER_ARN", arnOf(caller, name)]]))
+			} catch (f: Fault) {
+				throw failure(caller, f)
+			}
+		}
+		const v = { ...new Version(), version: (last?.version ?? 0) + 1, value: value, type: kind,
+			description: input.Description ?? last?.description, keyId: keyId, allowedPattern: pattern, tier: tier,
+			policies: input.Policies ?? last?.policies, dataType: dataType, modified: now(), user: caller.arn }
 		p.versions.push(v)
 		p.tags = tagged(p.tags, tags)
 		save(db, p)
@@ -133,7 +139,7 @@ export class Handler {
 				}
 				r.Parameters!.push(wire(caller, p!, version(p!, selector), selector, input.WithDecryption ?? false))
 			} catch (f: Fault) {
-				if (f.status >= 500) {
+				if (f.code != "ParameterNotFound" && f.code != "ParameterVersionNotFound") {
 					throw f
 				}
 				r.InvalidParameters!.push(given)
@@ -222,8 +228,8 @@ export class Handler {
 		const r = new api.GetParameterHistoryResult()
 		r.Parameters = p.versions.slice(from, to).map(v => ({ ...new api.ParameterHistory(), Name: p.name,
 			Type: v.type as api.ParameterType, KeyId: v.keyId, LastModifiedDate: v.modified, LastModifiedUser: v.user,
-			Description: v.description, Value: shown(v, decrypt), AllowedPattern: v.allowedPattern, Version: v.version,
-			Labels: v.labels, Tier: v.tier as api.ParameterTier, Policies: policies(v.policies),
+			Description: v.description, Value: shown(caller, p, v, decrypt), AllowedPattern: v.allowedPattern,
+			Version: v.version, Labels: v.labels, Tier: v.tier as api.ParameterTier, Policies: policies(v.policies),
 			DataType: v.dataType }))
 		r.NextToken = if (to < p.versions.length) base64.encode(`${to}`) else null
 		return r
@@ -411,21 +417,41 @@ function numbered(p: Parameter, n: i64): Version throws Fault {
 /// The parameter p at its version v as GetParameter answers it, of the selector given.
 function wire(caller: Caller, p: Parameter, v: Version, selector: string | null,
 	decrypt: bool): api.Parameter throws Fault {
-	return { ...new api.Parameter(), Name: p.name, Type: v.type as api.ParameterType, Value: shown(v, decrypt),
-		Version: v.version, Selector: if (selector == null) null else `:${selector}`, LastModifiedDate: v.modified,
+	return { ...new api.Parameter(), Name: p.name, Type: v.type as api.ParameterType,
+		Value: shown(caller, p, v, decrypt), Version: v.version,
+		Selector: if (selector == null) null else `:${selector}`, LastModifiedDate: v.modified,
 		ARN: arnOf(caller, p.name), DataType: v.dataType }
 }
 
-/// The value of v as answered: a SecureString's as a placeholder ciphertext unless decrypted.
-function shown(v: Version, decrypt: bool): string throws Fault {
-	if (v.type != "SecureString" || decrypt) {
+/// The value of v, a version of p, as answered: a SecureString's as its ciphertext blob in base64 unless decrypt, else
+/// decrypted as the caller may through SSM.
+function shown(caller: Caller, p: Parameter, v: Version, decrypt: bool): string throws Fault {
+	if (v.type != "SecureString" || !decrypt) {
 		return v.value
 	}
+	let blob = ""
 	try {
-		return base64.encode(sha256(`${v.keyId ?? ""}\x00${v.value}`))
-	} catch (e: CryptoError) {
-		throw new Fault(500, "InternalFailure", e.what)
+		blob = base64.decode(v.value)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A SecureString's ciphertext does not decode")
 	}
+	try {
+		return decryptAs(caller, "ssm", blob, [["PARAMETER_ARN", arnOf(caller, p.name)]])[0]
+	} catch (f: Fault) {
+		throw failure(caller, f)
+	}
+}
+
+/// SSM's fault for KMS's f: an AccessDeniedException of an access denied, else an InvalidKeyId, of KMS's message as
+/// SSM gives it.
+function failure(caller: Caller, f: Fault): Fault {
+	if (f.status >= 500) {
+		return f
+	}
+	const code = if (f.code == "AccessDeniedException") f.code else "InvalidKeyId"
+	return new Fault(400, code,
+		`${f.message} (Service: AWSKMS; Status Code: 400; Error Code: ${f.code}; Request ID: `
+		+ `${caller.requestId}; Proxy: null)`)
 }
 
 /// The tier of the version input puts, after last: Intelligent-Tiering's choice, the one asked, or Standard; and the
