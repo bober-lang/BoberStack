@@ -1,0 +1,23 @@
+//! What tests of a gateway share: a query signed as an SDK signs it, and what is in the answers. The request is handed
+//! to a gateway, not sent: its URL only names the host that is signed.
+
+import { sign } from "./auth/sigv4"
+import { CryptoError } from "std/crypto/error"
+import { parse } from "std/encoding/xml"
+import { Request, Response } from "std/http"
+import { ParseError } from "std/string"
+
+/// A query of body to service from accessKey, signed by secret, dated as tests see now.
+export function request(service: string, accessKey: string, secret: string, body: string,
+	token = ""): Request throws CryptoError | ParseError {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, service, "us-east-1", accessKey, secret, token, "20150626T140000Z")
+	return req
+}
+
+export function texts(res: Response, name: string): string[] throws ParseError {
+	return parse(res.body.whole ?? "").elements(name).map(e => e.text())
+}
+
+export function text(res: Response, name: string): string | null throws ParseError { return texts(res, name).at(0) }

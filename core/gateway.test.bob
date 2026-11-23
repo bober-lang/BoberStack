@@ -1,0 +1,164 @@
+import { request, text } from "./client.test"
+import { Fault } from "./fault"
+import { Gateway } from "./gateway"
+import { Caller } from "./service"
+import { Blob, live } from "./state/store"
+import { Request, Response } from "std/http"
+import { ParseError, parseInt } from "std/string"
+import { millisecond, sleep } from "std/time"
+
+/// Waits 10 ms of logical time between reading the count of requests and writing it one more, so that overlapping
+/// requests would race; fails as the body asks.
+function service(caller: Caller, req: Request, log: string[]): Response throws IoError | ParseError {
+	const body = req.body.text()
+	log.push(`start ${body}`)
+	try {
+		const count = parseInt(caller.store().get("count") ?? "0")
+		sleep(10 * millisecond)
+		caller.store().put("count", `${count + 1}`)
+		caller.store().put(body, "account")
+		caller.global().put(body, "global")
+	} catch (f: Fault) {
+		return new Response(f.status, f.message)
+	}
+	log.push(`end ${body}`)
+	if (body == "throw") {
+		throw new ParseError("syntax", 0)
+	}
+	return new Response(if (body == "fail") 400 else 200, "")
+}
+
+function gateway(log: string[] = []): Gateway {
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => service(caller, req, log))
+	return g
+}
+
+function held(g: Gateway, k: string): [string | null, string | null] {
+	return [g.trees.get("000000000000")?.get(k), g.trees.get("")?.get(k)]
+}
+
+test "a request that succeeds commits both trees, one that fails neither" {
+	const before = live()
+	const g = gateway()
+	assert g.handle(request("test", "test", "test", "ok")).status == 200
+	assert held(g, "ok") == ["account", "global"] && held(g, "count")[0] == "1"
+	assert g.handle(request("test", "test", "test", "fail")).status == 400
+	assert held(g, "fail") == [null, null] && held(g, "count")[0] == "1"
+	assert g.handle(request("test", "test", "test", "throw")) throws new ParseError("syntax", 0)
+	assert held(g, "throw") == [null, null] && held(g, "count")[0] == "1"
+	assert live()[1] == before[1] + 2
+	g.close()
+	assert live() == before
+}
+
+test "a request parked in its handler holds off the next, whose write is not lost" {
+	const before = live()
+	const log: string[] = []
+	const g = gateway(log)
+	const a = async g.handle(request("test", "test", "test", "a"))
+	const b = async g.handle(request("test", "test", "test", "b"))
+	assert (await a).status == 200 && (await b).status == 200
+	assert log == ["start a", "end a", "start b", "end b"]
+	assert held(g, "count")[0] == "2" && held(g, "a") == ["account", "global"] && held(g, "b") == ["account", "global"]
+	g.close()
+	assert live() == before
+}
+
+test "a request that opens no tree commits none" {
+	const before = live()
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => new Response(200, ""))
+	assert g.handle(request("test", "test", "test", "")).status == 200 && g.trees.size == 0 && live() == before
+}
+
+test "a service called for a request writes into the request's trees" {
+	const before = live()
+	const g = new Gateway()
+	g.services.set("test", (caller: Caller, req: Request) => {
+		const sns = caller.internal("sns.amazonaws.com", "arn:aws:sns:us-east-1:000000000000:t", [])
+		try {
+			sns.regional().put("k",
+				`${sns.arn} ${sns.source.slice(0, 11)} ${sns.endpoint} ${caller.regional().get("k")}`)
+		} catch (f: Fault) {
+			return new Response(f.status, f.message)
+		}
+		return new Response(if (req.body.text() == "fail") 400 else 200, "")
+	})
+	assert g.handle(request("test", "test", "test", "fail")).status == 400 && g.trees.size == 0
+	assert g.handle(request("test", "test", "test", "ok")).status == 200
+	assert g.trees.get("000000000000/us-east-1")?.get("k") == "sns.amazonaws.com arn:aws:sns http://localhost:4566 null"
+	g.close()
+	assert live() == before
+}
+
+function blobs(): Gateway {
+	const g = new Gateway()
+	g.services.set("s3", (caller: Caller, req: Request) => {
+		const body = req.body.text()
+		try {
+			caller.global().put("k", "", Blob.of(body))
+		} catch (f: Fault) {
+			return new Response(f.status, f.message)
+		}
+		const crc = req.headers.get("x-amz-checksum-crc32") ?? ""
+		return new Response(if (body == "fail") 400 else 200, `${caller.account}|${caller.arn}|${body}|${crc}`)
+	})
+	return g
+}
+
+test "a blob written by a request that fails is freed" {
+	const before = live()
+	const g = blobs()
+	assert g.handle(request("s3", "test", "test", "fail")).status == 400 && live() == before
+	assert g.handle(request("s3", "test", "test", "kept")).status == 200 && live()[2] == before[2] + 1
+	const kept = g.trees.get("")!.blob("k")!
+	assert kept.read() == "kept"
+	g.close()
+	assert live() == before
+}
+
+test "an aws-chunked body reaches the service decoded, or is answered in the service's form" {
+	const before = live()
+	const g = blobs()
+	const chunked = (decoded: string) => {
+		const req = request("s3", "test", "test", "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n")
+		req.headers.set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+		req.headers.set("content-encoding", "aws-chunked")
+		req.headers.set("x-amz-decoded-content-length", decoded)
+		return req
+	}
+	const ok = g.handle(chunked("5"))
+	assert ok.status == 200 && ok.body.text() == "000000000000|arn:aws:iam::000000000000:root|hello|NhCmhg=="
+	assert text(g.handle(chunked("6")), "Code") == "IncompleteBody"
+	g.faults.set("s3", (f: Fault, id: string, _: Request | null) => new Response(f.status, `${f.code} ${id.length}`))
+	const short = g.handle(chunked("6"))
+	assert short.status == 400 && short.body.text() == "IncompleteBody 36"
+	g.close()
+	assert live() == before
+}
+
+test "a request with no authentication reaches the service that takes them, or none" {
+	const g = blobs()
+	const anonymous = new Request("PUT", "http://localhost:4566/bucket/key", "public")
+	const refused = g.handle(anonymous)
+	assert refused.status == 403 && text(refused, "Code") == "MissingAuthenticationToken"
+	g.anonymous = "s3"
+	const res = g.handle(anonymous)
+	assert res.status == 200 && res.body.text() == "|*|public|"
+	g.close()
+}
+
+test "a body longer than its service's limit is refused before it is read, by S3 as EntityTooLarge, else as a 413" {
+	const g = gateway()
+	assert g.limits.get("s3") == 5 << 30 && g.limits.get("test") == null
+	g.limits.set("test", 4)
+	const res = g.handle(request("test", "test", "test", "large"))
+	assert res.status == 413 && res.body.text() == ""
+	assert g.handle(request("test", "test", "test", "four")).status == 200
+	g.services.set("s3", g.services.get("test")!)
+	g.limits.set("s3", 4)
+	const s3 = g.handle(request("s3", "s3", "s3", "large"))
+	assert s3.status == 400 && text(s3, "Code") == "EntityTooLarge" && text(s3, "MaxSizeAllowed") == "4"
+	g.close()
+}

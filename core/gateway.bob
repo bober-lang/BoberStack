@@ -1,0 +1,174 @@
+//! The HTTP handler in front of every service: it authenticates a request (SigV4, or a SigV2 presigned URL), decodes an
+//! aws-chunked body, and hands it to the service its credential scope names, in a transaction over the state.
+
+import * as chunked from "./auth/chunked"
+import { accountOf, authenticate, credentials, use } from "./auth/credentials"
+import * as sigv2 from "./auth/sigv2"
+import * as sigv4 from "./auth/sigv4"
+import { Fault } from "./fault"
+import { uuid } from "./random"
+import { addressed, Internal } from "./internal"
+import * as query from "./protocol/query"
+import { Caller, Identify } from "./service"
+import { Store } from "./state/store"
+import { Signal } from "builtin/fiber"
+import { HashMap } from "std/collections/hashmap"
+import { CryptoError } from "std/crypto/error"
+import { Body, Request, Response } from "std/http"
+import { ParseError } from "std/string"
+
+/// A service's handler; the request's body is already read whole.
+export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
+/// A service's answer, in its protocol, to a fault the gateway finds.
+export type Faulted = (f: Fault, requestId: string, req: Request | null) => Response
+
+/// One request at a time reads and writes the state: each in a transaction of the trees it opens, which commit together
+/// if it answers 2xx and are dropped if not, so that a request that fails leaves no trace.
+export class Gateway {
+	/// By signing name.
+	services = new HashMap[string, Service]()
+	/// How a service answers the faults the gateway finds, by signing name; awsQuery's XML for one not here.
+	faults = new HashMap[string, Faulted]()
+	/// The signing name of the service that unauthenticated requests go to, as S3 serves public objects; null answers
+	/// them MissingAuthenticationToken.
+	anonymous: string | null = null
+	/// Each account's committed tree, and the global one by "", which holds the credentials issued. Access keys of none
+	/// are taken, unchecked, for the root of accountOf's account.
+	trees = new HashMap[string, Store]()
+	/// The trees' names, which a HashMap does not list, for the snapshot endpoints.
+	named: string[] = []
+	internal = new Internal(this, n => this.services.has(n))
+	/// The most bytes a body may hold, by signing name, else std's 10 MiB. A body is read whole into memory.
+	limits = limits()
+	/// How IAM sees a caller; without it only an account's root is allowed.
+	identify: Identify | null = null
+	private busy = false
+	private freed = new Signal()
+
+	handle(req: Request): Response throws IoError | ParseError {
+		if (addressed(req.url.path)) {
+			return this.locked(() => this.internal.handle(req))
+		}
+		let id = ""
+		let auth: sigv4.Authorization | null = null
+		try {
+			id = uuid()
+			auth = sigv2.presigned(req) ?? sigv4.authorization(req)
+		} catch (f: Fault) {
+			return query.error(f, id)
+		}
+		const name = auth?.service ?? this.anonymous
+		const service = if (name == null) null else this.services.get(name!)
+		if (auth == null && service == null) {
+			const why = "Request is missing Authentication Token"
+			return query.error(new Fault(403, "MissingAuthenticationToken", why), id)
+		}
+		if (service == null) {
+			return query.error(new Fault(501, "NotImplemented", `The service ${name} is not implemented`), id)
+		}
+		const limit = this.limits.get(name!) ?? (10 << 20)
+		if ((req.body.length ?? 0) > limit) {
+			return this.oversized(name!, req.body.length!, limit, id)
+		}
+		const body = req.body.text(limit)
+		req.body = new Body(body)
+		return this.locked(() => this.serve(name!, service!, req, body, auth, id))
+	}
+
+	close() {
+		for (const t of this.trees.values()) {
+			t.close()
+		}
+		this.trees = new HashMap[string, Store]()
+		this.named = []
+		this.internal.close()
+	}
+
+	/// The answer to a body over limit, as AWS answers it: S3's EntityTooLarge, CloudWatch's RequestEntityTooLarge, Logs'
+	/// bare InternalFailure, else a 413 of no body, as STS's and Route 53's front ends. Where AWS differs: CloudWatch
+	/// refuses a body over 40960 bytes, and names that limit.
+	private oversized(name: string, size: i64, limit: i64, id: string): Response {
+		if (name == "s3") {
+			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
+				`<ProposedSize>${size}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
+			const faulted = this.faults.get(name)
+			return if (faulted == null) query.error(why, id) else faulted!(why, id, null)
+		}
+		if (name == "monitoring") {
+			const why = new Fault(413, "RequestEntityTooLarge", `Request size ${size} exceeded ${limit} bytes`, true)
+			return query.error(why, id, "http://monitoring.amazonaws.com/doc/2010-08-01/")
+		}
+		return new Response(if (name == "logs") 400 else 413, if (name == "logs") "<InternalFailure/>" else "")
+	}
+
+	private locked(f: () => Response throws IoError | ParseError): Response throws IoError | ParseError {
+		while (this.busy) {
+			this.freed.wait()
+		}
+		this.busy = true
+		try {
+			return f()
+		} finally {
+			this.busy = false
+			this.freed.wake()
+		}
+	}
+
+	private serve(name: string, service: Service, req: Request, body: string, auth: sigv4.Authorization | null,
+		id: string): Response throws IoError | ParseError {
+		const global = this.trees.get("")
+		const known = if (global == null || auth == null) null else credentials(global).get(auth.accessKey)
+		let why: Fault | null = null
+		try {
+			if (known != null) {
+				why = authenticate(known, req, body, auth!, now())
+				if (why == null) {
+					use(global!, auth!.accessKey, known, name, auth!.region, now())
+				}
+			}
+			if (why == null && auth != null && chunked.chunked(req)) {
+				req.body = new Body(chunked.decode(req, body, auth!, known?.secret))
+			}
+		} catch (e: CryptoError | Fault) {
+			why = if (e instanceof Fault) e else new Fault(500, "InternalFailure", e.what)
+		}
+		if (why != null) {
+			const faulted = this.faults.get(name)
+			return if (faulted == null) query.error(why!, id) else faulted!(why!, id, req)
+		}
+		let caller = new Caller("", auth?.region ?? "us-east-1", "*", id, "anonymous", this.trees)
+		if (auth != null) {
+			const account = if (known == null) accountOf(auth.accessKey) else known.account
+			const arn = if (known == null) `arn:aws:iam::${account}:root` else known.arn
+			caller = new Caller(account, auth.region, arn, id, known?.userId ?? account, this.trees)
+		}
+		caller.endpoint = `http://${req.headers.get("host") ?? "localhost:4566"}`
+		caller.credential = known
+		caller.userAgent = req.headers.get("user-agent") ?? ""
+		caller.identify = this.identify
+		let res: Response | null = null
+		try {
+			res = service(caller, req)
+		} finally {
+			const commit = res != null && res!.status < 300
+			for (const [account, tree] of caller.opened) {
+				if (commit) {
+					if (!this.trees.has(account)) {
+						this.named.push(account)
+					}
+					this.trees.get(account)?.close()
+					this.trees.set(account, tree)
+				} else {
+					tree.close()
+				}
+			}
+		}
+		return res!
+	}
+}
+
+function limits(): HashMap[string, i64] {
+	const m = new HashMap[string, i64]()
+	m.set("s3", 5 << 30)
+	return m
+}

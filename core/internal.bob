@@ -1,0 +1,307 @@
+//! The endpoints that are not AWS's, unsigned, under /_localstack/ (as LocalStack's tools probe them) and
+//! /_boberstack/: health, a reset, in-memory snapshots of the state, Lambda's code, and LocalStack's /_aws/ses of the
+//! mail SES stored.
+
+import { Fault } from "./fault"
+import { Store } from "./state/store"
+import { startsWith } from "std/algo"
+import { HashMap } from "std/collections/hashmap"
+import { decode, Rest, Unknown } from "std/encoding/json"
+import { json, Request, Response } from "std/http"
+import { Params, Router } from "std/http/router"
+import { lower, ParseError } from "std/string"
+import { rfc3339, second } from "std/time"
+
+/// Answered by health and info in place of LocalStack's.
+export const version = "0.1.0"
+
+/// LocalStack's service names, each with its signing name; those alike are listed too, so that health names each as
+/// LocalStack does. DynamoDB Streams signs as DynamoDB.
+const names: [string, string][] = [["acm", "acm"], ["apigateway", "apigateway"], ["cloudformation", "cloudformation"],
+	["cloudwatch", "monitoring"], ["config", "config"], ["dynamodb", "dynamodb"], ["dynamodbstreams", "dynamodb"],
+	["ec2", "ec2"], ["es", "es"], ["events", "events"], ["firehose", "firehose"], ["iam", "iam"],
+	["kinesis", "kinesis"], ["kms", "kms"], ["lambda", "lambda"], ["logs", "logs"], ["opensearch", "es"],
+	["redshift", "redshift"], ["resource-groups", "resource-groups"], ["resourcegroupstaggingapi", "tagging"],
+	["route53", "route53"], ["route53resolver", "route53resolver"], ["s3", "s3"], ["scheduler", "scheduler"],
+	["secretsmanager", "secretsmanager"], ["ses", "ses"], ["sns", "sns"], ["sqs", "sqs"], ["ssm", "ssm"],
+	["stepfunctions", "states"], ["sts", "sts"], ["support", "support"], ["swf", "swf"], ["transcribe", "transcribe"]]
+
+/// The prefix of the keys of the messages SES stores, of services/ses's table.
+const sent = "ses.messages\x00"
+/// LocalStack's init script stages, of which there are none here; all but SHUTDOWN have completed once serving.
+const stages: [string, bool][] = [["BOOT", true], ["START", true], ["READY", true], ["SHUTDOWN", false]]
+
+export interface State {
+	trees: HashMap[string, Store]
+	named: string[]
+}
+
+class Snapshot {
+	name: string
+	taken: i64
+	trees: [string, Store][]
+
+	constructor(name: string, taken: i64, trees: [string, Store][]) {
+		this.name = name
+		this.taken = taken
+		this.trees = trees
+	}
+
+	close() {
+		for (const [_, t] of this.trees) {
+			t.close()
+		}
+		this.trees = []
+	}
+}
+
+class Listed {
+	name = ""
+	taken = ""
+	trees = 0
+	records = 0
+}
+
+class Listing {
+	snapshots: Listed[] = []
+}
+
+/// The endpoints, and the snapshots taken, which outlive a reset.
+export class Internal {
+	/// When it began, which info's uptime counts from.
+	private started = now()
+	private snapshots: Snapshot[] = []
+	private state: State
+	private routes = new Router()
+
+	/// serves tells whether a service of a signing name is served.
+	constructor(state: State, serves: (name: string) => bool) {
+		this.state = state
+		const both = new Router()
+		both.get("/health", (req, p) => health(serves))
+		both.head("/health", (req, p) => health(serves))
+		both.get("/info", (req, p) => this.info())
+		both.post("/state/reset", (req, p) => {
+			reset(state)
+			return text(200, "{}")
+		})
+		const r = this.routes
+		r.mount("/_localstack", both)
+		r.mount("/_boberstack", both)
+		r.get("/_localstack/init", (req, p) => init(""))
+		r.get("/_localstack/init/*stage", (req, p) => init(p.get("stage")!))
+		r.get("/_aws/ses", (req, p) => mails(req, state))
+		r.delete("/_aws/ses", (req, p) => mails(req, state))
+		r.get("/_boberstack/lambda/:account/:region/:table/:name/:version", (req, p) => code(p, state))
+		r.get("/_boberstack/snapshots", (req, p) => {
+			const l = new Listing()
+			l.snapshots = this.snapshots.map(listed)
+			return json(l)
+		})
+		r.put("/_boberstack/snapshots/:name", (req, p) => this.take(p.get("name")!))
+		r.delete("/_boberstack/snapshots/:name", (req, p) => this.drop(p.get("name")!))
+		r.post("/_boberstack/snapshots/:name/restore", (req, p) => this.restore(p.get("name")!))
+	}
+
+	/// The answer to req, an addressed request, holding the gateway's lock.
+	handle(req: Request): Response throws IoError | ParseError { return this.routes.handle(req) }
+
+	close() {
+		for (const s of this.snapshots) {
+			s.close()
+		}
+		this.snapshots = []
+	}
+
+	private info(): Response {
+		const t = now()
+		return text(200,
+			`{"version": "${version}", "edition": "community", "is_license_activated": false, `
+			+ `"server_time_utc": "${rfc3339(t - t % second)}", "uptime": ${(t - this.started) / second}}`)
+	}
+
+	private take(name: string): Response {
+		if (!named(name)) {
+			return text(400, `{"error": "A snapshot's name is 1 to 255 letters, digits, '.', '_' or '-'"}`)
+		}
+		const state = this.state
+		let s: Snapshot | null = null
+		try {
+			s = new Snapshot(name, now(), clones(state.named.map(n => [n, state.trees.get(n)!])))
+		} catch (f: Fault) {
+			return failed(f)
+		}
+		let i = this.snapshots.length - 1
+		while (i >= 0 && this.snapshots[i].name != name) {
+			i--
+		}
+		if (i < 0) {
+			this.snapshots.push(s!)
+		} else {
+			this.snapshots[i].close()
+			this.snapshots[i] = s!
+		}
+		return json(listed(s!))
+	}
+
+	private restore(name: string): Response {
+		const s = this.snapshots.find(s => s.name == name)
+		if (s == null) {
+			return missing(name)
+		}
+		const state = this.state
+		try {
+			const trees = clones(s!.trees)
+			reset(state)
+			for (const [n, t] of trees) {
+				state.trees.set(n, t)
+				state.named.push(n)
+			}
+		} catch (f: Fault) {
+			return failed(f)
+		}
+		return json(listed(s!))
+	}
+
+	private drop(name: string): Response {
+		const s = this.snapshots.find(s => s.name == name)
+		if (s == null) {
+			return missing(name)
+		}
+		s!.close()
+		this.snapshots = this.snapshots.filter(s => s.name != name)
+		return new Response(204)
+	}
+}
+
+export function addressed(path: string): bool {
+	return startsWith(path, "/_localstack/") || startsWith(path, "/_boberstack/") || path == "/_aws/ses"
+}
+
+class Mail {
+	Id = ""
+	Source = ""
+	rest: Unknown[] @Rest = []
+}
+
+/// Lists the messages SES stored, as LocalStack's /_aws/ses does, of the query's id and source email if given; or
+/// deletes those of the id, if given.
+function mails(req: Request, state: State): Response {
+	const delete = req.method == "DELETE"
+	const id = req.url.query.get("id") ?? ""
+	const email = if (delete) "" else req.url.query.get("email") ?? ""
+	const found: string[] = []
+	try {
+		for (const n of state.named) {
+			const t = state.trees.get(n)!
+			let after: string | null = null
+			while (true) {
+				const page = t.scan(sent, after)
+				if (page.length == 0) {
+					break
+				}
+				for (const [k, v] of page) {
+					let m = new Mail()
+					try {
+						m = decode[Mail](v)
+					} catch (e: ParseError) {}
+					if ((id == "" || m.Id == id) && (email == "" || m.Source == email)) {
+						if (delete) {
+							t.delete(k)
+						} else {
+							found.push(v)
+						}
+					}
+				}
+				after = page[page.length - 1][0]
+			}
+		}
+	} catch (f: Fault) {
+		return failed(f)
+	}
+	return if (delete) new Response(204) else text(200, `{"messages": [${found.join(", ")}]}`)
+}
+
+function reset(state: State) {
+	for (const n of state.named) {
+		state.trees.get(n)!.close()
+		state.trees.delete(n)
+	}
+	state.named = []
+}
+
+/// The zip of a Lambda function's or layer's version, at /_boberstack/lambda/account/region/table/name/version, where
+/// GetFunction and GetLayerVersion locate it, of services/lambda's versions or layerVersions table.
+function code(p: Params, state: State): Response {
+	const table = p.get("table")!
+	const key = `lambda.${table}\x00${p.get("name")!}:${p.get("version")!}`
+	const b = if (table == "versions"
+		|| table == "layerVersions") state.trees.get(`${p.get("account")!}/${p.get("region")!}`)?.blob(key)
+		else null
+	if (b == null) {
+		return text(404, `{"error": "No such code"}`)
+	}
+	return text(200, b!.read(), "application/zip")
+}
+
+/// A clone of each of trees, by its name; none if one cannot be made.
+function clones(trees: [string, Store][]): [string, Store][] throws Fault {
+	const out: [string, Store][] = []
+	try {
+		for (const [n, t] of trees) {
+			out.push([n, t.clone()])
+		}
+	} catch (f: Fault) {
+		for (const [_, t] of out) {
+			t.close()
+		}
+		throw f
+	}
+	return out
+}
+
+function health(serves: (name: string) => bool): Response {
+	const running = names.filter(n => serves(n[1])).map(n => `"${n[0]}": "running"`)
+	return text(200, `{"services": {${running.join(", ")}}, "edition": "community", "version": "${version}"}`)
+}
+
+/// Of every stage if stage is "".
+function init(stage: string): Response {
+	const scripts = `"scripts": []`
+	if (stage == "") {
+		const done = stages.map(s => `"${s[0]}": ${s[1]}`)
+		return text(200, `{"completed": {${done.join(", ")}}, ${scripts}}`)
+	}
+	const s = stages.find(s => lower(s[0]) == lower(stage))
+	if (s == null) {
+		return text(404, `no such stage ${stage}`, "text/plain")
+	}
+	return text(200, `{"completed": ${s![1]}, ${scripts}}`)
+}
+
+function listed(s: Snapshot): Listed {
+	const l = new Listed()
+	l.name = s.name
+	l.taken = rfc3339(s.taken)
+	l.trees = s.trees.length
+	for (const [_, t] of s.trees) {
+		l.records += t.count()
+	}
+	return l
+}
+
+function named(name: string): bool {
+	return name.length > 0 && name.length <= 255
+		&& name.every(c => c >= 0x30 && c <= 0x39 || c >= 0x41 && c <= 0x5a || c >= 0x61 && c <= 0x7a || c == 0x2e
+		|| c == 0x5f || c == 0x2d)
+}
+
+function missing(name: string): Response { return text(404, `{"error": "No snapshot named ${name}"}`) }
+// The store's only fault, out of memory, has nothing JSON would escape.
+function failed(f: Fault): Response { return text(f.status, `{"error": "${f.message}"}`) }
+
+function text(status: i32, body: string, contentType = "application/json"): Response {
+	const r = new Response(status, body)
+	r.headers.set("content-type", contentType)
+	return r
+}
