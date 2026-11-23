@@ -5,7 +5,7 @@ import { accountOf, authenticate, credentials } from "./auth/credentials"
 import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
 import * as query from "./protocol/query"
-import { Caller } from "./service"
+import { Caller, Identify } from "./service"
 import { Store } from "./state/store"
 import { Signal } from "builtin/fiber"
 import { HashMap } from "std/collections/hashmap"
@@ -26,6 +26,8 @@ export class Gateway {
 	/// The committed state: each account's tree, from the first request that opens it, and the global one by "", which
 	/// holds the credentials issued. Access keys of none are taken, unchecked, for the root of accountOf's account.
 	trees = new HashMap[string, Store]()
+	/// How IAM sees a caller, which its requests are authorized by; without it only an account's root is allowed.
+	identify: Identify | null = null
 	/// Whether a request holds the lock on the trees, and what those waiting for it wait on.
 	private busy = false
 	private freed = new Signal()
@@ -84,6 +86,9 @@ export class Gateway {
 		const arn = if (known == null) `arn:aws:iam::${account}:root` else known.arn
 		const caller = new Caller(account, auth.region, arn, id, known?.userId ?? account, this.trees)
 		caller.endpoint = `http://${req.headers.get("host") ?? "localhost:4566"}`
+		caller.credential = known
+		caller.userAgent = req.headers.get("user-agent") ?? ""
+		caller.identify = this.identify
 		let res: Response | null = null
 		try {
 			res = service(caller, req)

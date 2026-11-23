@@ -1,8 +1,21 @@
 //! What a service's handlers are given and throw, whatever its protocol.
 
+import { Credential } from "./auth/credentials"
+import * as auth from "./auth/policy"
 import { Fault } from "./fault"
 import { Store } from "./state/store"
+import { lastIndexOf, startsWith } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
+import { bytes } from "std/crypto/random"
+import { split } from "std/string"
+import { rfc3339, second } from "std/time"
+
+/// How an access denied's message is worded: "reasoned", with the kind of policy that denies; "linked", with it and
+/// where the request's authorization details are, as IAM's; or "plain", with only where they are, as STS's. Of a
+/// resource of AWS's, there are no details to link to.
+export type Wording = "reasoned" | "plain" | "linked"
+/// A context key and its value, one of a single-valued key, a list of a multivalued one.
+export type Context = [string, string | string[]][]
 
 /// Who sent a request, where, and the id it is answered under; and the state it reads and writes.
 export class Caller {
@@ -14,10 +27,18 @@ export class Caller {
 	requestId: string
 	/// The actions of the operation being served, as IAM names them, set by its service's dispatch.
 	actions: string[] = []
+	/// The status, code and wording of the fault the service denies a request with, set by its dispatch.
+	denied: [i32, string, Wording] = [403, "AccessDenied", "reasoned"]
 	/// The ARN of the resource a service calls on behalf of; "" for a request from outside.
 	source = ""
 	/// Where the request came to, as http://localhost:4566, which the URLs a service gives its resources start with.
 	endpoint = "http://localhost:4566"
+	/// The credential the request is signed by, null for one never issued, taken for the account's root.
+	credential: Credential | null = null
+	/// The request's User-Agent.
+	userAgent = ""
+	/// How IAM sees the caller; null where there is no IAM, which then allows only the root.
+	identify: Identify | null = null
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
@@ -48,10 +69,56 @@ export class Caller {
 		return s
 	}
 
-	/// Throws AccessDenied unless the caller may perform the operation's actions on resource, an ARN, given the
-	/// resource's own policy if it has one.
-	allow(resource: string, policy: string | null = null) throws Fault {
-		// Policies are not evaluated yet: everything is allowed.
+	/// Throws the service's access denied unless the caller may perform each of the operation's actions on resource, an
+	/// ARN, given the resource's own policy if it has one, as IAM evaluates them: its identity-based policies,
+	/// permissions boundary and session policies, and the resource's, of the context keys the gateway knows and those
+	/// of context. The root of an account has no identity-based policies to allow it; a service, a caller made by
+	/// internal, none at all. The resource policy of sts:AssumeRole is the role's trust policy. The message names the
+	/// resource as shown, if not null, as IAM names some.
+	allow(resource: string, policy: string | null = null, context: Context = [],
+		shown: string | null = null) throws Fault {
+		const r = new auth.Request()
+		r.resource = resource
+		const named = owner(resource)
+		// One of AWS's, of the account aws, is as if of the caller's.
+		r.owner = if (named == null || named == "aws") this.account else named!
+		let ps = new auth.Policies()
+		if (this.source != "") {
+			r.principal.kind = "service"
+			r.principal.arn = this.arn
+			r.context.push(["aws:SourceArn", this.source])
+			r.context.push(["aws:SourceAccount", this.account])
+		} else if (this.arn == `arn:aws:iam::${this.account}:root`) {
+			r.principal.kind = "root"
+			r.principal.arn = this.arn
+			r.principal.account = this.account
+		} else if (this.identify != null) {
+			const [p, found] = this.identify!(this)
+			r.principal = p
+			ps = found
+		} else {
+			r.principal.arn = this.arn
+			r.principal.account = this.account
+		}
+		if (r.principal.kind != "service") {
+			this.describe(r.principal, r.context)
+		}
+		r.context.append(context)
+		if (policy != null) {
+			const trust = this.actions.length > 0 && startsWith(this.actions[0], "sts:AssumeRole")
+			try {
+				ps.resource = auth.parse(policy!, if (trust) "trust" else "resource")
+			} catch (f: Fault) {
+				throw new Fault(500, "InternalFailure", `The policy of ${resource} does not parse: ${f.message}`)
+			}
+		}
+		for (const a of this.actions) {
+			r.action = a
+			const d = auth.evaluate(r, ps)
+			if (d.effect != "allowed") {
+				throw this.denial(r, d, shown)
+			}
+		}
 	}
 
 	/// The caller that a service is, by its principal as sns.amazonaws.com, when it calls another for this request on
@@ -61,6 +128,7 @@ export class Caller {
 		const c = new Caller(this.account, this.region, principal, this.requestId, principal, this.committed)
 		c.source = source
 		c.endpoint = this.endpoint
+		c.identify = this.identify
 		c.opened = this.opened
 		return c
 	}
@@ -71,7 +139,57 @@ export class Caller {
 	regional(): Store throws Fault { return this.tree(`${this.account}/${this.region}`) }
 	/// The global state.
 	global(): Store throws Fault { return this.tree("") }
+
+	/// Adds to context the global keys of the principal p that the gateway knows.
+	private describe(p: auth.Principal, context: Context) {
+		const t = now()
+		const kind = p.kind
+		const named = if (kind == "root") "Account"
+			else if (kind == "user") "User"
+			else if (kind == "role") "AssumedRole"
+			else "FederatedUser"
+		context.push(["aws:PrincipalArn", if (kind == "role") p.role else p.arn])
+		context.push(["aws:PrincipalAccount", p.account])
+		context.push(["aws:PrincipalType", named])
+		context.push(["aws:userid", this.userId])
+		if (kind == "user") {
+			context.push(["aws:username", p.arn.slice(lastIndexOf(p.arn, "/") + 1, p.arn.length)])
+		}
+		for (const [k, v] of p.tags) {
+			context.push([`aws:PrincipalTag/${k}`, v])
+		}
+		context.push(["aws:CurrentTime", rfc3339(t - t % second)])
+		context.push(["aws:EpochTime", `${t / second}`])
+		context.push(["aws:SecureTransport", if (startsWith(this.endpoint, "https:")) "true" else "false"])
+		context.push(["aws:RequestedRegion", this.region])
+		if (this.userAgent != "") {
+			context.push(["aws:userAgent", this.userAgent])
+		}
+	}
+
+	/// The access denied of the request r, which d denies, as the service words it, naming the resource as shown.
+	private denial(r: auth.Request, d: auth.Decision, shown: string | null): Fault throws Fault {
+		const [status, code, wording] = this.denied
+		let why = auth.denied(r, d, shown)
+		if (wording == "plain") {
+			const on = shown ?? r.resource
+			why = `User: ${r.principal.arn} is not authorized to perform: ${r.action}`
+				+ (if (on == "*" || on == "") "" else ` on resource: ${on}`)
+		}
+		if (wording != "reasoned" && owner(r.resource) != "aws") {
+			const id = authorization()
+			why += `. Go to https://${this.region}.console.aws.amazon.com/iam/home?region=${this.region}`
+				+ `#/authorization-details/${id} for complete details, or call the GetRequestAuthorizationDetails API with `
+				+ `the following authorization id: ${id}`
+		}
+		return new Fault(status, code, why)
+	}
 }
+
+/// Who a caller that is neither a root nor a service is to IAM's policies, and the identity-based policies,
+/// permissions boundary and session policies that apply to it, read from the request's trees; IAM's, which the gateway
+/// is given.
+export type Identify = (caller: Caller) => [auth.Principal, auth.Policies] throws Fault
 
 /// The fault of the operation op, which the service does not implement.
 export function notImplemented(op: string): Fault {
@@ -80,3 +198,25 @@ export function notImplemented(op: string): Fault {
 
 /// The input or output of an operation that has none.
 export class Unit {}
+
+/// The account of the resource of ARN a, null if it names none, as "*" or an S3 bucket's.
+function owner(a: string): string | null {
+	const parts = split(a, ":")
+	return if (parts.length < 6 || parts[4] == "") null else parts[4]
+}
+
+/// An id of an authorization's details, as IAM's: 25 random digits and lower-case letters.
+function authorization(): string throws Fault {
+	let b = ""
+	try {
+		b = bytes(25)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	const out: u8[] = []
+	for (let i = 0; i < 25; i++) {
+		out.push(alphabet[(b[i] as i32) % alphabet.length])
+	}
+	return fromBytes(out)
+}

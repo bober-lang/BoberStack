@@ -2,6 +2,7 @@ import { Gateway } from "../core/gateway"
 import * as iamApi from "../services/iam/api"
 import { Catalog } from "../services/iam/catalog"
 import * as iam from "../services/iam/iam"
+import { identify } from "../services/iam/identities"
 import * as stsApi from "../services/sts/api"
 import * as sts from "../services/sts/sts"
 import { replay } from "../tools/tape/tape"
@@ -9,7 +10,9 @@ import { replay } from "../tools/tape/tape"
 /// A gateway of STS, and of IAM without AWS managed policies.
 function gateway(): Gateway {
 	const g = new Gateway()
-	const i = new iam.Handler(new Catalog(0, 0))
+	const catalog = new Catalog(0, 0)
+	const i = new iam.Handler(catalog)
+	g.identify = identify(catalog)
 	const s = new sts.Handler()
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
@@ -17,7 +20,7 @@ function gateway(): Gateway {
 }
 
 test "STS tapes replay" {
-	for (const tape of ["tapes/sts/assume-role.json"]) {
+	for (const tape of ["tapes/sts/assume-role.json", "tapes/sts/sessions.json"]) {
 		test `${tape}` {
 			const differences = replay(tape, gateway())
 			assert differences == []

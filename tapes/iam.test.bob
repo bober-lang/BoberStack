@@ -2,14 +2,21 @@ import { Gateway } from "../core/gateway"
 import * as api from "../services/iam/api"
 import { Catalog } from "../services/iam/catalog"
 import * as iam from "../services/iam/iam"
+import { identify } from "../services/iam/identities"
+import * as stsApi from "../services/sts/api"
+import * as sts from "../services/sts/sts"
 import { replay } from "../tools/tape/tape"
 import { catalog_text } from "../services/iam/catalog.c"
 
-/// A gateway of IAM, of every AWS managed policy, which the catalog's text costs this test's build.
+/// A gateway of IAM, of every AWS managed policy, which the catalog's text costs this test's build; and of STS, which
+/// a tape's users call to learn that their keys work.
 function gateway(catalog: Catalog): Gateway {
 	const g = new Gateway()
 	const h = new iam.Handler(catalog)
+	const s = new sts.Handler()
+	g.identify = identify(catalog)
 	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
 	return g
 }
 
@@ -24,7 +31,7 @@ const catalog = managed()
 
 test "IAM tapes replay" {
 	for (const tape of ["tapes/iam/users.json", "tapes/iam/roles.json", "tapes/iam/policies.json",
-		"tapes/iam/managed.json"]) {
+		"tapes/iam/managed.json", "tapes/iam/enforcement.json"]) {
 		test `${tape}` {
 			const differences = replay(tape, gateway(catalog))
 			assert differences == []

@@ -3,9 +3,9 @@
 //! AWS_SESSION_TOKEN, and writes the tape, by default over the scenario. ./tape.bob says what a scenario is.
 
 import * as client from "../../core/client"
-import { answer, bodyOf, find, form, load, request, Step, Tape, text, volatiles } from "./tape"
+import { answer, bodyOf, find, form, load, request, signer, Step, Tape, text, unlinked, volatiles } from "./tape"
 import * as tape from "./tape"
-import { indexOf, sortBy } from "std/algo"
+import { endsWith, indexOf, sortBy } from "std/algo"
 import { isDigit, isUpper } from "std/ascii"
 import { CryptoError } from "std/crypto/error"
 import { bytes } from "std/crypto/random"
@@ -87,16 +87,23 @@ class Recording {
 	/// The answer to s, its body whole.
 	send(s: Step): [Response, string] throws IoError | ParseError | CryptoError | Failure {
 		const host = if (s.service == "iam") "iam.amazonaws.com" else `${s.service}.us-east-1.amazonaws.com`
-		return call(this.caller, request(s, this.values, `https://${host}`), s.service)
+		const c = this.caller
+		const by = signer(s, this.values, [c.accessKey, c.secret, c.token])
+		if (by == null) {
+			throw new Failure(`no credentials captured as ${s.as}`)
+		}
+		const as = new Caller()
+		[as.accessKey, as.secret, as.token] = by!
+		return call(as, request(s, this.values, `https://${host}`), s.service)
 	}
 
-	/// s with the caller as the root of 000000000000, and the prefix the tape's.
+	/// s with the caller as the root of 000000000000, the prefix the tape's, and the ids of authorizations 0s.
 	normal(s: string): string {
 		const c = this.caller
 		let out = replace(s, c.arn, "arn:aws:iam::000000000000:root")
 		out = replace(out, c.userId, "000000000000")
 		out = replace(out, c.account, "000000000000")
-		return replace(out, this.prefix, tape.prefix)
+		return unlinked(replace(out, this.prefix, tape.prefix))
 	}
 }
 
@@ -157,7 +164,7 @@ function main(): i32 {
 	const out = text(t)
 	let leak = ""
 	try {
-		leak = leaks(out, c, mapFile("models/iam-managed-policies.jsonl"))
+		leak = leaks(out, c, r!.values, mapFile("models/iam-managed-policies.jsonl"))
 	} catch (e: IoError) {
 		leak = `what it cannot check: ${e}`
 	}
@@ -201,14 +208,20 @@ function call(c: Caller, req: Request,
 	return [res, res.body.text()]
 }
 
-/// What of the account out holds, "" if nothing: its id, the caller's access key or a part of its ARN or user id, or
-/// a unique id, which encodes the account, but those of AWS managed policies, which managed holds.
-function leaks(out: string, c: Caller, managed: string): string {
+/// What of the account out holds, "" if nothing: its id, the caller's access key or a part of its ARN or user id, a
+/// secret or session token of values, or a unique id, which encodes the account, but those of AWS managed policies,
+/// which managed holds.
+function leaks(out: string, c: Caller, values: [string, string][], managed: string): string {
 	if (indexOf(out, c.account) >= 0) {
 		return "the account id"
 	}
 	if (indexOf(out, c.accessKey) >= 0) {
 		return "the access key id"
+	}
+	for (const [name, v] of values) {
+		if ((endsWith(name, ".secret") || endsWith(name, ".token")) && v != "" && indexOf(out, v) >= 0) {
+			return `the secret ${name}`
+		}
 	}
 	const parts = split(c.arn, "/")
 	parts.append(split(c.userId, ":"))

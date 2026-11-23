@@ -1,20 +1,24 @@
 //! AWS Identity and Access Management: users and their access keys, roles, managed policies and their versions, and
 //! the policies attached to or embedded in users and roles, and AWS's managed policies, which any account may attach
-//! but none change. Policies are stored, never evaluated.
+//! but none change. Every request is authorized by the policies that apply to its caller, as core/service's Caller.allow
+//! evaluates them.
 
 import { Credential, credentials, id, secret } from "../../core/auth/credentials"
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Violations } from "../../core/protocol/model"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { Catalog } from "./catalog"
-import { AccessKey, arn, Attachment, Inline, key, Policy, Role, save, Tables, User, Version, within } from "./records"
+
+import { AccessKey, arn, Attachment, Inline, key, number, Policy, Role, save, Tables, User, Version,
+	within } from "./records"
+
 import { endsWith, indexOf, lastIndexOf, merge, startsWith } from "std/algo"
 import { isAlphanumeric, isGraphic } from "std/ascii"
 import { HashMap } from "std/collections/hashmap"
 import * as base64 from "std/encoding/base64"
-import * as json from "std/encoding/json"
 import { lower, ParseError, parseInt } from "std/string"
 import { Decodable } from "std/types"
 import { escape } from "std/url"
@@ -29,6 +33,8 @@ export class Handler {
 	constructor(catalog: Catalog) { this.catalog = catalog }
 
 	createUser(caller: Caller, input: api.CreateUserRequest): api.CreateUserResponse throws Fault {
+		tagging(caller, input.Tags)
+		caller.allow(arn(caller.account, "user", input.Path ?? "/", input.UserName))
 		const db = new Tables(caller.store())
 		const k = key(named(input.UserName, "userName", 64))
 		if (db.users.get(k) != null) {
@@ -47,12 +53,14 @@ export class Handler {
 	}
 
 	getUser(caller: Caller, input: api.GetUserRequest): api.GetUserResponse throws Fault {
+		onUser(caller, input.UserName)
 		const r = new api.GetUserResponse()
 		r.User = userOf(caller.account, owner(caller, new Tables(caller.store()), input.UserName), true)
 		return r
 	}
 
 	listUsers(caller: Caller, input: api.ListUsersRequest): api.ListUsersResponse throws Fault {
+		caller.allow(arn(caller.account, "user", "/", ""))
 		const prefix = input.PathPrefix ?? "/"
 		const [users, next] = page(new Tables(caller.store()).users, "", input.Marker, input.MaxItems,
 			u => startsWith(u.path, prefix))
@@ -64,6 +72,7 @@ export class Handler {
 	}
 
 	updateUser(caller: Caller, input: api.UpdateUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = user(db, input.UserName)
 		const was = key(u.name)
@@ -93,6 +102,7 @@ export class Handler {
 	}
 
 	deleteUser(caller: Caller, input: api.DeleteUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const k = key(user(db, input.UserName).name)
 		if (db.keys.scan(null, 1, within(k, "")).length > 0) {
@@ -109,6 +119,7 @@ export class Handler {
 	}
 
 	tagUser(caller: Caller, input: api.TagUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = user(db, input.UserName)
 		u.tags = tagged(u.tags, input.Tags, "User")
@@ -117,6 +128,7 @@ export class Handler {
 	}
 
 	untagUser(caller: Caller, input: api.UntagUserRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = user(db, input.UserName)
 		u.tags = u.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
@@ -125,6 +137,7 @@ export class Handler {
 	}
 
 	listUserTags(caller: Caller, input: api.ListUserTagsRequest): api.ListUserTagsResponse throws Fault {
+		onUser(caller, input.UserName)
 		const [tags,
 			next] = tagPage(user(new Tables(caller.store()), input.UserName).tags, input.Marker, input.MaxItems)
 		const r = new api.ListUserTagsResponse()
@@ -135,6 +148,7 @@ export class Handler {
 	}
 
 	createAccessKey(caller: Caller, input: api.CreateAccessKeyRequest): api.CreateAccessKeyResponse throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = owner(caller, db, input.UserName)
 		const k = key(u.name)
@@ -162,6 +176,7 @@ export class Handler {
 	}
 
 	listAccessKeys(caller: Caller, input: api.ListAccessKeysRequest): api.ListAccessKeysResponse throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = owner(caller, db, input.UserName)
 		const [keys, next] = page(db.keys, within(key(u.name), ""), input.Marker, input.MaxItems, a => true)
@@ -180,6 +195,7 @@ export class Handler {
 	}
 
 	updateAccessKey(caller: Caller, input: api.UpdateAccessKeyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
 		const a = accessKey(db, k, input.AccessKeyId)
@@ -193,6 +209,7 @@ export class Handler {
 	}
 
 	deleteAccessKey(caller: Caller, input: api.DeleteAccessKeyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const k = within(key(owner(caller, db, input.UserName).name), input.AccessKeyId)
 		accessKey(db, k, input.AccessKeyId)
@@ -206,6 +223,8 @@ export class Handler {
 	}
 
 	createRole(caller: Caller, input: api.CreateRoleRequest): api.CreateRoleResponse throws Fault {
+		tagging(caller, input.Tags)
+		caller.allow(arn(caller.account, "role", input.Path ?? "/", input.RoleName))
 		const db = new Tables(caller.store())
 		const k = key(named(input.RoleName, "roleName", 64))
 		if (db.roles.get(k) != null) {
@@ -216,7 +235,7 @@ export class Handler {
 		r.path = path(input.Path, "path")
 		r.id = id("AROA", 17)
 		r.created = now()
-		r.trust = document(input.AssumeRolePolicyDocument)
+		r.trust = document(input.AssumeRolePolicyDocument, "trust")
 		r.description = input.Description
 		r.maxSession = input.MaxSessionDuration ?? 3600
 		r.tags = tagged([], input.Tags ?? [], "Role")
@@ -227,6 +246,7 @@ export class Handler {
 	}
 
 	getRole(caller: Caller, input: api.GetRoleRequest): api.GetRoleResponse throws Fault {
+		onRole(caller, input.RoleName)
 		const r = new api.GetRoleResponse()
 		r.Role = roleOf(caller.account, role(new Tables(caller.store()), input.RoleName), true)
 		r.Role.RoleLastUsed = new api.RoleLastUsed()
@@ -234,6 +254,7 @@ export class Handler {
 	}
 
 	listRoles(caller: Caller, input: api.ListRolesRequest): api.ListRolesResponse throws Fault {
+		caller.allow(arn(caller.account, "role", "/", ""))
 		const prefix = input.PathPrefix ?? "/"
 		const [roles, next] = page(new Tables(caller.store()).roles, "", input.Marker, input.MaxItems,
 			r => startsWith(r.path, prefix))
@@ -245,14 +266,16 @@ export class Handler {
 	}
 
 	updateAssumeRolePolicy(caller: Caller, input: api.UpdateAssumeRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const r = role(db, input.RoleName)
-		r.trust = document(input.PolicyDocument)
+		r.trust = document(input.PolicyDocument, "trust")
 		save(db.roles, key(r.name), r)
 		return new Unit()
 	}
 
 	deleteRole(caller: Caller, input: api.DeleteRoleRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const k = key(role(db, input.RoleName).name)
 		if (db.roleAttached.scan(null, 1, within(k, "")).length > 0) {
@@ -266,6 +289,7 @@ export class Handler {
 	}
 
 	tagRole(caller: Caller, input: api.TagRoleRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const r = role(db, input.RoleName)
 		r.tags = tagged(r.tags, input.Tags, "Role")
@@ -274,6 +298,7 @@ export class Handler {
 	}
 
 	untagRole(caller: Caller, input: api.UntagRoleRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const r = role(db, input.RoleName)
 		r.tags = r.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
@@ -282,6 +307,7 @@ export class Handler {
 	}
 
 	listRoleTags(caller: Caller, input: api.ListRoleTagsRequest): api.ListRoleTagsResponse throws Fault {
+		onRole(caller, input.RoleName)
 		const [tags,
 			next] = tagPage(role(new Tables(caller.store()), input.RoleName).tags, input.Marker, input.MaxItems)
 		const r = new api.ListRoleTagsResponse()
@@ -292,6 +318,8 @@ export class Handler {
 	}
 
 	createPolicy(caller: Caller, input: api.CreatePolicyRequest): api.CreatePolicyResponse throws Fault {
+		tagging(caller, input.Tags)
+		caller.allow(arn(caller.account, "policy", input.Path ?? "/", input.PolicyName))
 		const db = new Tables(caller.store())
 		const k = key(named(input.PolicyName, "policyName", 128))
 		if (db.policies.get(k) != null) {
@@ -308,7 +336,7 @@ export class Handler {
 		p.tags = tagged([], input.Tags ?? [], "Policy")
 		const v = new Version()
 		v.id = "v1"
-		v.document = document(input.PolicyDocument)
+		v.document = document(input.PolicyDocument, "identity")
 		v.created = p.created
 		save(db.policies, k, p)
 		save(db.versions, within(k, number(1)), v)
@@ -318,6 +346,7 @@ export class Handler {
 	}
 
 	getPolicy(caller: Caller, input: api.GetPolicyRequest): api.GetPolicyResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
 		const p = managed(caller, db, this.catalog, a)
@@ -331,6 +360,7 @@ export class Handler {
 
 	/// The account's policies and AWS's, of each name the account's first.
 	listPolicies(caller: Caller, input: api.ListPoliciesRequest): api.ListPoliciesResponse throws Fault {
+		caller.allow(arn(caller.account, "policy", "/", ""))
 		const db = new Tables(caller.store())
 		const prefix = input.PathPrefix ?? "/"
 		const scope = input.Scope ?? "All"
@@ -365,6 +395,7 @@ export class Handler {
 	}
 
 	deletePolicy(caller: Caller, input: api.DeletePolicyRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const p = owned(caller, db, input.PolicyArn, "DeletePolicy")
 		const k = key(p.name)
@@ -383,6 +414,7 @@ export class Handler {
 
 	createPolicyVersion(caller: Caller,
 		input: api.CreatePolicyVersionRequest): api.CreatePolicyVersionResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const p = owned(caller, db, input.PolicyArn, "CreatePolicyVersion")
 		const k = key(p.name)
@@ -392,7 +424,7 @@ export class Handler {
 		}
 		const v = new Version()
 		v.id = `v${p.next}`
-		v.document = document(input.PolicyDocument)
+		v.document = document(input.PolicyDocument, "identity")
 		v.created = now()
 		save(db.versions, within(k, number(p.next)), v)
 		p.next++
@@ -407,6 +439,7 @@ export class Handler {
 	}
 
 	getPolicyVersion(caller: Caller, input: api.GetPolicyVersionRequest): api.GetPolicyVersionResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
 		const p = managed(caller, db, this.catalog, a)
@@ -427,6 +460,7 @@ export class Handler {
 	/// The account's policy's versions in their order, AWS's as AWS lists them, the latest first.
 	listPolicyVersions(caller: Caller,
 		input: api.ListPolicyVersionsRequest): api.ListPolicyVersionsResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
 		const p = managed(caller, db, this.catalog, a)
@@ -441,6 +475,7 @@ export class Handler {
 	}
 
 	deletePolicyVersion(caller: Caller, input: api.DeletePolicyVersionRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const p = owned(caller, db, input.PolicyArn, "DeletePolicyVersion")
 		const [k, v] = version(db, p, input.PolicyArn, input.VersionId)
@@ -452,6 +487,7 @@ export class Handler {
 	}
 
 	setDefaultPolicyVersion(caller: Caller, input: api.SetDefaultPolicyVersionRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const p = owned(caller, db, input.PolicyArn, "SetDefaultPolicyVersion")
 		p.defaultVersion = version(db, p, input.PolicyArn, input.VersionId)[1].id
@@ -461,12 +497,14 @@ export class Handler {
 	}
 
 	attachUserPolicy(caller: Caller, input: api.AttachUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		attach(caller, db, this.catalog, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn, "User")
 		return new Unit()
 	}
 
 	detachUserPolicy(caller: Caller, input: api.DetachUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		detach(caller, db, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn)
 		return new Unit()
@@ -474,6 +512,7 @@ export class Handler {
 
 	listAttachedUserPolicies(caller: Caller,
 		input: api.ListAttachedUserPoliciesRequest): api.ListAttachedUserPoliciesResponse throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const owner = key(user(db, input.UserName).name)
 		const [policies, next] = attached(db.userAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
@@ -485,12 +524,14 @@ export class Handler {
 	}
 
 	attachRolePolicy(caller: Caller, input: api.AttachRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "Role")
 		return new Unit()
 	}
 
 	detachRolePolicy(caller: Caller, input: api.DetachRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		detach(caller, db, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn)
 		return new Unit()
@@ -498,6 +539,7 @@ export class Handler {
 
 	listAttachedRolePolicies(caller: Caller,
 		input: api.ListAttachedRolePoliciesRequest): api.ListAttachedRolePoliciesResponse throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const owner = key(role(db, input.RoleName).name)
 		const [policies, next] = attached(db.roleAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
@@ -511,6 +553,7 @@ export class Handler {
 	/// The users, then the roles, a managed policy is attached to, each in the order of their names.
 	listEntitiesForPolicy(caller: Caller,
 		input: api.ListEntitiesForPolicyRequest): api.ListEntitiesForPolicyResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
 		managed(caller, db, this.catalog, a)
@@ -542,6 +585,7 @@ export class Handler {
 	}
 
 	putUserPolicy(caller: Caller, input: api.PutUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const owner = key(user(db, input.UserName).name)
 		embed(db.userInline, owner, input.PolicyName, input.PolicyDocument)
@@ -549,6 +593,7 @@ export class Handler {
 	}
 
 	getUserPolicy(caller: Caller, input: api.GetUserPolicyRequest): api.GetUserPolicyResponse throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = user(db, input.UserName)
 		const p = inline(db.userInline, key(u.name), input.PolicyName, "user")
@@ -560,6 +605,7 @@ export class Handler {
 	}
 
 	listUserPolicies(caller: Caller, input: api.ListUserPoliciesRequest): api.ListUserPoliciesResponse throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const owner = key(user(db, input.UserName).name)
 		const [policies, next] = page(db.userInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
@@ -571,6 +617,7 @@ export class Handler {
 	}
 
 	deleteUserPolicy(caller: Caller, input: api.DeleteUserPolicyRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const owner = key(user(db, input.UserName).name)
 		inline(db.userInline, owner, input.PolicyName, "user")
@@ -579,6 +626,7 @@ export class Handler {
 	}
 
 	putRolePolicy(caller: Caller, input: api.PutRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const owner = key(role(db, input.RoleName).name)
 		embed(db.roleInline, owner, input.PolicyName, input.PolicyDocument)
@@ -586,6 +634,7 @@ export class Handler {
 	}
 
 	getRolePolicy(caller: Caller, input: api.GetRolePolicyRequest): api.GetRolePolicyResponse throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const x = role(db, input.RoleName)
 		const p = inline(db.roleInline, key(x.name), input.PolicyName, "role")
@@ -597,6 +646,7 @@ export class Handler {
 	}
 
 	listRolePolicies(caller: Caller, input: api.ListRolePoliciesRequest): api.ListRolePoliciesResponse throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const owner = key(role(db, input.RoleName).name)
 		const [policies, next] = page(db.roleInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
@@ -608,11 +658,42 @@ export class Handler {
 	}
 
 	deleteRolePolicy(caller: Caller, input: api.DeleteRolePolicyRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const owner = key(role(db, input.RoleName).name)
 		inline(db.roleInline, owner, input.PolicyName, "role")
 		db.roleInline.delete(within(owner, key(input.PolicyName)))
 		return new Unit()
+	}
+}
+
+/// Throws unless the caller may perform the operation on the user named name, or if null on itself: on its ARN, of its
+/// path if it exists, which IAM's message names as user <name>.
+function onUser(caller: Caller, name: string | null) throws Fault {
+	const a = caller.arn
+	const n = name ?? (if (indexOf(a, ":user/") >= 0) a.slice(lastIndexOf(a, "/") + 1, a.length) else "")
+	if (n == "") {
+		caller.allow(a)
+		return
+	}
+	const u = new Tables(caller.store()).users.get(key(n))
+	caller.allow(arn(caller.account, "user", u?.path ?? "/", u?.name ?? n), null, [], `user ${n}`)
+}
+
+/// Throws unless the caller may perform the operation on the role named name, as onUser on a user.
+function onRole(caller: Caller, name: string) throws Fault {
+	const r = new Tables(caller.store()).roles.get(key(name))
+	caller.allow(arn(caller.account, "role", r?.path ?? "/", r?.name ?? name), null, [], `role ${name}`)
+}
+
+/// Throws unless the caller may perform the operation on the managed policy of ARN a, which IAM's message names as
+/// policy <a>.
+function onPolicy(caller: Caller, a: string) throws Fault { caller.allow(a, null, [], `policy ${a}`) }
+
+/// Drops the tagging action of the operation's, its last, unless tags are given.
+function tagging(caller: Caller, tags: api.Tag[] | null) {
+	if (tags == null || tags.length == 0) {
+		caller.actions = caller.actions.slice(0, caller.actions.length - 1)
 	}
 }
 
@@ -721,9 +802,6 @@ function unknownVersion(a: string, v: string): Fault {
 	return api.noSuchEntityException(`Policy ${a} version ${v} does not exist or is not attachable.`)
 }
 
-/// A version's number, of 10 digits so that keys sort by it.
-function number(n: i32): string { return `${10000000000 + (n as i64)}`.slice(1, 11) }
-
 /// The access key k of the user that k names, whose id is id.
 function accessKey(db: Tables, k: string, id: string): AccessKey throws Fault {
 	const a = db.keys.get(k)
@@ -787,7 +865,7 @@ function attached(t: Table[Attachment], owner: string, prefix: string | null, ma
 function embed(t: Table[Inline], owner: string, name: string, doc: string) throws Fault {
 	const p = new Inline()
 	p.name = named(name, "policyName", 128)
-	p.document = document(doc)
+	p.document = document(doc, "identity")
 	save(t, within(owner, key(name)), p)
 }
 
@@ -920,13 +998,9 @@ function invalidValue(m: string, why: string): Fault {
 	return new Fault(400, api.validation.code, `The specified value for ${m} is invalid. ${why}`)
 }
 
-/// d, if it is a policy document: a JSON object.
-function document(d: string): string throws Fault {
-	try {
-		json.decode[json.Keys](d)
-	} catch (e: ParseError) {
-		throw api.malformedPolicyDocumentException("Syntax errors in policy.")
-	}
+/// d, if it is a policy document of kind k, as IAM checks one.
+function document(d: string, k: auth.Kind): string throws Fault {
+	auth.parse(d, k)
 	return d
 }
 

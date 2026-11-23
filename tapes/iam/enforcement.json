@@ -1,0 +1,585 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UserId",
+		"AccessKeyId",
+		"SecretAccessKey",
+		"SessionToken",
+		"Expiration"
+	],
+	"steps": [
+		{
+			"name": "create the narrow user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-narrow</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "allow it to get itself and list users, but deny listing users",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow",
+				"PolicyName": "narrow",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetUser\",\"Resource\":\"arn:aws:iam::${account}:user/${prefix}-narrow\"},{\"Effect\":\"Allow\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\"iam:ListUsers\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the narrow user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow"
+			},
+			"capture": {
+				"narrow.key": "AccessKey/AccessKeyId",
+				"narrow.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${narrow.key}</AccessKeyId>\n      <SecretAccessKey>${narrow.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-narrow</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "create the user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-none</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-none</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"capture": {
+				"none.key": "AccessKey/AccessKeyId",
+				"none.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${none.key}</AccessKeyId>\n      <SecretAccessKey>${none.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-none</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "create the bounded user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-bounded</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-bounded</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "allow it to get users",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded",
+				"PolicyName": "users",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetUser\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "bound it by a policy that allows no IAM",
+			"service": "iam",
+			"differs": "permissions boundaries are not implemented",
+			"query": {
+				"Action": "PutUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the bounded user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"capture": {
+				"bounded.key": "AccessKey/AccessKeyId",
+				"bounded.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${bounded.key}</AccessKeyId>\n      <SecretAccessKey>${bounded.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-bounded</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "narrow",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user gets itself",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "narrow",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-narrow</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user gets another",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"as": "narrow",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow is not authorized to perform: iam:GetUser on resource: user boberstack-ab-00000000-none because no identity-based policy allows the iam:GetUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user gets a user that is not",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-missing"
+			},
+			"as": "narrow",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow is not authorized to perform: iam:GetUser on resource: user boberstack-ab-00000000-missing because no identity-based policy allows the iam:GetUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user lists users, explicitly denied",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08"
+			},
+			"as": "narrow",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow is not authorized to perform: iam:ListUsers on resource: arn:aws:iam::000000000000:user/ with an explicit deny in an identity-based policy. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user lists roles",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoles",
+				"Version": "2010-05-08"
+			},
+			"as": "narrow",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow is not authorized to perform: iam:ListRoles on resource: arn:aws:iam::000000000000:role/ because no identity-based policy allows the iam:ListRoles action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the narrow user creates a user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-x",
+				"Path": "/q/"
+			},
+			"as": "narrow",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-narrow is not authorized to perform: iam:CreateUser on resource: arn:aws:iam::000000000000:user/q/boberstack-ab-00000000-x because no identity-based policy allows the iam:CreateUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the user of no policy, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "none",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-none</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "the user of no policy gets itself",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "none",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: iam:GetUser on resource: user boberstack-ab-00000000-none because no identity-based policy allows the iam:GetUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the user of no policy gets an AWS managed policy",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess"
+			},
+			"as": "none",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: iam:GetPolicy on resource: policy arn:aws:iam::aws:policy/ReadOnlyAccess because no identity-based policy allows the iam:GetPolicy action</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the user of no policy takes a session token",
+			"service": "sts",
+			"differs": "the sizes of the session are missing",
+			"query": {
+				"Action": "GetSessionToken",
+				"Version": "2011-06-15",
+				"DurationSeconds": "900"
+			},
+			"capture": {
+				"session.key": "Credentials/AccessKeyId",
+				"session.secret": "Credentials/SecretAccessKey",
+				"session.token": "Credentials/SessionToken"
+			},
+			"as": "none",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetSessionTokenResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetSessionTokenResult>\n    <Credentials>\n      <AccessKeyId>${session.key}</AccessKeyId>\n      <SecretAccessKey>${session.secret}</SecretAccessKey>\n      <SessionToken>${session.token}</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <SessionTokenSize>676</SessionTokenSize>\n    <SessionTokenUtilization>16</SessionTokenUtilization>\n  </GetSessionTokenResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetSessionTokenResponse>\n"
+			}
+		},
+		{
+			"name": "its session calls IAM",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "session",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidClientTokenId</Code>\n    <Message>The security token included in the request is invalid</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "its session takes another",
+			"service": "sts",
+			"query": {
+				"Action": "GetSessionToken",
+				"Version": "2011-06-15",
+				"DurationSeconds": "900"
+			},
+			"as": "session",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>Cannot call GetSessionToken with session credentials</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the bounded user, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "bounded",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-bounded</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "the bounded user gets itself",
+			"service": "iam",
+			"differs": "the boundary of step 8 was not set, so its policy allows",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08"
+			},
+			"as": "bounded",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-bounded is not authorized to perform: iam:GetUser on resource: user boberstack-ab-00000000-bounded because no permissions boundary allows the iam:GetUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the narrow user's key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow",
+				"AccessKeyId": "${narrow.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the narrow user's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow",
+				"PolicyName": "narrow"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the narrow user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-narrow"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the key of the user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none",
+				"AccessKeyId": "${none.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user's key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded",
+				"AccessKeyId": "${bounded.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded",
+				"PolicyName": "users"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user's boundary",
+			"service": "iam",
+			"differs": "permissions boundaries are not implemented",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

@@ -6,6 +6,7 @@ import { live } from "../../core/state/store"
 import * as api from "./api"
 import { Catalog } from "./catalog"
 import { Handler } from "./iam"
+import { identify } from "./identities"
 import { indexOf } from "std/algo"
 import { Response } from "std/http"
 import { ParseError } from "std/string"
@@ -237,10 +238,14 @@ test "the root, by leaving out UserName: itself, and its own access keys, at mos
 
 test "a deleted access key is refused, where one never issued is taken for a root's" {
 	const g = gateway()
+	g.identify = identify(catalog(managed))
 	call(g, "CreateUser", [["UserName", "bob"]])
 	let res = call(g, "CreateAccessKey", [["UserName", "bob"]])
 	const key = text(res, "AccessKeyId")!
 	const secret = text(res, "SecretAccessKey")!
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	const own = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetUser","Resource":"*"}]}`
+	call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "own"], ["PolicyDocument", own]])
 	assert text(call(g, "GetUser", [], key, secret), "UserName") == "bob"
 	assert call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", key]]).status == 200
 	assert fails(call(g, "GetUser", [], key, secret), 403, "InvalidClientTokenId",
@@ -249,6 +254,7 @@ test "a deleted access key is refused, where one never issued is taken for a roo
 	assert texts(call(g, "ListAccessKeys", [["UserName", "bob"]]), "AccessKeyId") == []
 	assert fails(call(g, "UpdateAccessKey", [["UserName", "bob"], ["AccessKeyId", key], ["Status", "Active"]]), 404,
 		"NoSuchEntity")
+	call(g, "DeleteUserPolicy", [["UserName", "bob"], ["PolicyName", "own"]])
 	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
 	assert fails(call(g, "GetUser", [], key, secret), 403, "InvalidClientTokenId")
 	res = call(g, "GetUser", [], "AKIANEVERISSUEDKEY00", "anything")
@@ -267,7 +273,7 @@ test "roles: create, get, list, update the trust policy, delete" {
 	assert fails(call(g, "CreateRole", [["RoleName", "APP"], ["AssumeRolePolicyDocument", trust]]), 409,
 		"EntityAlreadyExists", "Role with name APP already exists.")
 	assert fails(call(g, "CreateRole", [["RoleName", "x"], ["AssumeRolePolicyDocument", "{\"Version\": "]]), 400,
-		"MalformedPolicyDocument", "Syntax errors in policy.")
+		"MalformedPolicyDocument", "This policy contains invalid Json")
 	assert fails(call(g, "CreateRole",
 		[["RoleName", "x"], ["AssumeRolePolicyDocument", trust], ["MaxSessionDuration", "60"]]), 400, "ValidationError")
 	res = call(g, "GetRole", [["RoleName", "app"]])
@@ -281,8 +287,12 @@ test "roles: create, get, list, update the trust policy, delete" {
 	assert texts(res, "RoleName") == ["app", "other"] && texts(res, "MaxSessionDuration") == ["3600", "7200"]
 	assert texts(res, "AssumeRolePolicyDocument") == [escape(trust, "component"), escape(trust, "component")]
 	assert texts(call(g, "ListRoles", [["PathPrefix", "/svc"]]), "RoleName") == ["app"]
-	assert call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", allow]]).status == 200
-	assert text(call(g, "GetRole", [["RoleName", "app"]]), "AssumeRolePolicyDocument") == escape(allow, "component")
+	assert fails(call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", allow]]), 400,
+		"MalformedPolicyDocument", "Has prohibited field Resource")
+	const other = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"000000000000"},`
+		+ `"Action":"sts:AssumeRole"}]}`
+	assert call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", other]]).status == 200
+	assert text(call(g, "GetRole", [["RoleName", "app"]]), "AssumeRolePolicyDocument") == escape(other, "component")
 	assert fails(call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", "[]"]]), 400,
 		"MalformedPolicyDocument")
 	assert call(g, "DeleteRole", [["RoleName", "app"]]).status == 200
@@ -395,8 +405,10 @@ test "inline policies" {
 	const g = gateway()
 	call(g, "CreateUser", [["UserName", "bob"]])
 	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
+	assert fails(call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "t"], ["PolicyDocument", trust]]), 400,
+		"MalformedPolicyDocument", "Policy document should not specify a principal.")
 	for (const name of ["b", "a"]) {
-		assert call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", name], ["PolicyDocument", trust]]).status
+		assert call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", name], ["PolicyDocument", allow]]).status
 			== 200
 	}
 	assert call(g, "PutUserPolicy", [["UserName", "bob"], ["PolicyName", "A"], ["PolicyDocument", allow]]).status == 200

@@ -68,6 +68,8 @@ export class Principal {
 	account = ""
 	/// The ARN of a session's role, with its path.
 	role = ""
+	/// Its tags, a session's over its role's, as the keys aws:PrincipalTag/<key> name them.
+	tags: [string, string][] = []
 }
 
 /// A request, as policies see it.
@@ -170,6 +172,10 @@ export function evaluate(r: Request, p: Policies): Decision {
 	const boundary = p.boundary == null || decides(p.boundary, r, action, true)
 	const session = p.session.length == 0 || p.session.some(x => decides(x, r, action, true))
 	const limited: By = if (!identity) "identity" else if (!boundary) "boundary" else "session"
+	if (rk == "trust" && grant == "") {
+		// A role is assumed only as its trust policy allows, whatever the identity-based policies do.
+		return new Decision("implicitDeny", "trust")
+	}
 	if (who.account == r.owner) {
 		if (grant == "principal" || grant == "role" && boundary && session) {
 			return new Decision("allowed", rk)
@@ -183,9 +189,11 @@ export function evaluate(r: Request, p: Policies): Decision {
 	return if (grant != "") new Decision("allowed", rk) else new Decision("implicitDeny", rk)
 }
 
-/// The message of the AccessDenied that d, a denial of r, answers with, as AWS words it.
-export function denied(r: Request, d: Decision): string {
-	const on = if (r.resource == "*" || r.resource == "") "" else ` on resource: ${r.resource}`
+/// The message of the AccessDenied that d, a denial of r, answers with, as AWS words it, naming the resource as shown,
+/// its ARN if null.
+export function denied(r: Request, d: Decision, shown: string | null = null): string {
+	const resource = shown ?? r.resource
+	const on = if (resource == "*" || resource == "") "" else ` on resource: ${resource}`
 	const head = `User: ${r.principal.arn} is not authorized to perform: ${r.action}${on}`
 	if (d.effect == "explicitDeny") {
 		return `${head} with an explicit deny in ${if (d.by == "trust") "the" else article(d.by)} ${named(d.by)}`

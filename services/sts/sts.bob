@@ -1,12 +1,15 @@
-//! AWS Security Token Service: who a caller is, and temporary credentials for a role or for the caller itself.
+//! AWS Security Token Service: who a caller is, and temporary credentials for a role, a federated user or the caller
+//! itself, whose sessions keep the session policies and tags they are given.
 
 import { Credential, credentials, id, secret } from "../../core/auth/credentials"
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
-import { Caller } from "../../core/service"
+import { Caller, Context } from "../../core/service"
 import { arn, key, save, Tables } from "../iam/records"
 
-import { AssumedRoleUser, AssumeRoleRequest, AssumeRoleResponse, Credentials, GetCallerIdentityRequest,
-	GetCallerIdentityResponse, GetSessionTokenRequest, GetSessionTokenResponse, Unimplemented } from "./api"
+import { AssumedRoleUser, AssumeRoleRequest, AssumeRoleResponse, Credentials, FederatedUser, GetCallerIdentityRequest,
+	GetCallerIdentityResponse, GetFederationTokenRequest, GetFederationTokenResponse, GetSessionTokenRequest,
+	GetSessionTokenResponse, PolicyDescriptorType, Tag, Unimplemented } from "./api"
 
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { second } from "std/time"
@@ -15,6 +18,7 @@ import { second } from "std/time"
 export class Handler {
 	...Unimplemented
 
+	/// Needs no permission.
 	getCallerIdentity(caller: Caller, input: GetCallerIdentityRequest): GetCallerIdentityResponse throws Fault {
 		const r = new GetCallerIdentityResponse()
 		r.UserId = caller.userId
@@ -23,6 +27,8 @@ export class Handler {
 		return r
 	}
 
+	/// As the role's trust policy and the caller's identity-based policies allow, of sts:TagSession too if it passes
+	/// tags, and sts:SetSourceIdentity if a source identity.
 	assumeRole(caller: Caller, input: AssumeRoleRequest): AssumeRoleResponse throws Fault {
 		const a = input.RoleArn
 		const session = input.RoleSessionName
@@ -30,12 +36,27 @@ export class Handler {
 			throw new Fault(400, "ValidationError", `${a} is not a valid role ARN`)
 		}
 		const account = a.slice(13, 25)
-		// The trust policy is not evaluated: any caller may assume a role that exists.
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(x => x == "sts:AssumeRole" || x == "sts:TagSession" && tags.length > 0
+			|| x == "sts:SetSourceIdentity" && input.SourceIdentity != null
+			|| x == "sts:SetContext" && input.ProvidedContexts != null)
 		const role = new Tables(caller.tree(account)).roles.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
 		if (role == null || arn(account, "role", role.path, role.name) != a) {
 			const why = `User: ${caller.arn} is not authorized to perform: sts:AssumeRole on resource: ${a}`
 			throw new Fault(403, "AccessDenied", why)
 		}
+		const context: Context = [["sts:RoleSessionName", session]]
+		if (input.ExternalId != null) {
+			context.push(["sts:ExternalId", input.ExternalId!])
+		}
+		if (input.SourceIdentity != null) {
+			context.push(["sts:SourceIdentity", input.SourceIdentity!])
+		}
+		requested(context, tags)
+		if (input.TransitiveTagKeys != null) {
+			context.push(["sts:TransitiveTagKeys", input.TransitiveTagKeys!])
+		}
+		caller.allow(a, role.trust, context)
 		const seconds = input.DurationSeconds ?? 3600
 		if (seconds > role.maxSession) {
 			const why = "The requested DurationSeconds exceeds the MaxSessionDuration set for this role."
@@ -46,12 +67,36 @@ export class Handler {
 		u.AssumedRoleId = `${role.id}:${session}`
 		u.Arn = `arn:aws:sts::${account}:assumed-role/${role.name}/${session}`
 		r.AssumedRoleUser = u
-		r.Credentials = issue(caller, account, u.Arn, u.AssumedRoleId, seconds)
+		const c = issued(account, u.Arn, u.AssumedRoleId, seconds, "role", input.Policy, input.PolicyArns, tags)
+		r.Credentials = issue(caller, c)
+		return r
+	}
+
+	/// As the caller's identity-based policies allow, for a federated user whose permissions are those of both the
+	/// caller's and the session policies.
+	getFederationToken(caller: Caller, input: GetFederationTokenRequest): GetFederationTokenResponse throws Fault {
+		const tags = input.Tags ?? []
+		if (tags.length == 0) {
+			caller.actions = caller.actions.filter(x => x != "sts:TagSession")
+		}
+		const context: Context = []
+		requested(context, tags)
+		const a = `arn:aws:sts::${caller.account}:federated-user/${input.Name}`
+		caller.allow(a, null, context)
+		const r = new GetFederationTokenResponse()
+		const u = new FederatedUser()
+		u.FederatedUserId = `${caller.account}:${input.Name}`
+		u.Arn = a
+		r.FederatedUser = u
+		const c = issued(caller.account, a, u.FederatedUserId, input.DurationSeconds ?? 43200, "federated-user",
+			input.Policy, input.PolicyArns, tags)
+		c.issuer = caller.arn
+		r.Credentials = issue(caller, c)
 		return r
 	}
 
 	getSessionToken(caller: Caller, input: GetSessionTokenRequest): GetSessionTokenResponse throws Fault {
-		if (indexOf(caller.arn, ":assumed-role/") >= 0) {
+		if (caller.credential != null && caller.credential!.token != "") {
 			throw new Fault(403, "AccessDenied", "Cannot call GetSessionToken with session credentials")
 		}
 		// A root's session lasts an hour at most, whatever it asks for.
@@ -61,14 +106,29 @@ export class Handler {
 			seconds = 3600
 		}
 		const r = new GetSessionTokenResponse()
-		r.Credentials = issue(caller, caller.account, caller.arn, caller.userId, seconds)
+		const c = issued(caller.account, caller.arn, caller.userId, seconds, if (root) "" else "user", null, null, [])
+		r.Credentials = issue(caller, c)
 		return r
 	}
 }
 
-/// Temporary credentials of account, acting as identity, of the unique id userId, for seconds from now, issued for caller.
-function issue(caller: Caller, account: string, identity: string, userId: string,
-	seconds: i32): Credentials throws Fault {
+/// Adds to context the keys of the session tags requested: aws:RequestTag/<key> and aws:TagKeys.
+function requested(context: Context, tags: Tag[]) {
+	for (const t of tags) {
+		context.push([`aws:RequestTag/${t.Key}`, t.Value])
+	}
+	if (tags.length > 0) {
+		context.push(["aws:TagKeys", tags.map(t => t.Key)])
+	}
+}
+
+/// A temporary credential of account, acting as identity, of the unique id userId, for seconds from now: a session of
+/// the kind session, of the session policy document policy and those of policyArns, and of tags.
+function issued(account: string, identity: string, userId: string, seconds: i32, session: string, policy: string | null,
+	policyArns: PolicyDescriptorType[] | null, tags: Tag[]): Credential throws Fault {
+	if (policy != null) {
+		auth.parse(policy!, "identity")
+	}
 	const c = new Credential()
 	c.secret = secret()
 	c.account = account
@@ -76,6 +136,15 @@ function issue(caller: Caller, account: string, identity: string, userId: string
 	c.userId = userId
 	c.token = secret(356)
 	c.expiry = now() + (seconds as i64) * second
+	c.session = session
+	c.policy = policy ?? ""
+	c.policyArns = (policyArns ?? []).map(p => p.arn ?? "")
+	c.tags = tags.map(t => [t.Key, t.Value])
+	return c
+}
+
+/// The credentials that c is, saved under a new access key id, issued for caller.
+function issue(caller: Caller, c: Credential): Credentials throws Fault {
 	const r = new Credentials()
 	r.AccessKeyId = id("ASIA", 16)
 	r.SecretAccessKey = c.secret

@@ -26,7 +26,9 @@
 //! recording, which name every resource made, `account` to the account and `region` to us-east-1, and the names that
 //! earlier steps `capture`, each the text at a path of its answer: segments separated by /, each the first element of
 //! XML, or member or index of JSON, of that name below the one before. Recording retries a step `until` its answer
-//! has that status, for what AWS makes eventually consistent, and runs `cleanup` even after a step failed.
+//! has that status, for what AWS makes eventually consistent, and runs `cleanup` even after a step failed. A step is
+//! sent as the scenario's caller unless `as` names others, whose access key, secret and session token, if any, earlier
+//! steps capture as `<as>.key`, `<as>.secret` and `<as>.token`; a tape holds them as captures, `${<as>.secret}`.
 //!
 //! A tape holds nothing of the account: recording makes its id 000000000000, the caller's identity the account's
 //! root, which a replay sends as, the prefix `boberstack-ab-00000000`, a value captured `${name}` wherever it is, and
@@ -38,7 +40,8 @@
 //! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
 //! does not. A captured value is expected where AWS's was, as is a volatile member, of the same form: its runs of
 //! letters, digits and +/= the same in number, between the same other characters, but for a date's fraction of a
-//! second, which BoberStack's have unless it is 0 and AWS's never do. A step with `differs`, the reason
+//! second, which BoberStack's have unless it is 0 and AWS's never do; and the random id of an authorization that
+//! IAM's denials link to is not compared. A step with `differs`, the reason
 //! BoberStack answers otherwise, is expected to differ, until it no longer does.
 
 import * as client from "../../core/client"
@@ -49,6 +52,7 @@ import * as xml from "std/encoding/xml"
 import { readFile } from "std/fs"
 import { Request, Response } from "std/http"
 import { CryptoError } from "std/crypto/error"
+import { indexOf } from "std/algo"
 import { ParseError, replace, split, trim } from "std/string"
 import { escape } from "std/url"
 
@@ -81,6 +85,8 @@ export class Step {
 	/// By name, the path of the text to bind it to.
 	capture: [string, string][] @Mapping @OmitEmpty = []
 	volatile: string[] @OmitEmpty = []
+	/// Whom it is sent as: by the values bound to <as>.key, <as>.secret and, of a session, <as>.token; the root if "".
+	as: string @OmitEmpty = ""
 	/// The status to retry for while recording, 0 for none.
 	until: i32 @OmitEmpty = 0
 	/// Why BoberStack answers otherwise than AWS, "" if it does not.
@@ -177,7 +183,7 @@ export function volatiles(body: string, names: string[]): string[] throws ParseE
 
 /// What differs between the answers of g to the tape at path, its steps then its cleanup, and those it holds: a line
 /// for each difference, naming the step, the path in the body and both values. g is sent requests as the root of
-/// 000000000000.
+/// 000000000000, unless a step is sent as others.
 export function replay(path: string, g: Gateway): string[] {
 	let t = new Tape()
 	try {
@@ -192,9 +198,12 @@ export function replay(path: string, g: Gateway): string[] {
 	for (let i = 0; i < steps.length; i++) {
 		const s = steps[i]
 		const name = `step ${i + 1} (${s.name})`
-		let lines: string[] = []
+		const by = signer(s, values, ["test", "test", ""])
+		let lines = [`no credentials captured as ${s.as}`]
 		try {
-			lines = check(s, send(s, values, g), t.volatile, values)
+			if (by != null) {
+				lines = check(s, send(s, values, by!, g), t.volatile, values)
+			}
 		} catch (e: IoError | ParseError | CryptoError) {
 			lines = [`${e}`]
 		}
@@ -207,11 +216,37 @@ export function replay(path: string, g: Gateway): string[] {
 	return out
 }
 
-/// The answer of g to s, its ${name}s replaced by values, from the root of 000000000000.
-function send(s: Step, values: [string, string][], g: Gateway): Response throws IoError | ParseError | CryptoError {
+/// The answer of g to s, its ${name}s replaced by values, signed by the access key, secret and token of by.
+function send(s: Step, values: [string, string][], by: [string, string, string],
+	g: Gateway): Response throws IoError | ParseError | CryptoError {
 	const req = request(s, values, "http://localhost:4566")
-	client.sign(req, req.body.whole ?? "", s.service, "us-east-1", "test", "test", "", "20150626T140000Z")
+	const [key, secret, token] = by
+	client.sign(req, req.body.whole ?? "", s.service, "us-east-1", key, secret, token, "20150626T140000Z")
 	return g.handle(req)
+}
+
+/// The access key, secret and session token s is sent with, as values binds them: root's if s is sent as no one, null
+/// if no access key and secret are bound.
+export function signer(s: Step, values: [string, string][],
+	root: [string, string, string]): [string, string, string] | null {
+	if (s.as == "") {
+		return root
+	}
+	const of = (part: string) => lookup(values, `${s.as}.${part}`) ?? ""
+	return if (of("key") == "" || of("secret") == "") null else [of("key"), of("secret"), of("token")]
+}
+
+/// s with the id of each authorization IAM links to, which a request is given at random, as 0s.
+export function unlinked(s: string): string {
+	let out = s
+	for (const before of ["authorization-details/", "authorization id: "]) {
+		for (let i = indexOf(out,
+			before); i >= 0 && i + before.length + 25 <= out.length; i = indexOf(out, before, i + 1)) {
+			const at = i + before.length
+			out = out.slice(0, at) + "0000000000000000000000000" + out.slice(at + 25, out.length)
+		}
+	}
+	return out
 }
 
 /// How res differs from the answer s holds, whose captures it binds in values.
@@ -401,7 +436,7 @@ function compare(e: Tree, a: Tree, path: string, volatile: string[], values: [st
 		return
 	}
 	if (e.leaf || a.leaf) {
-		if (e.leaf && a.leaf && want != a.text) {
+		if (e.leaf && a.leaf && unlinked(want) != unlinked(a.text)) {
 			out.push(`${at}: ${contrast(want, a.text)}`)
 		} else if (!e.leaf || !a.leaf) {
 			out.push(`${at}: expected ${if (e.leaf) show(want) else outline(e)}, got ${if (a.leaf) show(a.text) else outline(a)}`)
