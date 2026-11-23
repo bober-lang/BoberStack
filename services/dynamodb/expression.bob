@@ -1,0 +1,1007 @@
+//! DynamoDB's expressions: conditions, as ConditionExpression, KeyConditionExpression and FilterExpression take them;
+//! updates; and projections. Each is parsed into a tree, its placeholders resolved, then evaluated against an item.
+//! Unlike DynamoDB, a name that is one of its reserved words is taken as a name.
+
+import { Fault } from "../../core/fault"
+import * as api from "./api"
+import { add, compare as compareNumbers, format, negate, parse } from "./number"
+import { indexOf, startsWith, stableSort } from "std/algo"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import { lower } from "std/string"
+
+/// An item, or a map: its attributes by name.
+export type Item = [string, api.AttributeValue][]
+
+/// A step of a document path: an attribute or map key by name, or, where index is not -1, a list's element.
+export class Step {
+	name = ""
+	index = -1
+}
+
+/// A node of an expression's tree, of a kind: "path", "value", a function's name, an operator as "=" or "between", or
+/// "and", "or" and "not".
+export class Node {
+	kind = ""
+	args: Node[] = []
+	path: Step[] = []
+	value: api.AttributeValue | null = null
+}
+
+/// An action of an update expression: SET, REMOVE, ADD or DELETE, of the attribute at path, by value.
+export class Action {
+	kind = ""
+	path: Step[] = []
+	value: Node | null = null
+}
+
+/// The placeholders of a request's expressions, and those that its expressions used.
+export class Context {
+	names: [string, string][]
+	values: Item
+	private usedNames: string[] = []
+	private usedValues: string[] = []
+
+	constructor(names: [string, string][] | null, values: Item | null) {
+		this.names = names ?? []
+		this.values = values ?? []
+	}
+
+	/// The name of the placeholder p, as #n, in the expression what names.
+	name(p: string, what: string): string throws Fault {
+		const found = this.names.find(e => e[0] == p)
+		if (found == null) {
+			throw invalid(what,
+				`An expression attribute name used in the document path is not defined; attribute name: ${p}`)
+		}
+		this.usedNames.push(p)
+		return found[1]
+	}
+
+	/// The value of the placeholder p, as :v, in the expression what names.
+	value(p: string, what: string): api.AttributeValue throws Fault {
+		const found = this.values.find(e => e[0] == p)
+		if (found == null) {
+			throw invalid(what,
+				`An expression attribute value used in expression is not defined; attribute value: ${p}`)
+		}
+		this.usedValues.push(p)
+		return found[1]
+	}
+
+	/// Throws if a placeholder is one no expression used: values first, as DynamoDB checks them.
+	unused() throws Fault {
+		const values = this.values.filter(e => !this.usedValues.includes(e[0])).map(e => e[0])
+		if (values.length > 0) {
+			throw validation(`Value provided in ExpressionAttributeValues unused in expressions: keys: {${values.join(", ")}}`)
+		}
+		const names = this.names.filter(e => !this.usedNames.includes(e[0])).map(e => e[0])
+		if (names.length > 0) {
+			throw validation(`Value provided in ExpressionAttributeNames unused in expressions: keys: {${names.join(", ")}}`)
+		}
+	}
+}
+
+/// A ValidationException.
+export function validation(message: string): Fault { return new Fault(400, "ValidationException", message) }
+/// The fault of the expression what names, as ConditionExpression, invalid as why says.
+export function invalid(what: string, why: string): Fault { return validation(`Invalid ${what}: ${why}`) }
+
+/// The condition of the expression s, of the kind what names, as ConditionExpression.
+export function condition(s: string, what: string, c: Context): Node throws Fault {
+	const p = new Parser(s, what, c)
+	const n = p.condition()
+	p.end()
+	return n
+}
+
+/// The actions of the update expression s.
+export function update(s: string, c: Context): Action[] throws Fault {
+	const p = new Parser(s, "UpdateExpression", c)
+	const out: Action[] = []
+	const seen: string[] = []
+	while (p.peek().kind != "eof") {
+		const t = p.next()
+		const kind = if (t.kind == "name") upper(t.text) else ""
+		if (!["SET", "REMOVE", "ADD", "DELETE"].includes(kind)) {
+			throw p.syntax(p.i - 1)
+		}
+		if (seen.includes(kind)) {
+			throw invalid("UpdateExpression", `The "${kind}" section can only be used once in an update expression;`)
+		}
+		seen.push(kind)
+		while (true) {
+			const a = new Action()
+			a.kind = kind
+			a.path = p.path()
+			if (kind == "SET") {
+				p.expect("=")
+				a.value = p.setValue()
+			} else if (kind != "REMOVE") {
+				const v = p.operand(false)
+				if (v.kind != "value") {
+					throw p.syntax(p.i - 1)
+				}
+				const t = typeName(v.value!)
+				const sets = ["SS", "NS", "BS"]
+				if (kind == "ADD" && t != "N" && !sets.includes(t) || kind == "DELETE" && !sets.includes(t)) {
+					throw invalid("UpdateExpression",
+						`Incorrect operand type for operator or function; operator: ${kind}, `
+						+ `operand type: ${longType(t)}, typeSet: ALLOWED_FOR_${kind}_OPERAND`)
+				}
+				a.value = v
+			}
+			out.push(a)
+			if (p.peek().kind != ",") {
+				break
+			}
+			p.next()
+		}
+	}
+	if (out.length == 0) {
+		throw invalid("UpdateExpression", "The expression can not be empty;")
+	}
+	overlaps(out.map(a => a.path), "UpdateExpression")
+	return out
+}
+
+/// The paths of the projection expression s.
+export function projection(s: string, c: Context): Step[][] throws Fault {
+	const p = new Parser(s, "ProjectionExpression", c)
+	const out: Step[][] = [p.path()]
+	while (p.peek().kind == ",") {
+		p.next()
+		out.push(p.path())
+	}
+	p.end()
+	overlaps(out, "ProjectionExpression")
+	return out
+}
+
+/// Throws if one of paths is another or within it.
+function overlaps(paths: Step[][], what: string) throws Fault {
+	for (let j = 0; j < paths.length; j++) {
+		for (let i = 0; i < j; i++) {
+			if (within(paths[i], paths[j]) || within(paths[j], paths[i])) {
+				throw invalid(what,
+					"Two document paths overlap with each other; must remove or rewrite one of these "
+					+ `paths; path one: ${shown(paths[i])}, path two: ${shown(paths[j])}`)
+			}
+		}
+	}
+}
+
+/// Whether a is b or a path within it.
+function within(a: Step[], b: Step[]): bool {
+	if (a.length < b.length) {
+		return false
+	}
+	for (let i = 0; i < b.length; i++) {
+		if (a[i].name != b[i].name || a[i].index != b[i].index) {
+			return false
+		}
+	}
+	return true
+}
+
+/// p as DynamoDB shows it: [a, b, [0]].
+export function shown(p: Step[]): string {
+	return `[${p.map(s => if (s.index >= 0) `[${s.index}]` else s.name).join(", ")}]`
+}
+
+/// A token of an expression, of a kind: "name", "#", ":", "int", "eof" or its punctuation; and where it is.
+class Token {
+	kind = ""
+	text = ""
+	at = 0
+	end = 0
+}
+
+/// The tokens of s, then one of kind eof.
+function tokens(s: string): Token[] {
+	const out: Token[] = []
+	let i = 0
+	while (true) {
+		while (i < s.length && isSpace(s[i])) {
+			i++
+		}
+		const t = new Token()
+		t.at = i
+		if (i == s.length) {
+			t.kind = "eof"
+			t.text = "<EOF>"
+			t.end = i
+			out.push(t)
+			return out
+		}
+		const c = s[i]
+		if (word(c) || (c == 35 || c == 58) && i + 1 < s.length && word(s[i + 1])) {
+			// # :
+			let j = i + 1
+			while (j < s.length && word(s[j])) {
+				j++
+			}
+			t.kind = if (c == 35) "#" else if (c == 58) ":" else if (s.slice(i, j).every(isDigit)) "int" else "name"
+			i = j
+		} else {
+			const two = s.slice(i, if (i + 2 < s.length) i + 2 else s.length)
+			i += if (two == "<>" || two == "<=" || two == ">=") 2 else 1
+			t.kind = s.slice(t.at, i)
+		}
+		t.text = s.slice(t.at, i)
+		t.end = i
+		out.push(t)
+	}
+}
+
+/// Whether c may be in a name.
+function word(c: u8): bool { return isAlphanumeric(c) || c == 95 }
+
+/// s in upper case, of ASCII letters.
+function upper(s: string): string {
+	let out = ""
+	for (const c of s) {
+		out += chr(if (c >= 97 && c <= 122) c - 32 else c)
+	}
+	return out
+}
+
+/// What reads an expression's tokens.
+class Parser {
+	src: string
+	what: string
+	c: Context
+	toks: Token[]
+	i = 0
+
+	constructor(src: string, what: string, c: Context) throws Fault {
+		this.src = src
+		this.what = what
+		this.c = c
+		this.toks = tokens(src)
+		if (this.toks.length == 1) {
+			throw invalid(what, "The expression can not be empty;")
+		}
+	}
+
+	peek(): Token { return this.toks[this.i] }
+
+	next(): Token {
+		const t = this.toks[this.i]
+		if (t.kind != "eof") {
+			this.i++
+		}
+		return t
+	}
+
+	/// Whether the next token is the keyword k, which it then takes.
+	keyword(k: string): bool {
+		const t = this.peek()
+		if (t.kind == "name" && upper(t.text) == k) {
+			this.i++
+			return true
+		}
+		return false
+	}
+
+	expect(kind: string) throws Fault {
+		if (this.peek().kind != kind) {
+			throw this.syntax(this.i)
+		}
+		this.i++
+	}
+
+	end() throws Fault {
+		if (this.peek().kind != "eof") {
+			throw this.syntax(this.i)
+		}
+	}
+
+	/// The syntax error at the token i, near the text from the token before it to the one after.
+	syntax(i: i32): Fault {
+		const t = this.toks[i]
+		const from = this.toks[if (i > 0) i - 1 else 0].at
+		const to = if (i + 1 < this.toks.length) this.toks[i + 1].end else this.src.length
+		return invalid(this.what, `Syntax error; token: "${t.text}", near: "${this.src.slice(from, to)}"`)
+	}
+
+	condition(): Node throws Fault {
+		let left = this.conjunction()
+		while (this.keyword("OR")) {
+			left = node("or", [left, this.conjunction()])
+		}
+		return left
+	}
+
+	conjunction(): Node throws Fault {
+		let left = this.negation()
+		while (this.keyword("AND")) {
+			left = node("and", [left, this.negation()])
+		}
+		return left
+	}
+
+	negation(): Node throws Fault {
+		if (this.keyword("NOT")) {
+			return node("not", [this.negation()])
+		}
+		return this.primary()
+	}
+
+	primary(): Node throws Fault {
+		if (this.peek().kind == "(") {
+			this.next()
+			const n = this.condition()
+			this.expect(")")
+			return n
+		}
+		const t = this.peek()
+		if (t.kind == "name" && this.toks[this.i + 1].kind == "(" && lower(t.text) != "size") {
+			return this.test()
+		}
+		const left = this.operand(false)
+		const op = this.peek()
+		if (["=", "<>", "<", "<=", ">", ">="].includes(op.kind)) {
+			this.next()
+			const right = this.operand(false)
+			if (left.kind == "path" && right.kind == "path" && shown(left.path) == shown(right.path)) {
+				throw invalid(this.what,
+					"The first operand must be distinct from the remaining operands for this "
+					+ `operator or function; operator: ${op.kind}, first operand: ${shown(left.path)}`)
+			}
+			if (op.kind != "=" && op.kind != "<>") {
+				this.ordered(op.kind, left)
+				this.ordered(op.kind, right)
+			}
+			return node(op.kind, [left, right])
+		}
+		if (this.keyword("BETWEEN")) {
+			const lo = this.operand(false)
+			if (!this.keyword("AND")) {
+				throw this.syntax(this.i)
+			}
+			const hi = this.operand(false)
+			if (lo.kind == "value" && hi.kind == "value" && typeName(lo.value!) == typeName(hi.value!)
+				&& order(lo.value!, hi.value!) > 0) {
+				throw invalid(this.what,
+					"The BETWEEN operator requires upper bound to be greater than or equal to lower "
+					+ `bound; lower bound operand: AttributeValue: ${literal(lo.value!)}, upper bound operand: `
+					+ `AttributeValue: ${literal(hi.value!)}`)
+			}
+			return node("between", [left, lo, hi])
+		}
+		if (this.keyword("IN")) {
+			this.expect("(")
+			const args = [left, this.operand(false)]
+			while (this.peek().kind == ",") {
+				this.next()
+				args.push(this.operand(false))
+			}
+			this.expect(")")
+			return node("in", args)
+		}
+		if (left.kind == "size" && op.kind != "eof") {
+			throw this.syntax(this.i)
+		}
+		if (left.kind == "size") {
+			throw invalid(this.what, "The function is not allowed to be used this way in an expression; function: size")
+		}
+		throw this.syntax(this.i)
+	}
+
+	/// Throws if n, an operand of the comparison op, is a value of a type that does not order.
+	ordered(op: string, n: Node) throws Fault {
+		if (n.kind == "value" && !["S", "N", "B"].includes(typeName(n.value!))) {
+			throw invalid(this.what,
+				"Incorrect operand type for operator or function; operator or function: "
+				+ `${op}, operand type: ${typeName(n.value!)}`)
+		}
+	}
+
+	/// A function that tests, as attribute_exists(a).
+	test(): Node throws Fault {
+		const name = this.next().text
+		const f = lower(name)
+		const counts: [string, i32][] = [["attribute_exists", 1], ["attribute_not_exists", 1], ["attribute_type", 2],
+			["begins_with", 2], ["contains", 2]]
+		const known = counts.find(e => e[0] == name)
+		if (known == null) {
+			if (["if_not_exists", "list_append"].includes(f)) {
+				throw invalid(this.what, `The function is not allowed in a condition expression; function: ${name}`)
+			}
+			throw invalid(this.what, `Invalid function name; function: ${name}`)
+		}
+		const args = this.arguments(false)
+		if (args.length != known[1]) {
+			throw invalid(this.what,
+				"Incorrect number of operands for operator or function; operator or function: "
+				+ `${name}, number of operands: ${args.length}`)
+		}
+		if (args[0].kind != "path") {
+			throw invalid(this.what, `Operator or function requires a document path; operator or function: ${name}`)
+		}
+		if (name == "attribute_type") {
+			const t = args[1].value
+			const types = ["S", "SS", "N", "NS", "B", "BS", "BOOL", "NULL", "L", "M"]
+			if (t == null || !(t instanceof api.AttributeValue$S) || !types.includes(t.S)) {
+				const shown = if (t instanceof api.AttributeValue$S) t.S else ""
+				throw invalid(this.what,
+					`Invalid attribute type name found; type: ${shown}, valid types: ` + `{${types.join(",")}}`)
+			}
+		}
+		if (name == "begins_with" && args[1].kind == "value" && !["S", "B"].includes(typeName(args[1].value!))) {
+			throw invalid(this.what,
+				"Incorrect operand type for operator or function; operator or function: "
+				+ `begins_with, operand type: ${typeName(args[1].value!)}`)
+		}
+		return node(name, args)
+	}
+
+	/// The operands of a function, between parentheses, of an update's if update.
+	arguments(update: bool): Node[] throws Fault {
+		this.expect("(")
+		const args = [this.operand(update)]
+		while (this.peek().kind == ",") {
+			this.next()
+			args.push(this.operand(update))
+		}
+		this.expect(")")
+		return args
+	}
+
+	/// A path, a value, or a function of them: size in a condition; if_not_exists and list_append in an update.
+	operand(update: bool): Node throws Fault {
+		const t = this.peek()
+		if (t.kind == ":") {
+			this.next()
+			const n = node("value", [])
+			n.value = this.c.value(t.text, this.what)
+			return n
+		}
+		if (t.kind == "name" && this.toks[this.i + 1].kind == "(") {
+			const f = lower(t.text)
+			const allowed = if (update) ["if_not_exists", "list_append"] else ["size"]
+			if (!allowed.includes(t.text)) {
+				const known = ["size", "if_not_exists", "list_append", "attribute_exists", "attribute_not_exists",
+					"attribute_type", "begins_with", "contains"]
+				if (!known.includes(f)) {
+					throw invalid(this.what, `Invalid function name; function: ${t.text}`)
+				}
+				const where = if (update) "an update expression" else "a condition expression"
+				throw invalid(this.what, `The function is not allowed in ${where}; function: ${t.text}`)
+			}
+			this.next()
+			const args = this.arguments(update)
+			const n = if (t.text == "size") 1 else 2
+			if (args.length != n) {
+				throw invalid(this.what,
+					"Incorrect number of operands for operator or function; operator or "
+					+ `function: ${t.text}, number of operands: ${args.length}`)
+			}
+			if (t.text != "list_append" && args[0].kind != "path") {
+				throw invalid(this.what,
+					`Operator or function requires a document path; operator or function: ${t.text}`)
+			}
+			return node(t.text, args)
+		}
+		const n = node("path", [])
+		n.path = this.path()
+		return n
+	}
+
+	/// What SET gives a path: an operand, or the sum or difference of two.
+	setValue(): Node throws Fault {
+		const left = this.operand(true)
+		const op = this.peek().kind
+		if (op == "+" || op == "-") {
+			this.next()
+			return node(op, [left, this.operand(true)])
+		}
+		return left
+	}
+
+	/// A document path: a name, then names after dots and indexes in brackets.
+	path(): Step[] throws Fault {
+		const out = [this.step()]
+		while (true) {
+			const t = this.peek()
+			if (t.kind == ".") {
+				this.next()
+				out.push(this.step())
+			} else if (t.kind == "[") {
+				this.next()
+				const n = this.next()
+				if (n.kind != "int") {
+					throw this.syntax(this.i - 1)
+				}
+				const s = new Step()
+				s.index = index(n.text)
+				out.push(s)
+				this.expect("]")
+			} else {
+				return out
+			}
+		}
+	}
+
+	/// An attribute's name, or the placeholder of one.
+	step(): Step throws Fault {
+		const t = this.next()
+		const s = new Step()
+		if (t.kind == "name") {
+			s.name = t.text
+		} else if (t.kind == "#") {
+			s.name = this.c.name(t.text, this.what)
+		} else {
+			throw this.syntax(this.i - (if (t.kind == "eof") 0 else 1))
+		}
+		return s
+	}
+}
+
+/// The index of the digits s, capped where it is past any list's length.
+function index(s: string): i32 {
+	let n = 0
+	for (const c of s) {
+		n = if (n > 1000000) n else n * 10 + ((c - 48) as i32)
+	}
+	return n
+}
+
+function node(kind: string, args: Node[]): Node { return { ...new Node(), kind: kind, args: args } }
+/// v as DynamoDB shows one in a message: {N:1}.
+function literal(v: api.AttributeValue): string { return `{${typeName(v)}:${scalar(v)}}` }
+
+/// The text of v, a string, number or binary.
+function scalar(v: api.AttributeValue): string {
+	if (v instanceof api.AttributeValue$S) {
+		return v.S
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return v.N
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return v.B
+	}
+	return ""
+}
+
+/// The name of v's type: S, N, B, SS, NS, BS, M, L, NULL or BOOL.
+export function typeName(v: api.AttributeValue): string {
+	if (v instanceof api.AttributeValue$S) {
+		return "S"
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return "N"
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return "B"
+	}
+	if (v instanceof api.AttributeValue$SS) {
+		return "SS"
+	}
+	if (v instanceof api.AttributeValue$NS) {
+		return "NS"
+	}
+	if (v instanceof api.AttributeValue$BS) {
+		return "BS"
+	}
+	if (v instanceof api.AttributeValue$M) {
+		return "M"
+	}
+	if (v instanceof api.AttributeValue$L) {
+		return "L"
+	}
+	if (v instanceof api.AttributeValue$NULL) {
+		return "NULL"
+	}
+	return "BOOL"
+}
+
+/// The type of t, a type's name, as DynamoDB words it in an update's messages.
+function longType(t: string): string {
+	const all: [string, string][] = [["S", "STRING"], ["N", "NUMBER"], ["B", "BINARY"], ["SS", "STRING_SET"],
+		["NS", "NUMBER_SET"], ["BS", "BINARY_SET"], ["M", "MAP"], ["L", "LIST"], ["NULL", "NULL"], ["BOOL", "BOOLEAN"]]
+	return all.find(e => e[0] == t)![1]
+}
+
+/// How a compares to b, both strings, numbers or binaries of one type.
+export function order(a: api.AttributeValue, b: api.AttributeValue): i32 throws Fault {
+	if (a instanceof api.AttributeValue$N && b instanceof api.AttributeValue$N) {
+		return compareNumbers(parse(a.N), parse(b.N))
+	}
+	const x = scalar(a)
+	const y = scalar(b)
+	return if (x < y) -1 else if (x == y) 0 else 1
+}
+
+/// Whether a and b are equal: of one type and value, sets whatever their order, numbers by value.
+export function same(a: api.AttributeValue, b: api.AttributeValue): bool throws Fault {
+	const t = typeName(a)
+	if (t != typeName(b)) {
+		return false
+	}
+	if (a instanceof api.AttributeValue$S || a instanceof api.AttributeValue$N || a instanceof api.AttributeValue$B) {
+		return order(a, b) == 0
+	}
+	if (a instanceof api.AttributeValue$BOOL && b instanceof api.AttributeValue$BOOL) {
+		return a.BOOL == b.BOOL
+	}
+	if (a instanceof api.AttributeValue$NULL) {
+		return true
+	}
+	if (a instanceof api.AttributeValue$L && b instanceof api.AttributeValue$L) {
+		if (a.L.length != b.L.length) {
+			return false
+		}
+		for (let i = 0; i < a.L.length; i++) {
+			if (!same(a.L[i], b.L[i])) {
+				return false
+			}
+		}
+		return true
+	}
+	if (a instanceof api.AttributeValue$M && b instanceof api.AttributeValue$M) {
+		if (a.M.length != b.M.length) {
+			return false
+		}
+		for (const [k, v] of a.M) {
+			const w = b.M.find(e => e[0] == k)
+			if (w == null || !same(v, w[1])) {
+				return false
+			}
+		}
+		return true
+	}
+	const xs = members(a)
+	const ys = members(b)
+	if (xs.length != ys.length) {
+		return false
+	}
+	for (const x of xs) {
+		if (!has(ys, x)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The members of a set, each as a value of its own.
+export function members(v: api.AttributeValue): api.AttributeValue[] {
+	if (v instanceof api.AttributeValue$SS) {
+		return v.SS.map(s => ({ ...new api.AttributeValue$S(), S: s }) as api.AttributeValue)
+	}
+	if (v instanceof api.AttributeValue$NS) {
+		return v.NS.map(s => ({ ...new api.AttributeValue$N(), N: s }) as api.AttributeValue)
+	}
+	if (v instanceof api.AttributeValue$BS) {
+		return v.BS.map(s => ({ ...new api.AttributeValue$B(), B: s }) as api.AttributeValue)
+	}
+	return []
+}
+
+/// The set of type t, SS, NS or BS, of the members xs.
+function set(t: string, xs: api.AttributeValue[]): api.AttributeValue {
+	const all = xs.map(scalar)
+	if (t == "SS") {
+		return { ...new api.AttributeValue$SS(), SS: all }
+	}
+	if (t == "NS") {
+		return { ...new api.AttributeValue$NS(), NS: all }
+	}
+	return { ...new api.AttributeValue$BS(), BS: all }
+}
+
+/// Whether xs has a member equal to x.
+function has(xs: api.AttributeValue[], x: api.AttributeValue): bool throws Fault {
+	for (const y of xs) {
+		if (same(x, y)) {
+			return true
+		}
+	}
+	return false
+}
+
+/// The value at path in item, null if there is none.
+export function resolve(path: Step[], item: Item): api.AttributeValue | null {
+	const top = item.find(e => e[0] == path[0].name)
+	let v: api.AttributeValue | null = if (top == null) null else top[1]
+	for (let i = 1; i < path.length && v != null; i++) {
+		v = child(v!, path[i])
+	}
+	return v
+}
+
+/// The value at the step s in v, a map or list, null if there is none.
+function child(v: api.AttributeValue, s: Step): api.AttributeValue | null {
+	if (s.index < 0 && v instanceof api.AttributeValue$M) {
+		const e = v.M.find(e => e[0] == s.name)
+		return if (e == null) null else e[1]
+	}
+	if (s.index >= 0 && v instanceof api.AttributeValue$L) {
+		return v.L.at(s.index)
+	}
+	return null
+}
+
+/// Whether the condition n holds of item.
+export function holds(n: Node, item: Item): bool throws Fault {
+	switch (n.kind) {
+		case "and": return holds(n.args[0], item) && holds(n.args[1], item)
+		case "or": return holds(n.args[0], item) || holds(n.args[1], item)
+		case "not": return !holds(n.args[0], item)
+		case "attribute_exists": return resolve(n.args[0].path, item) != null
+		case "attribute_not_exists": return resolve(n.args[0].path, item) == null
+	}
+	const args: (api.AttributeValue | null)[] = []
+	for (const a of n.args) {
+		args.push(operand(a, item))
+	}
+	const a = args[0]
+	if (n.kind == "<>") {
+		return a == null || args[1] == null || !same(a!, args[1]!)
+	}
+	if (a == null || args.slice(1, args.length).some(x => x == null)) {
+		return false
+	}
+	const x = a!
+	const t = typeName(x)
+	const b = args[1]!
+	switch (n.kind) {
+		case "=": return same(x, b)
+		case "<", "<=", ">", ">=":
+			if (t != typeName(b) || !["S", "N", "B"].includes(t)) {
+				return false
+			}
+			const c = order(x, b)
+			return n.kind == "<" && c < 0 || n.kind == "<=" && c <= 0 || n.kind == ">" && c > 0
+				|| n.kind == ">=" && c >= 0
+		case "between":
+			const hi = args[2]!
+			return t == typeName(b) && t == typeName(hi) && ["S", "N", "B"].includes(t) && order(x, b) >= 0
+				&& order(x, hi) <= 0
+		case "in": return has(args.slice(1, args.length).map(v => v!), x)
+		case "attribute_type": return t == scalar(b)
+		case "begins_with": return (t == "S" || t == "B") && t == typeName(b) && startsWith(scalar(x), scalar(b))
+		case "contains":
+			if ((t == "S" || t == "B") && t == typeName(b)) {
+				return indexOf(scalar(x), scalar(b)) >= 0
+			}
+			if (x instanceof api.AttributeValue$L) {
+				return has(x.L, b)
+			}
+			return t == `${typeName(b)}S` && has(members(x), b)
+		default:
+			assert false
+			return false
+	}
+}
+
+/// The value of the operand n of a condition, null if what it refers to is not in item.
+function operand(n: Node, item: Item): api.AttributeValue | null throws Fault {
+	switch (n.kind) {
+		case "value": return n.value
+		case "path": return resolve(n.path, item)
+		case "size":
+			const v = resolve(n.args[0].path, item)
+			if (v == null) {
+				return null
+			}
+			let size = 0
+			if (v instanceof api.AttributeValue$S) {
+				size = v.S.length
+			} else if (v instanceof api.AttributeValue$B) {
+				size = v.B.length
+			} else if (v instanceof api.AttributeValue$M) {
+				size = v.M.length
+			} else if (v instanceof api.AttributeValue$L) {
+				size = v.L.length
+			} else if (["SS", "NS", "BS"].includes(typeName(v!))) {
+				size = members(v!).length
+			} else {
+				return null
+			}
+			return { ...new api.AttributeValue$N(), N: `${size}` }
+		default:
+			assert false
+			return null
+	}
+}
+
+/// item with actions applied: what SET gives each path computed from item as it was, list elements removed from the
+/// last.
+export function apply(actions: Action[], item: Item): Item throws Fault {
+	const out = copy(item)
+	const values: (api.AttributeValue | null)[] = []
+	for (const a of actions) {
+		values.push(if (a.kind == "SET") computed(a.value!, item) else null)
+	}
+	const order: i32[] = []
+	for (let i = 0; i < actions.length; i++) {
+		order.push(i)
+	}
+	stableSort(order,
+		(i, j) => actions[i].kind == "REMOVE" && actions[j].kind == "REMOVE"
+		&& last(actions[i].path) > last(actions[j].path))
+	for (const i of order) {
+		const a = actions[i]
+		switch (a.kind) {
+			case "SET": put(out, a.path, values[i]!)
+			case "REMOVE": take(out, a.path)
+			case "ADD":
+				const v = a.value!.value!
+				const was = resolve(a.path, out)
+				if (was == null) {
+					put(out, a.path, v)
+				} else if (was instanceof api.AttributeValue$N && v instanceof api.AttributeValue$N) {
+					put(out, a.path, { ...new api.AttributeValue$N(), N: format(add(parse(was.N), parse(v.N))) })
+				} else if (typeName(was!) == typeName(v)) {
+					const all = members(was!)
+					for (const x of members(v)) {
+						if (!has(all, x)) {
+							all.push(x)
+						}
+					}
+					put(out, a.path, set(typeName(v), all))
+				} else {
+					throw mistyped()
+				}
+			case "DELETE":
+				const v = a.value!.value!
+				const was = resolve(a.path, out)
+				if (was == null) {
+					continue
+				}
+				if (typeName(was!) != typeName(v)) {
+					throw mistyped()
+				}
+				const drop = members(v)
+				const left: api.AttributeValue[] = []
+				for (const x of members(was!)) {
+					if (!has(drop, x)) {
+						left.push(x)
+					}
+				}
+				if (left.length == 0) {
+					take(out, a.path)
+				} else {
+					put(out, a.path, set(typeName(v), left))
+				}
+		}
+	}
+	return out
+}
+
+/// The index of the last step of p, -1 for a name.
+function last(p: Step[]): i32 { return p[p.length - 1].index }
+/// The fault of an update's operand of the wrong type.
+function mistyped(): Fault { return validation("An operand in the update expression has an incorrect data type") }
+
+/// The value of n, of SET, computed from item.
+function computed(n: Node, item: Item): api.AttributeValue throws Fault {
+	switch (n.kind) {
+		case "value": return n.value!
+		case "path":
+			const v = resolve(n.path, item)
+			if (v == null) {
+				throw validation("The provided expression refers to an attribute that does not exist in the item")
+			}
+			return v!
+		case "if_not_exists": return resolve(n.args[0].path, item) ?? computed(n.args[1], item)
+		case "list_append":
+			const a = computed(n.args[0], item)
+			const b = computed(n.args[1], item)
+			if (a instanceof api.AttributeValue$L && b instanceof api.AttributeValue$L) {
+				const all = a.L.slice(0, a.L.length)
+				all.append(b.L)
+				return { ...new api.AttributeValue$L(), L: all }
+			}
+			throw mistyped()
+		default:
+			const a = computed(n.args[0], item)
+			const b = computed(n.args[1], item)
+			if (a instanceof api.AttributeValue$N && b instanceof api.AttributeValue$N) {
+				const y = parse(b.N)
+				return { ...new api.AttributeValue$N(),
+					N: format(add(parse(a.N), if (n.kind == "-") negate(y) else y)) }
+			}
+			throw mistyped()
+	}
+}
+
+/// A copy of item whose maps and lists are its own.
+export function copy(item: Item): Item { return item.map(e => [e[0], deep(e[1])]) }
+
+/// A copy of v whose maps and lists are its own.
+function deep(v: api.AttributeValue): api.AttributeValue {
+	if (v instanceof api.AttributeValue$M) {
+		return { ...new api.AttributeValue$M(), M: copy(v.M) }
+	}
+	if (v instanceof api.AttributeValue$L) {
+		return { ...new api.AttributeValue$L(), L: v.L.map(deep) }
+	}
+	return v
+}
+
+/// Sets the value at path in item to v: the map or list it is in must be there, and an index past a list's end
+/// appends.
+function put(item: Item, path: Step[], v: api.AttributeValue): void throws Fault {
+	if (path.length == 1) {
+		const i = item.map(e => e[0]).indexOf(path[0].name)
+		if (i < 0) {
+			item.push([path[0].name, v])
+		} else {
+			item[i] = [path[0].name, v]
+		}
+		return
+	}
+	const parent = resolve(path.slice(0, path.length - 1), item)
+	const s = path[path.length - 1]
+	if (s.index < 0 && parent instanceof api.AttributeValue$M) {
+		put(parent.M, [s], v)
+	} else if (s.index >= 0 && parent instanceof api.AttributeValue$L) {
+		if (s.index < parent.L.length) {
+			parent.L[s.index] = v
+		} else {
+			parent.L.push(v)
+		}
+	} else {
+		throw validation("The document path provided in the update expression is invalid for update")
+	}
+}
+
+/// Removes the value at path from item, if there is one.
+function take(item: Item, path: Step[]): void {
+	if (path.length == 1) {
+		const i = item.map(e => e[0]).indexOf(path[0].name)
+		if (i >= 0) {
+			item.remove(i)
+		}
+		return
+	}
+	const parent = resolve(path.slice(0, path.length - 1), item)
+	const s = path[path.length - 1]
+	if (s.index < 0 && parent instanceof api.AttributeValue$M) {
+		take(parent.M, [s])
+	} else if (s.index >= 0 && parent instanceof api.AttributeValue$L && s.index < parent.L.length) {
+		parent.L.remove(s.index)
+	}
+}
+
+/// The parts of item at paths: of a map, those of its entries; of a list, those of its elements, in their order,
+/// without the gaps between.
+export function project(item: Item, paths: Step[][]): Item {
+	const out: Item = []
+	for (const [k, v] of item) {
+		const rest = paths.filter(p => p[0].index < 0 && p[0].name == k).map(p => p.slice(1, p.length))
+		const kept = pick(v, rest)
+		if (kept != null) {
+			out.push([k, kept!])
+		}
+	}
+	return out
+}
+
+/// What of v the paths within it keep, null if nothing; all of it if one is empty.
+function pick(v: api.AttributeValue, paths: Step[][]): api.AttributeValue | null {
+	if (paths.length == 0) {
+		return null
+	}
+	if (paths.some(p => p.length == 0)) {
+		return v
+	}
+	if (v instanceof api.AttributeValue$M) {
+		const m = project(v.M, paths)
+		return if (m.length == 0) null else ({ ...new api.AttributeValue$M(), M: m })
+	}
+	if (v instanceof api.AttributeValue$L) {
+		const l: api.AttributeValue[] = []
+		for (let i = 0; i < v.L.length; i++) {
+			const kept = pick(v.L[i], paths.filter(p => p[0].index == i).map(p => p.slice(1, p.length)))
+			if (kept != null) {
+				l.push(kept!)
+			}
+		}
+		return if (l.length == 0) null else ({ ...new api.AttributeValue$L(), L: l })
+	}
+	return null
+}

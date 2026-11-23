@@ -1,0 +1,1520 @@
+//! Amazon DynamoDB: tables with their secondary indexes, tags and time to live; items, read and written one at a time,
+//! in batches and in transactions, with condition, update and projection expressions; and Query and Scan. A request is
+//! one transaction over the state, so a write and its indexes' entries commit together or not at all. Known
+//! differences from AWS, as nothing here runs but requests: tables and indexes are ACTIVE at once, time to live is
+//! stored but nothing expires, and streams are described but never written. A Query in descending order reads its
+//! whole range first; Scan returns items in the order of their keys' encoding.
+
+import { Fault } from "../../core/fault"
+import { Violations } from "../../core/protocol/model"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+
+import { Action, apply, condition, Context, copy, holds, invalid, Item, Node, project, projection, same, shown, Step,
+	typeName, update, validation } from "./expression"
+
+import { encode, escaped } from "./key"
+import { format, parse } from "./number"
+
+import { attribute, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected, sizeOf,
+	stored, Tables, typeOf } from "./records"
+
+import { id } from "../../core/auth/credentials"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import * as b64 from "std/encoding/base64"
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	createTable(caller: Caller, input: api.CreateTableInput): api.CreateTableOutput throws Fault {
+		named(input.TableName, "tableName")
+		caller.allow(arn(caller, input.TableName))
+		const db = new Tables(caller.regional())
+		const d = new Definition()
+		d.name = input.TableName
+		const defined = definitions(input.AttributeDefinitions, input.KeySchema)
+		d.attributes = defined
+		const [hash, range] = schema(input.KeySchema!, defined, null)
+		d.hash = hash
+		d.range = range
+		d.billing = input.BillingMode ?? "PROVISIONED"
+		const [read, write] = throughput(d.billing, input.ProvisionedThroughput, null)
+		d.read = read
+		d.write = write
+		const used = [hash.name]
+		if (range != null) {
+			used.push(range!.name)
+		}
+		for (const l of input.LocalSecondaryIndexes ?? []) {
+			if (range == null) {
+				throw invalidParameters("Table KeySchema does not have a range key, which is required when specifying a "
+					+ "LocalSecondaryIndex")
+			}
+			const x = index(d, l.IndexName, l.KeySchema, l.Projection, false)
+			if (x.hash.name != hash.name) {
+				throw invalidParameters(`Index KeySchema does not have the same leading hash key as table KeySchema for `
+					+ `index: ${l.IndexName}. index hash key: ${x.hash.name}, table hash key: ${hash.name}`)
+			}
+			if (x.range == null) {
+				throw invalidParameters(`Index KeySchema for a LocalSecondaryIndex must have a range key: ${l.IndexName}`)
+			}
+			used.push(x.range!.name)
+		}
+		for (const g of input.GlobalSecondaryIndexes ?? []) {
+			const x = index(d, g.IndexName, g.KeySchema, g.Projection, true)
+			const [r, w] = throughput(d.billing, g.ProvisionedThroughput, g.IndexName)
+			x.read = r
+			x.write = w
+			used.push(x.hash.name)
+			if (x.range != null) {
+				used.push(x.range!.name)
+			}
+		}
+		for (const [n, _] of defined) {
+			if (!used.includes(n)) {
+				throw invalidParameters("Number of attributes in KeySchema does not exactly match number of attributes "
+					+ "defined in AttributeDefinitions")
+			}
+		}
+		if (db.get(d.name) != null) {
+			throw api.resourceInUseException(`Table already exists: ${d.name}`)
+		}
+		d.id = uuid()
+		d.created = now()
+		d.onDemandSince = if (d.billing == "PAY_PER_REQUEST") d.created else 0
+		d.tableClass = input.TableClass ?? "STANDARD"
+		d.deletionProtection = input.DeletionProtectionEnabled ?? false
+		d.tags = tagged([], input.Tags ?? [])
+		stream(d, input.StreamSpecification)
+		db.save(d)
+		const r = new api.CreateTableOutput()
+		r.TableDescription = describe(caller, d, "ACTIVE")
+		return r
+	}
+
+	describeTable(caller: Caller, input: api.DescribeTableInput): api.DescribeTableOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const r = new api.DescribeTableOutput()
+		r.Table = describe(caller, d, "ACTIVE")
+		return r
+	}
+
+	listTables(caller: Caller, input: api.ListTablesInput): api.ListTablesOutput throws Fault {
+		caller.allow("*")
+		const n = input.Limit ?? 100
+		if (n < 1 || n > 100) {
+			const why = if (n < 1) "greater than or equal to 1" else "less than or equal to 100"
+			throw new Violations(api.service.validation).fault(`${n}`, "limit", `Member must have value ${why}`)
+		}
+		const got = new Tables(caller.regional()).definitions.scan(input.ExclusiveStartTableName, n + 1)
+		const r = new api.ListTablesOutput()
+		r.TableNames = got.slice(0, if (got.length > n) n else got.length).map(e => e[0])
+		r.LastEvaluatedTableName = if (got.length > n) got[n - 1][0] else null
+		return r
+	}
+
+	deleteTable(caller: Caller, input: api.DeleteTableInput): api.DeleteTableOutput throws Fault {
+		const d = table(caller, input.TableName)
+		if (d.deletionProtection) {
+			throw validation("Resource cannot be deleted as it is currently protected against deletion. Disable "
+				+ "deletion protection first.")
+		}
+		const db = new Tables(caller.regional())
+		clear(db, items(d.name))
+		for (const x of d.indexes) {
+			clear(db, entries(d.name, x.name))
+		}
+		db.definitions.delete(d.name)
+		const r = new api.DeleteTableOutput()
+		r.TableDescription = describe(caller, d, "DELETING")
+		return r
+	}
+
+	updateTable(caller: Caller, input: api.UpdateTableInput): api.UpdateTableOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const db = new Tables(caller.regional())
+		if (input.BillingMode != null && input.BillingMode != d.billing) {
+			d.billing = input.BillingMode!
+			d.onDemandSince = if (d.billing == "PAY_PER_REQUEST") now() else d.onDemandSince
+			if (d.billing == "PAY_PER_REQUEST") {
+				d.read = 0
+				d.write = 0
+				for (const x of d.indexes) {
+					x.read = 0
+					x.write = 0
+				}
+			}
+		}
+		if (input.ProvisionedThroughput != null || d.billing == "PROVISIONED" && d.read == 0) {
+			const [r, w] = throughput(d.billing, input.ProvisionedThroughput, null)
+			d.read = r
+			d.write = w
+		}
+		if (input.AttributeDefinitions != null) {
+			for (const a of input.AttributeDefinitions!) {
+				const was = d.attributes.find(e => e[0] == a.AttributeName)
+				if (was != null && was[1] != a.AttributeType) {
+					throw invalidParameters(`Cannot change the type of an existing attribute: ${a.AttributeName}`)
+				}
+				if (was == null) {
+					d.attributes.push([a.AttributeName, a.AttributeType])
+				}
+			}
+		}
+		for (const u of input.GlobalSecondaryIndexUpdates ?? []) {
+			if (u.Create != null) {
+				const c = u.Create!
+				const x = index(d, c.IndexName, c.KeySchema, c.Projection, true)
+				const [r, w] = throughput(d.billing, c.ProvisionedThroughput, c.IndexName)
+				x.read = r
+				x.write = w
+				backfill(db, d, x)
+			} else if (u.Delete != null) {
+				const name = u.Delete!.IndexName
+				const x = d.indexes.find(i => i.global && i.name == name)
+				if (x == null) {
+					throw api.resourceNotFoundException(`Requested resource not found: Index: ${name} not found`)
+				}
+				clear(db, entries(d.name, name))
+				d.indexes = d.indexes.filter(i => i.name != name)
+			} else if (u.Update != null) {
+				const x = d.indexes.find(i => i.global && i.name == u.Update!.IndexName)
+				if (x == null) {
+					throw api.resourceNotFoundException(`Requested resource not found: Index: ${u.Update!.IndexName} not found`)
+				}
+				const [r, w] = throughput(d.billing, u.Update!.ProvisionedThroughput, x!.name)
+				x!.read = r
+				x!.write = w
+			}
+		}
+		if (input.StreamSpecification != null) {
+			stream(d, input.StreamSpecification)
+		}
+		d.tableClass = input.TableClass ?? d.tableClass
+		d.deletionProtection = input.DeletionProtectionEnabled ?? d.deletionProtection
+		db.save(d)
+		const r = new api.UpdateTableOutput()
+		r.TableDescription = describe(caller, d, "ACTIVE")
+		return r
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceInput): Unit throws Fault {
+		const d = resource(caller, input.ResourceArn)
+		d.tags = tagged(d.tags, input.Tags)
+		new Tables(caller.regional()).save(d)
+		return new Unit()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceInput): Unit throws Fault {
+		const d = resource(caller, input.ResourceArn)
+		d.tags = d.tags.filter(t => !input.TagKeys.includes(t[0]))
+		new Tables(caller.regional()).save(d)
+		return new Unit()
+	}
+
+	listTagsOfResource(caller: Caller, input: api.ListTagsOfResourceInput): api.ListTagsOfResourceOutput throws Fault {
+		const d = resource(caller, input.ResourceArn)
+		const r = new api.ListTagsOfResourceOutput()
+		r.Tags = d.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return r
+	}
+
+	describeTimeToLive(caller: Caller, input: api.DescribeTimeToLiveInput): api.DescribeTimeToLiveOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const r = new api.DescribeTimeToLiveOutput()
+		r.TimeToLiveDescription = new api.TimeToLiveDescription()
+		r.TimeToLiveDescription!.TimeToLiveStatus = if (d.ttlEnabled) "ENABLED" else "DISABLED"
+		r.TimeToLiveDescription!.AttributeName = if (d.ttlEnabled) d.ttl else null
+		return r
+	}
+
+	updateTimeToLive(caller: Caller, input: api.UpdateTimeToLiveInput): api.UpdateTimeToLiveOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const s = input.TimeToLiveSpecification
+		if (s.Enabled == d.ttlEnabled) {
+			throw validation(`TimeToLive is already ${if (s.Enabled) "enabled" else "disabled"}`)
+		}
+		if (!s.Enabled && s.AttributeName != d.ttl) {
+			throw validation("TimeToLive is active on a different AttributeName: current AttributeName is " + d.ttl)
+		}
+		d.ttlEnabled = s.Enabled
+		d.ttl = s.AttributeName
+		new Tables(caller.regional()).save(d)
+		const r = new api.UpdateTimeToLiveOutput()
+		r.TimeToLiveSpecification = s
+		return r
+	}
+
+	describeLimits(caller: Caller, input: api.DescribeLimitsInput): api.DescribeLimitsOutput throws Fault {
+		caller.allow("*")
+		const r = new api.DescribeLimitsOutput()
+		r.AccountMaxReadCapacityUnits = 80000
+		r.AccountMaxWriteCapacityUnits = 80000
+		r.TableMaxReadCapacityUnits = 40000
+		r.TableMaxWriteCapacityUnits = 40000
+		return r
+	}
+
+	describeEndpoints(caller: Caller, input: api.DescribeEndpointsRequest): api.DescribeEndpointsResponse throws Fault {
+		caller.allow("*")
+		const r = new api.DescribeEndpointsResponse()
+		const host = caller.endpoint.slice(indexOf(caller.endpoint, "//") + 2, caller.endpoint.length)
+		r.Endpoints = [{ ...new api.Endpoint(), Address: host, CachePeriodInMinutes: 1440 }]
+		return r
+	}
+
+	describeContinuousBackups(caller: Caller,
+		input: api.DescribeContinuousBackupsInput): api.DescribeContinuousBackupsOutput throws Fault {
+		table(caller, input.TableName)
+		const r = new api.DescribeContinuousBackupsOutput()
+		r.ContinuousBackupsDescription = new api.ContinuousBackupsDescription()
+		r.ContinuousBackupsDescription!.ContinuousBackupsStatus = "ENABLED"
+		r.ContinuousBackupsDescription!.PointInTimeRecoveryDescription = { ...new api.PointInTimeRecoveryDescription(),
+			PointInTimeRecoveryStatus: "DISABLED" }
+		return r
+	}
+
+	putItem(caller: Caller, input: api.PutItemInput): api.PutItemOutput throws Fault {
+		let cond: Node | null = null
+		try {
+			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
+				input.ExpressionAttributeValues)
+			allOldOrNone(input.ReturnValues)
+			values(input.Item)
+		} catch (f: Fault) {
+			throw counted(f)
+		}
+		const d = table(caller, input.TableName)
+		const db = new Tables(caller.regional())
+		const k = itemKey(d, input.Item)
+		const before = db.item(d, k)
+		check(cond, before, input.ReturnValuesOnConditionCheckFailure)
+		write(db, d, k, before, input.Item)
+		const r = new api.PutItemOutput()
+		r.Attributes = if (input.ReturnValues == "ALL_OLD") before else null
+		r.ConsumedCapacity = consumed(input.ReturnConsumedCapacity, d.name, writeUnits(before, input.Item), false)
+		return r
+	}
+
+	getItem(caller: Caller, input: api.GetItemInput): api.GetItemOutput throws Fault {
+		const c = new Context(input.ExpressionAttributeNames, null)
+		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
+		placeholders(c, paths != null, input.ExpressionAttributeNames, null)
+		const d = table(caller, input.TableName)
+		const db = new Tables(caller.regional())
+		const found = db.item(d, keyFrom(d, input.Key))
+		const r = new api.GetItemOutput()
+		r.Item = if (found == null) null else if (paths == null) found else project(found!, paths!)
+		r.ConsumedCapacity = consumed(input.ReturnConsumedCapacity, d.name,
+			readUnits(if (found == null) 0 else sizeOf(found!), input.ConsistentRead ?? false), true)
+		return r
+	}
+
+	deleteItem(caller: Caller, input: api.DeleteItemInput): api.DeleteItemOutput throws Fault {
+		let cond: Node | null = null
+		try {
+			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
+				input.ExpressionAttributeValues)
+			allOldOrNone(input.ReturnValues)
+		} catch (f: Fault) {
+			throw counted(f)
+		}
+		const d = table(caller, input.TableName)
+		const db = new Tables(caller.regional())
+		const k = keyFrom(d, input.Key)
+		const before = db.item(d, k)
+		check(cond, before, input.ReturnValuesOnConditionCheckFailure)
+		if (before != null) {
+			write(db, d, k, before, null)
+		}
+		const r = new api.DeleteItemOutput()
+		r.Attributes = if (input.ReturnValues == "ALL_OLD") before else null
+		r.ConsumedCapacity = consumed(input.ReturnConsumedCapacity, d.name, writeUnits(before, null), false)
+		return r
+	}
+
+	updateItem(caller: Caller, input: api.UpdateItemInput): api.UpdateItemOutput throws Fault {
+		let actions: Action[] = []
+		let cond: Node | null = null
+		try {
+			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+			actions = if (input.UpdateExpression == null) [] else update(input.UpdateExpression!, c)
+			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
+				input.ExpressionAttributeValues, input.UpdateExpression != null)
+		} catch (f: Fault) {
+			throw counted(f)
+		}
+		const d = table(caller, input.TableName)
+		const db = new Tables(caller.regional())
+		const k = keyFrom(d, input.Key)
+		for (const a of actions) {
+			if (keyNames(d, null).includes(a.path[0].name)) {
+				throw invalidParameters(`Cannot update attribute ${a.path[0].name}. This attribute is part of the key`)
+			}
+		}
+		const before = db.item(d, k)
+		check(cond, before, input.ReturnValuesOnConditionCheckFailure)
+		const after = apply(actions, before ?? copy(input.Key))
+		values(after)
+		write(db, d, k, before, after)
+		const paths = actions.map(a => a.path)
+		const r = new api.UpdateItemOutput()
+		r.Attributes = switch (input.ReturnValues ?? "NONE") {
+			case "ALL_OLD": before
+			case "ALL_NEW": after
+			case "UPDATED_OLD": if (before == null) null else nonEmpty(project(before!, paths))
+			case "UPDATED_NEW": nonEmpty(project(after, paths))
+			default: null
+		}
+		r.ConsumedCapacity = consumed(input.ReturnConsumedCapacity, d.name, writeUnits(before, after), false)
+		return r
+	}
+
+	query(caller: Caller, input: api.QueryInput): api.QueryOutput throws Fault {
+		const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+		if (input.KeyConditionExpression == null) {
+			throw validation("Either the KeyConditions or KeyConditionExpression parameter must be specified in the "
+				+ "request.")
+		}
+		const keyed = condition(input.KeyConditionExpression!, "KeyConditionExpression", c)
+		const filter = if (input.FilterExpression == null) null
+			else condition(input.FilterExpression!, "FilterExpression", c)
+		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
+		placeholders(c, true, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+		limited(input.Limit)
+		const d = table(caller, input.TableName)
+		const x = indexed(caller, d, input.IndexName, input.ConsistentRead)
+		const select = selected(input.Select, paths, x)
+		const [hash, range] = keyConditions(d, x, keyed)
+		const prefix = (if (x == null) items(d.name) else entries(d.name, x!.name)) + encode(hash.args[1].value!)
+		let from = prefix
+		if (range != null && range!.kind == "begins_with") {
+			from = prefix + escaped(scalar(range!.args[1].value!))
+		} else if (range != null && range!.kind != "<" && range!.kind != "<=") {
+			const lo = encode(range!.args[1].value!)
+			from = prefix + lo.slice(0, lo.length - 1)
+		}
+		const p = read(new Tables(caller.regional()), d, x, prefix, from, input.ScanIndexForward ?? true,
+			start(d, x, input.ExclusiveStartKey), input.Limit, keyed, filter, 0, 1)
+		return { ...new api.QueryOutput(), Items: shaped(caller, d, x, p.items, select, paths), Count: p.items.length,
+			ScannedCount: p.scanned, LastEvaluatedKey: p.last,
+			ConsumedCapacity: consumed(input.ReturnConsumedCapacity, d.name,
+			readUnits(p.bytes, input.ConsistentRead ?? false), true) }
+	}
+
+	scan(caller: Caller, input: api.ScanInput): api.ScanOutput throws Fault {
+		const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+		const filter = if (input.FilterExpression == null) null
+			else condition(input.FilterExpression!, "FilterExpression", c)
+		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
+		placeholders(c, filter != null || paths != null, input.ExpressionAttributeNames,
+			input.ExpressionAttributeValues)
+		limited(input.Limit)
+		if (input.Segment != null && input.TotalSegments == null) {
+			throw validation("The TotalSegments parameter is required but was not present in the request when Segment "
+				+ "parameter is present")
+		}
+		if (input.TotalSegments != null && input.Segment == null) {
+			throw validation("The Segment parameter is required but was not present in the request when parameter "
+				+ "TotalSegments is present")
+		}
+		const segment = input.Segment ?? 0
+		const total = input.TotalSegments ?? 1
+		if (total < 1 || total > 1000000) {
+			throw new Violations(api.service.validation).fault(`${total}`, "totalSegments",
+				if (total < 1) "Member must have value greater than or equal to 1"
+				else "Member must have value less than or equal to 1000000")
+		}
+		if (segment < 0 || segment >= total) {
+			throw validation("The Segment parameter is zero-based and must be less than parameter TotalSegments")
+		}
+		const d = table(caller, input.TableName)
+		const x = indexed(caller, d, input.IndexName, input.ConsistentRead)
+		const select = selected(input.Select, paths, x)
+		const prefix = if (x == null) items(d.name) else entries(d.name, x!.name)
+		const p = read(new Tables(caller.regional()), d, x, prefix, prefix, true, start(d, x, input.ExclusiveStartKey),
+			input.Limit, null, filter, segment, total)
+		return { ...new api.ScanOutput(), Items: shaped(caller, d, x, p.items, select, paths), Count: p.items.length,
+			ScannedCount: p.scanned, LastEvaluatedKey: p.last,
+			ConsumedCapacity: consumed(input.ReturnConsumedCapacity, d.name,
+			readUnits(p.bytes, input.ConsistentRead ?? false), true) }
+	}
+
+	batchGetItem(caller: Caller, input: api.BatchGetItemInput): api.BatchGetItemOutput throws Fault {
+		let n = 0
+		for (const [_, ka] of input.RequestItems) {
+			n += ka.Keys.length
+		}
+		if (n > 100) {
+			throw validation("Too many items requested for the BatchGetItem call")
+		}
+		const db = new Tables(caller.regional())
+		const r = new api.BatchGetItemOutput()
+		r.Responses = []
+		r.UnprocessedKeys = []
+		const used: api.ConsumedCapacity[] = []
+		for (const [name, ka] of input.RequestItems) {
+			const c = new Context(ka.ExpressionAttributeNames, null)
+			const paths = if (ka.ProjectionExpression == null) null else projection(ka.ProjectionExpression!, c)
+			placeholders(c, paths != null, ka.ExpressionAttributeNames, null)
+			const d = table(caller, name)
+			const keys: string[] = []
+			const found: Item[] = []
+			let bytes: i64 = 0
+			for (const key of ka.Keys) {
+				const k = keyFrom(d, key)
+				if (keys.includes(k)) {
+					throw validation("Provided list of item keys contains duplicates")
+				}
+				keys.push(k)
+				const item = db.item(d, k)
+				if (item != null) {
+					bytes += sizeOf(item!)
+					found.push(if (paths == null) item! else project(item!, paths!))
+				}
+			}
+			r.Responses!.push([d.name, found])
+			const u = consumed(input.ReturnConsumedCapacity, d.name, readUnits(bytes, ka.ConsistentRead ?? false), true)
+			if (u != null) {
+				used.push(u!)
+			}
+		}
+		r.ConsumedCapacity = if (input.ReturnConsumedCapacity == null || input.ReturnConsumedCapacity == "NONE") null
+			else used
+		return r
+	}
+
+	batchWriteItem(caller: Caller, input: api.BatchWriteItemInput): api.BatchWriteItemOutput throws Fault {
+		let n = 0
+		for (const [_, requests] of input.RequestItems) {
+			n += requests.length
+		}
+		if (n > 25) {
+			throw validation("Too many items requested for the BatchWriteItem call")
+		}
+		const db = new Tables(caller.regional())
+		const used: api.ConsumedCapacity[] = []
+		for (const [name, requests] of input.RequestItems) {
+			const d = table(caller, name)
+			const keys: string[] = []
+			let units = 0.0
+			for (const w of requests) {
+				if ((w.PutRequest == null) == (w.DeleteRequest == null)) {
+					throw validation("Supplied AttributeValue has more than one datatypes set, must contain exactly one of "
+						+ "the supported datatypes")
+				}
+				const item = if (w.PutRequest != null) w.PutRequest!.Item else null
+				if (item != null) {
+					values(item!)
+				}
+				const k = if (item != null) itemKey(d, item!) else keyFrom(d, w.DeleteRequest!.Key)
+				if (keys.includes(k)) {
+					throw validation("Provided list of item keys contains duplicates")
+				}
+				keys.push(k)
+				const before = db.item(d, k)
+				if (item != null || before != null) {
+					write(db, d, k, before, item)
+				}
+				units += writeUnits(before, item)
+			}
+			const u = consumed(input.ReturnConsumedCapacity, d.name, units, false)
+			if (u != null) {
+				used.push(u!)
+			}
+		}
+		const r = new api.BatchWriteItemOutput()
+		r.UnprocessedItems = []
+		r.ConsumedCapacity = if (used.length == 0) null else used
+		return r
+	}
+
+	transactGetItems(caller: Caller, input: api.TransactGetItemsInput): api.TransactGetItemsOutput throws Fault {
+		if (input.TransactItems.length > 100) {
+			throw new Violations(api.service.validation).fault(null, "transactItems",
+				"Member must have length less than or equal to 100")
+		}
+		const db = new Tables(caller.regional())
+		const r = new api.TransactGetItemsOutput()
+		r.Responses = []
+		for (const t of input.TransactItems) {
+			const g = t.Get
+			const c = new Context(g.ExpressionAttributeNames, null)
+			const paths = if (g.ProjectionExpression == null) null else projection(g.ProjectionExpression!, c)
+			placeholders(c, paths != null, g.ExpressionAttributeNames, null)
+			const d = table(caller, g.TableName)
+			const item = db.item(d, keyFrom(d, g.Key))
+			r.Responses!.push({ ...new api.ItemResponse(),
+				Item: if (item == null) null else if (paths == null) item else project(item!, paths!) })
+		}
+		return r
+	}
+
+	transactWriteItems(caller: Caller, input: api.TransactWriteItemsInput): api.TransactWriteItemsOutput throws Fault {
+		if (input.TransactItems.length > 100) {
+			throw new Violations(api.service.validation).fault(null, "transactItems",
+				"Member must have length less than or equal to 100")
+		}
+		const db = new Tables(caller.regional())
+		const planned: Planned[] = []
+		for (const t of input.TransactItems) {
+			planned.push(plan(caller, db, t))
+		}
+		for (let i = 0; i < planned.length; i++) {
+			for (let j = 0; j < i; j++) {
+				if (planned[i].d.name == planned[j].d.name && planned[i].k == planned[j].k) {
+					throw validation("Transaction request cannot include multiple operations on one item")
+				}
+			}
+		}
+		const reasons: api.CancellationReason[] = []
+		let failed = false
+		for (const p of planned) {
+			const reason = new api.CancellationReason()
+			reason.Code = "None"
+			if (p.test != null && !holds(p.test!, p.before ?? [])) {
+				failed = true
+				reason.Code = "ConditionalCheckFailed"
+				reason.Message = "The conditional request failed"
+				reason.Item = if (p.onFailure == "ALL_OLD") p.before else null
+			}
+			reasons.push(reason)
+		}
+		if (failed) {
+			const codes = reasons.map(r => r.Code ?? "None").join(", ")
+			throw api.transactionCanceledException(`Transaction cancelled, please refer cancellation reasons for specific reasons [${codes}]`,
+				{ ...new api.TransactionCanceledException(), CancellationReasons: reasons })
+		}
+		for (const p of planned) {
+			if (p.kind == "Put") {
+				write(db, p.d, p.k, p.before, p.item)
+			} else if (p.kind == "Delete" && p.before != null) {
+				write(db, p.d, p.k, p.before, null)
+			} else if (p.kind == "Update") {
+				const after = apply(p.actions, p.before ?? copy(p.item!))
+				values(after)
+				write(db, p.d, p.k, p.before, after)
+			}
+		}
+		return new api.TransactWriteItemsOutput()
+	}
+}
+
+/// A write of a transaction, read but not done: of a kind, Put, Update, Delete or ConditionCheck, at the key k of
+/// table d, where the item before was; the item put, or the key updated; the condition, and what its failure
+/// returns.
+class Planned {
+	kind = ""
+	d = new Definition()
+	k = ""
+	before: Item | null = null
+	item: Item | null = null
+	actions: Action[] = []
+	test: Node | null = null
+	onFailure = ""
+}
+
+/// The write t of a transaction, read.
+function plan(caller: Caller, db: Tables, t: api.TransactWriteItem): Planned throws Fault {
+	const p = new Planned()
+	const set = [t.Put != null, t.Update != null, t.Delete != null, t.ConditionCheck != null].filter(b => b).length
+	if (set != 1) {
+		throw validation("TransactItems can only contain one of Check, Put, Update or Delete")
+	}
+	let name = ""
+	let c = new Context(null, null)
+	let expression: string | null = null
+	if (t.Put != null) {
+		const x = t.Put!
+		p.kind = "Put"
+		name = x.TableName
+		c = new Context(x.ExpressionAttributeNames, x.ExpressionAttributeValues)
+		expression = x.ConditionExpression
+		p.onFailure = x.ReturnValuesOnConditionCheckFailure ?? "NONE"
+		values(x.Item)
+		p.item = x.Item
+	} else if (t.Update != null) {
+		const x = t.Update!
+		p.kind = "Update"
+		name = x.TableName
+		c = new Context(x.ExpressionAttributeNames, x.ExpressionAttributeValues)
+		p.actions = update(x.UpdateExpression, c)
+		expression = x.ConditionExpression
+		p.onFailure = x.ReturnValuesOnConditionCheckFailure ?? "NONE"
+		p.item = x.Key
+	} else if (t.Delete != null) {
+		const x = t.Delete!
+		p.kind = "Delete"
+		name = x.TableName
+		c = new Context(x.ExpressionAttributeNames, x.ExpressionAttributeValues)
+		expression = x.ConditionExpression
+		p.onFailure = x.ReturnValuesOnConditionCheckFailure ?? "NONE"
+		p.item = x.Key
+	} else {
+		const x = t.ConditionCheck!
+		p.kind = "ConditionCheck"
+		name = x.TableName
+		c = new Context(x.ExpressionAttributeNames, x.ExpressionAttributeValues)
+		expression = x.ConditionExpression
+		p.onFailure = x.ReturnValuesOnConditionCheckFailure ?? "NONE"
+		p.item = x.Key
+	}
+	p.test = if (expression == null) null else condition(expression!, "ConditionExpression", c)
+	c.unused()
+	p.d = table(caller, name)
+	p.k = if (p.kind == "Put") itemKey(p.d, p.item!) else keyFrom(p.d, p.item!)
+	if (p.kind == "Update") {
+		for (const a of p.actions) {
+			if (keyNames(p.d, null).includes(a.path[0].name)) {
+				throw invalidParameters(`Cannot update attribute ${a.path[0].name}. This attribute is part of the key`)
+			}
+		}
+	}
+	p.before = db.item(p.d, p.k)
+	return p
+}
+
+/// A page that a Query or Scan read: the items that passed its filter, how many it read, their size, and the key of
+/// the last if it stopped short of the end.
+class Page {
+	items: Item[] = []
+	scanned = 0
+	bytes: i64 = 0
+	last: Item | null = null
+}
+
+/// The size of a page, at most, as DynamoDB reads one.
+const pageBytes: i64 = 1048576
+
+/// A page of the entries of the table d, or its index x if not null, whose keys start with prefix, from the first
+/// after from, in order or reversed; after the entry of key start if not null; at most limit of them read, and
+/// those of total segments in segment; those the key condition keyed holds for, then those of them filter keeps.
+function read(db: Tables, d: Definition, x: Index | null, prefix: string, from: string, forward: bool,
+	start: string | null, limit: i32 | null, keyed: Node | null, filter: Node | null, segment: i32,
+	total: i32): Page throws Fault {
+	const matched: [string, Item][] = []
+	const p = new Page()
+	let after = if (forward && start != null && start! > from) start! else from
+	let done = false
+	while (!done) {
+		const chunk = db.store.scan(prefix, after, 100)
+		for (const [k, v] of chunk) {
+			const item = parsed(v)
+			if (keyed != null && !holds(keyed!, item)) {
+				done = matched.length > 0
+				if (done) {
+					break
+				}
+				continue
+			}
+			if (total > 1 && segmentOf(k.slice(prefix.length, k.length), d, x) % total != segment) {
+				continue
+			}
+			if (!forward && start != null && k >= start!) {
+				continue
+			}
+			matched.push([k, item])
+			if (forward && (limit != null && matched.length == limit!)) {
+				done = true
+				break
+			}
+		}
+		if (chunk.length < 100) {
+			break
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+	if (!forward) {
+		matched.reverse()
+	}
+	for (const [k, item] of matched) {
+		p.scanned++
+		p.bytes += sizeOf(item)
+		if (filter == null || holds(filter!, item)) {
+			p.items.push(item)
+		}
+		if (limit != null && p.scanned == limit! || p.bytes >= pageBytes) {
+			p.last = project(item, keyNames(d, x).map(n => [{ ...new Step(), name: n }]))
+			break
+		}
+	}
+	return p
+}
+
+/// The segment of an entry of the table d or its index x, of the hash of its partition key, for the key after the
+/// table's or index's prefix.
+function segmentOf(k: string, d: Definition, x: Index | null): i32 {
+	let h: u32 = 2166136261
+	const n = partitionLength(k, (if (x == null) d.hash else x!.hash).type == "N")
+	for (let i = 0; i < n; i++) {
+		h = (h ^ (k[i] as u32)) * 16777619
+	}
+	return (h % 1000003) as i32
+}
+
+/// The length of the encoding of the partition key at the start of k, a number's if numeric.
+function partitionLength(k: string, numeric: bool): i32 {
+	if (numeric) {
+		// its sign, then for one not zero its exponent, digits and end
+		if (k[0] == 2) {
+			return 1
+		}
+		const end: u8 = if (k[0] == 1) 255 else 0
+		for (let i = 2; i < k.length; i++) {
+			if (k[i] == end) {
+				return i + 1
+			}
+		}
+		return k.length
+	}
+	for (let i = 0; i + 1 < k.length; i++) {
+		if (k[i] == 0) {
+			if (k[i + 1] == 1) {
+				return i + 2
+			}
+			i++
+		}
+	}
+	return k.length
+}
+
+/// The key after which a page starts, of the ExclusiveStartKey key, of the table d or its index x.
+function start(d: Definition, x: Index | null, key: Item | null): string | null throws Fault {
+	if (key == null) {
+		return null
+	}
+	const names = keyNames(d, x)
+	const ok = key!.length == names.length && names.every(n => attribute(key!, n) != null)
+		&& key!.every(e => typeOf(e[1]) != "")
+	if (!ok) {
+		throw validation("The provided starting key is invalid: The provided key element does not match the schema")
+	}
+	values(key!)
+	if (x == null) {
+		return items(d.name) + keyOf(d, key!)
+	}
+	const k = indexKeyOf(d, x!, key!)
+	if (k == null) {
+		throw validation("The provided starting key is invalid: The provided key element does not match the schema")
+	}
+	return entries(d.name, x!.name) + k!
+}
+
+/// The items of a page as Select and a projection expression ask for them, none for COUNT; those of the index x of
+/// d with the rest of their attributes from the table where it is local and all are asked for.
+function shaped(caller: Caller, d: Definition, x: Index | null, found: Item[], select: string,
+	paths: Step[][] | null): Item[] | null throws Fault {
+	if (select == "COUNT") {
+		return null
+	}
+	const db = new Tables(caller.regional())
+	const out: Item[] = []
+	for (const item of found) {
+		let full = item
+		if (x != null && !x!.global && x!.projection != "ALL" && select == "ALL_ATTRIBUTES") {
+			full = db.item(d, keyOf(d, item)) ?? item
+		}
+		out.push(if (paths == null) full else project(full, paths!))
+	}
+	return out
+}
+
+/// The Select of a Query or Scan, checked against its projection paths and its index x: as given, or by default all
+/// that the table or index has.
+function selected(select: api.Select | null, paths: Step[][] | null, x: Index | null): string throws Fault {
+	if (select == "COUNT" && paths != null) {
+		throw validation("1 validation error detected: Cannot specify the ProjectionExpression when choosing to get "
+			+ "only the Count")
+	}
+	if (select == "SPECIFIC_ATTRIBUTES" && paths == null) {
+		throw validation("1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when "
+			+ "choosing to get SPECIFIC_ATTRIBUTES")
+	}
+	if (select == "ALL_PROJECTED_ATTRIBUTES" && x == null) {
+		throw validation("One or more parameter values were invalid: Select type ALL_PROJECTED_ATTRIBUTES can only be "
+			+ "used when querying an index")
+	}
+	if (select == "ALL_ATTRIBUTES" && x != null && x!.global && x!.projection != "ALL") {
+		throw validation(`One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported for `
+			+ `global secondary index ${x!.name} because its projection type is not ALL`)
+	}
+	if (paths != null) {
+		return "SPECIFIC_ATTRIBUTES"
+	}
+	return select ?? (if (x == null) "ALL_ATTRIBUTES" else "ALL_PROJECTED_ATTRIBUTES")
+}
+
+/// Throws unless limit, if given, is at least 1.
+function limited(limit: i32 | null) throws Fault {
+	if (limit != null && limit! < 1) {
+		throw new Violations(api.service.validation).fault(`${limit!}`, "limit",
+			"Member must have value greater than or equal to 1")
+	}
+}
+
+/// The index of d named name, null if name is; checked against whether the read is consistent.
+function indexed(caller: Caller, d: Definition, name: string | null,
+	consistent: bool | null): Index | null throws Fault {
+	if (name == null) {
+		return null
+	}
+	const x = d.indexes.find(i => i.name == name)
+	if (x == null) {
+		throw validation(`The table does not have the specified index: ${name}`)
+	}
+	caller.allow(`${arn(caller, d.name)}/index/${name}`)
+	if (x!.global && consistent == true) {
+		throw validation("Consistent reads are not supported on global secondary indexes")
+	}
+	return x
+}
+
+/// The conditions of a key condition on the partition key and, if any, the sort key of the table d or its index x:
+/// each a comparison of a key attribute, first, with a value.
+function keyConditions(d: Definition, x: Index | null, n: Node): [Node, Node | null] throws Fault {
+	const hash = if (x == null) d.hash else x!.hash
+	const range = if (x == null) d.range else x!.range
+	const parts = if (n.kind == "and") n.args else [n]
+	const found: Node[] = []
+	for (const p of parts) {
+		if (!["=", "<", "<=", ">", ">=", "between", "begins_with"].includes(p.kind)) {
+			throw invalid("KeyConditionExpression", "Invalid operator used in KeyConditionExpression")
+		}
+		let args = p.args
+		if (args.length == 2 && args[0].kind == "value" && args[1].kind == "path") {
+			const flipped: [string, string][] = [["<", ">"], [">", "<"], ["<=", ">="], [">=", "<="], ["=", "="]]
+			p.kind = flipped.find(e => e[0] == p.kind)![1]
+			args = [args[1], args[0]]
+			p.args = args
+		}
+		const named = args.filter(a => a.kind == "path")
+		if (named.length > 1) {
+			throw invalid("KeyConditionExpression",
+				"Invalid condition in KeyConditionExpression: Multiple attribute names used in one condition")
+		}
+		if (named.length == 0 || args[0].kind != "path" || args.slice(1, args.length).some(a => a.kind != "value")) {
+			throw invalid("KeyConditionExpression",
+				"Invalid condition in KeyConditionExpression: Only attribute " + "names and values are allowed")
+		}
+		if (args[0].path.length > 1) {
+			throw invalid("KeyConditionExpression",
+				"KeyConditionExpressions cannot have conditions on nested attributes")
+		}
+		found.push(p)
+	}
+	const h = found.find(p => p.args[0].path[0].name == hash.name)
+	if (h == null) {
+		throw validation(`Query condition missed key schema element: ${hash.name}`)
+	}
+	if (h!.kind != "=") {
+		throw validation("Query key condition not supported")
+	}
+	const rest = found.filter(p => p != h)
+	if (rest.length > 1 || rest.length == 1 && (range == null || rest[0].args[0].path[0].name != range!.name)) {
+		throw validation(if (range == null) "Query key condition not supported"
+			else `Query condition missed key schema element: ${range!.name}`)
+	}
+	for (const p of found) {
+		const k = if (p == h) hash else range!
+		for (const a of p.args.slice(1, p.args.length)) {
+			if (typeOf(a.value!) != k.type) {
+				throw invalidParameters("Condition parameter type does not match schema type")
+			}
+			values([["", a.value!]])
+		}
+	}
+	return [h!, rest.at(0)]
+}
+
+/// The text of a string's or binary's value.
+function scalar(v: api.AttributeValue): string {
+	if (v instanceof api.AttributeValue$S) {
+		return v.S
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return v.B
+	}
+	return ""
+}
+
+/// Puts after, or deletes the item if null, at the key k of table d, where the item was before, and the entries of
+/// d's indexes; and counts them.
+function write(db: Tables, d: Definition, k: string, before: Item | null, after: Item | null) throws Fault {
+	if (after != null) {
+		const size = sizeOf(after!)
+		if (size > 409600) {
+			throw validation("Item size has exceeded the maximum allowed size")
+		}
+		indexTypes(d, after!)
+	}
+	for (const x of d.indexes) {
+		const old = if (before == null) null else indexKeyOf(d, x, before!)
+		const now = if (after == null) null else indexKeyOf(d, x, after!)
+		if (old != null) {
+			db.store.delete(entries(d.name, x.name) + old!)
+			x.count--
+			x.size -= sizeOf(projected(d, x, before!))
+		}
+		if (now != null) {
+			const p = projected(d, x, after!)
+			db.store.put(entries(d.name, x.name) + now!, stored(p))
+			x.count++
+			x.size += sizeOf(p)
+		}
+	}
+	if (before != null) {
+		d.count--
+		d.size -= sizeOf(before!)
+	}
+	if (after != null) {
+		db.store.put(items(d.name) + k, stored(after!))
+		d.count++
+		d.size += sizeOf(after!)
+	} else {
+		db.store.delete(items(d.name) + k)
+	}
+	db.save(d)
+}
+
+/// Throws if item has a key attribute of one of d's indexes of another type than the index's.
+function indexTypes(d: Definition, item: Item) throws Fault {
+	for (const x of d.indexes) {
+		for (const k of [x.hash, x.range]) {
+			if (k == null) {
+				continue
+			}
+			const v = attribute(item, k!.name)
+			if (v == null) {
+				continue
+			}
+			const t = typeName(v!)
+			if (t != k!.type) {
+				throw invalidParameters(`Type mismatch for Index Key ${k!.name} Expected: ${k!.type} Actual: ${t} `
+					+ `IndexName: ${x.name}`)
+			}
+			if (t != "N" && scalar(v!) == "") {
+				throw validation("One or more parameter values are not valid. A value specified for a secondary index key "
+					+ `is not supported. The AttributeValue for a key attribute cannot contain an empty string value. `
+					+ `IndexName: ${x.name}, IndexKey: ${k!.name}`)
+			}
+		}
+	}
+}
+
+/// Puts the entries of the new index x of d of the items there are.
+function backfill(db: Tables, d: Definition, x: Index) throws Fault {
+	let after: string | null = null
+	while (true) {
+		const chunk = db.store.scan(items(d.name), after, 100)
+		for (const [_, v] of chunk) {
+			const item = parsed(v)
+			const k = indexKeyOf(d, x, item)
+			if (k != null) {
+				const p = projected(d, x, item)
+				db.store.put(entries(d.name, x.name) + k!, stored(p))
+				x.count++
+				x.size += sizeOf(p)
+			}
+		}
+		if (chunk.length < 100) {
+			return
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+}
+
+/// Deletes the entries whose keys start with prefix.
+function clear(db: Tables, prefix: string) throws Fault {
+	while (true) {
+		const chunk = db.store.scan(prefix, null, 100)
+		for (const [k, _] of chunk) {
+			db.store.delete(k)
+		}
+		if (chunk.length < 100) {
+			return
+		}
+	}
+}
+
+/// The encoding of the key of item, of table d, which it must have.
+function itemKey(d: Definition, item: Item): string throws Fault {
+	for (const k of [d.hash, d.range]) {
+		if (k == null) {
+			continue
+		}
+		const v = attribute(item, k!.name)
+		if (v == null) {
+			throw invalidParameters(`Missing the key ${k!.name} in the item`)
+		}
+		const t = typeName(v!)
+		if (t != k!.type) {
+			throw invalidParameters(`Type mismatch for key ${k!.name} expected: ${k!.type} actual: ${t}`)
+		}
+		emptyKey(k!, v!)
+	}
+	return keyOf(d, item)
+}
+
+/// The encoding of key, which must be the key of an item of table d and no more.
+function keyFrom(d: Definition, key: Item): string throws Fault {
+	const names = keyNames(d, null)
+	if (key.length != names.length) {
+		throw validation("The provided key element does not match the schema")
+	}
+	for (const k of [d.hash, d.range]) {
+		if (k == null) {
+			continue
+		}
+		const v = attribute(key, k!.name)
+		if (v == null || typeName(v!) != k!.type) {
+			throw validation("The provided key element does not match the schema")
+		}
+		emptyKey(k!, v!)
+	}
+	values(key)
+	return keyOf(d, key)
+}
+
+/// Throws if v, of the key attribute k, is an empty string or binary.
+function emptyKey(k: Key, v: api.AttributeValue) throws Fault {
+	if (k.type != "N" && scalar(v) == "") {
+		throw validation("One or more parameter values are not valid. The AttributeValue for a key attribute cannot "
+			+ `contain an empty string value. Key: ${k.name}`)
+	}
+}
+
+/// Throws if a value of item is not one DynamoDB stores: a number it cannot hold, an empty set, a set with a member
+/// twice, or a NULL not true; writes its numbers as DynamoDB gives them back, in plain notation.
+function values(item: Item) throws Fault {
+	for (const [_, v] of item) {
+		value(v)
+	}
+}
+
+function value(v: api.AttributeValue): void throws Fault {
+	if (v instanceof api.AttributeValue$N) {
+		v.N = format(parse(v.N))
+	} else if (v instanceof api.AttributeValue$NULL) {
+		if (!v.NULL) {
+			throw invalidParameters("Null attribute value types must have the value of true")
+		}
+	} else if (v instanceof api.AttributeValue$M) {
+		values(v.M)
+	} else if (v instanceof api.AttributeValue$L) {
+		for (const x of v.L) {
+			value(x)
+		}
+	} else if (v instanceof api.AttributeValue$SS) {
+		distinct(v.SS, "string", `[${v.SS.map(s => `"${s}"`).join(", ")}] `)
+	} else if (v instanceof api.AttributeValue$BS) {
+		distinct(v.BS, "binary", `[${v.BS.map(s => `"${base64(s)}"`).join(",")}]of type BS `)
+	} else if (v instanceof api.AttributeValue$NS) {
+		if (v.NS.length == 0) {
+			throw invalidParameters("An number set  may not be empty")
+		}
+		const seen: api.AttributeValue[] = []
+		for (let i = 0; i < v.NS.length; i++) {
+			v.NS[i] = format(parse(v.NS[i]))
+			const x: api.AttributeValue = { ...new api.AttributeValue$N(), N: v.NS[i] }
+			for (const y of seen) {
+				if (same(x, y)) {
+					throw invalidParameters("Input collection contains duplicates.")
+				}
+			}
+			seen.push(x)
+		}
+	}
+}
+
+/// Throws if the members xs of a set of a kind, as string, are none or one twice, shown as they are.
+function distinct(xs: string[], kind: string, shown: string) throws Fault {
+	if (xs.length == 0) {
+		throw invalidParameters(`An ${kind} set  may not be empty`)
+	}
+	for (let i = 0; i < xs.length; i++) {
+		if (xs.indexOf(xs[i]) != i) {
+			throw invalidParameters(`Input collection ${shown}contains duplicates.`)
+		}
+	}
+}
+
+/// Throws the ConditionalCheckFailedException of test, if it does not hold for before, the item there was; with it
+/// if onFailure asks for ALL_OLD.
+function check(test: Node | null, before: Item | null,
+	onFailure: api.ReturnValuesOnConditionCheckFailure | null) throws Fault {
+	if (test != null && !holds(test!, before ?? [])) {
+		const m = new api.ConditionalCheckFailedException()
+		m.Item = if (onFailure == "ALL_OLD") before else null
+		throw api.conditionalCheckFailedException("The conditional request failed", m)
+	}
+}
+
+/// The condition of expression, of a write, if not null; the placeholders names and values checked for use, as
+/// those of an update expression too if updates.
+function conditional(c: Context, expression: string | null, names: [string, string][] | null, values: Item | null,
+	updates: bool = false): Node | null throws Fault {
+	const n = if (expression == null) null else condition(expression!, "ConditionExpression", c)
+	placeholders(c, n != null || updates, names, values)
+	return n
+}
+
+/// Throws if placeholders are given and unused, or given without an expression.
+function placeholders(c: Context, expressions: bool, names: [string, string][] | null,
+	values: Item | null) throws Fault {
+	if (!expressions && values != null) {
+		throw validation("ExpressionAttributeValues can only be specified when using expressions")
+	}
+	if (!expressions && names != null) {
+		throw validation("ExpressionAttributeNames can only be specified when using expressions")
+	}
+	if (values != null && values!.length == 0) {
+		throw validation("ExpressionAttributeValues must not be empty")
+	}
+	if (names != null && names!.length == 0) {
+		throw validation("ExpressionAttributeNames must not be empty")
+	}
+	c.unused()
+}
+
+/// Throws unless r, the ReturnValues of a put or delete, is ALL_OLD or NONE.
+function allOldOrNone(r: api.ReturnValue | null) throws Fault {
+	if (r != null && r != "ALL_OLD" && r != "NONE") {
+		throw validation("ReturnValues can only be ALL_OLD or NONE")
+	}
+}
+
+/// f as a write answers it: a ValidationException's message counted, as DynamoDB words those of the parameters of
+/// PutItem, UpdateItem and DeleteItem, found before their table is.
+function counted(f: Fault): Fault {
+	if (f.code != "ValidationException" || startsWith(f.message, "1 validation error")
+		|| startsWith(f.message, "Supplied AttributeValue")) {
+		return f
+	}
+	return new Fault(f.status, f.code, `1 validation error detected: ${f.message}`, f.sender, f.members)
+}
+
+/// item, null if it has no attributes.
+function nonEmpty(item: Item): Item | null { return if (item.length == 0) null else item }
+
+/// The capacity used of the table named table, of units, read or written, if mode asks for it.
+function consumed(mode: api.ReturnConsumedCapacity | null, table: string, units: f64,
+	read: bool): api.ConsumedCapacity | null {
+	if (mode == null || mode == "NONE") {
+		return null
+	}
+	const c = new api.ConsumedCapacity()
+	c.TableName = table
+	c.CapacityUnits = units
+	c.ReadCapacityUnits = if (read) units else null
+	c.WriteCapacityUnits = if (read) null else units
+	if (mode == "INDEXES") {
+		c.Table = { ...new api.Capacity(), CapacityUnits: units, ReadCapacityUnits: c.ReadCapacityUnits,
+			WriteCapacityUnits: c.WriteCapacityUnits }
+	}
+	return c
+}
+
+/// The units of a read of bytes: one for each 4 KB begun, at least one, half as many if not consistent.
+function readUnits(bytes: i64, consistent: bool): f64 {
+	const n = (if (bytes == 0) 1 else (bytes + 4095) / 4096) as f64
+	return if (consistent) n else n / 2.0
+}
+
+/// The units of a write that replaces before with after: one for each 1 KB begun of the larger.
+function writeUnits(before: Item | null, after: Item | null): f64 {
+	const a = if (before == null) 0 else sizeOf(before!)
+	const b = if (after == null) 0 else sizeOf(after!)
+	const n = if (a > b) a else b
+	return (if (n == 0) 1 else (n + 1023) / 1024) as f64
+}
+
+/// The ARN of the table named name.
+function arn(caller: Caller, name: string): string {
+	return `arn:aws:dynamodb:${caller.region}:${caller.account}:table/${name}`
+}
+
+/// The definition of the table that name, or its ARN, names; the caller allowed to act on it.
+function table(caller: Caller, name: string): Definition throws Fault {
+	const n = if (startsWith(name, "arn:")) name.slice(lastIndexOf(name, "/") + 1, name.length) else name
+	named(n, "tableName")
+	caller.allow(arn(caller, n))
+	const d = new Tables(caller.regional()).get(n)
+	if (d == null) {
+		throw api.resourceNotFoundException(`Requested resource not found: Table: ${n} not found`)
+	}
+	return d!
+}
+
+/// The table of the ARN a.
+function resource(caller: Caller, a: string): Definition throws Fault {
+	const prefix = `arn:aws:dynamodb:${caller.region}:${caller.account}:table/`
+	if (!startsWith(a, prefix) || indexOf(a, "/index/") >= 0) {
+		throw validation(`Invalid TableArn: Invalid ResourceArn provided as input ${a}`)
+	}
+	caller.allow(a)
+	const d = new Tables(caller.regional()).get(a.slice(prefix.length, a.length))
+	if (d == null) {
+		throw api.resourceNotFoundException(`Requested resource not found: ResourcArn: ${a} not found`)
+	}
+	return d!
+}
+
+/// Throws unless name, of the member m, is a name of a table or index: of 3 to 255 of letters, digits, _, . and -.
+function named(name: string, m: string) throws Fault {
+	const v = new Violations(api.service.validation)
+	if (name.length < 3) {
+		v.note(name, m, "Member must have length greater than or equal to 3")
+	} else if (name.length > 255) {
+		v.note(name, m, "Member must have length less than or equal to 255")
+	}
+	if (!name.every(c => c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95 || c == 46
+		|| c == 45)) {
+		v.note(name, m, "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+	}
+	v.check()
+}
+
+/// The fault "One or more parameter values were invalid: why".
+function invalidParameters(why: string): Fault {
+	return validation(`One or more parameter values were invalid: ${why}`)
+}
+
+/// The attribute definitions given, each once, which a table needs, as its key schema does.
+function definitions(given: api.AttributeDefinition[] | null,
+	keys: api.KeySchemaElement[] | null): [string, string][] throws Fault {
+	const v = new Violations(api.service.validation)
+	if (given == null) {
+		v.note(null, "attributeDefinitions", "Member must not be null")
+	}
+	if (keys == null) {
+		v.note(null, "keySchema", "Member must not be null")
+	}
+	v.check()
+	const out: [string, string][] = []
+	for (const a of given!) {
+		if (out.some(e => e[0] == a.AttributeName)) {
+			throw invalidParameters(`Duplicate AttributeName in AttributeDefinitions: ${a.AttributeName}`)
+		}
+		out.push([a.AttributeName, a.AttributeType])
+	}
+	return out
+}
+
+/// The partition and sort key of the key schema keys, of an index named index if not null, of attributes defined.
+function schema(keys: api.KeySchemaElement[], defined: [string, string][],
+	index: string | null): [Key, Key | null] throws Fault {
+	const what = if (index == null) "KeySchema" else `KeySchema of index ${index}`
+	if (keys.length < 1 || keys.length > 2) {
+		throw new Violations(api.service.validation).fault(null, "keySchema",
+			if (keys.length < 1) "Member must have length greater than or equal to 1"
+			else "Member must have length less than or equal to 2")
+	}
+	if (keys[0].KeyType != "HASH") {
+		throw invalidParameters(`Invalid ${what}: The first KeySchemaElement is not a HASH key type`)
+	}
+	if (keys.length == 2 && keys[1].KeyType != "RANGE") {
+		throw invalidParameters(`Invalid ${what}: The second KeySchemaElement is not a RANGE key type`)
+	}
+	if (keys.length == 2 && keys[0].AttributeName == keys[1].AttributeName) {
+		throw invalidParameters(`Invalid ${what}: Both the Hash Key and the Range Key element in the KeySchema have `
+			+ "the same name")
+	}
+	const out: Key[] = []
+	for (const k of keys) {
+		const t = defined.find(e => e[0] == k.AttributeName)
+		if (t == null) {
+			throw invalidParameters("Some index key attributes are not defined in AttributeDefinitions. Keys: "
+				+ `[${keys.map(k => k.AttributeName).join(", ")}], AttributeDefinitions: `
+				+ `[${defined.map(e => e[0]).join(", ")}]`)
+		}
+		out.push({ ...new Key(), name: k.AttributeName, type: t![1] })
+	}
+	return [out[0], out.at(1)]
+}
+
+/// The provisioned throughput of a table, or of its index named index, of billing: as given, which a provisioned
+/// one needs and one paid per request must not have.
+function throughput(billing: string, given: api.ProvisionedThroughput | null,
+	index: string | null): [i64, i64] throws Fault {
+	if (billing == "PAY_PER_REQUEST") {
+		if (given != null) {
+			throw invalidParameters("Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when "
+				+ "BillingMode is PAY_PER_REQUEST")
+		}
+		return [0, 0]
+	}
+	if (given == null) {
+		throw invalidParameters(if (index
+			== null) "ReadCapacityUnits and WriteCapacityUnits must both be specified when BillingMode is PROVISIONED"
+			else `ProvisionedThroughput is not specified for index: ${index}`)
+	}
+	for (const [n, m] of [[given!.ReadCapacityUnits, "readCapacityUnits"],
+		[given!.WriteCapacityUnits, "writeCapacityUnits"]] as [i64, string][]) {
+		if (n < 1) {
+			throw new Violations(api.service.validation).fault(`${n}`, `provisionedThroughput.${m}`,
+				"Member must have value greater than or equal to 1")
+		}
+	}
+	return [given!.ReadCapacityUnits, given!.WriteCapacityUnits]
+}
+
+/// A new index of d named name, of the key schema keys and projection, added to d's.
+function index(d: Definition, name: string, keys: api.KeySchemaElement[], p: api.Projection,
+	global: bool): Index throws Fault {
+	named(name, "indexName")
+	if (d.indexes.some(x => x.name == name)) {
+		throw invalidParameters(`Duplicate index name: ${name}`)
+	}
+	const x = new Index()
+	x.name = name
+	x.global = global
+	const [h, r] = schema(keys, d.attributes, name)
+	x.hash = h
+	x.range = r
+	x.projection = p.ProjectionType ?? "KEYS_ONLY"
+	x.nonKey = p.NonKeyAttributes ?? []
+	if (x.projection == "INCLUDE" && x.nonKey.length == 0) {
+		throw validation("One or more parameter values were invalid: NonKeyAttributes must not be empty when "
+			+ "ProjectionType is INCLUDE")
+	}
+	if (x.projection != "INCLUDE" && p.NonKeyAttributes != null) {
+		throw invalidParameters(`ProjectionType is ${x.projection}, but NonKeyAttributes is specified`)
+	}
+	d.indexes.push(x)
+	return x
+}
+
+/// Sets the stream of d as s specifies it.
+function stream(d: Definition, s: api.StreamSpecification | null) throws Fault {
+	if (s == null) {
+		return
+	}
+	if (s!.StreamEnabled && s!.StreamViewType == null) {
+		throw validation("One or more parameter values were invalid: StreamViewType is required when StreamEnabled is "
+			+ "true")
+	}
+	d.stream = s!.StreamEnabled
+	d.streamView = s!.StreamViewType ?? ""
+	if (d.stream) {
+		d.streamLabel = stamp(now())
+	}
+}
+
+/// The label of a stream made at t, ns since 1970: its time to the millisecond, as AWS's are, of the form
+/// 2015-05-11T21:21:33.291.
+function stamp(t: i64): string {
+	const ms = t / 1000000
+	const days = ms / 86400000
+	let rest = ms % 86400000
+	// days since 1970 to a civil date, after Howard Hinnant's algorithm
+	const z = days + 719468
+	const era = z / 146097
+	const doe = z - era * 146097
+	const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+	const doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+	const mp = (5 * doy + 2) / 153
+	const day = doy - (153 * mp + 2) / 5 + 1
+	const month = if (mp < 10) mp + 3 else mp - 9
+	const year = yoe + era * 400 + (if (month <= 2) 1 else 0)
+	const h = rest / 3600000
+	rest %= 3600000
+	return `${year}-${pad(month, 2)}-${pad(day, 2)}T${pad(h, 2)}:${pad(rest / 60000, 2)}:${pad(rest / 1000 % 60, 2)}`
+		+ `.${pad(rest % 1000, 3)}`
+}
+
+/// n in decimal, of at least width digits.
+function pad(n: i64, width: i32): string {
+	let s = `${n}`
+	while (s.length < width) {
+		s = "0" + s
+	}
+	return s
+}
+
+/// tags with given set over them by key; at most 50.
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] throws Fault {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	out.append(given.map(g => [g.Key, g.Value]))
+	if (out.length > 50) {
+		throw api.limitExceededException("The number of tags on the resource exceeds the limit of 50")
+	}
+	return out
+}
+
+/// A random UUID, as a table's id.
+function uuid(): string throws Fault {
+	const hex = "0123456789abcdef"
+	const r = id("", 32)
+	let s = ""
+	for (let i = 0; i < 32; i++) {
+		s += (if (i == 8 || i == 12 || i == 16 || i == 20) "-" else "") + chr(hex[r[i] % 16])
+	}
+	return s
+}
+
+/// The base64 of the bytes s.
+function base64(s: string): string { return b64.encode(s) }
+
+/// d as DescribeTable gives it, of status.
+function describe(caller: Caller, d: Definition, status: api.TableStatus): api.TableDescription {
+	const t = new api.TableDescription()
+	t.TableName = d.name
+	t.TableArn = arn(caller, d.name)
+	t.TableId = d.id
+	t.TableStatus = status
+	t.CreationDateTime = d.created
+	t.AttributeDefinitions = d.attributes.map(e => ({ ...new api.AttributeDefinition(), AttributeName: e[0],
+		AttributeType: e[1] as api.ScalarAttributeType }))
+	t.KeySchema = keySchema(d.hash, d.range)
+	t.ProvisionedThroughput = provisioned(d.read, d.write)
+	t.TableSizeBytes = d.size
+	t.ItemCount = d.count
+	t.BillingModeSummary = if (d.billing == "PAY_PER_REQUEST") ({ ...new api.BillingModeSummary(),
+		BillingMode: "PAY_PER_REQUEST", LastUpdateToPayPerRequestDateTime: d.onDemandSince })
+		else null
+	const locals = d.indexes.filter(x => !x.global)
+	const globals = d.indexes.filter(x => x.global)
+	t.LocalSecondaryIndexes = if (locals.length == 0) null
+		else locals.map(x => ({ ...new api.LocalSecondaryIndexDescription(), IndexName: x.name,
+		KeySchema: keySchema(x.hash, x.range), Projection: projectionOf(x), IndexSizeBytes: x.size, ItemCount: x.count,
+		IndexArn: `${t.TableArn!}/index/${x.name}` }))
+	t.GlobalSecondaryIndexes = if (globals.length == 0) null
+		else globals.map(x => ({ ...new api.GlobalSecondaryIndexDescription(), IndexName: x.name,
+		KeySchema: keySchema(x.hash, x.range), Projection: projectionOf(x), IndexStatus: "ACTIVE",
+		ProvisionedThroughput: provisioned(x.read, x.write), IndexSizeBytes: x.size, ItemCount: x.count,
+		IndexArn: `${t.TableArn!}/index/${x.name}` }))
+	if (d.stream) {
+		t.StreamSpecification = { ...new api.StreamSpecification(), StreamEnabled: true,
+			StreamViewType: d.streamView as api.StreamViewType }
+		t.LatestStreamLabel = d.streamLabel
+		t.LatestStreamArn = `${t.TableArn!}/stream/${d.streamLabel}`
+	}
+	t.TableClassSummary = if (d.tableClass == "STANDARD") null
+		else ({ ...new api.TableClassSummary(), TableClass: d.tableClass as api.TableClass })
+	t.DeletionProtectionEnabled = d.deletionProtection
+	return t
+}
+
+/// A key schema of hash and range.
+function keySchema(hash: Key, range: Key | null): api.KeySchemaElement[] {
+	const out = [{ ...new api.KeySchemaElement(), AttributeName: hash.name, KeyType: "HASH" as api.KeyType }]
+	if (range != null) {
+		out.push({ ...new api.KeySchemaElement(), AttributeName: range!.name, KeyType: "RANGE" as api.KeyType })
+	}
+	return out
+}
+
+/// Provisioned throughput as DescribeTable gives it.
+function provisioned(read: i64, write: i64): api.ProvisionedThroughputDescription {
+	return { ...new api.ProvisionedThroughputDescription(), NumberOfDecreasesToday: 0, ReadCapacityUnits: read,
+		WriteCapacityUnits: write }
+}
+
+/// x's projection as DescribeTable gives it.
+function projectionOf(x: Index): api.Projection {
+	return { ...new api.Projection(), ProjectionType: x.projection as api.ProjectionType,
+		NonKeyAttributes: if (x.nonKey.length == 0) null else x.nonKey }
+}

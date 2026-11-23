@@ -1,4 +1,6 @@
 import { Gateway } from "./core/gateway"
+import * as dynamodbApi from "./services/dynamodb/api"
+import * as dynamodb from "./services/dynamodb/dynamodb"
 import * as iamApi from "./services/iam/api"
 import { Catalog } from "./services/iam/catalog"
 import * as iam from "./services/iam/iam"
@@ -39,9 +41,11 @@ function main(): i32 {
 	const i = new iam.Handler(catalog!)
 	const s = new sts.Handler()
 	const q = new sqs.Handler()
+	const d = new dynamodb.Handler()
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
 	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
+	g.services.set(dynamodbApi.signingName, (caller, req) => dynamodbApi.handle(d, caller, req))
 	try {
 		serve(g.handle, `:${o.port}`)
 	} catch (e: IoError | ParseError) {

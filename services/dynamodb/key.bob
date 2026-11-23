@@ -1,0 +1,36 @@
+//! Key attributes as bytes that sort as DynamoDB orders them, none a prefix of another's of the same type, so that the
+//! encodings of a partition key and a sort key put one after the other sort by the first, then the second.
+
+import { Fault } from "../../core/fault"
+import * as api from "./api"
+import { encode as number, parse } from "./number"
+
+/// The bytes of v, a string, number or binary: a string's or binary's own bytes, each 0 followed by 255, then 0 and
+/// 1; a number's as ./number encodes it.
+export function encode(v: api.AttributeValue): string throws Fault {
+	if (v instanceof api.AttributeValue$S) {
+		return escaped(v.S) + "\x00\x01"
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return escaped(v.B) + "\x00\x01"
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return number(parse(v.N))
+	}
+	assert false
+	return ""
+}
+
+/// s with each 0 followed by 255: what encode puts before its end, so what every encoding of a value that starts with
+/// s starts with.
+export function escaped(s: string): string {
+	let out = ""
+	let from = 0
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == 0) {
+			out += s.slice(from, i + 1) + "\xff"
+			from = i + 1
+		}
+	}
+	return out + s.slice(from, s.length)
+}

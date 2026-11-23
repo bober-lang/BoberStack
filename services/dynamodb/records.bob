@@ -1,0 +1,219 @@
+//! DynamoDB's state in the tree of an account's region: the definitions of its tables, by name; each table's items,
+//! by the table's name, a NUL and the encoding of their key; and each index's entries, the items as it projects
+//! them, by the table's and the index's names, each followed by a NUL, the encoding of the item's key in the index,
+//! then of its key in the table.
+
+import { Fault } from "../../core/fault"
+import { decode, result } from "../../core/protocol/json"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { Item } from "./expression"
+import { encode } from "./key"
+import { EncodeError } from "std/encoding/json"
+
+/// A key attribute: its name and type, S, N or B.
+export class Key {
+	name = ""
+	type = "S"
+}
+
+/// A secondary index.
+export class Index {
+	name = ""
+	global = false
+	hash = new Key()
+	range: Key | null = null
+	/// ALL, KEYS_ONLY or INCLUDE, and the attributes INCLUDE adds.
+	projection = "ALL"
+	nonKey: string[] = []
+	read: i64 = 0
+	write: i64 = 0
+	count: i64 = 0
+	size: i64 = 0
+}
+
+/// A table's definition.
+export class Definition {
+	name = ""
+	id = ""
+	created: i64 = 0
+	hash = new Key()
+	range: Key | null = null
+	/// The attributes defined, by name and type.
+	attributes: [string, string][] = []
+	/// PROVISIONED or PAY_PER_REQUEST, and when it last became the latter.
+	billing = "PROVISIONED"
+	onDemandSince: i64 = 0
+	read: i64 = 0
+	write: i64 = 0
+	indexes: Index[] = []
+	stream = false
+	streamView = ""
+	streamLabel = ""
+	tags: [string, string][] = []
+	tableClass = "STANDARD"
+	deletionProtection = false
+	ttl = ""
+	ttlEnabled = false
+	count: i64 = 0
+	size: i64 = 0
+}
+
+/// The state of a region of an account.
+export class Tables {
+	store: Store
+	definitions: Table[Definition]
+
+	constructor(s: Store) {
+		this.store = s
+		this.definitions = new Table[Definition](s, "dynamodb/tables")
+	}
+
+	/// The definition of the table named name, null if there is none.
+	get(name: string): Definition | null { return this.definitions.get(name) }
+
+	save(d: Definition) throws Fault {
+		try {
+			this.definitions.put(d.name, d)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		}
+	}
+
+	/// The item of table d at the key k, as encoded, null if there is none.
+	item(d: Definition, k: string): Item | null throws Fault {
+		const s = this.store.get(items(d.name) + k)
+		return if (s == null) null else parsed(s)
+	}
+}
+
+/// The prefix of the items of the table named table.
+export function items(table: string): string { return `dynamodb/items\x00${table}\x00` }
+/// The prefix of the entries of the index named index of the table named table.
+export function entries(table: string, index: string): string { return `dynamodb/index\x00${table}\x00${index}\x00` }
+/// The item that text holds, as stored.
+export function parsed(text: string): Item throws Fault { return decode[api.GetItemOutput](text).Item ?? [] }
+/// item as stored.
+export function stored(item: Item): string { return result({ ...new api.GetItemOutput(), Item: item }) }
+
+/// The value of item's attribute name, null if it has none.
+export function attribute(item: Item, name: string): api.AttributeValue | null {
+	const e = item.find(e => e[0] == name)
+	return if (e == null) null else e[1]
+}
+
+/// The encoding of item's key in table d: its partition key's, then its sort key's.
+export function keyOf(d: Definition, item: Item): string throws Fault {
+	return encode(attribute(item, d.hash.name)!)
+		+ (if (d.range == null) "" else encode(attribute(item, d.range!.name)!))
+}
+
+/// The encoding of item's key in the index x of table d, then of its key in d; null if the item lacks the index's
+/// key, so that the index leaves it out.
+export function indexKeyOf(d: Definition, x: Index, item: Item): string | null throws Fault {
+	const h = attribute(item, x.hash.name)
+	const r = if (x.range == null) null else attribute(item, x.range!.name)
+	if (h == null || x.range != null && r == null || typeOf(h!) != x.hash.type
+		|| x.range != null && typeOf(r!) != x.range!.type) {
+		return null
+	}
+	return encode(h!) + (if (r == null) "" else encode(r!)) + keyOf(d, item)
+}
+
+/// The type of a key's value v, S, N or B, or "" for one of another type.
+export function typeOf(v: api.AttributeValue): string {
+	if (v instanceof api.AttributeValue$S) {
+		return "S"
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return "N"
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return "B"
+	}
+	return ""
+}
+
+/// The names of the key attributes of d and of x, if not null.
+export function keyNames(d: Definition, x: Index | null): string[] {
+	const out = [d.hash.name]
+	if (d.range != null) {
+		out.push(d.range!.name)
+	}
+	if (x != null) {
+		for (const k of [x!.hash, x!.range]) {
+			if (k != null && !out.includes(k!.name)) {
+				out.push(k!.name)
+			}
+		}
+	}
+	return out
+}
+
+/// The part of item that the index x of table d holds.
+export function projected(d: Definition, x: Index, item: Item): Item {
+	if (x.projection == "ALL") {
+		return item
+	}
+	const keep = keyNames(d, x)
+	if (x.projection == "INCLUDE") {
+		keep.append(x.nonKey)
+	}
+	return item.filter(e => keep.includes(e[0]))
+}
+
+/// The size of item as DynamoDB counts it: its names' bytes and its values'.
+export function sizeOf(item: Item): i64 {
+	let n: i64 = 0
+	for (const [k, v] of item) {
+		n += (k.length as i64) + valueSize(v)
+	}
+	return n
+}
+
+/// The size of v: a string's or binary's bytes, a number's of about two digits each, a set's members', a map's or
+/// list's 3 bytes and 1 for each element, and its elements'.
+function valueSize(v: api.AttributeValue): i64 {
+	if (v instanceof api.AttributeValue$S) {
+		return v.S.length as i64
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return v.B.length as i64
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return ((v.N.length + 1) / 2 + 1) as i64
+	}
+	if (v instanceof api.AttributeValue$SS) {
+		return total(v.SS)
+	}
+	if (v instanceof api.AttributeValue$BS) {
+		return total(v.BS)
+	}
+	if (v instanceof api.AttributeValue$NS) {
+		let n: i64 = 0
+		for (const x of v.NS) {
+			n += ((x.length + 1) / 2 + 1) as i64
+		}
+		return n
+	}
+	if (v instanceof api.AttributeValue$M) {
+		return 3 + (v.M.length as i64) + sizeOf(v.M)
+	}
+	if (v instanceof api.AttributeValue$L) {
+		let n: i64 = 3 + (v.L.length as i64)
+		for (const x of v.L) {
+			n += valueSize(x)
+		}
+		return n
+	}
+	return 1
+}
+
+/// The bytes of xs.
+function total(xs: string[]): i64 {
+	let n: i64 = 0
+	for (const x of xs) {
+		n += x.length as i64
+	}
+	return n
+}
