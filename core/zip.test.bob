@@ -1,0 +1,244 @@
+import { Entry, Zip } from "./zip"
+import { deflate } from "std/compress/deflate"
+import { decode } from "std/encoding/base64"
+import { Writer } from "std/encoding/binary"
+import { crc32 } from "std/hash/crc32"
+import { ParseError } from "std/string"
+
+/// Made by Info-ZIP's zip -y: an executable, a directory, a file in it and a symbolic link to that file.
+const unix = decode("UEsDBAoAAAAAAAWAd10vOtrpEgAAABIAAAAJAAAAYm9vdHN0cmFwIyEvYmluL3NoCmVjaG8gaGkKUEsDBAoAAAAAAAWAd10AAAAAAAAAAAAAAAAEAAAAbGli"
+	+ "L1BLAwQKAAAAAAAFgHddl5liMCAAAAAgAAAACgAAAGxpYi9hcHAucHlkZWYgaGFuZGxlcihlLCBjKToKICAgIHJldHVybiBlClBLAwQKAAAAAAAFgHdd"
+	+ "7BLaFgoAAAAKAAAABwAAAGxpbmsucHlsaWIvYXBwLnB5UEsBAh4DCgAAAAAABYB3XS862ukSAAAAEgAAAAkAAAAAAAAAAQAAAO2BAAAAAGJvb3RzdHJh"
+	+ "cFBLAQIeAwoAAAAAAAWAd10AAAAAAAAAAAAAAAAEAAAAAAAAAAAAEAD9QTkAAABsaWIvUEsBAh4DCgAAAAAABYB3XZeZYjAgAAAAIAAAAAoAAAAAAAAA"
+	+ "AQAAAKSBWwAAAGxpYi9hcHAucHlQSwECHgMKAAAAAAAFgHdd7BLaFgoAAAAKAAAABwAAAAAAAAAAAAAA/6GjAAAAbGluay5weVBLBQYAAAAABAAEANYA"
+	+ "AADSAAAAAAA=")
+
+/// Made by zip -9, which codes it in dynamic Huffman blocks: words(), deflated.
+const dynamic = decode("UEsDBBQAAgAIAAqAd12tv2uuNgIAAEgZAAAJAAAAd29yZHMudHh0nZhLTgMxEET3nMJHcNvu33EikohIARZEQtweUNqzr9qOVBrb/fpX99vHpUn7"
+	+ "vLZTu97ul/Z4Oz3a+XK9nx6Xr/Z9e7y188/H6f322l4/z3+f5OX+rxmIZj01E9HkU7Ogs9lTpIho6FNkiGjWnxx6hrpTICKrx0tEFBUl6dClSgTx"
+	+ "MOp8ghHhpYKY8FEqiIotgqiY+wUhLGz/C+Iii0CBwJg7XBAZ3it/ITKk7jUgNLROOCA0slJrQGiswnBAaOSuZhAba98LYiP3CSE2dMcLYiNKBKFh"
+	+ "heGE0BiVyRNCI+qEE0JDdyOB0BgF74TQiCrWE0LDCqiJdZP98hAasv+FoVHpNTE2SrUgNlZFeUFszIrXgtiQ/S+IjX0trGpU/i8IjaggLwgN33MQ"
+	+ "hIbvf0Fo+L5XMirtzAlVmNfQwby8TibKugigVBl21Zg8UWdyUoPJf02m1lhn6poJU0NtMPXaJtMbbDF9yJTpeWZMfzVnerkFMzdYEiOKd2YacmEm"
+	+ "Lx/MlOeTmSh9MdOrKzMpuzFTuTuzAXgw24Yns9lEZ7aoEGZji8FshzGJRTQWs/OGMvt1GLPLhxO2QQTjUERSZkhnfJcUxuLJwbhJORnjKhdhkaUS"
+	+ "XlwaYfolxEXlfgbzpyTuJL0TzyddmFBJp7iQPhkIpS+GeOnKpJd049xGpm5ID8pv7EkZjpglejiOoCm6VVRXEcwVPUxHzBY9XEfQGD1cYmMmARFq"
+	+ "7BDMG9XjkMkMVIK5o3/T2y9QSwECHgMUAAIACAAKgHddrb9rrjYCAABIGQAACQAAAAAAAAABAAAAtIEAAAAAd29yZHMudHh0UEsFBgAAAAABAAEA"
+	+ "NwAAAF0CAAAAAA==")
+
+function words(): string {
+	let s = ""
+	for (const i of 1 ... 120) {
+		s += `line ${i} of a file that deflates with dynamic codes ${i * i % 97}\n`
+	}
+	return s
+}
+
+class Item {
+	name: string
+	data: string
+	method = 8
+	/// The made-by system: 3 is Unix, 0 MS-DOS.
+	system = 3
+	external: u32 = 0o100644 << 16
+	flags = 0
+	/// What the headers claim, if not the data's.
+	size: i64 | null = null
+	crc: u32 | null = null
+
+	constructor(name: string, data: string) {
+		this.name = name
+		this.data = data
+	}
+}
+
+/// A zip of items; with zip64, every size and offset is in Zip64 fields and the directory found by Zip64's records.
+function archive(items: Item[], comment = "", zip64 = false): string {
+	const w = new Writer()
+	const central = new Writer()
+	for (const it of items) {
+		const body = if (it.method == 8) deflate(it.data) else it.data
+		const size = it.size ?? (it.data.length as i64)
+		const crc = it.crc ?? crc32(it.data)
+		const at = w.bytes.length
+		w.fixed(0x04034b50, 4)
+		w.fixed(20, 2)
+		w.fixed(it.flags as u64, 2)
+		w.fixed(it.method as u64, 2)
+		w.fixed(0, 4)
+		w.fixed(crc as u64, 4)
+		w.fixed(body.length as u64, 4)
+		w.fixed(size as u64, 4)
+		w.fixed(it.name.length as u64, 2)
+		w.fixed(0, 2)
+		w.raw(it.name)
+		w.raw(body)
+		const extra = new Writer()
+		if (zip64) {
+			extra.fixed(1, 2)
+			extra.fixed(24, 2)
+			extra.fixed(size as u64, 8)
+			extra.fixed(body.length as u64, 8)
+			extra.fixed(at as u64, 8)
+		}
+		central.fixed(0x02014b50, 4)
+		central.fixed((it.system << 8 | 30) as u64, 2)
+		central.fixed(20, 2)
+		central.fixed(it.flags as u64, 2)
+		central.fixed(it.method as u64, 2)
+		central.fixed(0, 4)
+		central.fixed(crc as u64, 4)
+		central.fixed(if (zip64) 0xffffffff else body.length as u64, 4)
+		central.fixed(if (zip64) 0xffffffff else size as u64, 4)
+		central.fixed(it.name.length as u64, 2)
+		central.fixed(extra.bytes.length as u64, 2)
+		central.fixed(0, 2)
+		central.fixed(0, 2)
+		central.fixed(0, 2)
+		central.fixed(it.external as u64, 4)
+		central.fixed(if (zip64) 0xffffffff else at as u64, 4)
+		central.raw(it.name)
+		central.raw(extra.bytes)
+	}
+	const at = w.bytes.length
+	w.raw(central.bytes)
+	if (zip64) {
+		const record = w.bytes.length
+		w.fixed(0x06064b50, 4)
+		w.fixed(44, 8)
+		w.fixed(45, 2)
+		w.fixed(45, 2)
+		w.fixed(0, 4)
+		w.fixed(0, 4)
+		w.fixed(items.length as u64, 8)
+		w.fixed(items.length as u64, 8)
+		w.fixed(central.bytes.length as u64, 8)
+		w.fixed(at as u64, 8)
+		w.fixed(0x07064b50, 4)
+		w.fixed(0, 4)
+		w.fixed(record as u64, 8)
+		w.fixed(1, 4)
+	}
+	w.fixed(0x06054b50, 4)
+	w.fixed(0, 2)
+	w.fixed(0, 2)
+	w.fixed(if (zip64) 0xffff else items.length as u64, 2)
+	w.fixed(if (zip64) 0xffff else items.length as u64, 2)
+	w.fixed(central.bytes.length as u64, 4)
+	w.fixed(if (zip64) 0xffffffff else at as u64, 4)
+	w.fixed(comment.length as u64, 2)
+	w.raw(comment)
+	return w.bytes
+}
+
+function broken(bytes: string): bool {
+	try {
+		new Zip(bytes)
+	} catch (e: ParseError) {
+		return true
+	}
+	return false
+}
+
+function unreadable(z: Zip): bool {
+	try {
+		z.read(z.entries[0])
+	} catch (e: ParseError) {
+		return true
+	}
+	return false
+}
+
+function named(z: Zip, name: string): Entry {
+	for (const e of z.entries) {
+		if (e.name == name) {
+			return e
+		}
+	}
+	assert false
+	return z.entries[0]
+}
+
+test "Info-ZIP's archive reads with its modes, directory and link" {
+	const z = new Zip(unix)
+	assert z.entries.length == 4
+	const boot = named(z, "bootstrap")
+	assert boot.kind == "file" && boot.mode == 0o755
+	assert z.read(boot) == "#!/bin/sh\necho hi\n"
+	const lib = named(z, "lib/")
+	assert lib.kind == "directory" && lib.mode == 0o775
+	const app = named(z, "lib/app.py")
+	assert app.kind == "file" && app.mode == 0o644
+	assert z.read(app) == "def handler(e, c):\n    return e\n"
+	const link = named(z, "link.py")
+	assert link.kind == "link"
+	assert z.read(link) == "lib/app.py"
+}
+
+test "dynamic Huffman blocks inflate" {
+	const z = new Zip(dynamic)
+	assert z.entries.length == 1 && z.entries[0].name == "words.txt"
+	assert z.read(z.entries[0]) == words()
+}
+
+test "stored and deflated entries read back" {
+	const plain = new Item("plain.txt", "stored as is")
+	plain.method = 0
+	const z = new Zip(archive([plain, new Item("words.txt", words()), new Item("empty", "")]))
+	assert z.entries.length == 3
+	assert z.read(z.entries[0]) == "stored as is"
+	assert z.read(z.entries[1]) == words()
+	assert z.read(z.entries[2]) == ""
+}
+
+test "Zip64's records and fields give sizes and offsets" {
+	const z = new Zip(archive([new Item("a", "first"), new Item("b", words())], "", true))
+	assert z.entries.length == 2
+	assert z.entries[1].size == (words().length as i64)
+	assert z.read(z.entries[0]) == "first"
+	assert z.read(z.entries[1]) == words()
+}
+
+test "a comment holding the end record's signature is not taken for it" {
+	const z = new Zip(archive([new Item("a", "x")], "PK\x05\x06 and twenty and more bytes after it"))
+	assert z.entries.length == 1 && z.read(z.entries[0]) == "x"
+}
+
+test "an archive made on MS-DOS has no modes, its directories an attribute" {
+	const dir = new Item("dir", "")
+	dir.system = 0
+	dir.external = 0x10
+	const file = new Item("dir/f", "f")
+	file.system = 0
+	file.external = 0x20
+	const z = new Zip(archive([dir, file]))
+	assert z.entries[0].kind == "directory" && z.entries[0].mode == 0
+	assert z.entries[1].kind == "file" && z.entries[1].mode == 0
+}
+
+test "what is not a whole, plain zip is a syntax error" {
+	assert new Zip("") throws new ParseError("syntax", 0)
+	assert broken("not a zip at all, though long enough to hold an end record")
+	const whole = archive([new Item("a", words())])
+	assert broken(whole.slice(0, whole.length - 30))
+	const encrypted = new Item("secret", "x")
+	encrypted.flags = 1
+	assert broken(archive([encrypted]))
+	const bzip = new Item("b", "x")
+	bzip.method = 12
+	assert broken(archive([bzip]))
+}
+
+test "an entry whose CRC or size is not its bytes' fails to read" {
+	const crc = new Item("a", "data")
+	crc.crc = 1
+	const z = new Zip(archive([crc]))
+	assert unreadable(z)
+	const bomb = new Item("b", words())
+	bomb.size = 100
+	const b = new Zip(archive([bomb]))
+	assert unreadable(b)
+	const short = new Item("c", "data")
+	short.size = 1000
+	short.method = 0
+	const c = new Zip(archive([short]))
+	assert unreadable(c)
+}

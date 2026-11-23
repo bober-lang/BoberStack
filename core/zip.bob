@@ -1,0 +1,191 @@
+//! Zip archives (APPNOTE 6.3), read: the central directory, then each entry's bytes on demand, stored or deflated,
+//! with Zip64's sizes and offsets. Encrypted entries and other methods are syntax errors at their header.
+
+import { endsWith } from "std/algo"
+import { Inflater, Once } from "std/compress/deflate"
+import { Reader } from "std/encoding/binary"
+import { crc32 } from "std/hash/crc32"
+import { ParseError } from "std/string"
+
+export type Kind = "file" | "directory" | "link"
+
+export class Entry {
+	name: string
+	kind: Kind = "file"
+	/// The permission bits a Unix zip gave it, else 0.
+	mode: u32 = 0
+	size: i64 = 0
+	method = 0
+	crc: u32 = 0
+	compressed: i64 = 0
+	/// Of its local header.
+	offset: i64 = 0
+	/// Of its central directory header, which errors give.
+	at = 0
+
+	constructor(name: string) { this.name = name }
+}
+
+export class Zip {
+	bytes: string
+	entries: Entry[] = []
+
+	constructor(bytes: string) throws ParseError {
+		this.bytes = bytes
+		const end = this.end()
+		const r = new Reader(bytes)
+		r.pos = end + 10
+		let count = r.fixed(2) as i64
+		r.pos = end + 16
+		let at = r.fixed(4) as i64
+		if (count == 0xffff || at == 0xffffffff) {
+			if (end < 20) {
+				throw new ParseError("syntax", end)
+			}
+			r.pos = end - 20
+			if (r.fixed(4) != 0x07064b50) {
+				throw new ParseError("syntax", end - 20)
+			}
+			r.pos = end - 12
+			const z = r.fixed(8) as i64
+			r.pos = within(bytes, z, 56)
+			if (r.fixed(4) != 0x06064b50) {
+				throw new ParseError("syntax", end - 20)
+			}
+			r.pos = (z + 32) as i32
+			count = r.fixed(8) as i64
+			r.pos = (z + 48) as i32
+			at = r.fixed(8) as i64
+		}
+		for (let i = 0 as i64; i < count; i++) {
+			this.entries.push(header(bytes, at))
+			r.pos = within(bytes, at, 46) + 28
+			at += 46 + ((r.fixed(2) + r.fixed(2) + r.fixed(2)) as i64)
+		}
+	}
+
+	/// The bytes of e, checked against its size and CRC; a deflated entry is inflated no further than its size.
+	read(e: Entry): string throws ParseError {
+		const r = new Reader(this.bytes)
+		r.pos = within(this.bytes, e.offset, 30)
+		if (r.fixed(4) != 0x04034b50) {
+			throw new ParseError("syntax", e.at)
+		}
+		r.pos += 22
+		const from = e.offset + 30 + ((r.fixed(2) + r.fixed(2)) as i64)
+		const data = this.bytes.slice(within(this.bytes, from, e.compressed), (from + e.compressed) as i32)
+		let out = data
+		if (e.method == 8) {
+			const inflater = new Inflater(new Once(data))
+			const parts: string[] = []
+			let n = 0 as i64
+			while (true) {
+				let part: string | null = null
+				try {
+					part = inflater.next(65536)
+				} catch (x: IoError) {
+					throw new ParseError("syntax", e.at)
+				}
+				if (part == null) {
+					break
+				}
+				n += part.length as i64
+				if (n > e.size) {
+					throw new ParseError("syntax", e.at)
+				}
+				parts.push(part)
+			}
+			out = parts.join("")
+		}
+		if ((out.length as i64) != e.size || crc32(out) != e.crc) {
+			throw new ParseError("syntax", e.at)
+		}
+		return out
+	}
+
+	/// Where the end of central directory record starts: the one whose comment runs to the end, as the comment may
+	/// hold its signature.
+	private end(): i32 throws ParseError {
+		const b = this.bytes
+		let i = b.length - 22
+		const r = new Reader(b)
+		while (i >= 0 && i >= b.length - 22 - 65535) {
+			r.pos = i
+			if (r.fixed(4) == 0x06054b50) {
+				r.pos = i + 20
+				if ((r.fixed(2) as i32) == b.length - i - 22) {
+					return i
+				}
+			}
+			i--
+		}
+		throw new ParseError("syntax", b.length)
+	}
+}
+
+function header(bytes: string, at: i64): Entry throws ParseError {
+	const r = new Reader(bytes)
+	r.pos = within(bytes, at, 46)
+	if (r.fixed(4) != 0x02014b50) {
+		throw new ParseError("syntax", at as i32)
+	}
+	const system = (r.fixed(2) >> 8) as i32
+	r.pos += 2
+	const flags = r.fixed(2)
+	const method = r.fixed(2) as i32
+	r.pos += 4
+	const crc = r.fixed(4) as u32
+	let compressed = r.fixed(4) as i64
+	let size = r.fixed(4) as i64
+	const names = r.fixed(2) as i32
+	const extras = r.fixed(2) as i32
+	r.pos += 6
+	const external = r.fixed(4) as u32
+	let offset = r.fixed(4) as i64
+	const name = r.raw(names)
+	if ((flags & 1) != 0 || (method != 0 && method != 8)) {
+		throw new ParseError("syntax", at as i32)
+	}
+	const extra = new Reader(r.raw(extras))
+	while (extra.pos + 4 <= extra.bytes.length) {
+		const id = extra.fixed(2)
+		const n = extra.fixed(2) as i32
+		const field = new Reader(extra.raw(n))
+		if (id == 1) {
+			if (size == 0xffffffff) {
+				size = field.fixed(8) as i64
+			}
+			if (compressed == 0xffffffff) {
+				compressed = field.fixed(8) as i64
+			}
+			if (offset == 0xffffffff) {
+				offset = field.fixed(8) as i64
+			}
+		}
+	}
+	const e = new Entry(name)
+	e.method = method
+	e.crc = crc
+	e.compressed = compressed
+	e.size = size
+	e.offset = offset
+	e.at = at as i32
+	const format = external >> 16 & 0o170000
+	if (system == 3) {
+		e.mode = external >> 16 & 0o777
+	}
+	if (system == 3 && format == 0o120000) {
+		e.kind = "link"
+	} else if (endsWith(name, "/") || (system == 3 && format == 0o040000) || (system != 3 && (external & 0x10) != 0)) {
+		e.kind = "directory"
+	}
+	return e
+}
+
+/// at, if n bytes from it are in bytes.
+function within(bytes: string, at: i64, n: i64): i32 throws ParseError {
+	if (at < 0 || n < 0 || at + n > (bytes.length as i64)) {
+		throw new ParseError("syntax", bytes.length)
+	}
+	return at as i32
+}
