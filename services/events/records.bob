@@ -1,0 +1,73 @@
+//! EventBridge's state in an account's regional tree: its event buses by name, their rules by the bus's name, a NUL
+//! and the rule's, and the rules' targets by the rule's key, a NUL and the target's id.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+import { Decodable } from "std/types"
+
+export class Bus {
+	name = ""
+	description: string | null = null
+	/// The resource policy, of the statements PutPermission adds, null if none.
+	policy: string | null = null
+	created: i64 = 0
+	modified: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Rule {
+	name = ""
+	bus = ""
+	pattern: string | null = null
+	/// Stored, never fired.
+	schedule: string | null = null
+	state = "ENABLED"
+	description: string | null = null
+	role: string | null = null
+	tags: [string, string][] = []
+}
+
+/// A rule's target: what delivery reads of it, and the whole of it as PutTargets took it, the JSON of the wire's
+/// Target, which ListTargetsByRule gives back.
+export class Target {
+	id = ""
+	arn = ""
+	given = ""
+}
+
+/// The tables of a regional tree.
+export class Tables {
+	buses: Table[Bus]
+	rules: Table[Rule]
+	targets: Table[Target]
+
+	constructor(s: Store) {
+		this.buses = new Table[Bus](s, "events/buses")
+		this.rules = new Table[Rule](s, "events/rules")
+		this.targets = new Table[Target](s, "events/targets")
+	}
+}
+
+/// The key of the record of name within what the key owner names.
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+/// The ARN of the bus named name of account in region.
+export function busArn(region: string, account: string, name: string): string {
+	return `arn:aws:events:${region}:${account}:event-bus/${name}`
+}
+
+/// The ARN of the rule r of account in region: the default bus's rules' without the bus's name.
+export function ruleArn(region: string, account: string, r: Rule): string {
+	const bus = if (r.bus == "default") "" else `${r.bus}/`
+	return `arn:aws:events:${region}:${account}:rule/${bus}${r.name}`
+}
+
+/// Puts v at k in t; a record holds no float, the one thing JSON cannot encode.
+export function save[V extends Decodable](t: Table[V], k: string, v: V) throws Fault {
+	try {
+		t.put(k, v)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

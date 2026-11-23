@@ -1,0 +1,141 @@
+import { Fault } from "../../core/fault"
+import { address, matches, validate } from "./pattern"
+
+const event = `{"version":"0","id":"1","detail-type":"Order Placed","source":"com.shop","account":"123456789012",`
+	+ `"time":"2015-06-26T14:00:00Z","region":"us-east-1","resources":["arn:aws:s3:::a","arn:aws:s3:::b"],`
+	+ `"detail":{"state":"running","count":5,"price":12.5,"ok":true,"none":null,"ip":"10.0.1.7","v6":"2001:db8::1",`
+	+ `"tags":["red","Blue"],"items":[{"sku":"a1"},{"sku":"b2"}],"path":"a*b\\\\c","nested":{"deep":{"x":"y"}}}}`
+
+/// Whether the pattern p is valid and matches the event above.
+function hit(p: string): bool {
+	validate(p)
+	return matches(p, event)
+}
+
+/// The fault of a pattern not valid for the reason why.
+function invalid(why: string): Fault {
+	return new Fault(400, "InvalidEventPatternException", `Event pattern is not valid. Reason: ${why}`)
+}
+
+test "exact values and nesting" {
+	assert hit(`{"source":["com.shop"]}`)
+	assert !hit(`{"source":["com.other"]}`)
+	assert hit(`{"source":["x","com.shop"],"detail-type":["Order Placed"]}`)
+	assert hit(`{"detail":{"state":["running"],"count":[5.0],"ok":[true],"none":[null]}}`)
+	assert !hit(`{"detail":{"count":["5"]}}`)
+	assert hit(`{"detail":{"nested":{"deep":{"x":["y"]}}}}`)
+	assert !hit(`{"detail":{"missing":["y"]}}`)
+	assert hit(`{"resources":["arn:aws:s3:::b"]}`)
+	assert hit(`{"detail":{"tags":["Blue"]}}`)
+	assert hit(`{"detail":{"items":{"sku":["b2"]}}}`)
+	assert !hit(`{"detail":{"state":{"x":["y"]}}}`)
+}
+
+test "prefix, suffix, equals-ignore-case and wildcard" {
+	assert hit(`{"source":[{"prefix":"com."}]}`)
+	assert !hit(`{"source":[{"prefix":"COM."}]}`)
+	assert hit(`{"source":[{"prefix":{"equals-ignore-case":"COM."}}]}`)
+	assert hit(`{"source":[{"suffix":".shop"}]}`)
+	assert hit(`{"source":[{"suffix":{"equals-ignore-case":".SHOP"}}]}`)
+	assert hit(`{"detail-type":[{"equals-ignore-case":"order placed"}]}`)
+	assert hit(`{"source":[{"wildcard":"com.*"}]}`)
+	assert hit(`{"source":[{"wildcard":"*.s*p"}]}`)
+	assert !hit(`{"source":[{"wildcard":"*.x*"}]}`)
+	assert hit(`{"detail":{"path":[{"wildcard":"a\\\\*b\\\\\\\\c"}]}}`)
+	assert !hit(`{"detail":{"path":[{"wildcard":"a\\\\*b"}]}}`)
+}
+
+test "anything-but" {
+	assert hit(`{"source":[{"anything-but":"com.other"}]}`)
+	assert !hit(`{"source":[{"anything-but":["com.shop","x"]}]}`)
+	assert hit(`{"detail":{"count":[{"anything-but":[1,2]}]}}`)
+	assert !hit(`{"detail":{"count":[{"anything-but":5}]}}`)
+	assert !hit(`{"source":[{"anything-but":{"prefix":"com"}}]}`)
+	assert hit(`{"source":[{"anything-but":{"suffix":["x","y"]}}]}`)
+	assert !hit(`{"source":[{"anything-but":{"equals-ignore-case":["COM.SHOP"]}}]}`)
+	assert !hit(`{"source":[{"anything-but":{"wildcard":"com*"}}]}`)
+	assert !hit(`{"detail":{"missing":[{"anything-but":"x"}]}}`)
+	assert hit(`{"detail":{"tags":[{"anything-but":"red"}]}}`)
+}
+
+test "numeric, exists and cidr" {
+	assert hit(`{"detail":{"count":[{"numeric":[">",0,"<=",5]}]}}`)
+	assert !hit(`{"detail":{"count":[{"numeric":[">",5]}]}}`)
+	assert hit(`{"detail":{"price":[{"numeric":["=",12.5]}]}}`)
+	assert !hit(`{"detail":{"state":[{"numeric":[">",0]}]}}`)
+	assert hit(`{"detail":{"state":[{"exists":true}],"missing":[{"exists":false}]}}`)
+	assert !hit(`{"detail":{"state":[{"exists":false}]}}`)
+	assert hit(`{"detail":{"gone":{"x":[{"exists":false}]}}}`)
+	assert hit(`{"detail":{"ip":[{"cidr":"10.0.0.0/16"}]}}`)
+	assert !hit(`{"detail":{"ip":[{"cidr":"10.0.2.0/24"}]}}`)
+	assert hit(`{"detail":{"v6":[{"cidr":"2001:db8::/32"}]}}`)
+	assert address("::1") == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+	assert address("1:2:3") == null && address("1.2.3.256") == null
+}
+
+test "$or" {
+	assert hit(`{"$or":[{"source":["x"]},{"detail":{"count":[5]}}]}`)
+	assert !hit(`{"$or":[{"source":["x"]},{"detail":{"count":[6]}}]}`)
+	assert hit(`{"source":["com.shop"],"$or":[{"detail":{"ok":[false]}},{"resources":[{"prefix":"arn:"}]}]}`)
+}
+
+test "validation, in EventBridge's words" {
+	const cases: [string, string][] = [["[]", "Filter is not an object"], ["{}", "Empty objects are not allowed"],
+		[`{"a":[]}`, "Empty arrays are not allowed"], [`{"a":{}}`, "Empty objects are not allowed"],
+		[`{"a":"x"}`, `"a" must be an object or an array`], [`{"a":[{}]}`, "Match expression name not found"],
+		[`{"a":[[1]]}`, "Match value must be String, number, true, false, or null"],
+		[`{"a":[{"foo":1}]}`, "Unrecognized match type foo"],
+		[`{"a":[{"prefix":"x","suffix":"y"}]}`, "Only one key allowed in match expression"],
+		[`{"a":[{"suffix":1}]}`, "suffix match pattern must be a string"],
+		[`{"a":[{"prefix":{"foo":"x"}}]}`, "Unsupported prefix pattern: foo"],
+		[`{"a":[{"suffix":{"equals-ignore-case":1}}]}`, "equals-ignore-case match pattern must be a string"],
+		[`{"a":[{"anything-but":{}}]}`, "Anything-But expression name not found"],
+		[`{"a":[{"anything-but":[]}]}`,
+		"Inside anything but list, either all values are number or string, mixed type is not supported"],
+		[`{"a":[{"anything-but":[1,"x"]}]}`,
+		"Inside anything but list, either all values are number or string, mixed type is not supported"],
+		[`{"a":[{"anything-but":[{"prefix":"x"}]}]}`, "Inside anything but list, start|null|boolean is not supported."],
+		[`{"a":[{"anything-but":{"foo":"x"}}]}`, "Unsupported anything-but pattern: foo"],
+		[`{"a":[{"anything-but":{"prefix":1}}]}`, "prefix/suffix match pattern must be a string"],
+		[`{"a":[{"anything-but":null}]}`, "Value of anything-but must be an array or single string/number value."],
+		[`{"a":[{"anything-but":{"equals-ignore-case":[1]}}]}`,
+		"Inside anything-but/equals-ignore-case list, number|start|null|boolean is not supported."],
+		[`{"a":[{"anything-but":{"prefix":"x","suffix":"y"}}]}`, "Too many elements in numeric expression"],
+		[`{"a":[{"numeric":">"}]}`, "Value of numeric must be an array."],
+		[`{"a":[{"numeric":[]}]}`, "Invalid member in numeric match: ]"],
+		[`{"a":[{"numeric":[1]}]}`, "Invalid member in numeric match: 1"],
+		[`{"a":[{"numeric":["!",1]}]}`, "Unrecognized numeric range operator: !"],
+		[`{"a":[{"numeric":[">"]}]}`, "Value of > must be numeric"],
+		[`{"a":[{"numeric":["=","x"]}]}`, "Value of equals must be numeric"],
+		[`{"a":[{"numeric":[">",1,">",2]}]}`, "Bad numeric range operator: >"],
+		[`{"a":[{"numeric":[">",5,"<",2]}]}`, "Bottom must be less than top"],
+		[`{"a":[{"numeric":["<",1,">",0]}]}`, "Too many elements in numeric expression"],
+		[`{"a":[{"numeric":[">",1,"<",2,"<",3]}]}`, "Too many terms in numeric range expression"],
+		[`{"a":[{"exists":"yes"}]}`, "exists match pattern must be either true or false."],
+		[`{"a":[{"cidr":1}]}`, "prefix match pattern must be a string"],
+		[`{"a":[{"cidr":"x"}]}`, "Malformed CIDR, one '/' required"],
+		[`{"a":[{"cidr":"10.0.0/8"}]}`, "Nonstandard IP address: 10.0.0"],
+		[`{"a":[{"cidr":"300.0.0.0/8"}]}`, "Invalid IP address: 300.0.0.0"],
+		[`{"a":[{"cidr":"10.0.0.0/32"}]}`, "IPv4 mask bits must be < 32"],
+		[`{"a":[{"cidr":"::/129"}]}`, "IPv6 mask bits must be < 128"],
+		[`{"a":[{"wildcard":1}]}`, "wildcard match pattern must be a string"],
+		[`{"a":[{"wildcard":"a**b"}]}`, "Consecutive wildcard characters at pos 2"],
+		[`{"a":[{"wildcard":"a\\\\x"}]}`, "Invalid escape character at pos 2"],
+		[`{"$or":[]}`, "There must have at least 2 Objects in $or relationship."],
+		[`{"$or":[{"a":["x"]}]}`, "There must have at least 2 Objects in $or relationship."],
+		[`{"$or":{"a":["x"]}}`, "It must be an Array followed with $or."],
+		[`{"$or":[{"a":["x"]},1]}`, "Only JSON object is allowed in array of $or relationship."],
+		[`{"a":[{"$or":[1]}]}`, "Unrecognized match type $or"]]
+	for (const [p, why] of cases) {
+		test `${p}` {
+			assert validate(p) throws invalid(why)
+		}
+	}
+	for (const p of [`{"a":[1,"x",null,true]}`, `{"a":[{"anything-but":{"prefix":["x"]}}]}`,
+		`{"a":[{"anything-but":{"wildcard":["x*"]}}]}`, `{"a":[{"numeric":[">",5000000000]}]}`,
+		`{"a":[{"exists":false}]}`]) {
+		test `${p}` {
+			validate(p)
+		}
+	}
+}

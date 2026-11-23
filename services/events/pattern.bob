@@ -1,0 +1,594 @@
+//! Event patterns: their validation, faults in EventBridge's words but for where in the pattern the fault is, and
+//! the matching of events against them by the content-filtering language: exact values, prefix, suffix,
+//! anything-but, numeric, exists, cidr, equals-ignore-case and wildcard, $or, nested objects, and an array in an
+//! event matching where any of its items does. Letters are compared ignoring case in ASCII only.
+
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { backslash, isDigit, lbrace, lbracket, minus, quote, star } from "std/ascii"
+import * as std from "std/encoding/json"
+import { lower, ParseError, parseInt, split } from "std/string"
+import { Fault } from "../../core/fault"
+import { invalidEventPatternException } from "./api"
+
+/// Throws an InvalidEventPatternException unless p is an event pattern.
+export function validate(p: string) throws Fault {
+	let top: std.Unknown[] = []
+	try {
+		top = std.decode[std.Keys](p).all
+	} catch (e: ParseError) {
+		const lead = p.slice(0, 1)
+		throw invalid(if (lead == "{" || lead == "") "Malformed JSON" else "Filter is not an object")
+	}
+	object(top)
+}
+
+/// Whether event, a JSON object, matches the valid pattern p.
+export function matches(p: string, event: string): bool { return fits(members(p), event) }
+
+/// The fault of a pattern that is not valid, for the reason why.
+function invalid(why: string): Fault {
+	return invalidEventPatternException(`Event pattern is not valid. Reason: ${why}`)
+}
+
+/// Validates the members of an object of a pattern.
+function object(fs: std.Unknown[]): void throws Fault {
+	if (fs.length == 0) {
+		throw invalid("Empty objects are not allowed")
+	}
+	for (const [k, v] of fs) {
+		if (k == "$or") {
+			or(v)
+		} else if (v.length > 0 && v[0] == lbrace) {
+			object(members(v))
+		} else if (v.length > 0 && v[0] == lbracket) {
+			matchers(v)
+		} else {
+			throw invalid(`"${k}" must be an object or an array`)
+		}
+	}
+}
+
+/// Validates the alternatives of a $or.
+function or(v: string): void throws Fault {
+	if (v.length == 0 || v[0] != lbracket) {
+		throw invalid("It must be an Array followed with $or.")
+	}
+	const alternatives = list(v)
+	for (const a of alternatives) {
+		if (a[0] != lbrace) {
+			throw invalid("Only JSON object is allowed in array of $or relationship.")
+		}
+		object(members(a))
+	}
+	if (alternatives.length < 2) {
+		throw invalid("There must have at least 2 Objects in $or relationship.")
+	}
+}
+
+/// Validates a field's array of values and match expressions.
+function matchers(v: string): void throws Fault {
+	const ms = list(v)
+	if (ms.length == 0) {
+		throw invalid("Empty arrays are not allowed")
+	}
+	for (const m of ms) {
+		if (m[0] == lbracket) {
+			throw invalid("Match value must be String, number, true, false, or null")
+		}
+		if (m[0] == lbrace) {
+			expression(members(m))
+		}
+	}
+}
+
+/// Validates a match expression, as {"prefix": "a"}.
+function expression(fs: std.Unknown[]): void throws Fault {
+	if (fs.length == 0) {
+		throw invalid("Match expression name not found")
+	}
+	const [k, v] = fs[0]
+	switch (k) {
+		case "prefix", "suffix": affix(k, v)
+		case "equals-ignore-case": text(v, "equals-ignore-case match pattern must be a string")
+		case "wildcard": wildcard(v)
+		case "anything-but": anythingBut(v)
+		case "numeric": numeric(v)
+		case "cidr": cidr(v)
+		case "exists": if (v != "true" && v != "false") {
+			throw invalid("exists match pattern must be either true or false.")
+		}
+		default: throw invalid(`Unrecognized match type ${k}`)
+	}
+	if (fs.length > 1) {
+		throw invalid("Only one key allowed in match expression")
+	}
+}
+
+/// The string the JSON v is, or the fault why if it is not one.
+function text(v: string, why: string): string throws Fault {
+	const s = str(v)
+	if (s == null) {
+		throw invalid(why)
+	}
+	return s
+}
+
+/// Validates the value of a prefix or suffix, as k names it: a string, or one to compare ignoring case.
+function affix(k: string, v: string) throws Fault {
+	if (v[0] != lbrace) {
+		text(v, `${k} match pattern must be a string`)
+		return
+	}
+	const fs = members(v)
+	if (fs.length == 0 || fs[0][0] != "equals-ignore-case") {
+		throw invalid(`Unsupported ${k} pattern: ${if (fs.length == 0) "" else fs[0][0]}`)
+	}
+	text(fs[0][1], "equals-ignore-case match pattern must be a string")
+}
+
+/// Validates a wildcard: * matches any characters, \* a star and \\ a backslash.
+function wildcard(v: string) throws Fault {
+	const s = text(v, "wildcard match pattern must be a string")
+	let starred = false
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == backslash) {
+			if (i + 1 == s.length || s[i + 1] != star && s[i + 1] != backslash) {
+				throw invalid(`Invalid escape character at pos ${i + 1}`)
+			}
+			i++
+			starred = false
+		} else if (s[i] == star) {
+			if (starred) {
+				throw invalid(`Consecutive wildcard characters at pos ${i}`)
+			}
+			starred = true
+		} else {
+			starred = false
+		}
+	}
+}
+
+/// Validates the value of an anything-but: a string or number, a list of either, or a prefix, suffix, wildcard or
+/// equals-ignore-case of one or a list.
+function anythingBut(v: string) throws Fault {
+	if (v[0] == lbracket) {
+		const xs = list(v)
+		if (xs.some(x => x[0] != quote && !numeral(x))) {
+			throw invalid("Inside anything but list, start|null|boolean is not supported.")
+		}
+		if (xs.length == 0 || xs.some(x => (x[0] == quote) != (xs[0][0] == quote))) {
+			throw invalid("Inside anything but list, either all values are number or string, mixed type is not supported")
+		}
+		return
+	}
+	if (v[0] != lbrace) {
+		if (v[0] != quote && !numeral(v)) {
+			throw invalid("Value of anything-but must be an array or single string/number value.")
+		}
+		return
+	}
+	const fs = members(v)
+	if (fs.length == 0) {
+		throw invalid("Anything-But expression name not found")
+	}
+	const [k, w] = fs[0]
+	const xs = if (w[0] == lbracket) list(w) else [w]
+	switch (k) {
+		case "prefix", "suffix": for (const x of xs) {
+			text(x, "prefix/suffix match pattern must be a string")
+		}
+		case "wildcard": for (const x of xs) {
+			wildcard(x)
+		}
+		case "equals-ignore-case": for (const x of xs) {
+			if (x[0] != quote) {
+				throw invalid(if (w[0] == lbracket) "Inside anything-but/equals-ignore-case list, number|start|null|boolean is not supported."
+					else "equals-ignore-case match pattern must be a string")
+			}
+		}
+		default: throw invalid(`Unsupported anything-but pattern: ${k}`)
+	}
+	if (fs.length > 1) {
+		throw invalid("Too many elements in numeric expression")
+	}
+}
+
+/// Validates a numeric match: an operator and a number, or a lower bound and then an upper one.
+function numeric(v: string) throws Fault {
+	if (v[0] != lbracket) {
+		throw invalid("Value of numeric must be an array.")
+	}
+	const xs = list(v)
+	const first = operator(xs, 0)
+	const low = bound(xs, 0, first)
+	if (xs.length == 2) {
+		return
+	}
+	if (first == "=" || first == "<" || first == "<=") {
+		throw invalid("Too many elements in numeric expression")
+	}
+	const second = operator(xs, 2)
+	if (second != "<" && second != "<=") {
+		throw invalid(`Bad numeric range operator: ${second}`)
+	}
+	if (bound(xs, 2, second) <= low) {
+		throw invalid("Bottom must be less than top")
+	}
+	if (xs.length > 4) {
+		throw invalid("Too many terms in numeric range expression")
+	}
+}
+
+/// The comparison operator at i of a numeric match's items xs.
+function operator(xs: string[], i: i32): string throws Fault {
+	const op = if (i < xs.length) str(xs[i]) else null
+	if (op == null) {
+		throw invalid(`Invalid member in numeric match: ${if (i < xs.length) xs[i] else "]"}`)
+	}
+	if (op != "=" && op != "<" && op != "<=" && op != ">" && op != ">=") {
+		throw invalid(`Unrecognized numeric range operator: ${op}`)
+	}
+	return op
+}
+
+/// The number after the operator op at i of a numeric match's items xs.
+function bound(xs: string[], i: i32, op: string): f64 throws Fault {
+	const n = if (i + 1 < xs.length) number(xs[i + 1]) else null
+	if (n == null) {
+		throw invalid(`Value of ${if (op == "=") "equals" else op} must be numeric`)
+	}
+	return n
+}
+
+/// Validates a CIDR block, as 10.0.0.0/24 or 2001:db8::/32.
+function cidr(v: string) throws Fault {
+	const s = text(v, "prefix match pattern must be a string")
+	const parts = split(s, "/")
+	if (parts.length != 2) {
+		throw invalid("Malformed CIDR, one '/' required")
+	}
+	const ip = parts[0]
+	const v6 = indexOf(ip, ":") >= 0
+	if (v6) {
+		if (address(ip) == null) {
+			throw invalid(`Invalid IP address: ${ip}`)
+		}
+	} else {
+		const octets = split(ip, ".")
+		if (octets.length != 4) {
+			throw invalid(`Nonstandard IP address: ${ip}`)
+		}
+		if (address(ip) == null) {
+			throw invalid(`Invalid IP address: ${ip}`)
+		}
+	}
+	const bits = digits(parts[1])
+	if (v6 && (bits == null || bits! >= 128)) {
+		throw invalid("IPv6 mask bits must be < 128")
+	}
+	if (!v6 && (bits == null || bits! >= 32)) {
+		throw invalid("IPv4 mask bits must be < 32")
+	}
+}
+
+/// Whether the event's members fit the pattern's members fs: each field present as the pattern asks, nested objects
+/// within objects, an array's items each a value.
+function fits(fs: std.Unknown[], event: string): bool {
+	const at = members(event)
+	for (const [k, v] of fs) {
+		if (k == "$or") {
+			if (!list(v).some(o => fits(members(o), event))) {
+				return false
+			}
+			continue
+		}
+		const found = at.find(e => e[0] == k)
+		const values = if (found == null) [] else if (found[1][0] == lbracket) list(found[1]) else [found[1]]
+		if (v[0] == lbrace) {
+			const objects = values.filter(x => x[0] == lbrace)
+			const sub = members(v)
+			if (if (objects.length == 0) !fits(sub, "{}") else !objects.some(o => fits(sub, o))) {
+				return false
+			}
+			continue
+		}
+		const scalars = values.filter(x => x[0] != lbrace && x[0] != lbracket)
+		if (!list(v).some(m => test(m, scalars))) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether the values of a field, the JSON scalars xs, none if it is not there, match m, a value or an expression.
+function test(m: string, xs: string[]): bool {
+	if (m[0] != lbrace) {
+		return xs.some(x => same(m, x))
+	}
+	const [k, w] = members(m)[0]
+	switch (k) {
+		case "prefix": return xs.some(x => affixed(w, x, (s, a) => startsWith(s, a)))
+		case "suffix": return xs.some(x => affixed(w, x, (s, a) => endsWith(s, a)))
+		case "equals-ignore-case": return xs.some(x => folded(x) == folded(w))
+		case "wildcard": return xs.some(x => wild(str(w) ?? "", x))
+		case "exists": return (w == "true") == (xs.length > 0)
+		case "numeric": return xs.some(x => inRange(list(w), x))
+		case "cidr": return xs.some(x => within(str(w) ?? "", x))
+		default: return xs.some(x => !excluded(w, x)) // anything-but
+	}
+}
+
+/// Whether the scalar x is a string that has the prefix or suffix of w, as has finds it, ignoring case if w asks to.
+function affixed(w: string, x: string, has: (s: string, affix: string) => bool): bool {
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	if (w[0] != lbrace) {
+		return has(s, str(w) ?? "")
+	}
+	return has(lower(s), lower(str(members(w)[0][1]) ?? ""))
+}
+
+/// Whether anything-but's value w excludes the scalar x.
+function excluded(w: string, x: string): bool {
+	if (w[0] == lbracket) {
+		return list(w).some(y => same(y, x))
+	}
+	if (w[0] != lbrace) {
+		return same(w, x)
+	}
+	const [k, v] = members(w)[0]
+	const ys = if (v[0] == lbracket) list(v) else [v]
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	switch (k) {
+		case "prefix": return ys.some(y => startsWith(s, str(y) ?? ""))
+		case "suffix": return ys.some(y => endsWith(s, str(y) ?? ""))
+		case "wildcard": return ys.some(y => wild(str(y) ?? "", x))
+		default: return ys.some(y => folded(y) == lower(s)) // equals-ignore-case
+	}
+}
+
+/// Whether the scalars a and b are the same value: strings by their text, numbers by their value.
+function same(a: string, b: string): bool {
+	if (numeral(a) && numeral(b)) {
+		return number(a) == number(b)
+	}
+	if (a[0] == quote && b[0] == quote) {
+		return str(a) == str(b)
+	}
+	return a == b
+}
+
+/// The text of the JSON string x lower-cased; null if x is not a string.
+function folded(x: string): string | null {
+	const s = str(x)
+	return if (s == null) null else lower(s)
+}
+
+/// Whether the scalar x is a string that the wildcard pattern p matches.
+function wild(p: string, x: string): bool {
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	// The literal pieces between the stars.
+	const pieces: string[] = [""]
+	for (let i = 0; i < p.length; i++) {
+		if (p[i] == backslash && i + 1 < p.length) {
+			i++
+			pieces[pieces.length - 1] += p.slice(i, i + 1)
+		} else if (p[i] == star) {
+			pieces.push("")
+		} else {
+			pieces[pieces.length - 1] += p.slice(i, i + 1)
+		}
+	}
+	const head = pieces[0]
+	if (pieces.length == 1) {
+		return s == head
+	}
+	const tail = pieces[pieces.length - 1]
+	if (s.length < head.length + tail.length || !startsWith(s, head) || !endsWith(s, tail)) {
+		return false
+	}
+	let at = head.length
+	const end = s.length - tail.length
+	for (const piece of pieces.slice(1, pieces.length - 1)) {
+		const i = indexOf(s.slice(0, end), piece, at)
+		if (i < 0) {
+			return false
+		}
+		at = i + piece.length
+	}
+	return true
+}
+
+/// Whether the scalar x is a number within the numeric match of the items xs.
+function inRange(xs: string[], x: string): bool {
+	const n = number(x)
+	if (n == null) {
+		return false
+	}
+	for (let i = 0; i + 1 < xs.length; i += 2) {
+		if (!compare(n!, str(xs[i]) ?? "", number(xs[i + 1]) ?? 0.0)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether n op b holds, of the operators of a numeric match.
+function compare(n: f64, op: string, b: f64): bool {
+	switch (op) {
+		case "=": return n == b
+		case "<": return n < b
+		case "<=": return n <= b
+		case ">": return n > b
+		default: return n >= b
+	}
+}
+
+/// Whether the scalar x is a string of an IP address within the CIDR block c.
+function within(c: string, x: string): bool {
+	const s = str(x)
+	const parts = split(c, "/")
+	const ip = if (s == null) null else address(s)
+	const net = address(parts[0])
+	const bits = digits(parts[1])
+	if (ip == null || net == null || bits == null || ip.length != net.length) {
+		return false
+	}
+	for (let i = 0; i < bits!; i++) {
+		const mask = (128 >> (i % 8)) as u8
+		if ((ip[i / 8] & mask) != (net[i / 8] & mask)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The bytes of the IPv4 or IPv6 address s, null if it is not one.
+export function address(s: string): u8[] | null {
+	if (indexOf(s, ":") < 0) {
+		const octets = split(s, ".")
+		if (octets.length != 4) {
+			return null
+		}
+		const out: u8[] = []
+		for (const o of octets) {
+			const n = digits(o)
+			if (n == null || n! > 255) {
+				return null
+			}
+			out.push(n! as u8)
+		}
+		return out
+	}
+	const halves = split(s, "::")
+	if (halves.length > 2) {
+		return null
+	}
+	const head = groups(halves[0])
+	const tail = if (halves.length == 2) groups(halves[1]) else []
+	if (head == null || tail == null) {
+		return null
+	}
+	const missing = 8 - head.length - tail.length
+	if (missing < 0 || halves.length == 1 && missing != 0 || halves.length == 2 && missing == 0) {
+		return null
+	}
+	const all: i32[] = []
+	all.append(head)
+	for (let i = 0; i < missing; i++) {
+		all.push(0)
+	}
+	all.append(tail)
+	const out: u8[] = []
+	for (const g of all) {
+		out.push((g >> 8) as u8)
+		out.push((g & 255) as u8)
+	}
+	return out
+}
+
+/// The 16-bit groups of a run of an IPv6 address, as db8:1, null if they are not.
+function groups(s: string): i32[] | null {
+	if (s == "") {
+		return []
+	}
+	const out: i32[] = []
+	for (const g of split(s, ":")) {
+		if (g.length < 1 || g.length > 4) {
+			return null
+		}
+		try {
+			out.push(parseInt(g, 16))
+		} catch (e: ParseError) {
+			return null
+		}
+	}
+	return out
+}
+
+/// The number that the decimal digits s spell, null if s is not of digits.
+function digits(s: string): i32 | null {
+	if (s.length < 1 || s.length > 9 || !s.every(isDigit)) {
+		return null
+	}
+	try {
+		return parseInt(s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// Whether the JSON scalar x is a number.
+function numeral(x: string): bool { return x.length > 0 && (x[0] == minus || isDigit(x[0])) }
+
+/// The value of the JSON scalar x, null if it is not a number.
+function number(x: string): f64 | null {
+	if (!numeral(x)) {
+		return null
+	}
+	try {
+		return std.decode[f64](x)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The text of the JSON scalar x, null if it is not a string.
+export function str(x: string): string | null {
+	if (x.length == 0 || x[0] != quote) {
+		return null
+	}
+	try {
+		return std.decode[string](x)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The members of the JSON object v, none if it is not one.
+export function members(v: string): std.Unknown[] {
+	try {
+		return std.decode[std.Keys](v).all
+	} catch (e: ParseError) {
+		return []
+	}
+}
+
+/// The JSON of the member named k of the JSON object v, null if none.
+export function member(v: string, k: string): string | null {
+	for (const [key, x] of members(v)) {
+		if (key == k) {
+			return x
+		}
+	}
+	return null
+}
+
+/// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
+type Item = i64 | f64 | string | bool | std.Keys | null | (i64 | f64 | string | bool | std.Keys | null)[]
+
+/// The JSON of each item of the JSON array v, none if it is not one or holds arrays of arrays, which std/encoding/json
+/// cannot decode.
+export function list(v: string): string[] {
+	let items: Item[] = []
+	try {
+		items = std.decode[Item[]](v)
+	} catch (e: ParseError) {
+		return []
+	}
+	return items.map(x => {
+		try {
+			return std.encode(x)
+		} catch (e: std.EncodeError) {
+			return "" // a float of JSON is finite
+		}
+	})
+}
