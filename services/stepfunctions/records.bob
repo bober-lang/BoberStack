@@ -1,5 +1,5 @@
 //! Step Functions' state in an account's regional tree: its state machines by name, their executions by the machine's
-//! name, a NUL and the execution's, and its activities by name.
+//! name, a NUL and the execution's, their versions and aliases, and its activities by name.
 
 import { Store, Table } from "../../core/state/store"
 
@@ -12,6 +12,8 @@ export class Machine {
 	/// A UUID, renewed by each update.
 	revision = ""
 	tags: [string, string][] = []
+	/// The number of its last version, 0 if none.
+	versions = 0
 }
 
 export class Execution {
@@ -36,10 +38,40 @@ export class Execution {
 	steps: string[] = []
 	/// The number of the task, counted from 0 in the run's order, a RUNNING execution waits on for its token.
 	waiting: i32 = -1
-	/// The ARN of the activity that task is of, "" if it is a callback; its input, and whether a worker has it.
+	/// The ARN of the activity that task is of, "" if it is a callback; its input, whether a worker has it, and when it
+	/// was scheduled.
 	activity = ""
 	work = ""
 	handed = false
+	scheduled: i64 = 0
+	/// Random hex its task tokens carry.
+	secret = ""
+	/// The task token of the .sync task of the execution that started it and waits for its end, "" if none does; and
+	/// whether that task is of .sync:2.
+	parent = ""
+	sync2 = false
+	/// The ARNs of the version and alias it was started by, if it was.
+	version: string | null = null
+	alias: string | null = null
+}
+
+/// A version of a state machine, its number counted from 1.
+export class Version {
+	number = 0
+	definition = ""
+	role = ""
+	revision = ""
+	description: string | null = null
+	created: i64 = 0
+}
+
+/// An alias of a state machine: the versions it routes to, by number, and their weights.
+export class Alias {
+	name = ""
+	description: string | null = null
+	routes: [i32, i32][] = []
+	created: i64 = 0
+	updated: i64 = 0
 }
 
 export class Activity {
@@ -53,10 +85,15 @@ export class Tables {
 	machines: Table[Machine]
 	executions: Table[Execution]
 	activities: Table[Activity]
+	/// Versions and aliases by the machine's name, a NUL and the version's number or the alias's name.
+	versions: Table[Version]
+	aliases: Table[Alias]
 
 	constructor(s: Store) {
 		this.machines = new Table[Machine](s, "states/machines")
 		this.executions = new Table[Execution](s, "states/executions")
 		this.activities = new Table[Activity](s, "states/activities")
+		this.versions = new Table[Version](s, "states/versions")
+		this.aliases = new Table[Alias](s, "states/aliases")
 	}
 }

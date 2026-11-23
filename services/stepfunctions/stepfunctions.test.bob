@@ -188,6 +188,33 @@ test "an execution waits at an activity's task until a worker answers it" {
 	assert ok(sfn(g, "GetActivityTask", `{"activityArn":"${activity}"}`), "{}")
 }
 
+test "versions, aliases and TestState" {
+	const g = world()
+	const d = `{"StartAt":"A","States":{"A":{"Type":"Pass","Result":1,"End":true}}}`
+	assert ok(sfn(g, "CreateStateMachine",
+		`{"name":"m","roleArn":"${role}","definition":${json.quoted(d)},"publish":true}`),
+		`"stateMachineVersionArn":"${machine}:1"`)
+	assert fails(sfn(g, "CreateStateMachineAlias",
+		`{"name":"a","routingConfiguration":[{"stateMachineVersionArn":"${machine}:1","weight":90}]}`),
+		"ValidationException", "Sum of routing configuration weights must be equal to 100")
+	assert ok(sfn(g, "CreateStateMachineAlias",
+		`{"name":"a","routingConfiguration":[{"stateMachineVersionArn":"${machine}:1","weight":100}]}`),
+		`"stateMachineAliasArn":"${machine}:a"`)
+	const conflict = sfn(g, "DeleteStateMachineVersion", `{"stateMachineVersionArn":"${machine}:1"}`)
+	assert conflict.status == 409
+		&& indexOf(conflict.body.whole ?? "", `Current list of aliases referencing this version: [${machine}:a]`) >= 0
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}:a","name":"x"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:m:x"}`),
+		`"stateMachineVersionArn":"${machine}:1"`, `"stateMachineAliasArn":"${machine}:a"`)
+	const full = `{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Task",`
+		+ `"Resource":"arn:aws:states:::lambda:invoke","Retry":[{"ErrorEquals":["X"]}],`
+		+ `"Catch":[{"ErrorEquals":["X"],"Next":"A"},{"ErrorEquals":["States.ALL"],"Next":"A","ResultPath":"$.e"}],`
+		+ `"End":true}}}`
+	assert ok(sfn(g, "TestState",
+		`{"definition":${json.quoted(full)},"stateName":"B","roleArn":"${role}","input":"{}","inspectionLevel":"DEBUG"}`),
+		`"status":"CAUGHT_ERROR"`, `"nextState":"A"`, `"errorDetails":{"catchIndex":1}`, `"error":"States.TaskFailed"`)
+}
+
 /// The task token of the answer res of GetActivityTask.
 function token(res: Response): string {
 	const b = res.body.whole ?? ""

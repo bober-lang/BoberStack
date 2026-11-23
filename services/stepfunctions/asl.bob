@@ -29,6 +29,17 @@ export class Failure {
 	}
 }
 
+/// The outcome of a state run alone, as Execution.test describes it.
+export class Test {
+	status = "SUCCEEDED"
+	output: Json | null = null
+	next: string | null = null
+	failure: Failure | null = null
+	steps: [string, Json][] = []
+	retry = -1
+	catcher = -1
+}
+
 /// What runs an execution's tasks and keeps its history.
 export interface Host {
 	/// The result of the Task resource given parameters, its effective input; or the Failure it fails with.
@@ -170,6 +181,89 @@ export class Execution {
 	/// The output of the machine of definition given input, its events recorded; or the Failure that ends it.
 	run(definition: Json, input: Json): Json throws Failure { return this.states(definition, input) }
 
+	/// The state s run alone given input, as TestState runs it: its status, SUCCEEDED, FAILED, RETRIABLE or
+	/// CAUGHT_ERROR; its output; the state it goes to next, null at an end; the Failure it raised, if it did; and its
+	/// inspection data, each step's value by the name TestState gives it, and the index of the retrier or catcher that
+	/// matched its error.
+	test(s: Json, input: Json): Test {
+		const t = new Test()
+		const steps = t.steps
+		steps.push(["input", input])
+		const kind = s.str("Type") ?? ""
+		t.next = if (s.get("End")?.text == "true") null else s.str("Next")
+		try {
+			const aip = this.inputPath(s, input)
+			steps.push(["afterInputPath", aip])
+			switch (kind) {
+				case "Choice":
+					t.next = this.choose(s, aip)
+					t.output = this.outputPath(s, aip)
+				case "Fail": throw this.fail(s, input)
+				case "Succeed":
+					t.next = null
+					t.output = this.outputPath(s, aip)
+				case "Wait": t.output = this.outputPath(s, aip)
+				case "Pass":
+					const ap = this.parameters(s, "Parameters", aip)
+					steps.push(["afterParameters", ap])
+					const result = s.get("Result") ?? ap
+					steps.push(["result", result])
+					const arp = this.resultPath(s, input, result)
+					steps.push(["afterResultPath", arp])
+					t.output = this.outputPath(s, arp)
+				case "Task":
+					const p = this.parameters(s, "Parameters", aip)
+					steps.push(["afterParameters", p])
+					const r = this.task(s, p)
+					steps.push(["result", r])
+					const rs = this.parameters(s, "ResultSelector", r)
+					steps.push(["afterResultSelector", rs])
+					const rp = this.resultPath(s, input, rs)
+					steps.push(["afterResultPath", rp])
+					t.output = this.outputPath(s, rp)
+				default: t.output = this.attempt(s, kind, input)[0]
+			}
+		} catch (f: Failure) {
+			t.failure = f
+			t.status = "FAILED"
+			t.next = null
+			if (f.error == "States.Runtime" || kind == "Fail") {
+				return t
+			}
+			const retriers = s.get("Retry")?.items ?? []
+			for (let i = 0; i < retriers.length; i++) {
+				if (matches(retriers[i], f.error)) {
+					if (retriers[i].get("MaxAttempts")?.text != "0") {
+						t.status = "RETRIABLE"
+						t.retry = i
+						return t
+					}
+					break
+				}
+			}
+			const catchers = s.get("Catch")?.items ?? []
+			for (let i = 0; i < catchers.length; i++) {
+				const c = catchers[i]
+				if (matches(c, f.error)) {
+					const e = obj([["Error", str(f.error)], ["Cause", str(f.cause)]])
+					const p = c.get("ResultPath")
+					try {
+						t.output = if (p != null && p.kind == "null") input
+							else this.put(input, c.str("ResultPath") ?? "$", e)
+					} catch (g: Failure) {
+						t.failure = g
+						return t
+					}
+					t.status = "CAUGHT_ERROR"
+					t.next = c.str("Next")
+					t.catcher = i
+					return t
+				}
+			}
+		}
+		return t
+	}
+
 	/// The output of the states of d, a machine, branch or item processor, from its StartAt, given input.
 	private states(d: Json, input: Json): Json throws Failure {
 		const states = d.get("States")!
@@ -291,6 +385,9 @@ export class Execution {
 	private task(s: Json, eff: Json): Json throws Failure {
 		const resource = s.str("Resource") ?? ""
 		const [kind, op] = typed(resource)
+		if (kind == "states" && startsWith(op, "activity:")) {
+			return this.activity(resource, eff)
+		}
 		const named: [string, Json][] = [["resourceType", str(kind)], ["resource", str(op)]]
 		const scheduled = named.slice(0, 2)
 		scheduled.push(["region", str(this.region())])
@@ -309,6 +406,25 @@ export class Execution {
 			failed.push(["error", str(f.error)])
 			failed.push(["cause", str(f.cause)])
 			this.host.event("TaskFailed", "taskFailedEventDetails", obj(failed))
+			throw f
+		}
+	}
+
+	/// The result of the task of the activity of the ARN resource given eff, its events recorded: its start is the
+	/// worker's, recorded by the host when a worker takes it, and made again here as the history has it.
+	private activity(resource: string, eff: Json): Json throws Failure {
+		this.host.event("ActivityScheduled", "activityScheduledEventDetails",
+			obj([["resource", str(resource)], ["input", str(write(eff))], ["inputDetails", truncated()]]))
+		try {
+			const out = this.host.task(resource, eff)
+			this.host.event("ActivityStarted", "activityStartedEventDetails", obj([]))
+			this.host.event("ActivitySucceeded", "activitySucceededEventDetails",
+				obj([["output", str(write(out))], ["outputDetails", truncated()]]))
+			return out
+		} catch (f: Failure) {
+			this.host.event("ActivityStarted", "activityStartedEventDetails", obj([]))
+			this.host.event("ActivityFailed", "activityFailedEventDetails",
+				obj([["error", str(f.error)], ["cause", str(f.cause)]]))
 			throw f
 		}
 	}
