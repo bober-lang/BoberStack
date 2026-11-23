@@ -1,23 +1,27 @@
-//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, templates,
-//! configuration sets and their event destinations, tags and the messages sent.
+//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, their
+//! attributes and sending authorization policies, templates, configuration sets and their event destinations, tags,
+//! the account's suppression list and the messages sent.
 //!
 //! An identity is verified at once, as nobody can follow a verification mail's link: its verification and DKIM status
-//! are Success from its creation on. Nothing is sent anywhere: each message is stored, in its account's regional
-//! state, as LocalStack's /_aws/ses lists it (core/internal). A template's message is rendered when sent: one that
-//! cannot be, of data that is not JSON or lacks an attribute the template names, is accepted with a message id and
-//! then not sent, as AWS reports it by a rendering failure event, so it is not stored.
+//! are Success from its creation on, as is its MAIL FROM domain's. Nothing is sent anywhere: each message is stored, in
+//! its account's regional state, as LocalStack's /_aws/ses lists it (core/internal), and delivered, or bounced or
+//! complained of as the mailbox simulator's addresses ask, bounced if suppressed, as the notifications published inside the request to the
+//! identity's SNS topics and its configuration set's SNS event destinations tell. A template's message is rendered when
+//! sent: one that cannot be, of data that is not JSON or lacks an attribute the template names, is accepted with a
+//! message id and then not sent, as AWS reports it by a rendering failure event, so it is not stored.
 //!
 //! Where AWS differs: first, the account has production access, out of its sandbox, so only the source is checked,
 //! by its address or its domain, never the recipients as AWS checks them in the sandbox. A rendered template's MIME
-//! message has no Date or Message-ID header; event destinations are stored but no event is published to them; the
-//! send statistics are empty; a request to v2 that fails before it is routed, as one badly signed, is answered as
-//! the classic API answers it.
+//! message has no Date or Message-ID header; event destinations other than SNS are stored but nothing is published to
+//! them, nor are open, click or rendering failure events; the send statistics are empty; a request to v2 that fails
+//! before it is routed, as one badly signed, is answered as the classic API answers it.
 
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
 import { Store, Table } from "../../core/state/store"
 import * as api from "./api"
 import * as v2 from "./v2/api"
+import * as snsApi from "../sns/api"
 import { indexOf, lastIndexOf } from "std/algo"
 import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
@@ -41,6 +45,17 @@ class Identity {
 	token = ""
 	dkim: string[] = []
 	tags: [string, string][] = []
+	/// DKIM signing turned off, though its tokens were given.
+	unsigned = false
+	mailFrom: string | null = null
+	/// What to do on the MAIL FROM domain's MX failure, of v1's names.
+	mxFailure = "UseDefaultValue"
+	/// The SNS topics of notifications, by v1's type, Bounce, Complaint or Delivery, and the types of those with headers.
+	topics: [string, string][] = []
+	headers: string[] = []
+	forwarding = true
+	policies: [string, string][] = []
+	configurationSet: string | null = null
 }
 
 class Template {
@@ -113,15 +128,24 @@ class Sent {
 	Timestamp = ""
 }
 
+/// An address on the account's suppression list.
+class Suppressed {
+	address = ""
+	reason = ""
+	updated: i64 = 0
+}
+
 /// SES's state in an account's regional tree.
 class Tables {
 	identities: Table[Identity]
+	suppressed: Table[Suppressed]
 	templates: Table[Template]
 	sets: Table[ConfigurationSet]
 	sent: Table[Sent]
 
 	constructor(s: Store) {
 		this.identities = new Table[Identity](s, "ses.identities")
+		this.suppressed = new Table[Suppressed](s, "ses.suppressed")
 		this.templates = new Table[Template](s, "ses.templates")
 		this.sets = new Table[ConfigurationSet](s, "ses.sets")
 		this.sent = new Table[Sent](s, messages)
@@ -131,6 +155,9 @@ class Tables {
 /// The classic API, of the operations implemented.
 export class Handler {
 	...api.Unimplemented
+
+	/// What notifications of messages are published to.
+	sns: snsApi.SNS | null = null
 
 	verifyEmailIdentity(caller: Caller,
 		input: api.VerifyEmailIdentityRequest): api.VerifyEmailIdentityResponse throws Fault {
@@ -204,7 +231,7 @@ export class Handler {
 			const i = t.get(n)
 			if (i != null) {
 				const a = new api.IdentityDkimAttributes()
-				a.DkimEnabled = i.dkim.length > 0
+				a.DkimEnabled = i.dkim.length > 0 && !i.unsigned
 				a.DkimVerificationStatus = if (i.dkim.length > 0) "Success" else "NotStarted"
 				a.DkimTokens = if (i.dkim.length > 0) i.dkim else null
 				r.DkimAttributes.push([n, a])
@@ -219,12 +246,126 @@ export class Handler {
 		return new api.DeleteIdentityResponse()
 	}
 
+	setIdentityMailFromDomain(caller: Caller,
+		input: api.SetIdentityMailFromDomainRequest): api.SetIdentityMailFromDomainResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.mailFrom = input.MailFromDomain
+			i.mxFailure = input.BehaviorOnMXFailure ?? "UseDefaultValue"
+		})
+		return new api.SetIdentityMailFromDomainResponse()
+	}
+
+	setIdentityNotificationTopic(caller: Caller,
+		input: api.SetIdentityNotificationTopicRequest): api.SetIdentityNotificationTopicResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.topics = i.topics.filter(t => t[0] != input.NotificationType)
+			if (input.SnsTopic != null) {
+				i.topics.push([input.NotificationType, input.SnsTopic!])
+			}
+		})
+		return new api.SetIdentityNotificationTopicResponse()
+	}
+
+	setIdentityFeedbackForwardingEnabled(caller: Caller, input: api.SetIdentityFeedbackForwardingEnabledRequest): api.SetIdentityFeedbackForwardingEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.forwarding = input.ForwardingEnabled
+		})
+		return new api.SetIdentityFeedbackForwardingEnabledResponse()
+	}
+
+	setIdentityHeadersInNotificationsEnabled(caller: Caller, input: api.SetIdentityHeadersInNotificationsEnabledRequest): api.SetIdentityHeadersInNotificationsEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.headers = i.headers.filter(h => h != input.NotificationType)
+			if (input.Enabled) {
+				i.headers.push(input.NotificationType)
+			}
+		})
+		return new api.SetIdentityHeadersInNotificationsEnabledResponse()
+	}
+
+	setIdentityDkimEnabled(caller: Caller,
+		input: api.SetIdentityDkimEnabledRequest): api.SetIdentityDkimEnabledResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.unsigned = !input.DkimEnabled
+		})
+		return new api.SetIdentityDkimEnabledResponse()
+	}
+
+	getIdentityNotificationAttributes(caller: Caller, input: api.GetIdentityNotificationAttributesRequest): api.GetIdentityNotificationAttributesResponse throws Fault {
+		const r = new api.GetIdentityNotificationAttributesResponse()
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = new Tables(caller.regional()).identities.get(n)
+			if (i != null) {
+				const a = new api.IdentityNotificationAttributes()
+				a.BounceTopic = topicOf(i!, "Bounce") ?? ""
+				a.ComplaintTopic = topicOf(i!, "Complaint") ?? ""
+				a.DeliveryTopic = topicOf(i!, "Delivery") ?? ""
+				a.ForwardingEnabled = i!.forwarding
+				a.HeadersInBounceNotificationsEnabled = i!.headers.includes("Bounce")
+				a.HeadersInComplaintNotificationsEnabled = i!.headers.includes("Complaint")
+				a.HeadersInDeliveryNotificationsEnabled = i!.headers.includes("Delivery")
+				r.NotificationAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	getIdentityMailFromDomainAttributes(caller: Caller, input: api.GetIdentityMailFromDomainAttributesRequest): api.GetIdentityMailFromDomainAttributesResponse throws Fault {
+		const r = new api.GetIdentityMailFromDomainAttributesResponse()
+		for (const n of input.Identities) {
+			caller.allow(identityArn(caller, n))
+			const i = new Tables(caller.regional()).identities.get(n)
+			if (i != null && i!.mailFrom != null) {
+				const a = new api.IdentityMailFromDomainAttributes()
+				a.MailFromDomain = i!.mailFrom!
+				a.MailFromDomainStatus = "Success"
+				a.BehaviorOnMXFailure = if (i!.mxFailure == "RejectMessage") "RejectMessage" else "UseDefaultValue"
+				r.MailFromDomainAttributes.push([n, a])
+			}
+		}
+		return r
+	}
+
+	putIdentityPolicy(caller: Caller, input: api.PutIdentityPolicyRequest): api.PutIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, false)
+		changeIdentity(caller, input.Identity, false, i => {
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+			i.policies.push([input.PolicyName, input.Policy])
+		})
+		return new api.PutIdentityPolicyResponse()
+	}
+
+	getIdentityPolicies(caller: Caller,
+		input: api.GetIdentityPoliciesRequest): api.GetIdentityPoliciesResponse throws Fault {
+		const i = changeIdentity(caller, input.Identity, false, null)
+		const r = new api.GetIdentityPoliciesResponse()
+		r.Policies = i.policies.filter(p => input.PolicyNames.includes(p[0]))
+		return r
+	}
+
+	listIdentityPolicies(caller: Caller,
+		input: api.ListIdentityPoliciesRequest): api.ListIdentityPoliciesResponse throws Fault {
+		const i = changeIdentity(caller, input.Identity, false, null)
+		const r = new api.ListIdentityPoliciesResponse()
+		r.PolicyNames = i.policies.map(p => p[0])
+		return r
+	}
+
+	deleteIdentityPolicy(caller: Caller,
+		input: api.DeleteIdentityPolicyRequest): api.DeleteIdentityPolicyResponse throws Fault {
+		changeIdentity(caller, input.Identity, false, i => {
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+		})
+		return new api.DeleteIdentityPolicyResponse()
+	}
+
 	sendEmail(caller: Caller, input: api.SendEmailRequest): api.SendEmailResponse throws Fault {
-		const s = sent(caller, input.Source, v1Recipients(input.Destination))
+		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
 		s.Subject = input.Message.Subject.Data
 		s.Body = parts(input.Message.Body.Text?.Data, input.Message.Body.Html?.Data)
 		const r = new api.SendEmailResponse()
-		r.MessageId = store(caller, s)
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
 		return r
 	}
 
@@ -234,19 +375,19 @@ export class Handler {
 		if (source == null) {
 			throw new Fault(400, "InvalidParameterValue", "Missing required header 'From'.")
 		}
-		const s = sent(caller, source!, null)
+		const s = sent(caller, source!, null, input.SourceArn)
 		s.RawData = data
 		const r = new api.SendRawEmailResponse()
-		r.MessageId = store(caller, s)
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
 		return r
 	}
 
 	sendTemplatedEmail(caller: Caller,
 		input: api.SendTemplatedEmailRequest): api.SendTemplatedEmailResponse throws Fault {
-		const s = sent(caller, input.Source, v1Recipients(input.Destination))
+		const s = sent(caller, input.Source, v1Recipients(input.Destination), input.SourceArn)
 		const t = template(caller, input.Template)
 		const r = new api.SendTemplatedEmailResponse()
-		r.MessageId = storeRendered(caller, s, t, input.TemplateData, null)
+		r.MessageId = storeRendered(caller, s, t, input.TemplateData, null, input.ConfigurationSetName, this.sns)
 		return r
 	}
 
@@ -255,10 +396,11 @@ export class Handler {
 		const t = template(caller, input.Template)
 		const r = new api.SendBulkTemplatedEmailResponse()
 		for (const d of input.Destinations) {
-			const s = sent(caller, input.Source, v1Recipients(d.Destination))
+			const s = sent(caller, input.Source, v1Recipients(d.Destination), input.SourceArn)
 			const status = new api.BulkEmailDestinationStatus()
 			status.Status = "Success"
-			status.MessageId = storeRendered(caller, s, t, d.ReplacementTemplateData ?? "{}", input.DefaultTemplateData)
+			status.MessageId = storeRendered(caller, s, t, d.ReplacementTemplateData ?? "{}", input.DefaultTemplateData,
+				input.ConfigurationSetName, this.sns)
 			r.Status.push(status)
 		}
 		return r
@@ -400,6 +542,9 @@ export class Handler {
 export class V2 {
 	...v2.Unimplemented
 
+	/// What notifications of messages are published to.
+	sns: snsApi.SNS | null = null
+
 	createEmailIdentity(caller: Caller,
 		input: v2.CreateEmailIdentityRequest): v2.CreateEmailIdentityResponse throws Fault {
 		const n = input.EmailIdentity
@@ -425,15 +570,156 @@ export class V2 {
 		const i = emailIdentity(caller, input.EmailIdentity, `<${input.EmailIdentity}>`)
 		const r = new v2.GetEmailIdentityResponse()
 		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
-		r.FeedbackForwardingStatus = true
+		r.FeedbackForwardingStatus = i.forwarding
 		r.VerifiedForSendingStatus = true
 		r.DkimAttributes = dkim(i)
-		r.Policies = []
+		r.Policies = i.policies
+		r.ConfigurationSetName = i.configurationSet
+		if (i.mailFrom != null) {
+			const m = new v2.MailFromAttributes()
+			m.MailFromDomain = i.mailFrom!
+			m.MailFromDomainStatus = "SUCCESS"
+			m.BehaviorOnMxFailure = if (i.mxFailure == "RejectMessage") "REJECT_MESSAGE" else "USE_DEFAULT_VALUE"
+			r.MailFromAttributes = m
+		}
 		r.Tags = i.tags.map(t => {
 			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
 		})
 		r.VerificationStatus = "SUCCESS"
 		return r
+	}
+
+	putSuppressedDestination(caller: Caller,
+		input: v2.PutSuppressedDestinationRequest): v2.PutSuppressedDestinationResponse throws Fault {
+		caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+		const a = addressOf(input.EmailAddress)
+		save(new Tables(caller.regional()).suppressed, a,
+			{ ...new Suppressed(), address: a, reason: input.Reason, updated: now() })
+		return new v2.PutSuppressedDestinationResponse()
+	}
+
+	getSuppressedDestination(caller: Caller,
+		input: v2.GetSuppressedDestinationRequest): v2.GetSuppressedDestinationResponse throws Fault {
+		const d = suppressed(caller, input.EmailAddress)
+		const r = new v2.GetSuppressedDestinationResponse()
+		r.SuppressedDestination.EmailAddress = d.address
+		r.SuppressedDestination.Reason = if (d.reason == "COMPLAINT") "COMPLAINT" else "BOUNCE"
+		r.SuppressedDestination.LastUpdateTime = d.updated
+		return r
+	}
+
+	listSuppressedDestinations(caller: Caller,
+		input: v2.ListSuppressedDestinationsRequest): v2.ListSuppressedDestinationsResponse throws Fault {
+		caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+		const reasons = input.Reasons ?? []
+		const all = new Tables(caller.regional()).suppressed.scan(null, 1000000).map(e => e[1]).filter(d => (reasons.length
+			== 0 || reasons.some(r => r == d.reason)) && (input.StartDate == null || d.updated >= input.StartDate!)
+			&& (input.EndDate == null || d.updated <= input.EndDate!))
+		const [items, next] = paged(keyed(all, d => d.address), input.NextToken, min(input.PageSize ?? 100, 1000),
+			"NextToken", true)
+		const r = new v2.ListSuppressedDestinationsResponse()
+		r.SuppressedDestinationSummaries = items.map(d => {
+			return { ...new v2.SuppressedDestinationSummary(), EmailAddress: d.address,
+				Reason: if (d.reason == "COMPLAINT") "COMPLAINT" else "BOUNCE", LastUpdateTime: d.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	deleteSuppressedDestination(caller: Caller,
+		input: v2.DeleteSuppressedDestinationRequest): v2.DeleteSuppressedDestinationResponse throws Fault {
+		const d = suppressed(caller, input.EmailAddress)
+		new Tables(caller.regional()).suppressed.delete(d.address)
+		return new v2.DeleteSuppressedDestinationResponse()
+	}
+
+	putEmailIdentityDkimAttributes(caller: Caller,
+		input: v2.PutEmailIdentityDkimAttributesRequest): v2.PutEmailIdentityDkimAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.unsigned = !input.SigningEnabled
+		})
+		return new v2.PutEmailIdentityDkimAttributesResponse()
+	}
+
+	putEmailIdentityDkimSigningAttributes(caller: Caller, input: v2.PutEmailIdentityDkimSigningAttributesRequest): v2.PutEmailIdentityDkimSigningAttributesResponse throws Fault {
+		const i = changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (i.dkim.length == 0) {
+				i.dkim = [token(16), token(16), token(16)]
+			}
+			i.unsigned = false
+		})
+		const r = new v2.PutEmailIdentityDkimSigningAttributesResponse()
+		r.DkimStatus = "SUCCESS"
+		r.DkimTokens = if (input.SigningAttributesOrigin == "EXTERNAL") null else i.dkim
+		return r
+	}
+
+	putEmailIdentityMailFromAttributes(caller: Caller, input: v2.PutEmailIdentityMailFromAttributesRequest): v2.PutEmailIdentityMailFromAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.mailFrom = input.MailFromDomain
+			i.mxFailure = if (input.BehaviorOnMxFailure == "REJECT_MESSAGE") "RejectMessage" else "UseDefaultValue"
+		})
+		return new v2.PutEmailIdentityMailFromAttributesResponse()
+	}
+
+	putEmailIdentityFeedbackAttributes(caller: Caller, input: v2.PutEmailIdentityFeedbackAttributesRequest): v2.PutEmailIdentityFeedbackAttributesResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.forwarding = input.EmailForwardingEnabled
+		})
+		return new v2.PutEmailIdentityFeedbackAttributesResponse()
+	}
+
+	putEmailIdentityConfigurationSetAttributes(caller: Caller,
+		input: v2.PutEmailIdentityConfigurationSetAttributesRequest): v2.PutEmailIdentityConfigurationSetAttributesResponse throws Fault {
+		if (input.ConfigurationSetName != null) {
+			configurationSet(caller, input.ConfigurationSetName!, true)
+		}
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			i.configurationSet = input.ConfigurationSetName
+		})
+		return new v2.PutEmailIdentityConfigurationSetAttributesResponse()
+	}
+
+	createEmailIdentityPolicy(caller: Caller,
+		input: v2.CreateEmailIdentityPolicyRequest): v2.CreateEmailIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, true)
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.alreadyExistsException(`Policy ${input.PolicyName} already exists.`)
+			}
+			i.policies.push([input.PolicyName, input.Policy])
+		})
+		return new v2.CreateEmailIdentityPolicyResponse()
+	}
+
+	updateEmailIdentityPolicy(caller: Caller,
+		input: v2.UpdateEmailIdentityPolicyRequest): v2.UpdateEmailIdentityPolicyResponse throws Fault {
+		checkPolicy(input.Policy, true)
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (!i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.notFoundException(`Policy ${input.PolicyName} does not exist.`)
+			}
+			i.policies = i.policies.map(p => if (p[0] == input.PolicyName) [p[0], input.Policy] else p)
+		})
+		return new v2.UpdateEmailIdentityPolicyResponse()
+	}
+
+	getEmailIdentityPolicies(caller: Caller,
+		input: v2.GetEmailIdentityPoliciesRequest): v2.GetEmailIdentityPoliciesResponse throws Fault {
+		const r = new v2.GetEmailIdentityPoliciesResponse()
+		r.Policies = changeIdentity(caller, input.EmailIdentity, true, null).policies
+		return r
+	}
+
+	deleteEmailIdentityPolicy(caller: Caller,
+		input: v2.DeleteEmailIdentityPolicyRequest): v2.DeleteEmailIdentityPolicyResponse throws Fault {
+		changeIdentity(caller, input.EmailIdentity, true, i => {
+			if (!i.policies.some(p => p[0] == input.PolicyName)) {
+				throw v2.notFoundException(`Policy ${input.PolicyName} does not exist.`)
+			}
+			i.policies = i.policies.filter(p => p[0] != input.PolicyName)
+		})
+		return new v2.DeleteEmailIdentityPolicyResponse()
 	}
 
 	listEmailIdentities(caller: Caller,
@@ -468,7 +754,8 @@ export class V2 {
 		if (from == null) {
 			throw v2.badRequestException("Missing required parameter: FromEmailAddress")
 		}
-		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!))
+		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!),
+			input.FromEmailAddressIdentityArn)
 		const simple = c.Simple
 		const t = c.Template
 		const r = new v2.SendEmailResponse()
@@ -478,12 +765,13 @@ export class V2 {
 		} else if (raw != null) {
 			s.RawData = raw!.Data
 		} else if (t != null) {
-			r.MessageId = storeRendered(caller, s, inline(caller, t!), t!.TemplateData ?? "{}", null)
+			r.MessageId = storeRendered(caller, s, inline(caller, t!), t!.TemplateData ?? "{}", null,
+				input.ConfigurationSetName, this.sns)
 			return r
 		} else {
 			throw v2.badRequestException("Missing required parameter: Content")
 		}
-		r.MessageId = store(caller, s)
+		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
 		return r
 	}
 
@@ -496,11 +784,13 @@ export class V2 {
 		const template = inline(caller, t!)
 		const r = new v2.SendBulkEmailResponse()
 		for (const e of input.BulkEmailEntries) {
-			const s = sent(caller, input.FromEmailAddress!, v2Recipients(e.Destination))
+			const s = sent(caller, input.FromEmailAddress!, v2Recipients(e.Destination),
+				input.FromEmailAddressIdentityArn)
 			const o = new v2.BulkEmailEntryResult()
 			o.Status = "SUCCESS"
 			o.MessageId = storeRendered(caller, s, template,
-				e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? "{}", t!.TemplateData)
+				e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? "{}", t!.TemplateData,
+				input.ConfigurationSetName, this.sns)
 			r.BulkEmailEntryResults.push(o)
 		}
 		return r
@@ -752,9 +1042,54 @@ function emailIdentity(caller: Caller, name: string, shown: string): Identity th
 	return i!
 }
 
+/// The identity of name, made over by f unless null, as v2 or the classic API answers one that does not exist.
+function changeIdentity(caller: Caller, name: string, ofV2: bool,
+	f: ((i: Identity) => void throws Fault) | null): Identity throws Fault {
+	caller.allow(identityArn(caller, name))
+	const t = new Tables(caller.regional()).identities
+	const i = t.get(name)
+	if (i == null) {
+		throw if (ofV2) v2.notFoundException(`Email identity <${name}> does not exist.`)
+			else new Fault(400, "InvalidParameterValue", `Identity <${name}> does not exist.`)
+	}
+	if (f != null) {
+		f!(i!)
+		save(t, name, i!)
+	}
+	return i!
+}
+
+/// Throws unless policy is a JSON object, as v2 or the classic API answers one that is not.
+function checkPolicy(policy: string, ofV2: bool) throws Fault {
+	if (dataOf(policy) == null) {
+		throw if (ofV2) v2.badRequestException("Policy is not valid JSON.")
+			else api.invalidPolicyException("Policy is not valid JSON.")
+	}
+}
+
+/// The address on the account's suppression list, as v2 answers one not there.
+function suppressed(caller: Caller, address: string): Suppressed throws Fault {
+	caller.allow(`arn:aws:ses:${caller.region}:${caller.account}:`)
+	const d = new Tables(caller.regional()).suppressed.get(addressOf(address))
+	if (d == null) {
+		throw v2.notFoundException(`Email address ${address} does not exist on your suppression list.`)
+	}
+	return d!
+}
+
+/// The SNS topic of i's notifications of kind, of v1's names, null if it has none.
+function topicOf(i: Identity, kind: string): string | null {
+	for (const [k, t] of i.topics) {
+		if (k == kind) {
+			return t
+		}
+	}
+	return null
+}
+
 function dkim(i: Identity): v2.DkimAttributes {
 	const d = new v2.DkimAttributes()
-	d.SigningEnabled = i.dkim.length > 0
+	d.SigningEnabled = i.dkim.length > 0 && !i.unsigned
 	d.Status = if (i.dkim.length > 0) "SUCCESS" else "NOT_STARTED"
 	d.Tokens = if (i.dkim.length > 0) i.dkim else null
 	d.SigningAttributesOrigin = "AWS_SES"
@@ -796,8 +1131,8 @@ function inline(caller: Caller, t: v2.Template): Template throws Fault {
 
 /// The id of s, a message of the template t with data, whose attributes fall back to those of fallback unless null:
 /// stored if t renders of them, else only answered, as AWS answers a message it then fails to render.
-function storeRendered(caller: Caller, s: Sent, t: Template, data: string,
-	fallback: string | null): string throws Fault {
+function storeRendered(caller: Caller, s: Sent, t: Template, data: string, fallback: string | null, set: string | null,
+	sns: snsApi.SNS | null): string throws Fault {
 	s.Template = if (t.name == "") null else t.name
 	s.TemplateData = data
 	const given = dataOf(data)
@@ -817,7 +1152,7 @@ function storeRendered(caller: Caller, s: Sent, t: Template, data: string,
 	} catch (f: Fault) {
 		return unstored(s)
 	}
-	return store(caller, s)
+	return store(caller, s, set, sns)
 }
 
 /// The id a message not sent is given.
@@ -1170,12 +1505,25 @@ function parts(text: string | null, html: string | null): Parts {
 }
 
 /// A message from source to recipients, once source's address or its domain is a verified identity, as AWS checks it.
-function sent(caller: Caller, source: string, recipients: Recipients | null): Sent throws Fault {
+/// A message from source to recipients, if the caller may send from source: by an identity of its account, of the
+/// address or its domain, or of another's that arn names, as the identity's sending authorization policies allow.
+function sent(caller: Caller, source: string, recipients: Recipients | null,
+	arn: string | null = null): Sent throws Fault {
 	const address = addressOf(source)
-	caller.allow(identityArn(caller, address))
-	const t = new Tables(caller.regional()).identities
 	const at = lastIndexOf(address, "@")
-	if (t.get(address) == null && (at < 0 || t.get(address.slice(at + 1, address.length)) == null)) {
+	const fields = split(arn ?? "", ":")
+	const slash = indexOf(arn ?? "", ":identity/")
+	const account = if (arn == null || fields.length < 6) caller.account else fields[4]
+	const tree = if (account == caller.account) caller.regional() else caller.existing(`${account}/${caller.region}`)
+	const t = if (tree == null) null else new Tables(tree!).identities
+	let i: Identity | null = null
+	if (t != null && arn != null && slash >= 0) {
+		i = t!.get(arn!.slice(slash + 10, arn!.length))
+	} else if (t != null) {
+		i = t!.get(address) ?? (if (at < 0) null else t!.get(address.slice(at + 1, address.length)))
+	}
+	caller.allow(arn ?? identityArn(caller, i?.name ?? address), if (i == null) null else policyOf(i!))
+	if (i == null) {
 		throw api.messageRejected("Email address is not verified. The following identities failed the check in region "
 			+ `${upper(caller.region)}: ${address}`)
 	}
@@ -1184,6 +1532,22 @@ function sent(caller: Caller, source: string, recipients: Recipients | null): Se
 	s.Source = source
 	s.Destination = recipients
 	return s
+}
+
+/// The sending authorization policies of i, as one, null if it has none.
+function policyOf(i: Identity): string | null {
+	const statements: string[] = []
+	for (const [_, p] of i.policies) {
+		try {
+			for (const [k, v] of json.decode[json.Keys](p).all) {
+				if (k == "Statement") {
+					const raw = trim(v)
+					statements.push(if (raw.length > 1 && raw.slice(0, 1) == "[") raw.slice(1, raw.length - 1) else raw)
+				}
+			}
+		} catch (e: ParseError) {}
+	}
+	return if (statements.length == 0) null else `{"Version": "2012-10-17", "Statement": [${statements.join(", ")}]}`
 }
 
 /// The address of a mailbox, written bare or as Name <address>.
@@ -1207,13 +1571,118 @@ function header(data: string, name: string): string | null {
 	return null
 }
 
-/// Stores s, of a new id as AWS shapes one, and answers that id.
-function store(caller: Caller, s: Sent): string throws Fault {
+/// Stores s, of a new id as AWS shapes one, publishes its notifications to sns of its identity's and its
+/// configuration set's, set or else its identity's, and answers that id.
+function store(caller: Caller, s: Sent, set: string | null = null, sns: snsApi.SNS | null = null): string throws Fault {
 	const t = now()
 	s.Id = id(t)
 	s.Timestamp = rfc3339(t - t % second).slice(0, 19)
 	save(new Tables(caller.regional()).sent, s.Id, s)
+	if (sns != null) {
+		notify(caller, s, set, sns!)
+	}
 	return s.Id
+}
+
+/// The outcomes of a message, by v1's name, event publishing's and the member of a notification that tells it.
+const outcomes: [string, string, string][] = [["Delivery", "DELIVERY", "delivery"], ["Bounce", "BOUNCE", "bounce"],
+	["Complaint", "COMPLAINT", "complaint"]]
+
+/// The outcome of a message to address: a bounce if the account suppresses it, else as the mailbox simulator's
+/// addresses ask, else delivered.
+function outcome(address: string, suppressing: string[]): string {
+	const a = addressOf(address)
+	if (suppressing.includes(a) || a == "bounce@simulator.amazonses.com"
+		|| a == "suppressionlist@simulator.amazonses.com") {
+		return "Bounce"
+	}
+	return if (a == "complaint@simulator.amazonses.com") "Complaint" else "Delivery"
+}
+
+/// Publishes the notifications of s, as AWS documents them: to its identity's topic of each outcome, and to each SNS
+/// event destination of its configuration set, set or else its identity's, that matches the send or an outcome.
+function notify(caller: Caller, s: Sent, set: string | null, sns: snsApi.SNS) throws Fault {
+	const db = new Tables(caller.regional())
+	const address = addressOf(s.Source)
+	const at = lastIndexOf(address, "@")
+	const i = db.identities.get(address)
+		?? (if (at < 0) null else db.identities.get(address.slice(at + 1, address.length)))
+	const named = set ?? i?.configurationSet
+	const c = if (named == null) null else db.sets.get(named!)
+	const to = s.Destination
+	const recipients: string[] = []
+	if (to != null) {
+		for (const r of [to!.ToAddresses ?? [], to!.CcAddresses ?? [], to!.BccAddresses ?? []]) {
+			for (const a of r) {
+				recipients.push(addressOf(a))
+			}
+		}
+	}
+	const at0 = `${s.Timestamp}.000Z`
+	const suppressing = recipients.filter(r => db.suppressed.get(r) != null)
+	const source = identityArn(caller, i?.name ?? address)
+	let mail = `{"timestamp":${json.quoted(at0)},"source":${json.quoted(s.Source)},"sourceArn":${json.quoted(source)},`
+		+ `"sendingAccountId":${json.quoted(caller.account)},"messageId":${json.quoted(s.Id)},`
+		+ `"destination":[${recipients.map(r => json.quoted(r)).join(",")}],"headersTruncated":false`
+	if (c != null) {
+		mail = `${mail},"tags":{"ses:configuration-set":[${json.quoted(c!.name)}]}`
+	}
+	mail = `${mail}}`
+	const destinations = if (c == null) [] else c!.destinations.filter(d => d.enabled && d.sns != null)
+	const setArnOf = if (c == null) "" else setArn(caller, c!.name)
+	for (const d of destinations) {
+		if (d.types.includes("SEND")) {
+			publish(caller, sns, d.sns!, setArnOf, `{"eventType":"Send","mail":${mail},"send":{}}`)
+		}
+	}
+	for (const [kind, event, member] of outcomes) {
+		const these = recipients.filter(r => outcome(r, suppressing) == kind)
+		if (these.length == 0) {
+			continue
+		}
+		const body = outcomeJson(kind, these, suppressing, at0, s.Id)
+		for (const d of destinations) {
+			if (d.types.includes(event)) {
+				publish(caller, sns, d.sns!, setArnOf, `{"eventType":"${kind}","mail":${mail},"${member}":${body}}`)
+			}
+		}
+		const topic = if (i == null) null else topicOf(i!, kind)
+		if (topic != null) {
+			publish(caller, sns, topic!, source, `{"notificationType":"${kind}","mail":${mail},"${member}":${body}}`)
+		}
+	}
+}
+
+/// The member of a notification of kind that tells the outcome of the message of id to recipients, at at.
+function outcomeJson(kind: string, recipients: string[], suppressing: string[], at: string, id: string): string {
+	const feedback = json.quoted(`${id}-feedback`)
+	if (kind == "Bounce") {
+		const bounced = recipients.map(r => `{"emailAddress":${json.quoted(r)},"action":"failed","status":"5.1.1",`
+			+ `"diagnosticCode":"smtp; 550 5.1.1 user unknown"}`)
+		const sub = if (recipients.every(r => suppressing.includes(r))) "OnAccountSuppressionList"
+			else if (recipients.every(r => r == "suppressionlist@simulator.amazonses.com")) "Suppressed"
+			else "General"
+		return `{"bounceType":"Permanent","bounceSubType":"${sub}","bouncedRecipients":[${bounced.join(",")}],`
+			+ `"timestamp":${json.quoted(at)},"feedbackId":${feedback},"reportingMTA":"dsn; amazonses.com"}`
+	}
+	if (kind == "Complaint") {
+		const complained = recipients.map(r => `{"emailAddress":${json.quoted(r)}}`)
+		return `{"complainedRecipients":[${complained.join(",")}],"timestamp":${json.quoted(at)},`
+			+ `"feedbackId":${feedback},"complaintFeedbackType":"abuse","arrivalDate":${json.quoted(at)}}`
+	}
+	return `{"timestamp":${json.quoted(at)},"processingTimeMillis":0,`
+		+ `"recipients":[${recipients.map(r => json.quoted(r)).join(",")}],`
+		+ `"smtpResponse":"250 2.6.0 Message received","reportingMTA":"amazonses.com"}`
+}
+
+/// Publishes message to topic as SES does, for the resource of source: a failure is not the sender's.
+function publish(caller: Caller, sns: snsApi.SNS, topic: string, source: string, message: string) throws Fault {
+	const input = new snsApi.PublishInput()
+	input.TopicArn = topic
+	input.Message = message
+	try {
+		sns.publish(caller.internal("ses.amazonaws.com", source, ["sns:Publish"]), input)
+	} catch (f: Fault) {}
 }
 
 /// A message id, beginning with the millisecond t is in.

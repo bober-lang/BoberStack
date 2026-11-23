@@ -2,14 +2,21 @@ import { request, sign, text } from "../../core/client"
 import { Gateway } from "../../core/gateway"
 import { stack } from "../../stack"
 import { Catalog } from "../iam/catalog"
+import * as snsApi from "../sns/api"
+import * as api from "./api"
+import { Handler, routed, V2 } from "./ses"
+import * as v2Api from "./v2/api"
+import { Fault } from "../../core/fault"
+import { Caller } from "../../core/service"
 import { indexOf } from "std/algo"
 import { Request, Response } from "std/http"
+import { replace } from "std/string"
 import { escape } from "std/url"
 
-/// The answer of g to action with params by the classic API, from the root of 000000000000.
-function call(g: Gateway, action: string, params: [string, string][] = []): Response {
+/// The answer of g to action with params by the classic API, from the root of the account of key, 000000000000 for test.
+function call(g: Gateway, action: string, params: [string, string][] = [], key = "test"): Response {
 	const query = params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
-	return g.handle(request("ses", "test", "test", `Action=${action}&Version=2010-12-01${query}`))
+	return g.handle(request("ses", key, "test", `Action=${action}&Version=2010-12-01${query}`))
 }
 
 /// The answer of g to a request of method to path by v2, of the JSON body.
@@ -168,4 +175,117 @@ test "tags and pages" {
 	const v2page = callV2(g, "GET", "/v2/email/identities?PageSize=1")
 	assert has(v2page, `"IdentityName":"a@example.com"`) && !has(v2page, "b@example.com") && has(v2page, "NextToken")
 	assert callV2(g, "GET", "/v2/email/identities?NextToken=garbage").status == 400
+}
+
+test "an identity's attributes, and its policies let another account send from it" {
+	const g = stack(new Catalog(0, 0))
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	assert call(g, "SetIdentityNotificationTopic",
+		[["Identity", "example.com"], ["NotificationType", "Bounce"],
+		["SnsTopic", "arn:aws:sns:us-east-1:000000000000:t"]]).status == 200
+	const n = call(g, "GetIdentityNotificationAttributes", [["Identities.member.1", "example.com"]])
+	assert text(n, "BounceTopic") == "arn:aws:sns:us-east-1:000000000000:t" && text(n, "ForwardingEnabled") == "true"
+	callV2(g, "PUT", "/v2/email/identities/example.com/mail-from", `{"MailFromDomain": "m.example.com"}`)
+	const m = call(g, "GetIdentityMailFromDomainAttributes", [["Identities.member.1", "example.com"]])
+	assert text(m, "MailFromDomain") == "m.example.com"
+	assert text(call(g, "SetIdentityDkimEnabled", [["Identity", "nope.example"], ["DkimEnabled", "true"]]), "Code")
+		== "InvalidParameterValue"
+	const arn = "arn:aws:ses:us-east-1:000000000000:identity/example.com"
+	const send: [string, string][] = [["Source", "a@example.com"], ["SourceArn", arn],
+		["Destination.ToAddresses.member.1", "b@example.net"], ["Message.Subject.Data", "Hi"],
+		["Message.Body.Text.Data", "Hello"]]
+	assert call(g, "SendEmail", send, "111111111111").status == 403
+	const policy = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "111111111111"}, `
+		+ `"Action": "ses:Send*", "Resource": "${arn}"}]}`
+	assert callV2(g, "POST", "/v2/email/identities/example.com/policies/p", `{"Policy": ${quoted(policy)}}`).status
+		== 200
+	assert text(call(g, "ListIdentityPolicies", [["Identity", "example.com"]]), "member") == "p"
+	assert call(g, "SendEmail", send, "111111111111").status == 200
+	assert call(g, "DeleteIdentityPolicy", [["Identity", "example.com"], ["PolicyName", "p"]]).status == 200
+	assert call(g, "SendEmail", send, "111111111111").status == 403
+}
+
+/// s as a JSON string.
+function quoted(s: string): string { return `"${replace(s, "\"", "\\\"")}"` }
+
+/// SNS as SES sees it: what it was asked to publish, and by whom.
+class Topics {
+	...snsApi.Unimplemented
+
+	published: snsApi.PublishInput[] = []
+	callers: Caller[] = []
+
+	publish(caller: Caller, input: snsApi.PublishInput): snsApi.PublishResponse throws Fault {
+		this.published.push(input)
+		this.callers.push(caller)
+		return new snsApi.PublishResponse()
+	}
+}
+
+/// SES alone, publishing to topics.
+function publishing(topics: Topics): Gateway {
+	const v = new Handler()
+	const w = new V2()
+	v.sns = topics
+	w.sns = topics
+	const g = new Gateway()
+	g.services.set(api.signingName, (caller, req) => {
+		return if (indexOf(req.url.path, "/v2/") == 0) v2Api.handle(w, caller, routed(req))
+			else api.handle(v, caller, req)
+	})
+	return g
+}
+
+test "an identity's topics and a configuration set's SNS destinations are notified of each message" {
+	const topics = new Topics()
+	const g = publishing(topics)
+	const topic = "arn:aws:sns:us-east-1:000000000000:t"
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	call(g, "SetIdentityNotificationTopic",
+		[["Identity", "example.com"], ["NotificationType", "Bounce"], ["SnsTopic", topic]])
+	call(g, "SetIdentityNotificationTopic",
+		[["Identity", "example.com"], ["NotificationType", "Delivery"], ["SnsTopic", topic]])
+	call(g, "CreateConfigurationSet", [["ConfigurationSet.Name", "c"]])
+	call(g, "CreateConfigurationSetEventDestination",
+		[["ConfigurationSetName", "c"], ["EventDestination.Name", "d"], ["EventDestination.Enabled", "true"],
+		["EventDestination.MatchingEventTypes.member.1", "send"],
+		["EventDestination.MatchingEventTypes.member.2", "bounce"],
+		["EventDestination.SNSDestination.TopicARN", topic]])
+	assert call(g, "SendEmail",
+		[["Source", "a@example.com"], ["ConfigurationSetName", "c"],
+		["Destination.ToAddresses.member.1", "success@simulator.amazonses.com"],
+		["Destination.ToAddresses.member.2", "bounce@simulator.amazonses.com"], ["Message.Subject.Data", "Hi"],
+		["Message.Body.Text.Data", "Hello"]]).status == 200
+	const ms = topics.published.map(p => p.Message)
+	assert ms.length == 4
+	assert indexOf(ms[0], `{"eventType":"Send","mail":{`) == 0
+	assert indexOf(ms[1], `{"notificationType":"Delivery",`) == 0
+		&& indexOf(ms[1], `"recipients":["success@simulator.amazonses.com"]`) > 0
+	assert indexOf(ms[2], `{"eventType":"Bounce",`) == 0 && indexOf(ms[2], `"bounceType":"Permanent"`) > 0
+	assert indexOf(ms[3], `{"notificationType":"Bounce",`) == 0
+		&& indexOf(ms[3], `"tags":{"ses:configuration-set":["c"]}`) > 0
+	assert topics.callers[0].source == "arn:aws:ses:us-east-1:000000000000:configuration-set/c"
+	assert topics.callers[1].source == "arn:aws:ses:us-east-1:000000000000:identity/example.com"
+}
+
+test "a send to a suppressed address is stored, and bounces" {
+	const topics = new Topics()
+	const g = publishing(topics)
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	call(g, "SetIdentityNotificationTopic",
+		[["Identity", "example.com"], ["NotificationType", "Bounce"],
+		["SnsTopic", "arn:aws:sns:us-east-1:000000000000:t"]])
+	assert callV2(g, "PUT", "/v2/email/suppression/addresses",
+		`{"EmailAddress": "b@x.net", "Reason": "COMPLAINT"}`).status == 200
+	assert has(callV2(g, "GET", "/v2/email/suppression/addresses/b@x.net"), `"Reason":"COMPLAINT"`)
+	assert has(callV2(g, "GET", "/v2/email/suppression/addresses?Reason=COMPLAINT"), `"EmailAddress":"b@x.net"`)
+	assert !has(callV2(g, "GET", "/v2/email/suppression/addresses?Reason=BOUNCE"), "b@x.net")
+	const sent = call(g, "SendEmail",
+		[["Source", "a@example.com"], ["Destination.ToAddresses.member.1", "b@x.net"], ["Message.Subject.Data", "Hi"],
+		["Message.Body.Text.Data", "Hello"]])
+	assert sent.status == 200
+	assert topics.published.length == 1
+		&& indexOf(topics.published[0].Message, `"bounceSubType":"OnAccountSuppressionList"`) > 0
+	assert callV2(g, "DELETE", "/v2/email/suppression/addresses/b@x.net").status == 200
+	assert callV2(g, "GET", "/v2/email/suppression/addresses/b@x.net").status == 404
 }
