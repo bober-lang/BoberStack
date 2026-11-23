@@ -1,0 +1,471 @@
+//! What the REST protocols, restXml and restJson1, share: an operation is a method and a path of labels, and its
+//! input's and output's members are bound, under the tags below, to the path, the query, headers or the status, or else
+//! to the body, which each protocol writes its own way.
+
+import { endsWith, indexOf, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { parseFloat } from "std/float"
+import { Body, Request, Response } from "std/http"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { Decodable, has, tag } from "std/types"
+import { unescape } from "std/url"
+import { Fault } from "../fault"
+import { check, Violations } from "./model"
+import { choice, instant, stamp } from "./query"
+
+/// Tags a member bound to the path's label of its name.
+export class Label {}
+/// Tags a member bound to the query parameter K.
+export class Query[K extends string] {}
+/// Tags a map member bound to every query parameter.
+export class Params {}
+/// Tags a member bound to the header K.
+export class Header[K extends string] {}
+/// Tags a map member bound to the headers whose names start with P, by the rest of their names, lowered.
+export class Prefix[P extends string] {}
+/// Tags the member that is the body: a string or blob as it is, a structure or union as the document of its protocol.
+export class Payload {}
+/// Tags an i32 member of an output bound to the status.
+export class Status {}
+/// Tags an i64 member, or its items, as a timestamp in ns since 1970, on the wire in the format F: date-time,
+/// epoch-seconds or http-date, or if "" that of where it is bound: http-date in a header, date-time in the path or
+/// query, and in the body that of its protocol.
+export class Timestamp[F extends string = ""] {}
+/// Tags a string member, or its items, as bytes: base64 on the wire, but as they are in a payload.
+export class Blob {}
+
+/// Where a request is the operation named operation: of method, the path pattern path, of labels {L} and a last
+/// greedy one {L+}, and the query literals, each k or k=v; and of the query parameters and headers that its required
+/// members are bound to, which tell it from another of the same path. An x-id literal, which clients may leave out,
+/// is required only of a request that has an x-id, which then decides alone.
+export class Route {
+	operation: string
+	method: string
+	path: string
+	literals: string[]
+	queries: string[]
+	headers: string[]
+
+	constructor(operation: string, method: string, path: string, literals: string[] = [], queries: string[] = [],
+		headers: string[] = []) {
+		this.operation = operation
+		this.method = method
+		this.path = path
+		this.literals = literals
+		this.queries = queries
+		this.headers = headers
+	}
+
+	/// The labels of req's path if req is of this route, else null.
+	match(req: Request): [string, string][] | null {
+		if (req.method != this.method) {
+			return null
+		}
+		const q = req.url.query
+		const id = q.get("x-id")
+		for (const l of this.literals) {
+			const [k,
+				v] = if (indexOf(l, "=") < 0) [l, ""] else [split(l, "=")[0], l.slice(indexOf(l, "=") + 1, l.length)]
+			if (k == "x-id" && (id == null || id == v)) {
+				continue
+			}
+			if (!q.has(k) || v != "" && q.get(k) != v) {
+				return null
+			}
+		}
+		if (id == null && (this.queries.some(k => !q.has(k)) || this.headers.some(h => !req.headers.has(h)))) {
+			return null
+		}
+		return labels(this.path, req.url.path)
+	}
+}
+
+/// The operation of the first of routes that req is of, "" if none, and the labels of its path.
+export function routed(req: Request, routes: Route[]): [string, [string, string][]] {
+	for (const r of routes) {
+		const found = r.match(req)
+		if (found != null) {
+			return [r.operation, found!]
+		}
+	}
+	return ["", []]
+}
+
+/// The labels of the path p, by the pattern's, each unescaped; null if p is not of the pattern. A path may end in a /
+/// that the pattern does not.
+export function labels(pattern: string, p: string): [string, string][] | null {
+	const ps = split(pattern.slice(1, pattern.length), "/")
+	const xs = split(p.slice(1, p.length), "/")
+	const out: [string, string][] = []
+	let j = 0
+	for (let i = 0; i < ps.length; i++) {
+		const s = ps[i]
+		if (startsWith(s, "{") && endsWith(s, "+}")) {
+			const end = xs.length - (ps.length - i - 1)
+			const v = if (end <= j) "" else xs.slice(j, end).join("/")
+			if (v == "") {
+				return null
+			}
+			out.push([s.slice(1, s.length - 2), unescape(v, "path")])
+			j = end
+		} else if (startsWith(s, "{")) {
+			if (j >= xs.length || xs[j] == "") {
+				return null
+			}
+			out.push([s.slice(1, s.length - 1), unescape(xs[j], "path")])
+			j++
+		} else {
+			if (j >= xs.length || xs[j] != s) {
+				return null
+			}
+			j++
+		}
+	}
+	return if (j == xs.length || j == xs.length - 1 && xs[j] == "") out else null
+}
+
+/// res, without its body if it answers req, a HEAD.
+export function headless(req: Request, res: Response): Response {
+	if (req.method == "HEAD") {
+		res.body = new Body()
+	}
+	return res
+}
+
+/// Whether a member of tags is bound to the path, the query or headers.
+export function bound(tags: Type[]): bool {
+	return has(tags, Label) || has(tags, Query) || has(tags, Params) || has(tags, Header) || has(tags, Prefix)
+}
+
+/// Whether req holds the member named n, of tags, bound to the labels of its path, its query or headers.
+export function present(req: Request, labels: [string, string][], n: string, tags: Type[]): bool {
+	if (has(tags, Label)) {
+		return labels.some(l => l[0] == n)
+	} else if (has(tags, Query)) {
+		return req.url.query.all(tag(tags, Query, "")).length > 0
+	} else if (has(tags, Params)) {
+		return req.url.query.entries.length > 0
+	} else if (has(tags, Header)) {
+		return req.headers.has(tag(tags, Header, ""))
+	}
+	const p = lower(tag(tags, Prefix, ""))
+	return req.headers.entries.some(e => startsWith(lower(e[0]), p))
+}
+
+/// The T of the member named n, of tags, at the member path at, that req holds, as present finds it, bound to the
+/// labels of its path, its query or headers.
+export function http[T extends Decodable](req: Request, labels: [string, string][], n: string, at: string, tags: Type[],
+	v: Violations): T throws Fault {
+	if (has(tags, Label)) {
+		return texts[T]([labels.find(l => l[0] == n)![1]], at, tags, "date-time", v)
+	} else if (has(tags, Query)) {
+		return texts[T](req.url.query.all(tag(tags, Query, "")), at, tags, "date-time", v)
+	} else if (has(tags, Params)) {
+		return pairs[T](req.url.query.entries, at, tags, v)
+	} else if (has(tags, Header)) {
+		return texts[T](items[T](req.headers.get(tag(tags, Header, ""))!, tags), at, tags, "http-date", v)
+	}
+	const p = lower(tag(tags, Prefix, ""))
+	const all: [string, string][] = []
+	for (const [k, x] of req.headers.entries) {
+		if (startsWith(lower(k), p)) {
+			all.push([lower(k).slice(p.length, k.length), x])
+		}
+	}
+	return pairs[T](all, at, tags, v)
+}
+
+/// The T, a map of strings or of lists of strings, of the pairs all, of a member tagged tags.
+function pairs[T extends Decodable](all: [string, string][], at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return pairs[M](all, at, tags, v)
+				}
+			}
+			throw v.fault(null, at, `Member must be a ${T.name}`)
+		case "array":
+			const xs: T = []
+			const keys: string[] = []
+			for (const [k, _] of all) {
+				if (!keys.includes(k)) {
+					keys.push(k)
+				}
+			}
+			if (T.elem.kind == "tuple") {
+				for (const k of keys) {
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						e[f.name] = if (f.name == "0") texts[f.type]([k], at, [], "", v)
+							else texts[f.type](all.filter(p => p[0] == k).map(p => p[1]), `${at}.${k}`, tags, "", v)
+					}
+					xs.push(e)
+				}
+			}
+			check(xs, at, tags, v)
+			return xs
+		default: throw v.fault(null, at, `Member must be a map, not a ${T.name}`)
+	}
+}
+
+/// The values of the header h, of a member of type T tagged tags: of a list, its items, each of which may be quoted;
+/// of an http-date, which holds a comma, the halves of each pair of them.
+function items[T](h: string, tags: Type[]): string[] {
+	if (!isList[T]()) {
+		return [h]
+	}
+	const out: string[] = []
+	let quoted = false
+	let at = 0
+	let s = ""
+	for (let i = 0; i <= h.length; i++) {
+		const c = if (i < h.length) h.slice(i, i + 1) else ","
+		if (quoted && c == "\\" && i + 1 < h.length) {
+			s += h.slice(i + 1, i + 2)
+			i++
+		} else if (c == "\"" && trim(s) == "" && !quoted) {
+			quoted = true
+			s = ""
+		} else if (c == "\"" && quoted) {
+			quoted = false
+			at = 1
+		} else if (c == "," && !quoted) {
+			out.push(if (at == 1) s else trim(s))
+			s = ""
+			at = 0
+		} else if (at == 0) {
+			s += c
+		}
+	}
+	if (tag(tags, Timestamp, "") == "" || tag(tags, Timestamp, "") == "http-date") {
+		if (dates[T]()) {
+			const joined: string[] = []
+			for (let i = 0; i + 1 < out.length; i += 2) {
+				joined.push(`${out[i]}, ${out[i + 1]}`)
+			}
+			return joined
+		}
+	}
+	return out
+}
+
+/// Whether T, or what it is of null, is a list.
+function isList[T](): bool {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind == "array") {
+					return true
+				}
+			}
+			return false
+		case "array": return true
+		default: return false
+	}
+}
+
+/// Whether T, or what it is of null, is a list of i64s, timestamps if so tagged.
+function dates[T](): bool {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind == "array" && M.elem == i64) {
+					return true
+				}
+			}
+			return false
+		case "array": return T.elem == i64
+		default: return false
+	}
+}
+
+/// The T of the texts xs, one but of a list, of a member tagged tags, a timestamp of the format at its location
+/// otherwise unless tagged with one.
+export function texts[T extends Decodable](xs: string[], at: string, tags: Type[], otherwise: string,
+	v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "array":
+			const out: T = []
+			for (let i = 0; i < xs.length; i++) {
+				out.push(texts[T.elem]([xs[i]], `${at}.${i + 1}.member`, tags, otherwise, v))
+			}
+			check(out, at, tags, v)
+			return out
+		case "union":
+			if (enumerated(T)) {
+				return choice[T](xs[0], at, v)
+			}
+			for (const M of T.members) {
+				if (M.kind != "null") {
+					return texts[M](xs, at, tags, otherwise, v)
+				}
+			}
+			throw v.fault(xs[0], at, `Member must be a ${T.name}`)
+		case "literal": return choice[T](xs[0], at, v)
+		case "string":
+			if (!has(tags, Blob)) {
+				check(xs[0], at, tags, v)
+				return xs[0]
+			}
+			let b = ""
+			try {
+				b = base64.decode(xs[0])
+			} catch (e: ParseError) {
+				throw v.fault(xs[0], at, "Member must be base64")
+			}
+			check(b, at, tags, v, true)
+			return b
+		case "bool":
+			const s = trim(xs[0])
+			if (s == "true" || s == "false") {
+				return s == "true"
+			}
+			throw v.fault(s, at, "Member must be true or false")
+		case "int":
+			const s = trim(xs[0])
+			let n: T = 0
+			try {
+				if (T == i64 && has(tags, Timestamp)) {
+					const format = tag(tags, Timestamp, "")
+					return instant(s, if (format == "") otherwise else format)
+				}
+				n = parseInt[T](s)
+			} catch (e: ParseError) {
+				throw v.fault(s, at, `Member must be ${if (has(tags, Timestamp)) "a timestamp" else "an integer"}`)
+			}
+			check(n, at, tags, v)
+			return n
+		case "float":
+			const s = trim(xs[0])
+			const zero: T = 0.0
+			switch (s) {
+				case "NaN": return zero / zero
+				case "Infinity": return 1.0 / zero
+				case "-Infinity": return -1.0 / zero
+			}
+			let x: T = 0.0
+			try {
+				x = parseFloat[T](s)
+			} catch (e: ParseError) {
+				throw v.fault(s, at, "Member must be a number")
+			}
+			check(x, at, tags, v)
+			return x
+		default: throw v.fault(xs[0], at, `Member must be a ${T.name}`)
+	}
+}
+
+/// Whether t is an enum, of null or not.
+export function enumerated(t: Type): bool { return t.members.every(M => M.kind == "literal" || M.kind == "null") }
+
+/// Whether t takes null.
+export function nullable(t: Type): bool {
+	return t.kind == "null" || t.kind == "union" && t.members.some(M => M.kind == "null")
+}
+
+/// Whether a member of tags of an output is bound to the status or headers.
+export function answers(tags: Type[]): bool { return has(tags, Status) || has(tags, Header) || has(tags, Prefix) }
+
+/// Sets on res the status or headers that x, of a member tagged tags, as answers finds it, is bound to.
+export function respond[T](res: Response, x: T, tags: Type[]) {
+	if (has(tags, Status)) {
+		res.status = status(x, res.status)
+	} else if (has(tags, Header)) {
+		headers(res, tag(tags, Header, ""), x, tags, false)
+	} else {
+		headers(res, tag(tags, Prefix, ""), x, tags, true)
+	}
+}
+
+/// The status x is, if set, else otherwise.
+function status[T](x: T, otherwise: i32): i32 {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return status(x, otherwise)
+				}
+			}
+			return otherwise
+		case "int": return x as i32
+		default: return otherwise
+	}
+}
+
+/// Sets on res the header k of x, of a member tagged tags, if set; of a map, if prefixed, the header of each entry,
+/// k its name's prefix.
+function headers[T](res: Response, k: string, x: T, tags: Type[], prefixed: bool): void {
+	switch (T.kind) {
+		case "null": return
+		case "union": for (const M of T.members) {
+			if (M.kind != "null" && x instanceof M) {
+				headers(res, k, x, tags, prefixed)
+			}
+		}
+		case "array": if (prefixed) {
+			for (const e of x) {
+				headers(res, k, e, tags, true)
+			}
+		} else {
+			res.headers.set(k, header(x, tags))
+		}
+		case "tuple":
+			// an entry, of the rest of the header's name and its value
+			let name = k
+			for (const f of T.fields) {
+				if (f.name == "0") {
+					name = `${k}${x[f.name]}`
+				} else {
+					headers(res, name, x[f.name], tags, false)
+				}
+			}
+		default: res.headers.set(k, header(x, tags))
+	}
+}
+
+/// The header's value of x, of a member tagged tags: of a list, its items between commas, quoted where they hold a
+/// comma or quote.
+export function header[T](x: T, tags: Type[]): string {
+	switch (T.kind) {
+		case "union":
+			for (const M of T.members) {
+				if (M.kind != "null" && x instanceof M) {
+					return header(x, tags)
+				}
+			}
+			return ""
+		case "array":
+			const out: string[] = []
+			for (const i of x) {
+				const s = header(i, tags)
+				out.push(if (T.elem == string && (indexOf(s, ",") >= 0 || indexOf(s, "\"") >= 0)) `"${replace(replace(s, "\\", "\\\\"), "\"", "\\\"")}"`
+					else s)
+			}
+			return out.join(", ")
+		default: return format(x, tags, "http-date")
+	}
+}
+
+/// The text of the scalar v of a member tagged tags, a timestamp of the format otherwise unless tagged with one; a
+/// date-time to the millisecond where otherwise is "milliseconds".
+export function format[T](v: T, tags: Type[], otherwise: string = "date-time"): string {
+	if (T.kind == "union") {
+		for (const M of T.members) {
+			if (M.kind != "null" && v instanceof M) {
+				return format(v, tags, otherwise)
+			}
+		}
+		return ""
+	}
+	if (T == i64 && has(tags, Timestamp)) {
+		const f = tag(tags, Timestamp, "")
+		const g = if (f == "" || f == "date-time" && otherwise == "milliseconds") otherwise else f
+		const s = stamp(v, g)
+		return if (g == "milliseconds" && indexOf(s, ".") < 0) `${s.slice(0, s.length - 1)}.000Z` else s
+	}
+	if (T == string && has(tags, Blob)) {
+		return base64.encode(v)
+	}
+	return `${v}`
+}

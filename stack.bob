@@ -1,6 +1,7 @@
 //! BoberStack whole: every service behind one gateway, as main serves it and tests of several services build it.
 
 import { Gateway } from "./core/gateway"
+import * as restjson from "./core/protocol/restjson"
 import * as restxml from "./core/protocol/restxml"
 import * as dynamodbApi from "./services/dynamodb/api"
 import * as dynamodb from "./services/dynamodb/dynamodb"
@@ -16,6 +17,8 @@ import * as kinesisApi from "./services/kinesis/api"
 import * as kinesis from "./services/kinesis/kinesis"
 import * as kmsApi from "./services/kms/api"
 import * as kms from "./services/kms/kms"
+import * as lambdaApi from "./services/lambda/api"
+import * as lambda from "./services/lambda/lambda"
 import * as logsApi from "./services/logs/api"
 import * as logs from "./services/logs/logs"
 import * as s3Api from "./services/s3/api"
@@ -67,6 +70,9 @@ export function stack(catalog: Catalog): Gateway {
 	g.services.set(logsApi.signingName, (caller, req) => logsApi.handle(l, caller, req))
 	g.services.set(kmsApi.signingName, (caller, req) => kmsApi.handle(k, caller, req))
 	g.services.set(kinesisApi.signingName, (caller, req) => kinesisApi.handle(r, caller, req))
+	const f = new lambda.Handler()
+	g.services.set(lambdaApi.signingName, (caller, req) => lambdaApi.handle(f, caller, req))
+	g.faults.set(lambdaApi.signingName, (why, id) => restjson.error(lambdaApi.service, why, id))
 	g.services.set(s3Api.signingName, (caller, req) => s3.serve(o, caller, req))
 	g.faults.set(s3Api.signingName, (f, id) => restxml.error(s3Api.service, f, id))
 	g.anonymous = s3Api.signingName

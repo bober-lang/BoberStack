@@ -1,8 +1,9 @@
-//! Generates the API of an awsQuery or awsJson service from its Smithy model, in the JSON AST: a class for each
-//! structure its operations take or give, a type for each enum, for each union a class U$M of one field M for each
-//! member M and their union U, a function making each error's Fault, an interface of the operations' handlers, a class
-//! Unimplemented answering each NotImplemented, for a service to mix in, and a function handle serving the service's
-//! requests by a handler with the codec of ../../core/protocol/query or json. It fails on what that cannot express.
+//! Generates the API of an awsQuery, awsJson, restXml or restJson1 service from its Smithy model, in the JSON AST: a
+//! class for each structure its operations take or give, a type for each enum, for each union a class U$M of one field
+//! M for each member M and their union U, a function making each error's Fault, an interface of the operations'
+//! handlers, a class Unimplemented answering each NotImplemented, for a service to mix in, and a function handle
+//! serving the service's requests by a handler with its codec of ../../core/protocol. It fails on what that cannot
+//! express, but for a REST operation, which it leaves not implemented and lists.
 //! Given a list of the model's protocol test vectors to skip, it generates a test of each of the others beside the API,
 //! as OUT.test.bob: of a request by a class Got noting the input, of a response by a class, named by the vector's id,
 //! answering as the vector does.
@@ -33,6 +34,14 @@ class Shape {
 	output: Ref | null
 	operations: Ref[] = []
 	resources: Ref[] = []
+	/// A resource's lifecycle operations, besides its operations.
+	create: Ref | null
+	put: Ref | null
+	read: Ref | null
+	update: Ref | null
+	delete: Ref | null
+	list: Ref | null
+	collectionOperations: Ref[] = []
 	errors: Ref[] = []
 	traits = new Traits()
 	rest: json.Unknown[] @json.Rest = []
@@ -68,6 +77,8 @@ class Traits {
 	awsJson11: Mark | null @json.Name["aws.protocols#awsJson1_1"]
 	queryCompatible: Mark | null @json.Name["aws.protocols#awsQueryCompatible"]
 	restXml: RestXml | null @json.Name["aws.protocols#restXml"]
+	restJson1: Mark | null @json.Name["aws.protocols#restJson1"]
+	jsonName: string | null @json.Name["smithy.api#jsonName"]
 	http: Http | null @json.Name["smithy.api#http"]
 	httpLabel: Mark | null @json.Name["smithy.api#httpLabel"]
 	httpQuery: string | null @json.Name["smithy.api#httpQuery"]
@@ -192,7 +203,8 @@ const validations: [string, string, bool, bool][] = [["com.amazonaws.iam#AWSIden
 	["com.amazonaws.eventbridge#AWSEvents", "ValidationException", true, true],
 	["com.amazonaws.cloudwatchlogs#Logs_20140328", "InvalidParameterException", false, true],
 	["com.amazonaws.kms#TrentService", "ValidationException", true, true],
-	["com.amazonaws.kinesis#Kinesis_20131202", "ValidationException", true, true]]
+	["com.amazonaws.kinesis#Kinesis_20131202", "ValidationException", true, true],
+	["com.amazonaws.lambda#AWSGirApiService", "ValidationException", true, true]]
 
 /// How the services below answer a request IAM denies, as AWS did on 2026-11-23: by their shape ids, the status and
 /// code of the fault, and its wording, of core/service's Wording; any other by AccessDenied, of 403, reasoned.
@@ -207,7 +219,8 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 	["com.amazonaws.ssm#AmazonSSM", 400, "AccessDeniedException", "reasoned"],
 	["com.amazonaws.cloudwatchlogs#Logs_20140328", 400, "AccessDeniedException", "reasoned"],
 	["com.amazonaws.kms#TrentService", 400, "AccessDeniedException", "linked"],
-	["com.amazonaws.kinesis#Kinesis_20131202", 400, "AccessDeniedException", "linked"]]
+	["com.amazonaws.kinesis#Kinesis_20131202", 400, "AccessDeniedException", "linked"],
+	["com.amazonaws.lambda#AWSGirApiService", 403, "AccessDeniedException", "reasoned"]]
 
 /// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
 /// with an error of the service's own.
@@ -266,7 +279,8 @@ const unconstrained: [string, string[]][] = [["com.amazonaws.cloudwatchlogs#Logs
 
 /// The member holding the message of an access denied of the services below, where AWS names it otherwise than their
 /// models, as on 2026-11-23: by their shape ids.
-const deniedMessages: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328", "Message"]]
+const deniedMessages: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328", "Message"],
+	["com.amazonaws.lambda#AWSGirApiService", "Message"]]
 
 class Generator {
 	model: Model
@@ -294,12 +308,16 @@ class Generator {
 	/// express.
 	payload = false
 	unexpressible: string[] = []
+	/// Whether the member being typed is bound outside a restJson1 body, and so takes the tags of core/protocol/rest.
+	bound = false
 
 	/// The names declared, the imported ones too, to fail on a second of one.
 	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
-		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes"]
+		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes", "rest",
+		"restjson"]
 
-	/// The service's protocol, awsQuery, awsJson1_0 or awsJson1_1, once api has begun; and its shape id, operations and
+	/// The service's protocol, awsQuery, awsJson1_0, awsJson1_1, restXml or restJson1, once api has begun; and its
+	/// shape id, operations and
 	/// version, once api has run.
 	protocol = ""
 	id = ""
@@ -319,11 +337,13 @@ class Generator {
 			else if (t.awsJson10 != null) "awsJson1_0"
 			else if (t.awsJson11 != null) "awsJson1_1"
 			else if (t.restXml != null) "restXml"
+			else if (t.restJson1 != null) "restJson1"
 			else ""
 		const query = this.protocol == "awsQuery"
-		const rest = this.protocol == "restXml"
-		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null || s.resources.length > 0) {
-			const why = "not an awsQuery service of an XML namespace, an awsJson or restXml one, of sigv4, or has resources"
+		const rest = this.rest()
+		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null
+			|| !rest && s.resources.length > 0) {
+			const why = "not an awsQuery service of an XML namespace, an awsJson or REST one, of sigv4, or has resources"
 			throw new ModelError(`${services[0][0]}: ${why}`)
 		}
 		this.amend(services[0][0])
@@ -337,7 +357,7 @@ class Generator {
 		this.interleaved = if (merged == null) [] else merged[1]
 		const fixed = statuses.find(c => c[0] == services[0][0])
 		const answered = if (fixed == null) [] else fixed[1]
-		const ops = s.operations.map(r => r.target)
+		const ops = [...s.operations.map(r => r.target), ...this.operationsOf(s.resources)]
 		sortNames(ops)
 		const errors = s.errors.map(r => r.target)
 		const signatures: Decl[] = []
@@ -428,24 +448,36 @@ class Generator {
 		if (query) {
 			head.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
 			head.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
-		} else if (rest) {
+		} else if (this.protocol == "restXml") {
 			const ns = json.quoted(t.xmlNamespace?.uri ?? "")
 			const start = `export const service = new restxml.Service(${json.quoted(services[0][0])}, ${ns}`
 			const ms = milliseconds.includes(services[0][0])
 			const end = if (validated) `, ${ms}, validation` else if (ms) ", true" else ""
 			head.push(new Decl("const", wrap(`${start}, ${!t.restXml!.noErrorWrapping}${end})`)))
+		}
+		const renamed = deniedMessages.find(d => d[0] == services[0][0])
+		const denier = if (denial == null || renamed == null) "" else denial[2]
+		const held = if (renamed == null) "" else renamed[1]
+		const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id, denier, held)})`)
+		const besides = undeclared.find(u => u[0] == services[0][0])
+		for (const [code, typed] of if (besides == null) [] else besides[1]) {
+			shapes.push(`new json.ErrorShape(${json.quoted(typed)}, "message", ${json.quoted(code)})`)
+		}
+		if (denier != "" && !unique(errors).some(id => name(id) == denier)) {
+			// an access denied the model does not declare
+			const typed = `${split(services[0][0], "#")[0]}#${denier}`
+			shapes.push(`new json.ErrorShape(${json.quoted(typed)}, ${json.quoted(held)}, "")`)
+		}
+		if (this.protocol == "restJson1") {
+			const start = `export const service = new restjson.Service(${json.quoted(services[0][0])}`
+			const end = if (validated) ", validation" else ""
+			head.push(new Decl("const", wrap(`${start}, [${shapes.join(", ")}]${end})`)))
+		}
+		if (rest) {
 			sortBy(routes, (a, b) => a[0] > b[0] || a[0] == b[0] && a[1] < b[1])
 			const doc = "/// The operations' routes, the most specific first."
 			head.push(new Decl("const", [doc, ...wrap(`export const routes = [${routes.map(r => r[1]).join(", ")}]`)]))
-		} else {
-			const renamed = deniedMessages.find(d => d[0] == services[0][0])
-			const denier = if (denial == null || renamed == null) "" else denial[2]
-			const held = if (renamed == null) "" else renamed[1]
-			const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id, denier, held)})`)
-			const besides = undeclared.find(u => u[0] == services[0][0])
-			for (const [code, typed] of if (besides == null) [] else besides[1]) {
-				shapes.push(`new json.ErrorShape(${json.quoted(typed)}, "message", ${json.quoted(code)})`)
-			}
+		} else if (!query) {
 			const version = json.quoted(if (this.protocol == "awsJson1_0") "1.0" else "1.1")
 			const start = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
 			const end = if (validated) ", validation" else ""
@@ -463,6 +495,23 @@ class Generator {
 			else `${denial[1]}, ${json.quoted(denial[2])}, ${json.quoted(denial[3])}`
 		decls.push(new Decl("function", handle(handlers, cases, codec, validated, denied)))
 		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
+	}
+
+	/// The operations of the resources rs and of theirs, each of a REST service, which binds them to routes as it does
+	/// its own.
+	operationsOf(rs: Ref[]): string[] throws ModelError {
+		const out: string[] = []
+		for (const r of rs) {
+			const s = this.shape(r.target)
+			for (const o of [s.create, s.put, s.read, s.update, s.delete, s.list]) {
+				if (o != null) {
+					out.push(o.target)
+				}
+			}
+			out.append([...s.operations, ...s.collectionOperations].map(o => o.target))
+			out.append(this.operationsOf(s.resources))
+		}
+		return out
 	}
 
 	/// Adds to the model what the service id answers that it lacks, as amendments gives it.
@@ -485,7 +534,7 @@ class Generator {
 		}
 	}
 
-	/// The Route of the operation id, of restXml, and how specific it is: by the literals and required members of the
+	/// The Route of the operation id, of a REST protocol, and how specific it is: by the literals and required members of the
 	/// query and headers it requires, then by its path's literal segments.
 	route(id: string): [i32, string] throws ModelError {
 		const op = this.shape(id)
@@ -513,10 +562,10 @@ class Generator {
 		}
 		const required = literals.filter(l => !startsWith(l, "x-id=")).length + queries.length + headers.length
 		const fixed = split(parts[0], "/").filter(s => s != "" && !startsWith(s, "{")).length
-		return [100 * required + fixed, `new restxml.Route(${args.join(", ")})`]
+		return [100 * required + fixed, `new rest.Route(${args.join(", ")})`]
 	}
 
-	/// Why the API cannot express the restXml operation id, "" if it can: of an event stream, or of the shapes its
+	/// Why the API cannot express the REST operation id, "" if it can: of an event stream, or of the shapes its
 	/// input and output reach.
 	unexpressed(id: string): string throws ModelError {
 		const op = this.shape(id)
@@ -663,46 +712,56 @@ class Generator {
 
 	/// The module of the service's codec, of core/protocol.
 	codec(): string {
-		return if (this.protocol == "awsQuery") "query" else if (this.protocol == "restXml") "restxml" else "json"
+		return switch (this.protocol) {
+			case "awsQuery": "query"
+			case "restXml": "restxml"
+			case "restJson1": "restjson"
+			default: "json"
+		}
 	}
 
+	/// Whether the service's protocol is restXml or restJson1, of core/protocol/rest's bindings.
+	rest(): bool { return this.protocol == "restXml" || this.protocol == "restJson1" }
+	/// Whether the service's bodies are JSON.
+	json(): bool { return this.codec() == "json" || this.codec() == "restjson" }
 	/// The tag n of the service's codec.
 	tag(n: string): string { return `@${this.codec()}.${n}` }
 
-	/// The tags of restXml that bind the member r to where it is on the wire and shape its XML: of a payload, its
-	/// element's name too.
+	/// The tags of a REST protocol that bind the member r to where it is on the wire, and of restXml those that shape
+	/// its XML: of a payload, its element's name too.
 	bindings(r: Ref): string[] throws ModelError {
 		const t = r.traits
 		const tags: string[] = []
+		const xml = this.protocol == "restXml"
 		if (t.httpLabel != null) {
-			tags.push("@restxml.Label")
+			tags.push("@rest.Label")
 		}
 		if (t.httpQuery != null) {
-			tags.push(`@restxml.Query[${json.quoted(t.httpQuery!)}]`)
+			tags.push(`@rest.Query[${json.quoted(t.httpQuery!)}]`)
 		}
 		if (t.httpQueryParams != null) {
-			tags.push("@restxml.Params")
+			tags.push("@rest.Params")
 		}
 		if (t.httpHeader != null) {
-			tags.push(`@restxml.Header[${json.quoted(t.httpHeader!)}]`)
+			tags.push(`@rest.Header[${json.quoted(t.httpHeader!)}]`)
 		}
 		if (t.httpPrefixHeaders != null) {
-			tags.push(`@restxml.Prefix[${json.quoted(t.httpPrefixHeaders!)}]`)
+			tags.push(`@rest.Prefix[${json.quoted(t.httpPrefixHeaders!)}]`)
 		}
 		if (t.httpResponseCode != null) {
-			tags.push("@restxml.Status")
+			tags.push("@rest.Status")
 		}
 		if (t.httpPayload != null) {
-			tags.push("@restxml.Payload")
-			if (t.xmlName == null) {
+			tags.push("@rest.Payload")
+			if (xml && t.xmlName == null) {
 				const s = this.shape(r.target)
 				tags.push(`@restxml.Name[${json.quoted(s.traits.xmlName ?? name(r.target))}]`)
 			}
 		}
-		if (t.xmlAttribute != null) {
+		if (xml && t.xmlAttribute != null) {
 			tags.push("@restxml.Attr")
 		}
-		if (t.xmlNamespace != null) {
+		if (xml && t.xmlNamespace != null) {
 			tags.push(namespace(t.xmlNamespace!))
 		}
 		return tags
@@ -712,16 +771,21 @@ class Generator {
 	field(id: string, m: [string, Ref], required: bool): Decl throws ModelError {
 		const t = m[1].traits
 		const query = this.protocol == "awsQuery"
-		const rest = this.protocol == "restXml"
+		const xml = query || this.protocol == "restXml"
 		if (query && t.xmlAttribute != null) {
 			throw new ModelError(`${id}$${m[0]}: an XML attribute`)
 		}
-		const tags = if (rest) this.bindings(m[1]) else []
-		if ((query || rest) && t.xmlName != null) {
+		const tags = if (this.rest()) this.bindings(m[1]) else []
+		if (xml && t.xmlName != null) {
 			tags.push(this.tag(`Name[${json.quoted(t.xmlName!)}]`))
 		}
-		if ((query || rest) && t.xmlFlattened != null) {
+		if (xml && t.xmlFlattened != null) {
 			tags.push(this.tag("Flat"))
+		}
+		const bound = t.httpLabel != null || t.httpQuery != null || t.httpQueryParams != null || t.httpHeader != null
+			|| t.httpPrefixHeaders != null || t.httpPayload != null
+		if (this.protocol == "restJson1" && t.jsonName != null && !bound) {
+			tags.push(`@json.Name[${json.quoted(t.jsonName!)}]`)
 		}
 		const d = m[1].traits.rest.find(x => x[0] == "smithy.api#default")
 		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
@@ -732,9 +796,11 @@ class Generator {
 		const valid = if (this.unconstrained.includes(`${id}$${m[0]}`)) "" else this.valid(m[1])
 		this.open = this.opened || this.strings.includes(`${id}$${m[0]}`)
 		this.payload = t.httpPayload != null
+		this.bound = bound && this.protocol == "restJson1"
 		const ty = this.typeOf(m[1], tags, false)
 		this.open = false
 		this.payload = false
+		this.bound = false
 		if (valid != "") {
 			tags.push(valid)
 		}
@@ -852,7 +918,9 @@ class Generator {
 			}
 			return enumName(r.target)
 		}
-		const xml = this.protocol == "awsQuery" || this.protocol == "restXml"
+		const xml = this.protocol == "awsQuery" || this.protocol == "restXml" || this.bound
+		// the module of the timestamp and blob tags
+		const of = if (this.protocol == "awsQuery") "query" else if (xml) "rest" else "json"
 		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
 			return this.jsonType(r, s, tags)
 		}
@@ -866,24 +934,23 @@ class Generator {
 			case "float": return "f32"
 			case "double": return "f64"
 			case "timestamp":
-				// restXml's default is of where the member is bound
-				const otherwise = if (this.protocol == "restXml") "" else "date-time"
+				// that of core/protocol/rest is of where the member is bound
+				const otherwise = if (of == "rest") "" else "date-time"
 				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? otherwise
-				tags.push(if (format == otherwise) this.tag("Timestamp")
-					else this.tag(`Timestamp[${json.quoted(format)}]`))
+				tags.push(if (format == otherwise) `@${of}.Timestamp` else `@${of}.Timestamp[${json.quoted(format)}]`)
 				return "i64"
 			case "blob":
 				if (s.traits.streaming != null && !this.payload) {
 					throw new ModelError(`${r.target}: a stream`)
 				}
-				tags.push(this.tag("Blob"))
+				tags.push(`@${of}.Blob`)
 				return "string"
 			case "list":
 				const m = s.member!
 				if (s.traits.sparse != null || inner && m.traits.xmlName != null) {
 					throw new ModelError(`${r.target}: a sparse list, or one within a list or map whose items are named`)
 				}
-				if (m.traits.xmlName != null) {
+				if (m.traits.xmlName != null && this.protocol != "restJson1") {
 					tags.push(this.tag(`Member[${json.quoted(m.traits.xmlName!)}]`))
 				}
 				return `${this.item(m, tags)}[]`
@@ -893,10 +960,10 @@ class Generator {
 				if (s.traits.sparse != null || inner && (k.traits.xmlName != null || v.traits.xmlName != null)) {
 					throw new ModelError(`${r.target}: a sparse map, or one within a list or map whose keys or values are named`)
 				}
-				if (k.traits.xmlName != null) {
+				if (k.traits.xmlName != null && this.protocol != "restJson1") {
 					tags.push(this.tag(`Key[${json.quoted(k.traits.xmlName!)}]`))
 				}
-				if (v.traits.xmlName != null) {
+				if (v.traits.xmlName != null && this.protocol != "restJson1") {
 					tags.push(this.tag(`Value[${json.quoted(v.traits.xmlName!)}]`))
 				}
 				return `[${this.typeOf(k, tags, true)}, ${this.item(v, tags)}][]`
@@ -1023,7 +1090,7 @@ class Generator {
 					skipped.push(`// ${test}: ${why}`)
 				} else if (this.unexpressible.includes(op)) {
 					skipped.push(`// ${test}: of an operation the API cannot express`)
-				} else if (error != null && this.protocol == "restXml" && this.unrequestable(op)) {
+				} else if (error != null && this.rest() && this.unrequestable(op)) {
 					skipped.push(`// ${test}: of an input whose required members a request of its route lacks`)
 				} else if (error == null) {
 					if (!requested) {
@@ -1053,7 +1120,7 @@ class Generator {
 		const up = root(out)
 		const decls = [new Decl("import", [`import { Fault } from "${up}core/fault"`])]
 		decls.push(new Decl("import", [`import { Caller, Unit } from "${up}core/service"`]))
-		const same = if (this.codec() == "json") "sameJson" else "same"
+		const same = if (this.json()) "sameJson" else "same"
 		decls.push(new Decl("import", [`import { caller, ${same} } from "${up}tools/smithygen/vectors"`]))
 		decls.push(new Decl("import", [`import * as api from "./${replace(split(out, "/").pop()!, ".bob", "")}"`]))
 		decls.push(new Decl("import", [`import { Request } from "std/http"`]))
@@ -1077,7 +1144,7 @@ class Generator {
 	request(op: string, v: Vector): string[] throws ModelError | ParseError {
 		const o = this.shape(op)
 		const input = this.className(o.input)
-		const rest = this.protocol == "restXml"
+		const rest = this.rest()
 		if (v.body == null && !rest) {
 			throw new ModelError(`${v.id}: a request without a body`)
 		}
@@ -1141,7 +1208,7 @@ class Generator {
 			const id = if (has(body, "<RequestId>")) split(split(body, "<RequestId>")[1], "</RequestId>")[0] else ""
 			const req = `new Request("POST", "/", ${json.quoted(`Action=${name(op)}&Version=${this.version}`)})`
 			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), ${req})`))
-		} else if (this.protocol == "restXml") {
+		} else if (this.rest()) {
 			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
 			const id = if (header == null) "" else header[1]
 			lines.append(this.routed(op))
@@ -1162,7 +1229,7 @@ class Generator {
 				throw new ModelError(`${v.id}: a body that a template literal cannot hold as it is`)
 			}
 			const want = (if (verbatim) `\`${body}\`` else json.quoted(body)) + ")"
-			const same = if (this.codec() == "json") "sameJson" else "same"
+			const same = if (this.json()) "sameJson" else "same"
 			const line = `\tassert ${same}(res, ${want}`
 			// as bober format breaks it, a body of several lines measured as if of one
 			lines.append(if (wide(line)) [`\tassert ${same}(res,`, `\t\t${want}`] else [line])
@@ -1170,7 +1237,7 @@ class Generator {
 		return lines
 	}
 
-	/// The statements making req, a request of the restXml operation op's route: each label and required query
+	/// The statements making req, a request of the REST operation op's route: each label and required query
 	/// parameter or header of it "a".
 	routed(op: string): string[] throws ModelError {
 		const http = this.shape(op).traits.http!
@@ -1198,7 +1265,7 @@ class Generator {
 		return this.shape(input.target).members.filter(m => m[1].traits.required != null).map(m => m[1])
 	}
 
-	/// Whether a request of the restXml operation op's route, as routed makes it, lacks a member its input requires.
+	/// Whether a request of the REST operation op's route, as routed makes it, lacks a member its input requires.
 	unrequestable(op: string): bool throws ModelError {
 		return this.required(op).some(m => m.traits.httpLabel == null && m.traits.httpQuery == null
 			&& m.traits.httpHeader == null)
@@ -1322,11 +1389,17 @@ function root(out: string): string {
 	return up
 }
 
-/// The imports of the file out, of the codec, of Unit if unit, and of the codecs' model if modeled.
+/// The imports of the file out, of the codec, the bindings of a REST one and the JSON of restjson's, of Unit if unit,
+/// and of the codecs' model if modeled.
 function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
-	decls.push(new Decl("import", [`import * as ${codec} from "${up}core/protocol/${codec}"`]))
+	const of = if (codec == "restjson") [codec, "rest", "json"]
+		else if (codec == "restxml") [codec, "rest"]
+		else [codec]
+	for (const c of of) {
+		decls.push(new Decl("import", [`import * as ${c} from "${up}core/protocol/${c}"`]))
+	}
 	if (modeled) {
 		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))
 	}
@@ -1338,7 +1411,7 @@ function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] 
 }
 
 /// The function serving a request by a handler of the interface handlers, by the cases of its operations, of the codec
-/// query, json or restxml; of the service's validation if validated; IAM's denials answered as denied says, its
+/// query, json, restxml or restjson; of the service's validation if validated; IAM's denials answered as denied says, its
 /// status, code and wording as 403, "AccessDenied", "reasoned".
 function handle(handlers: string, cases: string[], codec: string, validated: bool, denied: string): string[] {
 	const lines = ["/// The answer of h to req."]
@@ -1351,7 +1424,7 @@ function handle(handlers: string, cases: string[], codec: string, validated: boo
 		lines.push("\t\tdefault: return c.invalidAction()")
 	} else {
 		const call = if (codec == "json") "json.call(caller, req, service)"
-			else "restxml.call(caller, req, service, routes)"
+			else `${codec}.call(caller, req, service, routes)`
 		lines.append([`\tconst c = ${call}`, "\tswitch (c.operation) {", ...cases])
 		lines.push("\t\tdefault: return c.unknownOperation()")
 	}

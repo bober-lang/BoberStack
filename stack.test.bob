@@ -710,3 +710,23 @@ test "SSM encrypts a SecureString under its key, decrypting it only WithDecrypti
 		"InvalidKeyId", "DisabledException")
 	g.close()
 }
+
+/// The answer of g to a GET of path from Lambda, signed by k.
+function lambdaGet(g: Gateway, path: string, k: Key = root()): Response {
+	const req = new Request("GET", `http://localhost:4566${path}`, "")
+	sign(req, "", "lambda", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "Lambda routes and authenticates a request, and answers NotImplemented in restJson1's error form" {
+	const g = gateway()
+	let res = lambdaGet(g, "/2015-03-31/functions")
+	assert res.status == 501 && res.headers.get("x-amzn-errortype") == "NotImplemented"
+	assert res.headers.get("content-type") == "application/json"
+	assert res.body.whole == `{"message":"The operation ListFunctions is not implemented"}`
+	const forged = user(g, "bob")
+	forged.secret = "wrong"
+	res = lambdaGet(g, "/2015-03-31/functions", forged)
+	assert res.status == 403 && res.headers.get("x-amzn-errortype") == "SignatureDoesNotMatch"
+	g.close()
+}

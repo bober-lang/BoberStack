@@ -69,6 +69,11 @@ test "services/kinesis/api.bob is what models/kinesis.json generates" {
 		== readFile("services/kinesis/api.bob")
 }
 
+test "services/lambda/api.bob is what models/lambda.json generates" {
+	assert generate(readFile("models/lambda.json")!, "models/lambda.json", "services/lambda/api.bob")
+		== readFile("services/lambda/api.bob")
+}
+
 /// Whether the API and tests in the directory dir are what the model, of protocol test vectors, generates; and their
 /// tally.
 function fresh(model: string, dir: string, tally: string): bool throws ModelError {
@@ -98,12 +103,16 @@ test "a model it cannot express" {
 		{"U": {"target": "a#U"}}}, "a#U": {"type": "document"}}}`
 	assert generate(document, "m.json", "api.bob") throws new ModelError("a#U: a document")
 	const rest = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "traits": {"aws.protocols#restXml": {}}}}}`
-	const why = "a#S: not an awsQuery service of an XML namespace, an awsJson or restXml one, of sigv4, or has resources"
+	const why = "a#S: not an awsQuery service of an XML namespace, an awsJson or REST one, of sigv4, or has resources"
 	assert generate(rest, "m.json", "api.bob") throws new ModelError(why)
 }
 
 test "protocoltests/restxml is what models/restxml-tests.json generates" {
 	assert fresh("models/restxml-tests.json", "protocoltests/restxml", "184 vectors: 139 tests, 45 skipped")
+}
+
+test "protocoltests/restjson is what models/restjson-tests.json generates" {
+	assert fresh("models/restjson-tests.json", "protocoltests/restjson", "267 vectors: 176 tests, 91 skipped")
 }
 
 test "services/s3/api.bob is what models/s3.json generates" {

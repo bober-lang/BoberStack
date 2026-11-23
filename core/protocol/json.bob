@@ -23,6 +23,8 @@ export class Timestamp[F extends string = "epoch-seconds"] {}
 export class Blob {}
 /// Tags a string member, or its items, as a document: the JSON text of any value, "" for none.
 export class Document {}
+/// Tags a member to be named K on the wire, as Smithy's jsonName, which restJson1 reads and awsJson does not.
+export class Name[K extends string] {}
 
 /// An error that a service's model declares, or that the service answers with besides: its shape id, the member that
 /// holds its message, "" if none, and its code under awsQuery, "" if it has none of its own.
@@ -156,7 +158,8 @@ type Item = i64 | f64 | string | bool | std.Keys | null | (i64 | f64 | string | 
 
 /// The T that the JSON s holds, at k on the wire and the member path at, of a member tagged tags; how it breaks the
 /// model noted into v.
-function value[T extends Decodable](s: string, k: string, at: string, tags: Type[], v: Violations): T throws Fault {
+export function value[T extends Decodable](s: string, k: string, at: string, tags: Type[],
+	v: Violations): T throws Fault {
 	switch (T.kind) {
 		case "null":
 			if (s == "null") {
@@ -212,8 +215,9 @@ function value[T extends Decodable](s: string, k: string, at: string, tags: Type
 			const from: i32[] = []
 			for (const f of T.fields) {
 				from.push(v.found.length)
-				const m = if (k == "") f.name else `${k}.${f.name}`
-				const x = members.find(e => e[0] == f.name)
+				const n = tag(f.tags, Name, f.name)
+				const m = if (k == "") n else `${k}.${n}`
+				const x = members.find(e => e[0] == n)
 				if (x != null && x[1] != "null") {
 					r[f.name] = value[f.type](x[1], m, path(at, f.name), f.tags, v)
 				} else if (!nullable(f.type) && !has(f.tags, Default)) {
@@ -280,7 +284,7 @@ function variant[T extends Decodable](s: string, k: string, at: string, v: Viola
 		if (M.kind != "class") {
 			continue
 		}
-		if (set.length == 1 && M.fields[0].name == set[0][0]) {
+		if (set.length == 1 && tag(M.fields[0].tags, Name, M.fields[0].name) == set[0][0]) {
 			return value[M](s, k, at, [], v)
 		}
 		if (set.length != 1 && v.worded(split(M.name, "$")[0], set.length == 0)) {
@@ -291,7 +295,7 @@ function variant[T extends Decodable](s: string, k: string, at: string, v: Viola
 }
 
 /// The members of the JSON object s, at the member path k.
-function object(s: string, k: string): std.Unknown[] throws Fault {
+export function object(s: string, k: string): std.Unknown[] throws Fault {
 	try {
 		return std.decode[std.Keys](s).all
 	} catch (e: ParseError) {
@@ -323,7 +327,7 @@ function nullable(t: Type): bool {
 }
 
 /// The JSON of v, of a member tagged tags: of a structure, its members but those null.
-function put[T](v: T, tags: Type[]): string {
+export function put[T](v: T, tags: Type[]): string {
 	switch (T.kind) {
 		case "null": return "null"
 		case "union":
@@ -356,7 +360,7 @@ function put[T](v: T, tags: Type[]): string {
 			for (const f of T.fields) {
 				const x = v[f.name]
 				if (x != null) {
-					members.push(`${std.quoted(f.name)}:${put(x, f.tags)}`)
+					members.push(`${std.quoted(tag(f.tags, Name, f.name))}:${put(x, f.tags)}`)
 				}
 			}
 			return `{${members.join(",")}}`
