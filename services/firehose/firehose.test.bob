@@ -84,3 +84,36 @@ test "tags, encryption, and a Kinesis-sourced stream refusing records" {
 	assert has(call(g, "ListDeliveryStreams", "{}"), `"DeliveryStreamNames":["s"]`)
 	g.close()
 }
+
+test "an HTTP endpoint destination is stored, updated and described as AWS shapes it, its access key left out" {
+	const g = gateway()
+	assert call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"h","HttpEndpointDestinationConfiguration":{`
+		+ `"EndpointConfiguration":{"Url":"https://example.com/","AccessKey":"secret"},`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r","S3Configuration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r"}}}`).status == 200
+	assert call(g, "UpdateDestination",
+		`{"DeliveryStreamName":"h","CurrentDeliveryStreamVersionId":"1",`
+		+ `"DestinationId":"destinationId-000000000001","HttpEndpointDestinationUpdate":{"S3Update":{"Prefix":"u/"}}}`).status
+		== 200
+	const d = call(g, "DescribeDeliveryStream", `{"DeliveryStreamName":"h"}`)
+	assert has(d, `"HttpEndpointDestinationDescription":{`) && has(d, `"Url":"https://example.com/"`)
+		&& !has(d, "secret") && has(d, `"BucketARN":"arn:aws:s3:::b"`) && has(d, `"Prefix":"u/"`)
+	g.close()
+}
+
+test "a prefix's expressions need an error output prefix with the error output's type" {
+	const g = gateway()
+	const create = (prefixes: string) => call(g, "CreateDeliveryStream",
+		`{"DeliveryStreamName":"p",` + `"ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::b",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/r",${prefixes}}}`)
+	assert fails(create(`"Prefix":"!{timestamp:yyyy}/"`), "InvalidArgumentException",
+		"ErrorOutputPrefix cannot be null when expressions are used in Prefix.")
+	assert fails(create(`"Prefix":"!{nope}/","ErrorOutputPrefix":"e/"`), "InvalidArgumentException",
+		"The expression '!{nope}' is not valid.")
+	assert fails(create(`"Prefix":"!{timestamp:yyyy}/","ErrorOutputPrefix":"!{timestamp:yyyy}/"`),
+		"InvalidArgumentException",
+		"ErrorOutputPrefix must contain the '!{firehose:error-output-type}' expression when expressions are used.")
+	assert create(`"Prefix":"!{timestamp:yyyy}/","ErrorOutputPrefix":"!{firehose:error-output-type}/"`).status == 200
+	g.close()
+}

@@ -6,26 +6,36 @@
 //!   Each PutRecord and PutRecordBatch writes its records' data, concatenated, as one S3 object within the request,
 //!   whatever the buffering hints, by calling the S3 handler directly as a session of the destination's role, whose
 //!   trust policy is not consulted; an object that S3 refuses is lost, unreported, as AWS's failed deliveries are but
-//!   for their logs and retries. A KinesisStreamAsSource stream is stored, but nothing reads its Kinesis stream.
-//! - Only S3 destinations, plain or extended, are taken; any other kind is not implemented. Of an extended one, data
-//!   format conversion, dynamic partitioning, processing and backups are stored as their mode only, and a prefix's
-//!   expressions are not evaluated: every object's key is the prefix, the hour's YYYY/MM/dd/HH/, and the name AWS
-//!   gives it. GZIP compression gzips the object as AWS does; ZIP and Snappy leave it as is.
-//! - There is no KMS: a key is stored as given, and records are not encrypted.
+//!   for their retries and their error logs, whose wording AWS does not document, so none is written. A
+//!   KinesisStreamAsSource, MSKAsSource or DatabaseAsSource stream is stored, but nothing reads its source.
+//! - Only S3 destinations deliver. The others, Redshift, OpenSearch, Elasticsearch, Splunk, HTTP endpoints,
+//!   Snowflake and Iceberg, are stored, updated and described as AWS shapes them, a VPC's id empty and secrets left
+//!   out, but nothing is delivered to them, nor to their S3 backups. Of an extended S3 one, data format conversion,
+//!   dynamic partitioning, processing and backups are stored as their mode only; a dynamic partitioning key in a
+//!   prefix evaluates to nothing.
+//! - A prefix's timestamps take of DateTimeFormatter's letters only y, M, d, H, m and s, with quoted text; any other
+//!   letter is written as is. The errors of invalid prefixes and time zones are worded here, as AWS documents none.
+//!   GZIP compression gzips the object as AWS does; ZIP and Snappy leave it as is.
+//! - A customer's KMS key is checked as Firehose's caller may describe it, but records are not encrypted, and S3
+//!   destinations' KMS keys are stored as given.
 //! - Nothing is throttled, and no record fails: PutRecordBatch always answers a FailedPutCount of 0.
 
 import { Fault } from "../../core/fault"
-import { Caller, notImplemented, requestTags, resourceTags } from "../../core/service"
+import * as protocol from "../../core/protocol/json"
+import { Caller, requestTags, resourceTags } from "../../core/service"
+import { keyArn } from "../kms/kms"
 import * as s3Api from "../s3/api"
 import * as s3 from "../s3/s3"
 import * as api from "./api"
 import { Destination, save, Stream, streams } from "./records"
+import * as shapes from "./shapes"
+import { indexOf, startsWith } from "std/algo"
 import { gzip } from "std/compress/gzip"
 import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
-import { split } from "std/string"
-import { rfc3339 } from "std/time"
+import { ParseError, split } from "std/string"
+import { load, rfc3339, utc, Zone } from "std/time"
 
 /// The tags a delivery stream may have.
 const tagLimit = 50
@@ -48,8 +58,18 @@ export class Handler {
 		caller.allow(arn, null, requestTags(tags))
 		const kind = input.DeliveryStreamType ?? "DirectPut"
 		const source = input.KinesisStreamSourceConfiguration
-		if (kind != "DirectPut" && kind != "KinesisStreamAsSource") {
-			throw notImplemented(`CreateDeliveryStream of a ${kind} delivery stream`)
+		let sourced = ""
+		if (kind == "MSKAsSource") {
+			if (input.MSKSourceConfiguration == null) {
+				throw api.invalidArgumentException("MSKSourceConfiguration is required for MSKAsSource delivery stream type.")
+			}
+			sourced = protocol.put(input.MSKSourceConfiguration!, [])
+		}
+		if (kind == "DatabaseAsSource") {
+			if (input.DatabaseSourceConfiguration == null) {
+				throw api.invalidArgumentException("DatabaseSourceConfiguration is required for DatabaseAsSource delivery stream type.")
+			}
+			sourced = protocol.put(input.DatabaseSourceConfiguration!, [])
 		}
 		if (kind == "KinesisStreamAsSource" && source == null) {
 			throw api.invalidArgumentException("KinesisSourceStreamConfig is required for KinesisStreamAsSource delivery stream type.")
@@ -57,45 +77,47 @@ export class Handler {
 		if (kind == "DirectPut" && source != null) {
 			throw api.invalidArgumentException("KinesisSourceStreamConfig is only applicable for KinesisStreamAsSource delivery stream type.")
 		}
-		if (kind == "KinesisStreamAsSource" && input.DeliveryStreamEncryptionConfigurationInput != null) {
-			throw api.invalidArgumentException("KinesisStreamAsSource delivery stream type cannot be encrypted.")
+		if (kind != "DirectPut" && input.DeliveryStreamEncryptionConfigurationInput != null) {
+			throw api.invalidArgumentException(`${kind} delivery stream type cannot be encrypted.`)
 		}
 		const plain = input.S3DestinationConfiguration
 		const extended = input.ExtendedS3DestinationConfiguration
-		const others = input.RedshiftDestinationConfiguration != null
-			|| input.ElasticsearchDestinationConfiguration != null
-			|| input.AmazonopensearchserviceDestinationConfiguration != null
-			|| input.SplunkDestinationConfiguration != null || input.HttpEndpointDestinationConfiguration != null
-			|| input.AmazonOpenSearchServerlessDestinationConfiguration != null
-			|| input.SnowflakeDestinationConfiguration != null || input.IcebergDestinationConfiguration != null
-		const given: i32 = (if (plain == null) 0 else 1) + (if (extended == null) 0 else 1) + (if (others) 1 else 0)
+		const others = shapes.configured(input)
+		const given: i32 = (if (plain == null) 0 else 1) + (if (extended == null) 0 else 1) + others.length
 		if (given != 1) {
 			throw api.invalidArgumentException("Exactly one destination configuration is supported for a Firehose")
 		}
-		if (others) {
-			throw notImplemented("CreateDeliveryStream to a destination other than S3")
+		const d = if (plain != null) fromPlain(plain!)
+			else if (extended != null) fromExtended(extended!)
+			else new Destination()
+		if (others.length > 0) {
+			d.kind = others[0][0]
+			d.config = others[0][1]
 		}
-		const d = if (plain != null) fromPlain(plain!) else fromExtended(extended!)
 		d.id = "destinationId-000000000001"
+		prefixes(d)
 		caller.actions = passed
 		if (passed.length > 0) {
 			if (source != null) {
 				caller.allow(source!.RoleARN)
 			}
-			caller.allow(d.role)
+			if (d.role != "") {
+				caller.allow(d.role)
+			}
 		}
 		const db = streams(caller.regional())
 		if (db.get(name) != null) {
 			throw api.resourceInUseException(`Firehose ${name} under accountId ${caller.account} already exists`)
 		}
-		const s = { ...new Stream(), name: name, kind: kind, created: now(), tags: tags, destinations: [d] }
+		const s = { ...new Stream(), name: name, kind: kind, created: now(), tags: tags, destinations: [d],
+			sourceConfig: sourced }
 		if (source != null) {
 			s.source = source!.KinesisStreamARN
 			s.sourceRole = source!.RoleARN
 		}
 		const e = input.DeliveryStreamEncryptionConfigurationInput
 		if (e != null) {
-			encrypt(s, e!)
+			encrypt(caller, s, e!)
 		}
 		save(db, s)
 		const r = new api.CreateDeliveryStreamOutput()
@@ -126,10 +148,15 @@ export class Handler {
 			k.DeliveryStartTimestamp = s.created
 			d.Source = { ...new api.SourceDescription(), KinesisStreamSourceDescription: k }
 		}
+		if (s.sourceConfig != "") {
+			d.Source = shapes.source(s.kind, s.sourceConfig, s.created)
+		}
 		const after = input.ExclusiveStartDestinationId
 		const listed = s.destinations.filter(x => after == null || x.id > after!)
 		const n = input.Limit ?? 10
-		d.Destinations = listed.slice(0, if (n < listed.length) n else listed.length).map(x => described(x))
+		for (const x of listed.slice(0, if (n < listed.length) n else listed.length)) {
+			d.Destinations.push(described(x))
+		}
 		d.HasMoreDestinations = listed.length > n
 		const r = new api.DescribeDeliveryStreamOutput()
 		r.DeliveryStreamDescription = d
@@ -171,8 +198,17 @@ export class Handler {
 		const d = found[0]
 		const plain = input.S3DestinationUpdate
 		const extended = input.ExtendedS3DestinationUpdate
-		if (plain == null && extended == null) {
-			throw notImplemented("UpdateDestination to a destination other than S3")
+		const other = shapes.updated(input)
+		let role: string | null = null
+		if (other != null) {
+			const [kind, json] = other!
+			d.config = shapes.merged(d.config, json, d.kind == kind)
+			d.kind = kind
+			role = shapes.member(json, "RoleARN")
+		} else if (d.kind != "S3") {
+			// From another kind, AWS merges nothing.
+			d.kind = "S3"
+			d.config = ""
 		}
 		if (plain != null) {
 			update(d, plain!.RoleARN, plain!.BucketARN, plain!.Prefix, plain!.ErrorOutputPrefix, plain!.BufferingHints,
@@ -186,7 +222,12 @@ export class Handler {
 			d.extension = x.FileExtension ?? d.extension
 			d.zone = x.CustomTimeZone ?? d.zone
 		}
-		const role = if (plain != null) plain!.RoleARN else extended!.RoleARN
+		if (plain != null) {
+			role = plain!.RoleARN
+		} else if (extended != null) {
+			role = extended!.RoleARN
+		}
+		prefixes(d)
 		if (passed.length > 0 && role != null) {
 			caller.actions = passed
 			caller.allow(role!)
@@ -263,7 +304,7 @@ export class Handler {
 		if (s.kind != "DirectPut") {
 			throw api.invalidArgumentException(`Encryption is not supported for delivery stream type ${s.kind}.`)
 		}
-		encrypt(s,
+		encrypt(caller, s,
 			input.DeliveryStreamEncryptionConfigurationInput ?? new api.DeliveryStreamEncryptionConfigurationInput())
 		save(streams(caller.regional()), s)
 		return new api.StartDeliveryStreamEncryptionOutput()
@@ -288,15 +329,17 @@ export class Handler {
 			return
 		}
 		const t = now()
-		const stamp = rfc3339(t)
-		const hour = `${stamp.slice(0, 4)}/${stamp.slice(5, 7)}/${stamp.slice(8, 10)}/${stamp.slice(11, 13)}/`
-		const when = `${stamp.slice(0, 10)}-${stamp.slice(11, 13)}-${stamp.slice(14, 16)}-${stamp.slice(17, 19)}`
-		for (const d of s.destinations) {
+		const when = formatted("yyyy-MM-dd-HH-mm-ss", t, utc)
+		for (const d of s.destinations.filter(x => x.kind == "S3")) {
 			const zipped = d.compression == "GZIP"
 			const o = new s3Api.PutObjectRequest()
 			const parts = split(d.bucket, ":::")
 			o.Bucket = parts[parts.length - 1]
-			o.Key = (d.prefix ?? "") + hour + `${s.name}-${s.version}-${when}-${uuid()}`
+			let prefix = d.prefix ?? ""
+			if (indexOf(prefix, "!{timestamp:") < 0) {
+				prefix += "!{timestamp:yyyy/MM/dd/HH/}"
+			}
+			o.Key = evaluated(prefix, t, zoneOf(d.zone)) + `${s.name}-${s.version}-${when}-${uuid()}`
 				+ (d.extension ?? (if (zipped) ".gz" else ""))
 			o.Body = if (zipped) gzip(data) else data
 			try {
@@ -339,17 +382,132 @@ function notFound(caller: Caller, name: string): Fault {
 
 function pair(t: api.Tag): [string, string] { return [t.Key, t.Value ?? ""] }
 
-/// Sets s's encryption to e, enabled.
-function encrypt(s: Stream, e: api.DeliveryStreamEncryptionConfigurationInput) throws Fault {
+/// Sets s's encryption to e, enabled: a customer's key as the caller may describe it through Firehose.
+function encrypt(caller: Caller, s: Stream, e: api.DeliveryStreamEncryptionConfigurationInput) throws Fault {
 	if (e.KeyType == "CUSTOMER_MANAGED_CMK" && e.KeyARN == null) {
 		throw api.invalidArgumentException("KeyARN is required for CUSTOMER_MANAGED_CMK.")
 	}
 	if (e.KeyType == "AWS_OWNED_CMK" && e.KeyARN != null) {
 		throw api.invalidArgumentException("KeyARN is not allowed for AWS_OWNED_CMK.")
 	}
+	let key: string | null = null
+	if (e.KeyARN != null) {
+		try {
+			key = keyArn(caller, "firehose", e.KeyARN!)
+		} catch (f: Fault) {
+			throw api.invalidKMSResourceException(f.message, { ...new api.InvalidKMSResourceException(), code: f.code })
+		}
+	}
 	s.encryption = "ENABLED"
 	s.keyType = e.KeyType
-	s.keyArn = e.KeyARN
+	s.keyArn = key
+}
+
+/// Throws unless the prefixes of d are as AWS takes them: of known expressions, the error output's type only in the
+/// error output prefix, which expressions in the prefix need, and which has it if it has any.
+function prefixes(d: Destination) throws Fault {
+	const prefix = d.prefix ?? ""
+	const error = d.errorPrefix
+	expressions(prefix)
+	if (indexOf(prefix, "!{firehose:error-output-type}") >= 0) {
+		throw api.invalidArgumentException("The '!{firehose:error-output-type}' expression is only allowed in "
+			+ "ErrorOutputPrefix.")
+	}
+	if (indexOf(prefix, "!{") >= 0 && error == null) {
+		throw api.invalidArgumentException("ErrorOutputPrefix cannot be null when expressions are used in Prefix.")
+	}
+	if (error != null) {
+		expressions(error!)
+		if (indexOf(error!, "!{") >= 0 && indexOf(error!, "!{firehose:error-output-type}") < 0) {
+			throw api.invalidArgumentException("ErrorOutputPrefix must contain the '!{firehose:error-output-type}' "
+				+ "expression when expressions are used.")
+		}
+	}
+	zoneOf(d.zone)
+}
+
+/// Throws unless each !{ in p begins an expression of a namespace and value AWS knows.
+function expressions(p: string) throws Fault {
+	let at = indexOf(p, "!{")
+	while (at >= 0) {
+		const end = indexOf(p, "}", at)
+		const e = if (end < 0) "" else p.slice(at + 2, end)
+		const known = e == "firehose:random-string" || e == "firehose:error-output-type"
+			|| startsWith(e, "timestamp:") && e.length > 10 || startsWith(e, "partitionKeyFromQuery:")
+			|| startsWith(e, "partitionKeyFromLambda:")
+		if (!known) {
+			throw api.invalidArgumentException(`The expression '${p.slice(at, if (end < 0) p.length else end + 1)}' `
+				+ "is not valid.")
+		}
+		at = indexOf(p, "!{", end)
+	}
+}
+
+/// The zone of the name given, UTC if null.
+function zoneOf(name: string | null): Zone throws Fault {
+	if (name == null || name! == "" || name! == "UTC") {
+		return utc
+	}
+	try {
+		return load(name!)
+	} catch (e: IoError | ParseError) {
+		throw api.invalidArgumentException(`Invalid CustomTimeZone: ${name!}`)
+	}
+}
+
+/// The prefix p with its expressions evaluated at t in zone: timestamps by their format, random strings each anew;
+/// dynamic partitioning keys, which nothing evaluates, as the empty string.
+function evaluated(p: string, t: i64, zone: Zone): string throws Fault {
+	let out = ""
+	let from = 0
+	let at = indexOf(p, "!{")
+	while (at >= 0) {
+		const end = indexOf(p, "}", at)
+		out += p.slice(from, at)
+		const e = p.slice(at + 2, end)
+		if (startsWith(e, "timestamp:")) {
+			out += formatted(e.slice(10, e.length), t, zone)
+		} else if (e == "firehose:random-string") {
+			out += hex.encode(random(6)).slice(0, 11)
+		}
+		from = end + 1
+		at = indexOf(p, "!{", from)
+	}
+	return out + p.slice(from, p.length)
+}
+
+/// t in zone as the Java DateTimeFormatter pattern f writes it, of its letters y, M, d, H, m and s; text in single
+/// quotes and any other character as is.
+function formatted(f: string, t: i64, zone: Zone): string {
+	const s = rfc3339(t, zone)
+	let out = ""
+	let i = 0
+	while (i < f.length) {
+		const c = f.slice(i, i + 1)
+		if (c == "'") {
+			const end = indexOf(f, "'", i + 1)
+			const to = if (end < 0) f.length else end
+			out += f.slice(i + 1, to)
+			i = to + 1
+			continue
+		}
+		let j = i
+		while (j < f.length && f.slice(j, j + 1) == c) {
+			j++
+		}
+		const n = j - i
+		out += switch (c) {
+			case "y": if (n == 2) s.slice(2, 4) else s.slice(0, 4)
+			case "M": s.slice(5, 7)
+			case "d": s.slice(8, 10)
+			case "H": s.slice(11, 13)
+			case "m": s.slice(14, 16)
+			case "s": s.slice(17, 19)
+			default: f.slice(i, j)
+		}
+		i = j
+	}
+	return out
 }
 
 /// The destination that a plain S3 configuration makes.
@@ -392,8 +550,15 @@ function update(d: Destination, role: string | null, bucket: string | null, pref
 	}
 }
 
-/// How DescribeDeliveryStream describes d: as both a plain and an extended S3 destination, as AWS does.
-function described(d: Destination): api.DestinationDescription {
+/// How DescribeDeliveryStream describes d: of S3, as both a plain and an extended S3 destination, as AWS does; of
+/// another kind, by ./shapes.
+function described(d: Destination): api.DestinationDescription throws Fault {
+	if (d.kind != "S3") {
+		const r = new api.DestinationDescription()
+		r.DestinationId = d.id
+		shapes.describe(r, d.kind, d.config, c => described(fromPlain(c)).S3DestinationDescription!)
+		return r
+	}
 	const hints = { ...new api.BufferingHints(), SizeInMBs: d.size, IntervalInSeconds: d.interval }
 	const e = new api.EncryptionConfiguration()
 	if (d.key == null) {
