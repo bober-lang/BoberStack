@@ -8,15 +8,19 @@
 //! REVIEW_IN_PROGRESS until it is executed, and executing one deletes the stack's others, as AWS does. Where AWS
 //! differs:
 //!
-//! - Templates are JSON only: YAML, TemplateURL, transforms and change sets of type IMPORT are refused.
+//! - Templates are JSON only: YAML, transforms and change sets of type IMPORT are refused. A TemplateURL is read
+//!   from S3 as the caller, path-style or virtual-hosted, at amazonaws.com or localhost; any failure to read it is
+//!   "TemplateURL must reference a valid S3 object to which you have access.".
 //! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SQS::QueuePolicy,
 //!   AWS::SNS::Topic, AWS::SNS::Subscription, AWS::S3::Bucket, AWS::Logs::LogGroup, AWS::DynamoDB::Table,
-//!   AWS::IAM::Role (with Policies and ManagedPolicyArns), AWS::IAM::Policy and AWS::IAM::ManagedPolicy (of Roles),
-//!   AWS::IAM::User, AWS::KMS::Key, AWS::KMS::Alias, AWS::SNS::TopicPolicy, AWS::S3::BucketPolicy, AWS::Events::Rule,
+//!   AWS::IAM::Role (with Policies and ManagedPolicyArns), AWS::IAM::Policy and AWS::IAM::ManagedPolicy (of Roles
+//!   and Users; IAM has no groups or instance profiles here), AWS::IAM::User, AWS::CloudWatch::Alarm,
+//!   AWS::KinesisFirehose::DeliveryStream, AWS::KMS::Key, AWS::KMS::Alias, AWS::SNS::TopicPolicy, AWS::S3::BucketPolicy, AWS::Events::Rule,
 //!   AWS::StepFunctions::StateMachine, AWS::Kinesis::Stream, AWS::Logs::LogStream, AWS::SecretsManager::Secret (with
 //!   GenerateSecretString), AWS::SSM::Parameter and AWS::Lambda's Function, Version, Alias, Permission, Url,
 //!   EventSourceMapping and LayerVersion (of S3 content); any other fails its resource, CREATE_FAILED, and the stack
-//!   rolls back. Their properties are those of each service's create call; tags are not propagated, but to a function.
+//!   rolls back. Their properties are those of each service's create call. A resource's Tags, and then the stack's,
+//!   are given to each create call that takes tags (not a bucket's); the aws:cloudformation: tags AWS adds are not.
 //! - A function's inline ZipFile is zipped as index.py for a Python runtime, else index.js, stored rather than
 //!   deflated, so its CodeSha256 and CodeSize are not AWS's.
 //! - A change set's Modify is of a resource whose definition changes or refers to a parameter whose value changes,
@@ -36,14 +40,17 @@ import * as api from "./api"
 import { condition, evaluate, EvalError, has, ordered, read, references, resource, Scope, Template, TemplateError,
 	text } from "./template"
 
+import * as cloudwatchApi from "../cloudwatch/api"
 import * as dynamodbApi from "../dynamodb/api"
 import * as eventsApi from "../events/api"
+import * as firehoseApi from "../firehose/api"
 import * as iamApi from "../iam/api"
 import * as kinesisApi from "../kinesis/api"
 import * as kmsApi from "../kms/api"
 import * as lambdaApi from "../lambda/api"
 import * as logsApi from "../logs/api"
 import * as s3Api from "../s3/api"
+import * as s3Handler from "../s3/s3"
 import * as secretsmanagerApi from "../secretsmanager/api"
 import * as snsApi from "../sns/api"
 import * as ssmApi from "../ssm/api"
@@ -55,7 +62,7 @@ import * as json from "../../core/protocol/json"
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
-import { indexOf, startsWith } from "std/algo"
+import { endsWith, indexOf, startsWith } from "std/algo"
 import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
@@ -63,6 +70,7 @@ import { EncodeError } from "std/encoding/json"
 import { crc32 } from "std/hash/crc32"
 import { lower, ParseError, parseInt, replace, split } from "std/string"
 import { rfc3339 } from "std/time"
+import { unescape } from "std/url"
 
 /// Who CloudFormation is to the roles it assumes.
 const principal = "cloudformation.amazonaws.com"
@@ -164,7 +172,7 @@ export class Handler {
 	/// The services whose resources stacks make.
 	sqs: sqsApi.SQS
 	sns: snsApi.SNS
-	s3: s3Api.S3
+	s3: s3Handler.Handler
 	logs: logsApi.CloudWatchLogs
 	iam: iamApi.IAM
 	dynamodb: dynamodbApi.DynamoDB
@@ -175,11 +183,15 @@ export class Handler {
 	secretsmanager: secretsmanagerApi.SecretsManager
 	events: eventsApi.EventBridge
 	stepfunctions: sfnApi.SFN
+	cloudwatch: cloudwatchApi.CloudWatch
+	firehose: firehoseApi.Firehose
 
-	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Api.S3, logs: logsApi.CloudWatchLogs, iam: iamApi.IAM,
+	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Handler.Handler, logs: logsApi.CloudWatchLogs, iam: iamApi.IAM,
 		dynamodb: dynamodbApi.DynamoDB, ssm: ssmApi.SSM, lambda: lambdaApi.Lambda, kms: kmsApi.KMS,
 		kinesis: kinesisApi.Kinesis, secretsmanager: secretsmanagerApi.SecretsManager, events: eventsApi.EventBridge,
-		stepfunctions: sfnApi.SFN) {
+		stepfunctions: sfnApi.SFN, cloudwatch: cloudwatchApi.CloudWatch, firehose: firehoseApi.Firehose) {
+		this.cloudwatch = cloudwatch
+		this.firehose = firehose
 		this.events = events
 		this.stepfunctions = stepfunctions
 		this.lambda = lambda
@@ -195,8 +207,44 @@ export class Handler {
 		this.ssm = ssm
 	}
 
+	/// body, else the text of the S3 object at url, read as the caller.
+	private fetched(caller: Caller, body: string | null, url: string | null): string | null throws Fault {
+		if (body != null || url == null) {
+			return body
+		}
+		const [bucket, key] = located(url!)
+		if (bucket == "" || key == "") {
+			throw validation("TemplateURL must be a supported URL.")
+		}
+		const q = new s3Api.GetObjectRequest()
+		q.Bucket = bucket
+		q.Key = key
+		const c = caller.internal(principal, "", ["s3:GetObject"])
+		c.source = ""
+		c.arn = caller.arn
+		c.userId = caller.userId
+		c.credential = caller.credential
+		const refused = "TemplateURL must reference a valid S3 object to which you have access."
+		let text = ""
+		try {
+			text = this.s3.getObject(c, q).Body
+		} catch (f: Fault) {
+			throw validation(refused)
+		}
+		const streamed = this.s3.streamed
+		this.s3.streamed = null
+		if (streamed == null) {
+			return text
+		}
+		try {
+			return streamed!.text(1048576)
+		} catch (e: IoError) {
+			throw validation(refused)
+		}
+	}
+
 	validateTemplate(caller: Caller, input: api.ValidateTemplateInput): api.ValidateTemplateOutput throws Fault {
-		const t = template(input.TemplateBody, input.TemplateURL)
+		const t = template(this.fetched(caller, input.TemplateBody, input.TemplateURL), input.TemplateURL)
 		const out = new api.ValidateTemplateOutput()
 		out.Description = t.description
 		const ps: api.TemplateParameter[] = []
@@ -232,7 +280,7 @@ export class Handler {
 	private create(caller: Caller, db: Table[Stack], s: Stack,
 		c: api.CreateStackInput): api.CreateStackOutput throws Fault {
 		const input = c
-		const body = input.TemplateBody
+		const body = this.fetched(caller, input.TemplateBody, input.TemplateURL)
 		const t = template(body, input.TemplateURL)
 		capable(t, input.Capabilities ?? [])
 		usable(caller, input.RoleARN, s.id)
@@ -285,7 +333,8 @@ export class Handler {
 		if (s.status != "CREATE_COMPLETE" && s.status != "UPDATE_COMPLETE" && s.status != "UPDATE_ROLLBACK_COMPLETE") {
 			throw validation(`Stack:${s.id} is in ${s.status} state and can not be updated.`)
 		}
-		const body = if (input.UsePreviousTemplate ?? false) s.body else input.TemplateBody
+		const body = this.fetched(caller, if (input.UsePreviousTemplate ?? false) s.body else input.TemplateBody,
+			input.TemplateURL)
 		const t = template(body, input.TemplateURL)
 		capable(t, input.Capabilities ?? s.capabilities)
 		usable(caller, input.RoleARN, s.id)
@@ -386,7 +435,8 @@ export class Handler {
 				}
 			}
 		}
-		const body = if (input.UsePreviousTemplate ?? false) s?.body else input.TemplateBody
+		const body = this.fetched(caller, if (input.UsePreviousTemplate ?? false) s?.body else input.TemplateBody,
+			input.TemplateURL)
 		const t = template(body, input.TemplateURL)
 		capable(t, input.Capabilities ?? [])
 		if (s == null) {
@@ -547,7 +597,9 @@ export class Handler {
 				}
 			}
 		}
-		out.Stacks = stacks
+		const [shown, next] = page(stacks, input.NextToken)
+		out.Stacks = shown
+		out.NextToken = next
 		return out
 	}
 
@@ -569,7 +621,9 @@ export class Handler {
 				sums.push(m)
 			}
 		}
-		out.StackSummaries = sums
+		const [shown, next] = page(sums, input.NextToken)
+		out.StackSummaries = shown
+		out.NextToken = next
 		return out
 	}
 
@@ -592,7 +646,9 @@ export class Handler {
 			m.ResourceStatusReason = e.reason
 			events.push(m)
 		}
-		out.StackEvents = events
+		const [shown, next] = page(events, input.NextToken)
+		out.StackEvents = shown
+		out.NextToken = next
 		return out
 	}
 
@@ -689,7 +745,9 @@ export class Handler {
 	}
 
 	getTemplateSummary(caller: Caller, input: api.GetTemplateSummaryInput): api.GetTemplateSummaryOutput throws Fault {
-		const body = if (input.StackName != null) found(table(caller), input.StackName!).body else input.TemplateBody
+		const body = this.fetched(caller,
+			if (input.StackName != null) found(table(caller), input.StackName!).body else input.TemplateBody,
+			input.TemplateURL)
 		const t = template(body, input.TemplateURL)
 		const out = new api.GetTemplateSummaryOutput()
 		out.Description = t.description
@@ -904,6 +962,7 @@ export class Handler {
 				}
 			}
 			q.Attributes = attrs
+			q.tags = tagged(s, p)
 			c.actions = ["sqs:CreateQueue"]
 			const url = this.sqs.createQueue(c, q).QueueUrl ?? ""
 			const arn = `arn:aws:sqs:${c.region}:${c.account}:${name}`
@@ -925,6 +984,7 @@ export class Handler {
 				}
 			}
 			q.Attributes = attrs
+			q.Tags = tagged(s, p).map(t => ({ ...new snsApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["sns:CreateTopic"]
 			const arn = this.sns.createTopic(c, q).TopicArn ?? ""
 			r.physical = arn
@@ -949,6 +1009,7 @@ export class Handler {
 			const name = p.str("LogGroupName") ?? physical(s, r, 512, false)
 			const q = new logsApi.CreateLogGroupRequest()
 			q.logGroupName = name
+			q.tags = tagged(s, p)
 			c.actions = ["logs:CreateLogGroup"]
 			this.logs.createLogGroup(c, q)
 			r.physical = name
@@ -963,8 +1024,12 @@ export class Handler {
 			if (streams != null) {
 				streams!.set("StreamEnabled", boolean(true))
 			}
+			const tags = tagged(s, p)
+			p.set("Tags", nul())
+			const made = json.decode[dynamodbApi.CreateTableInput](write(p))
+			made.Tags = tags.map(t => ({ ...new dynamodbApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["dynamodb:CreateTable"]
-			const d = this.dynamodb.createTable(c, json.decode[dynamodbApi.CreateTableInput](write(p))).TableDescription
+			const d = this.dynamodb.createTable(c, made).TableDescription
 			r.physical = name
 			r.ref = name
 			r.attributes = [["Arn", d?.TableArn ?? `arn:aws:dynamodb:${c.region}:${c.account}:table/${name}`]]
@@ -980,6 +1045,7 @@ export class Handler {
 			q.Path = p.str("Path")
 			q.Description = p.str("Description")
 			q.AssumeRolePolicyDocument = document(p.get("AssumeRolePolicyDocument"))
+			q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["iam:CreateRole"]
 			const role = this.iam.createRole(c, q).Role
 			r.physical = name
@@ -1012,6 +1078,7 @@ export class Handler {
 			q.Type = if (p.str("Type") == "StringList") "StringList" else "String"
 			q.Description = p.str("Description")
 			q.AllowedPattern = p.str("AllowedPattern")
+			q.Tags = tagged(s, p).map(t => ({ ...new ssmApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["ssm:PutParameter"]
 			this.ssm.putParameter(c, q)
 			r.physical = name
@@ -1083,6 +1150,7 @@ export class Handler {
 				q.Path = p.str("Path")
 				q.Description = p.str("Description")
 				q.PolicyDocument = doc
+				q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 				c.actions = ["iam:CreatePolicy"]
 				const made = this.iam.createPolicy(c, q).Policy
 				arn = made?.Arn ?? ""
@@ -1105,6 +1173,23 @@ export class Handler {
 				}
 				r.parts.push([x.text, name])
 			}
+			for (const x of p.get("Users")?.items ?? []) {
+				if (managed) {
+					const a = new iamApi.AttachUserPolicyRequest()
+					a.UserName = x.text
+					a.PolicyArn = arn
+					c.actions = ["iam:AttachUserPolicy"]
+					this.iam.attachUserPolicy(c, a)
+				} else {
+					const i = new iamApi.PutUserPolicyRequest()
+					i.UserName = x.text
+					i.PolicyName = name
+					i.PolicyDocument = doc
+					c.actions = ["iam:PutUserPolicy"]
+					this.iam.putUserPolicy(c, i)
+				}
+				r.parts.push([`user/${x.text}`, name])
+			}
 			r.physical = if (managed) arn else physical(s, r, 128, false)
 			r.ref = r.physical
 			return
@@ -1118,6 +1203,7 @@ export class Handler {
 			q.State = if (p.str("State") == "DISABLED") "DISABLED" else "ENABLED"
 			q.Description = p.str("Description")
 			q.RoleArn = p.str("RoleArn")
+			q.Tags = tagged(s, p).map(t => ({ ...new eventsApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["events:PutRule"]
 			const arn = this.events.putRule(c, q).RuleArn ?? ""
 			const targets = p.get("Targets")?.items ?? []
@@ -1150,6 +1236,7 @@ export class Handler {
 			q.definition = definition
 			q.roleArn = p.str("RoleArn") ?? ""
 			q.type = if (p.str("StateMachineType") == "EXPRESS") "EXPRESS" else "STANDARD"
+			q.tags = tagged(s, p).map(t => ({ ...new sfnApi.Tag(), key: t[0], value: t[1] }))
 			c.actions = ["states:CreateStateMachine"]
 			const arn = this.stepfunctions.createStateMachine(c, q).stateMachineArn
 			r.physical = arn
@@ -1157,10 +1244,41 @@ export class Handler {
 			r.attributes = [["Arn", arn], ["Name", q.name]]
 			return
 		}
+		if (r.kind == "AWS::CloudWatch::Alarm") {
+			const name = p.str("AlarmName") ?? physical(s, r, 255, false)
+			p.set("AlarmName", str(name))
+			const tags = tagged(s, p)
+			p.set("Tags", nul())
+			numeric(p, ["Period", "EvaluationPeriods", "DatapointsToAlarm", "Threshold"])
+			const q = json.decode[cloudwatchApi.PutMetricAlarmInput](write(p))
+			q.Tags = tags.map(t => ({ ...new cloudwatchApi.Tag(), Key: t[0], Value: t[1] }))
+			c.actions = ["cloudwatch:PutMetricAlarm"]
+			this.cloudwatch.putMetricAlarm(c, q)
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", `arn:aws:cloudwatch:${c.region}:${c.account}:alarm:${name}`]]
+			return
+		}
+		if (r.kind == "AWS::KinesisFirehose::DeliveryStream") {
+			const name = p.str("DeliveryStreamName") ?? physical(s, r, 64, false)
+			p.set("DeliveryStreamName", str(name))
+			const tags = tagged(s, p)
+			p.set("Tags", nul())
+			numeric(p, ["IntervalInSeconds", "SizeInMBs"])
+			const q = json.decode[firehoseApi.CreateDeliveryStreamInput](write(p))
+			q.Tags = tags.map(t => ({ ...new firehoseApi.Tag(), Key: t[0], Value: t[1] }))
+			c.actions = ["firehose:CreateDeliveryStream"]
+			const arn = this.firehose.createDeliveryStream(c, q).DeliveryStreamARN ?? ""
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", arn]]
+			return
+		}
 		if (r.kind == "AWS::IAM::User") {
 			const q = new iamApi.CreateUserRequest()
 			q.UserName = p.str("UserName") ?? physical(s, r, 64, false)
 			q.Path = p.str("Path")
+			q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["iam:CreateUser"]
 			const u = this.iam.createUser(c, q).User
 			r.physical = q.UserName
@@ -1174,6 +1292,7 @@ export class Handler {
 			if (p.get("KeyPolicy") != null) {
 				q.Policy = document(p.get("KeyPolicy"))
 			}
+			q.Tags = tagged(s, p).map(t => ({ ...new kmsApi.Tag(), TagKey: t[0], TagValue: t[1] }))
 			c.actions = ["kms:CreateKey"]
 			const k = this.kms.createKey(c, q).KeyMetadata
 			r.physical = k?.KeyId ?? ""
@@ -1226,6 +1345,7 @@ export class Handler {
 			} else {
 				q.ShardCount = (p.get("ShardCount")?.number() ?? 1.0) as i32
 			}
+			q.Tags = tagged(s, p)
 			c.actions = ["kinesis:CreateStream"]
 			this.kinesis.createStream(c, q)
 			r.physical = q.StreamName
@@ -1256,6 +1376,7 @@ export class Handler {
 					q.SecretString = password
 				}
 			}
+			q.Tags = tagged(s, p).map(t => ({ ...new secretsmanagerApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["secretsmanager:CreateSecret"]
 			const made = this.secretsmanager.createSecret(c, q)
 			r.physical = made.ARN ?? ""
@@ -1276,7 +1397,22 @@ export class Handler {
 			this.logs.deleteLogStream(c, q)
 		} else if (r.kind == "AWS::IAM::ManagedPolicy" || r.kind == "AWS::IAM::Policy") {
 			for (const [role, name] of r.parts) {
-				if (r.kind == "AWS::IAM::ManagedPolicy") {
+				if (startsWith(role, "user/")) {
+					const user = role.slice(5, role.length)
+					if (r.kind == "AWS::IAM::ManagedPolicy") {
+						const q = new iamApi.DetachUserPolicyRequest()
+						q.UserName = user
+						q.PolicyArn = r.physical
+						c.actions = ["iam:DetachUserPolicy"]
+						this.iam.detachUserPolicy(c, q)
+					} else {
+						const q = new iamApi.DeleteUserPolicyRequest()
+						q.UserName = user
+						q.PolicyName = name
+						c.actions = ["iam:DeleteUserPolicy"]
+						this.iam.deleteUserPolicy(c, q)
+					}
+				} else if (r.kind == "AWS::IAM::ManagedPolicy") {
 					const q = new iamApi.DetachRolePolicyRequest()
 					q.RoleName = role
 					q.PolicyArn = r.physical
@@ -1317,6 +1453,16 @@ export class Handler {
 			q.stateMachineArn = r.physical
 			c.actions = ["states:DeleteStateMachine"]
 			this.stepfunctions.deleteStateMachine(c, q)
+		} else if (r.kind == "AWS::CloudWatch::Alarm") {
+			const q = new cloudwatchApi.DeleteAlarmsInput()
+			q.AlarmNames = [r.physical]
+			c.actions = ["cloudwatch:DeleteAlarms"]
+			this.cloudwatch.deleteAlarms(c, q)
+		} else if (r.kind == "AWS::KinesisFirehose::DeliveryStream") {
+			const q = new firehoseApi.DeleteDeliveryStreamInput()
+			q.DeliveryStreamName = r.physical
+			c.actions = ["firehose:DeleteDeliveryStream"]
+			this.firehose.deleteDeliveryStream(c, q)
 		} else if (r.kind == "AWS::IAM::User") {
 			const q = new iamApi.DeleteUserRequest()
 			q.UserName = r.physical
@@ -1371,10 +1517,10 @@ export class Handler {
 				const ext = if (startsWith(p.str("Runtime") ?? "", "python")) "py" else "js"
 				code!.set("ZipFile", str(base64.encode(zipped(`index.${ext}`, inline!))))
 			}
-			const tags = p.get("Tags")
+			const tags = tagged(s, p)
 			p.set("Tags", nul())
 			const q = json.decode[lambdaApi.CreateFunctionRequest](write(p))
-			q.Tags = (tags?.items ?? []).map(t => [t.str("Key") ?? "", t.str("Value") ?? ""] as [string, string])
+			q.Tags = tags
 			c.actions = ["lambda:CreateFunction"]
 			const f = this.lambda.createFunction(c, q)
 			r.physical = name
@@ -1768,16 +1914,50 @@ function found(db: Table[Stack], name: string): Stack throws Fault {
 
 function validation(message: string): Fault { return new Fault(400, "ValidationError", message) }
 
-/// The template of body, refusing a TemplateURL and the lack of both as AWS does.
+/// The bucket and key of url, an S3 URL of AWS, path-style or virtual-hosted, or of this server, at localhost; empty if
+/// it is neither.
+function located(url: string): [string, string] {
+	const scheme = indexOf(url, "://")
+	if (scheme < 0) {
+		return ["", ""]
+	}
+	const rest = url.slice(scheme + 3, url.length)
+	const slash = indexOf(rest, "/")
+	if (slash < 0) {
+		return ["", ""]
+	}
+	const host = lower(split(rest.slice(0, slash), ":")[0])
+	let path = rest.slice(slash + 1, rest.length)
+	const q = indexOf(path, "?")
+	if (q >= 0) {
+		path = path.slice(0, q)
+	}
+	const aws = endsWith(host, ".amazonaws.com")
+	const local = host == "localhost" || host == "127.0.0.1"
+	const pathStyle = local || (aws && (startsWith(host, "s3.") || startsWith(host, "s3-")))
+	if (pathStyle) {
+		const cut = indexOf(path, "/")
+		return if (cut < 0) ["", ""] else [path.slice(0, cut), unescape(path.slice(cut + 1, path.length), "path")]
+	}
+	for (const marker of [".s3.", ".s3-"]) {
+		const at = indexOf(host, marker)
+		if (aws && at > 0) {
+			return [host.slice(0, at), unescape(path, "path")]
+		}
+	}
+	if (endsWith(host, ".localhost")) {
+		return [host.slice(0, host.length - 10), unescape(path, "path")]
+	}
+	return ["", ""]
+}
+
+/// The template of body, refusing the lack of it and of a TemplateURL as AWS does.
 function template(body: string | null, url: string | null): Template throws Fault {
 	if (body == null && url == null) {
 		throw validation("Either Template URL or Template Body must be specified.")
 	}
-	if (body == null) {
-		throw validation("TemplateURL is not supported; give the template as TemplateBody")
-	}
 	try {
-		const t = read(body!)
+		const t = read(body ?? "")
 		ordered(t)
 		return t
 	} catch (e: TemplateError) {
@@ -2127,4 +2307,50 @@ function generated(g: Json): string throws Fault {
 		out = `${out}${chars.slice(at, at + 1)}`
 	}
 	return out
+}
+
+/// The tags of r's properties p, a list of Key and Value or an object, and then those of s that p does not name.
+function tagged(s: Stack, p: Json): [string, string][] {
+	const own = p.get("Tags")
+	const out: [string, string][] = if (own == null) []
+		else if (own!.kind == "object") own!.keys.map(e => [e[0], text(e[1])] as [string, string])
+		else own!.items.map(t => [t.str("Key") ?? "", t.str("Value") ?? ""] as [string, string])
+	for (const [k, v] of s.tags) {
+		if (!out.some(t => t[0] == k)) {
+			out.push([k, v])
+		}
+	}
+	return out
+}
+
+/// Makes each member of v, at any depth, named by one of keys and given as a string, the number it writes.
+function numeric(v: Json, keys: string[]): void {
+	for (let i = 0; i < v.keys.length; i++) {
+		const [k, x] = v.keys[i]
+		if (x.kind == "string" && keys.some(n => n == k)) {
+			v.keys[i] = [k, { ...new Json(), kind: "number", text: x.text }]
+		} else {
+			numeric(x, keys)
+		}
+	}
+	for (const x of v.items) {
+		numeric(x, keys)
+	}
+}
+
+/// The page of items after token, of 100 as AWS gives, and the token of the next page, null if none.
+function page[T](items: T[], token: string | null): [T[], string | null] throws Fault {
+	let from = 0
+	if (token != null) {
+		try {
+			from = parseInt(base64.decode(token!)) as i32
+		} catch (e: ParseError) {
+			throw validation("Invalid NextToken")
+		}
+		if (from < 0 || from > items.length) {
+			throw validation("Invalid NextToken")
+		}
+	}
+	const to = if (from + 100 < items.length) from + 100 else items.length
+	return [items.slice(from, to), if (to < items.length) base64.encode(`${to}`) else null]
 }
