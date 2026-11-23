@@ -1,0 +1,45 @@
+//! Step Functions' state in an account's regional tree: its state machines by name, and their executions by the
+//! machine's name, a NUL and the execution's.
+
+import { Store, Table } from "../../core/state/store"
+
+export class Machine {
+	name = ""
+	kind = "STANDARD"
+	definition = ""
+	role = ""
+	created: i64 = 0
+	/// A UUID, renewed by each update.
+	revision = ""
+	tags: [string, string][] = []
+}
+
+export class Execution {
+	name = ""
+	machine = ""
+	express = false
+	/// RUNNING, SUCCEEDED, FAILED, TIMED_OUT or ABORTED.
+	status = "RUNNING"
+	input = ""
+	output: string | null = null
+	error: string | null = null
+	cause: string | null = null
+	started: i64 = 0
+	stopped: i64 | null = null
+	/// The definition and role it ran with.
+	definition = ""
+	role = ""
+	/// Its history, each event the JSON of the wire's HistoryEvent.
+	events: string[] = []
+}
+
+/// The tables of a regional tree.
+export class Tables {
+	machines: Table[Machine]
+	executions: Table[Execution]
+
+	constructor(s: Store) {
+		this.machines = new Table[Machine](s, "states/machines")
+		this.executions = new Table[Execution](s, "states/executions")
+	}
+}

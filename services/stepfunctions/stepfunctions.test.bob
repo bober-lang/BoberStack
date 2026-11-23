@@ -1,0 +1,155 @@
+import { sign } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { indexOf } from "std/algo"
+import * as json from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+const machine = "arn:aws:states:us-east-1:000000000000:stateMachine:m"
+const role = "arn:aws:iam::000000000000:role/r"
+
+/// The answer of g to the operation op of the JSON service of target and signing name, from the account's root.
+function call(g: Gateway, service: string, op: string, body: string): Response {
+	const [target, version] = switch (service) {
+		case "states": ["AWSStepFunctions", "1.0"]
+		case "sqs": ["AmazonSQS", "1.0"]
+		default: ["DynamoDB_20120810", "1.0"]
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", `application/x-amz-json-${version}`)
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function sfn(g: Gateway, op: string, body: string): Response { return call(g, "states", op, body) }
+
+/// The answer of g to IAM's action of params.
+function iam(g: Gateway, params: [string, string][]): Response {
+	const body = "Version=2010-05-08"
+		+ params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, "iam", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// Whether res succeeded and its body holds each of parts.
+function ok(res: Response, ...parts: string[]): bool {
+	const b = res.body.whole ?? ""
+	const fine = res.status == 200 && parts.every(p => indexOf(b, p) >= 0)
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+/// Whether res is the error of code holding message.
+function fails(res: Response, code: string, message: string): bool {
+	const b = res.body.whole ?? ""
+	const fine = res.status == 400 && indexOf(b, `${code}"`) >= 0 && indexOf(b, message) >= 0
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+/// A gateway with the role r, which may send to queues and put items, the queue q and the table tab.
+function world(): Gateway {
+	const g = stack(new Catalog(0, 0))
+	const trust = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},`
+		+ `"Action":"sts:AssumeRole"}]}`
+	assert iam(g, [["Action", "CreateRole"], ["RoleName", "r"], ["AssumeRolePolicyDocument", trust]]).status == 200
+	const allowed = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:SendMessage",`
+		+ `"dynamodb:PutItem"],"Resource":"*"}]}`
+	assert iam(g,
+		[["Action", "PutRolePolicy"], ["RoleName", "r"], ["PolicyName", "p"], ["PolicyDocument", allowed]]).status
+		== 200
+	assert ok(call(g, "sqs", "CreateQueue", `{"QueueName":"q"}`))
+	assert ok(call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"id",`
+		+ `"AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`))
+	return g
+}
+
+/// A request to create the machine m of the definition d.
+function create(d: string): string { return `{"name":"m","roleArn":"${role}","definition":${json.quoted(d)}}` }
+
+const definition = `{"StartAt":"Each","States":{
+	"Each":{"Type":"Map","ItemsPath":"$.items","ItemProcessor":{"StartAt":"Send","States":{"Send":{"Type":"Task",
+		"Resource":"arn:aws:states:::sqs:sendMessage","Parameters":{"QueueUrl":"http://localhost:4566/000000000000/q",
+		"MessageBody.$":"States.Format('item {}', $)"},"ResultSelector":{"id.$":"$.MessageId"},"End":true}}},
+		"ResultPath":"$.sent","Next":"Both"},
+	"Both":{"Type":"Parallel","Branches":[{"StartAt":"Put","States":{"Put":{"Type":"Task",
+		"Resource":"arn:aws:states:::dynamodb:putItem","Parameters":{"TableName":"tab","Item":{"id":{"S.$":"$.id"}}},
+		"End":true}}},{"StartAt":"Lambda","States":{"Lambda":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke",
+		"Parameters":{"FunctionName":"f"},"Retry":[{"ErrorEquals":["States.ALL"],"MaxAttempts":1}],
+		"Catch":[{"ErrorEquals":["States.TaskFailed"],"Next":"Caught"}],"End":true},
+		"Caught":{"Type":"Pass","Result":"caught","End":true}}}],"ResultPath":"$.both","Next":"Which"},
+	"Which":{"Type":"Choice","Choices":[{"Variable":"$.both[1]","StringEquals":"caught","Next":"Done"}],
+		"Default":"Bad"},
+	"Bad":{"Type":"Fail","Error":"Bad"},
+	"Done":{"Type":"Succeed","OutputPath":"$.both[1]"}}}`
+
+test "a machine runs to its end within StartExecution" {
+	const g = world()
+	assert ok(sfn(g, "CreateStateMachine", create(definition)), machine)
+	// The same again is the same machine; another definition of its name a conflict.
+	assert ok(sfn(g, "CreateStateMachine", create(definition)), machine)
+	const other = `{"StartAt":"A","States":{"A":{"Type":"Succeed"}}}`
+	assert fails(sfn(g, "CreateStateMachine", create(other)), "StateMachineAlreadyExists", machine)
+	assert ok(sfn(g, "StartExecution",
+		`{"stateMachineArn":"${machine}","name":"e","input":"{\\"items\\":[1,2],\\"id\\":\\"k\\"}"}`),
+		`"executionArn":"arn:aws:states:us-east-1:000000000000:execution:m:e"`)
+	const e = "arn:aws:states:us-east-1:000000000000:execution:m:e"
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"${e}"}`), `"status":"SUCCEEDED"`, `"output":"\\"caught\\""`)
+	assert ok(call(g, "sqs", "ReceiveMessage",
+		`{"QueueUrl":"http://localhost:4566/000000000000/q","MaxNumberOfMessages":10}`), "item 1", "item 2")
+	assert ok(call(g, "dynamodb", "GetItem", `{"TableName":"tab","Key":{"id":{"S":"k"}}}`), `"Item":{"id":{"S":"k"}}`)
+	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${e}","reverseOrder":true,"maxResults":1}`),
+		`"type":"ExecutionSucceeded"`, `"nextToken":"1"`)
+	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${e}"}`), `"type":"ExecutionStarted"`,
+		`"type":"MapIterationStarted"`, `"resourceType":"sqs","resource":"sendMessage"`, `"type":"TaskFailed"`,
+		`"cause":"BoberStack has no Lambda to invoke"`, `"type":"SucceedStateEntered"`)
+	assert fails(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"e"}`), "ExecutionAlreadyExists", e)
+	assert ok(sfn(g, "ListExecutions", `{"stateMachineArn":"${machine}","statusFilter":"SUCCEEDED"}`), `"name":"e"`)
+	assert ok(sfn(g, "DescribeStateMachineForExecution", `{"executionArn":"${e}"}`), `"roleArn":"${role}"`)
+}
+
+test "a task its role may not perform fails the execution" {
+	const g = world()
+	const d = `{"StartAt":"A","States":{"A":{"Type":"Task","Resource":"arn:aws:states:::dynamodb:getItem",`
+		+ `"Parameters":{"TableName":"tab","Key":{"id":{"S":"k"}}},"End":true}}}`
+	assert ok(sfn(g, "CreateStateMachine", create(d)))
+	assert ok(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"x"}`))
+	assert ok(sfn(g, "DescribeExecution", `{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:m:x"}`),
+		`"status":"FAILED"`, `"error":"DynamoDB.AccessDenied"`,
+		"assumed-role/r/x is not authorized to perform: dynamodb:GetItem")
+}
+
+test "state machines" {
+	const g = world()
+	assert fails(sfn(g, "CreateStateMachine", `{"name":"m","roleArn":"x","definition":"{}"}`), "InvalidArn",
+		"Invalid Role Arn: 'x'")
+	assert fails(sfn(g, "CreateStateMachine", create(`{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"}}}`)),
+		"InvalidDefinition", "MISSING_TRANSITION_TARGET: Missing 'Next' target: B at /States/A/Next")
+	assert fails(sfn(g, "DescribeStateMachine", `{"stateMachineArn":"x"}`), "InvalidArn",
+		"Invalid Arn: 'Invalid ARN prefix: x'")
+	assert fails(sfn(g, "DescribeStateMachine", `{"stateMachineArn":"${machine}"}`), "StateMachineDoesNotExist",
+		`State Machine Does Not Exist: '${machine}'`)
+	assert ok(sfn(g, "ValidateStateMachineDefinition", `{"definition":"{}"}`), `"result":"FAIL"`)
+	const d = `{"StartAt":"A","States":{"A":{"Type":"Pass","End":true}}}`
+	assert ok(sfn(g, "CreateStateMachine",
+		`{"name":"m","roleArn":"${role}","definition":${json.quoted(d)},`
+		+ `"type":"EXPRESS","tags":[{"key":"k","value":"v"}]}`))
+	assert ok(sfn(g, "ListStateMachines", "{}"), `"type":"EXPRESS"`)
+	assert ok(sfn(g, "ListTagsForResource", `{"resourceArn":"${machine}"}`), `{"key":"k","value":"v"}`)
+	assert ok(sfn(g, "StartSyncExecution", `{"stateMachineArn":"${machine}","input":"{\\"a\\":1}"}`),
+		`"status":"SUCCEEDED"`, `"output":"{\\"a\\":1}"`)
+	assert ok(sfn(g, "UpdateStateMachine", `{"stateMachineArn":"${machine}","definition":${json.quoted(d)}}`),
+		`"revisionId"`)
+	assert ok(sfn(g, "DeleteStateMachine", `{"stateMachineArn":"${machine}"}`))
+	assert ok(sfn(g, "ListStateMachines", "{}"), `"stateMachines":[]`)
+}
