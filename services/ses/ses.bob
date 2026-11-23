@@ -15,13 +15,13 @@
 
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
+import { random } from "../../core/random"
 import { Caller, Unit } from "../../core/service"
 import { Store, Table } from "../../core/state/store"
 import * as api from "./api"
 import * as v2 from "./v2/api"
 import * as snsApi from "../sns/api"
-import { indexOf, lastIndexOf } from "std/algo"
-import { bytes } from "std/crypto/random"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
@@ -2013,7 +2013,7 @@ function render(s: string, data: json.Unknown[]): string throws Fault {
 		if (v == null) {
 			throw api.missingRenderingAttributeException(`Attribute '${name}' is not present in the rendering data.`)
 		}
-		out += s.slice(at, open) + unquoted(v![1])
+		out += s.slice(at, open) + unquoted(v![1].text)
 		at = close + 2
 	}
 }
@@ -2083,8 +2083,8 @@ function policyOf(i: Identity): string | null {
 		try {
 			for (const [k, v] of json.decode[json.Keys](p).all) {
 				if (k == "Statement") {
-					const raw = trim(v)
-					statements.push(if (raw.length > 1 && raw.slice(0, 1) == "[") raw.slice(1, raw.length - 1) else raw)
+					statements.append(if (startsWith(v.text, "[")) json.decode[json.Raw[]](v.text).map(x => x.text)
+						else [v.text])
 				}
 			}
 		} catch (e: ParseError) {}
@@ -2255,11 +2255,3 @@ function hex12(v: i64): string {
 }
 
 function token(n: i32): string throws Fault { return hex.encode(random(n)) }
-
-function random(n: i32): string throws Fault {
-	try {
-		return bytes(n)
-	} catch (e: IoError) {
-		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
-	}
-}

@@ -1,4 +1,5 @@
-import { request, sign, text } from "../../core/client"
+import { sign } from "../../core/auth/sigv4"
+import { request, text } from "../../core/client.test"
 import { Gateway } from "../../core/gateway"
 import { stack } from "../../stack"
 import { Catalog } from "../iam/catalog"
@@ -34,7 +35,7 @@ function internal(g: Gateway, method: string, path: string): Response {
 function has(res: Response, s: string): bool { return indexOf(res.body.whole ?? "", s) >= 0 }
 
 test "an identity verified by one API is the other's, verified at once" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert call(g, "VerifyEmailIdentity", [["EmailAddress", "a@example.com"]]).status == 200
 	assert callV2(g, "POST", "/v2/email/identities", `{"EmailIdentity": "example.org"}`).status == 200
 	const listed = callV2(g, "POST", "/v2/email/list-identities", "{}")
@@ -51,7 +52,7 @@ test "an identity verified by one API is the other's, verified at once" {
 }
 
 test "a message is stored, not sent, only from a verified source, and /_aws/ses lists and clears it" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const send: [string, string][] = [["Source", "a@example.com"],
 		["Destination.ToAddresses.member.1", "b@example.net"], ["Message.Subject.Data", "Hi"],
 		["Message.Body.Text.Data", "Hello"]]
@@ -81,7 +82,7 @@ test "a message is stored, not sent, only from a verified source, and /_aws/ses 
 }
 
 test "templates render their {{names}}, and a send of one names it" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert call(g, "CreateTemplate",
 		[["Template.TemplateName", "t"], ["Template.SubjectPart", "Hi {{name}}"],
 		["Template.TextPart", "Dear {{ name }}, {{n}}"]]).status == 200
@@ -119,7 +120,7 @@ test "templates render their {{names}}, and a send of one names it" {
 }
 
 test "configuration sets: create, describe, list, delete" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert call(g, "CreateConfigurationSet", [["ConfigurationSet.Name", "c"]]).status == 200
 	assert text(call(g, "DescribeConfigurationSet", [["ConfigurationSetName", "c"]]), "Name") == "c"
 	assert text(call(g, "ListConfigurationSets"), "Name") == "c"
@@ -129,7 +130,7 @@ test "configuration sets: create, describe, list, delete" {
 }
 
 test "event destinations are one state of both APIs" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert callV2(g, "POST", "/v2/email/configuration-sets",
 		`{"ConfigurationSetName": "c", "Tags": [{"Key": "k", "Value": "v"}]}`).status == 200
 	assert call(g, "CreateConfigurationSetEventDestination",
@@ -149,7 +150,7 @@ test "event destinations are one state of both APIs" {
 }
 
 test "tags and pages" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const arn = "arn:aws:ses:us-east-1:000000000000:configuration-set/c"
 	callV2(g, "POST", "/v2/email/configuration-sets", `{"ConfigurationSetName": "c"}`)
 	assert callV2(g, "POST", "/v2/email/tags", `{"ResourceArn": "${arn}", "Tags": [{"Key": "k", "Value": "v"}]}`).status
@@ -176,7 +177,7 @@ test "tags and pages" {
 }
 
 test "an identity's attributes, and its policies let another account send from it" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
 	assert call(g, "SetIdentityNotificationTopic",
 		[["Identity", "example.com"], ["NotificationType", "Bounce"],
@@ -214,7 +215,7 @@ test "an identity's attributes, and its policies let another account send from i
 }
 
 test "a badly signed request is answered in the protocol of the API it is to" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const created = g.handle(request("iam", "test", "test", "Action=CreateAccessKey&Version=2010-05-08"))
 	const key = text(created, "AccessKeyId")!
 	const req = new Request("GET", "http://localhost:4566/v2/email/account")
@@ -353,7 +354,7 @@ test "a configuration set keeps the options put to it" {
 }
 
 test "contact lists, their contacts, and a send to a list's topic skips who opted out" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert callV2(g, "POST", "/v2/email/contact-lists",
 		`{"ContactListName": "l", "Topics": [{"TopicName": "news", "DisplayName": "News", `
 		+ `"DefaultSubscriptionStatus": "OPT_IN"}, {"TopicName": "ads", "DisplayName": "Ads", `
@@ -391,7 +392,7 @@ test "contact lists, their contacts, and a send to a list's topic skips who opte
 }
 
 test "an identity made with a DKIM key of its own and a configuration set" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const body = `{"EmailIdentity": "own.example", "ConfigurationSetName": "c", "DkimSigningAttributes": `
 		+ `{"DomainSigningSelector": "sel", "DomainSigningPrivateKey": "a2V5"}}`
 	assert callV2(g, "POST", "/v2/email/identities", body).status == 404
@@ -402,7 +403,7 @@ test "an identity made with a DKIM key of its own and a configuration set" {
 }
 
 test "receipt rule sets, their rules in order, the active one, and receipt filters" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	assert call(g, "CreateReceiptRuleSet", [["RuleSetName", "s"]]).status == 200
 	assert text(call(g, "CreateReceiptRuleSet", [["RuleSetName", "s"]]), "Code") == "AlreadyExists"
 	call(g, "CreateReceiptRule",

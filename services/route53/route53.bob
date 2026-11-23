@@ -9,6 +9,7 @@
 //! implemented.
 
 import { Fault } from "../../core/fault"
+import { pick, random, uuid } from "../../core/random"
 import * as rest from "../../core/protocol/rest"
 import * as restxml from "../../core/protocol/restxml"
 import { Caller } from "../../core/service"
@@ -19,8 +20,6 @@ import { Alias, Change, Check, CheckReference, Collection, DelegationSet, Record
 
 import { endsWith, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
-import { bytes } from "std/crypto/random"
-import * as hex from "std/encoding/hex"
 import { encode, EncodeError } from "std/encoding/json"
 import { Body, Request, Response } from "std/http"
 import { min } from "std/math"
@@ -813,31 +812,12 @@ function info(c: Change): api.ChangeInfo {
 }
 
 function items(n: i32 | null): i32 { return if (n == null || n! <= 0) 100 else n! }
-
 /// A new id of the prefix p, as AWS's: 20 upper-case letters and digits after it.
-function id(p: string): string throws Fault {
-	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	let b = ""
-	try {
-		b = bytes(20)
-	} catch (e: IoError) {
-		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
-	}
-	const out: u8[] = []
-	for (let i = 0; i < 20; i++) {
-		out.push(alphabet[(b[i] as i32) % alphabet.length])
-	}
-	return p + fromBytes(out)
-}
+function id(p: string): string throws Fault { return p + pick(20, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") }
 
 /// Four name servers, as AWS's: of .com, .net, .org and .co.uk.
 function nameServers(): string[] throws Fault {
-	let b = ""
-	try {
-		b = bytes(8)
-	} catch (e: IoError) {
-		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
-	}
+	const b = random(8)
 	const out: string[] = []
 	const tlds = ["com", "net", "org", "co.uk"]
 	for (let i = 0; i < 4; i++) {
@@ -1259,14 +1239,4 @@ function checked(c: Check): api.HealthCheckConfig throws Fault {
 			+ "GetHealthCheckStatus can't return the status of one of these special health checks.")
 	}
 	return c.config
-}
-
-function uuid(): string throws Fault {
-	let h = ""
-	try {
-		h = hex.encode(bytes(16))
-	} catch (e: IoError) {
-		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
-	}
-	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
 }

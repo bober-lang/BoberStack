@@ -1,4 +1,5 @@
-import { sign, text, texts } from "../../core/client"
+import { sign } from "../../core/auth/sigv4"
+import { text, texts } from "../../core/client.test"
 import { Gateway } from "../../core/gateway"
 import { Catalog } from "../iam/catalog"
 import { stack } from "../../stack"
@@ -38,7 +39,7 @@ test "names are normalised as Route 53 holds them" {
 }
 
 test "a zone, its records and its deletion" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const made = call(g, "POST", "/hostedzone", create("example.test", "r1"))
 	assert made.status == 201
 	assert made.headers.get("content-type") == "text/xml"
@@ -78,7 +79,7 @@ test "a zone, its records and its deletion" {
 }
 
 test "a private zone and its VPCs" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const body = `<CreateHostedZoneRequest xmlns="${ns}"><Name>internal.test</Name><VPC><VPCRegion>us-east-1</VPCRegion>`
 		+ "<VPCId>vpc-1</VPCId></VPC><CallerReference>p1</CallerReference></CreateHostedZoneRequest>"
 	const made = call(g, "POST", "/hostedzone", body)
@@ -97,7 +98,7 @@ test "a private zone and its VPCs" {
 }
 
 test "tags of a zone" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const id = text(call(g, "POST", "/hostedzone", create("tagged.test", "t1")), "Id")!
 	const bare = id.slice(12, id.length)
 	const change = `<ChangeTagsForResourceRequest xmlns="${ns}"><AddTags><Tag><Key>team</Key><Value>dns</Value></Tag>`
@@ -108,7 +109,7 @@ test "tags of a zone" {
 }
 
 test "a health check's update resets only the elements named" {
-	const g = stack(new Catalog(0, 0))
+	const g = stack(new Catalog(""))
 	const made = call(g, "POST", "/healthcheck",
 		`<CreateHealthCheckRequest xmlns="${ns}"><CallerReference>h1`
 		+ "</CallerReference><HealthCheckConfig><Type>HTTP</Type><ResourcePath>/up</ResourcePath>"

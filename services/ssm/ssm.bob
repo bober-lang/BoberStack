@@ -14,7 +14,7 @@ import { decryptAs, encryptAs } from "../kms/kms"
 import * as api from "./api"
 import { Parameter, parameters, save, Version } from "./records"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
-import { isAlphanumeric, isDigit, lbracket } from "std/ascii"
+import { isAlphanumeric, isDigit } from "std/ascii"
 import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { compile, Regex } from "std/regex"
@@ -538,7 +538,7 @@ function policies(given: string | null): api.ParameterInlinePolicy[] | null {
 		try {
 			for (const [k, v] of json.decode[json.Keys](text).all) {
 				if (k == "Type") {
-					kind = json.decode[string](v)
+					kind = json.decode[string](v.text)
 				}
 			}
 		} catch (e: ParseError) {}
@@ -547,33 +547,11 @@ function policies(given: string | null): api.ParameterInlinePolicy[] | null {
 }
 
 function items(s: string): string[] {
-	const out: string[] = []
-	let depth = 0
-	let quoted = false
-	let start = -1
-	for (let i = 0; i < s.length; i++) {
-		const c = s[i]
-		if (quoted) {
-			if (c == "\\"[0]) {
-				i++
-			} else if (c == "\""[0]) {
-				quoted = false
-			}
-		} else if (c == "\""[0]) {
-			quoted = true
-		} else if (c == "{"[0] || c == lbracket) {
-			depth++
-			if (depth == 2) {
-				start = i
-			}
-		} else if (c == "}"[0] || c == "]"[0]) {
-			if (depth == 2) {
-				out.push(s.slice(start, i + 1))
-			}
-			depth--
-		}
+	try {
+		return json.decode[json.Raw[]](s).map(x => x.text)
+	} catch (e: ParseError) {
+		return []
 	}
-	return out
 }
 
 function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] {

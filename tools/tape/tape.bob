@@ -60,7 +60,6 @@
 //! when a test's clock reads, and an anonymous one unsigned. A step with `differs`, the reason BoberStack answers
 //! otherwise, is expected to differ, until it no longer does.
 
-import * as client from "../../core/client"
 import * as sigv4 from "../../core/auth/sigv4"
 import { Gateway } from "../../core/gateway"
 import * as base64 from "std/encoding/base64"
@@ -241,7 +240,7 @@ export function content(s: Step, values: [string, string][]): string throws Pars
 }
 
 /// Signs req, the request of s, by the access key, secret and session token of by at the instant t: not if s is
-/// anonymous; of S3 as an SDK signs it, or in a presigned URL; of any other service as ./../../core/client signs a
+/// anonymous; of S3 as an SDK signs it, or in a presigned URL; of any other service as ./../../core/auth/sigv4 signs a
 /// query.
 export function authorize(req: Request, s: Step, values: [string, string][], by: [string, string, string],
 	t: i64) throws CryptoError {
@@ -252,7 +251,7 @@ export function authorize(req: Request, s: Step, values: [string, string][], by:
 	const region = regionOf(s, values)
 	const body = req.body.whole ?? ""
 	if (s.service != "s3") {
-		client.sign(req, body, s.service, region, key, secret, token, iso8601Basic(t - t % second))
+		sigv4.sign(req, body, s.service, region, key, secret, token, iso8601Basic(t - t % second))
 		return
 	}
 	const a = new sigv4.Authorization()
@@ -619,9 +618,6 @@ class Tree {
 	constructor(name: string) { this.name = name }
 }
 
-/// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
-type Item = i64 | f64 | string | bool | Keys | null | (i64 | f64 | string | bool | Keys | null)[]
-
 /// t with the children named one of names, at any depth, sorted by their texts, after the others.
 function ordered(t: Tree, names: string[]): Tree {
 	const rest = t.children.filter(c => !names.includes(c.name)).map(c => ordered(c, names))
@@ -683,17 +679,13 @@ function value(s: string, name: string): Tree throws ParseError {
 	if (first == "{") {
 		t.leaf = false
 		for (const [k, v] of json.decode[Keys](s).all) {
-			t.children.push(value(v, k))
+			t.children.push(value(v.text, k))
 		}
 	} else if (first == "[") {
 		t.leaf = false
-		const items = json.decode[Item[]](s)
+		const items = json.decode[json.Raw[]](s)
 		for (let i = 0; i < items.length; i++) {
-			let item = "null"
-			try {
-				item = json.encode(items[i])
-			} catch (e: json.EncodeError) {} // a float of JSON is finite
-			t.children.push(value(item, `${i}`))
+			t.children.push(value(items[i].text, `${i}`))
 		}
 	} else if (first == "\"") {
 		t.text = json.decode[string](s)
