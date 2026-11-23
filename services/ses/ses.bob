@@ -1,14 +1,17 @@
 //! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, templates,
-//! configuration sets (classic only, without event destinations) and the messages sent.
+//! configuration sets and their event destinations, tags and the messages sent.
 //!
 //! An identity is verified at once, as nobody can follow a verification mail's link: its verification and DKIM status
 //! are Success from its creation on. Nothing is sent anywhere: each message is stored, in its account's regional
-//! state, as LocalStack's /_aws/ses lists it (core/internal). The account has production access, so only the source is
-//! checked, by its address or its domain, never the recipients as AWS checks them in the sandbox. Where AWS differs
-//! further: a list answers every item at once, never a NextToken; a send of a template renders nothing, so a missing
-//! attribute is no rendering failure; TestRenderTemplate answers the subject and the parts, not a whole MIME message;
-//! the send statistics are empty; a request to v2 that fails before it is routed, as one badly signed, is answered
-//! as the classic API answers it.
+//! state, as LocalStack's /_aws/ses lists it (core/internal). A template's message is rendered when sent: one that
+//! cannot be, of data that is not JSON or lacks an attribute the template names, is accepted with a message id and
+//! then not sent, as AWS reports it by a rendering failure event, so it is not stored.
+//!
+//! Where AWS differs: first, the account has production access, out of its sandbox, so only the source is checked,
+//! by its address or its domain, never the recipients as AWS checks them in the sandbox. A rendered template's MIME
+//! message has no Date or Message-ID header; event destinations are stored but no event is published to them; the
+//! send statistics are empty; a request to v2 that fails before it is routed, as one badly signed, is answered as
+//! the classic API answers it.
 
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
@@ -20,9 +23,10 @@ import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
-import { ParseError, replace, split, trim, utf8 } from "std/string"
+import { min } from "std/math"
+import { ParseError, parseInt, replace, split, trim, utf8 } from "std/string"
 import { day, millisecond, rfc3339, second } from "std/time"
-import { Request } from "std/http"
+import { Body, Request } from "std/http"
 import { Decodable } from "std/types"
 
 /// The table of the messages sent, in each account's regional tree, which ./internal reads.
@@ -51,7 +55,37 @@ class Template {
 class ConfigurationSet {
 	name = ""
 	created: i64 = 0
+	tags: [string, string][] = []
+	destinations: Destination[] = []
 }
+
+/// An event destination, its event types and dimension sources as v2 names them; a target null if not given.
+class Destination {
+	name = ""
+	enabled = false
+	types: string[] = []
+	sns: string | null = null
+	firehoseStream: string | null = null
+	firehoseRole: string | null = null
+	eventBus: string | null = null
+	pinpoint: string | null = null
+	dimensions: Dimension[] | null = null
+}
+
+class Dimension {
+	name = ""
+	source = ""
+	fallback = ""
+}
+
+/// The event types, as each API names them.
+const eventTypes: [api.EventType, v2.EventType][] = [["send", "SEND"], ["reject", "REJECT"], ["bounce", "BOUNCE"],
+	["complaint", "COMPLAINT"], ["delivery", "DELIVERY"], ["open", "OPEN"], ["click", "CLICK"],
+	["renderingFailure", "RENDERING_FAILURE"]]
+
+/// The sources of a dimension's value, as each API names them.
+const sources: [api.DimensionValueSource, v2.DimensionValueSource][] = [["messageTag", "MESSAGE_TAG"],
+	["emailHeader", "EMAIL_HEADER"], ["linkTag", "LINK_TAG"]]
 
 /// A message's recipients, as given.
 class Recipients {
@@ -130,8 +164,11 @@ export class Handler {
 	listIdentities(caller: Caller, input: api.ListIdentitiesRequest): api.ListIdentitiesResponse throws Fault {
 		caller.allow(identityArn(caller, "*"))
 		const domain = input.IdentityType == "Domain"
+		const all = keyed(identities(caller).filter(i => input.IdentityType == null || i.domain == domain), i => i.name)
+		const [items, next] = paged(all, input.NextToken, input.MaxItems ?? 1000, "NextToken", false)
 		const r = new api.ListIdentitiesResponse()
-		r.Identities = identities(caller).filter(i => input.IdentityType == null || i.domain == domain).map(i => i.name)
+		r.Identities = items.map(i => i.name)
+		r.NextToken = next
 		return r
 	}
 
@@ -206,26 +243,22 @@ export class Handler {
 
 	sendTemplatedEmail(caller: Caller,
 		input: api.SendTemplatedEmailRequest): api.SendTemplatedEmailResponse throws Fault {
-		templated(caller, input.Template)
 		const s = sent(caller, input.Source, v1Recipients(input.Destination))
-		s.Template = input.Template
-		s.TemplateData = input.TemplateData
+		const t = template(caller, input.Template)
 		const r = new api.SendTemplatedEmailResponse()
-		r.MessageId = store(caller, s)
+		r.MessageId = storeRendered(caller, s, t, input.TemplateData, null)
 		return r
 	}
 
 	sendBulkTemplatedEmail(caller: Caller,
 		input: api.SendBulkTemplatedEmailRequest): api.SendBulkTemplatedEmailResponse throws Fault {
-		templated(caller, input.Template)
+		const t = template(caller, input.Template)
 		const r = new api.SendBulkTemplatedEmailResponse()
 		for (const d of input.Destinations) {
 			const s = sent(caller, input.Source, v1Recipients(d.Destination))
-			s.Template = input.Template
-			s.TemplateData = d.ReplacementTemplateData ?? input.DefaultTemplateData
 			const status = new api.BulkEmailDestinationStatus()
 			status.Status = "Success"
-			status.MessageId = store(caller, s)
+			status.MessageId = storeRendered(caller, s, t, d.ReplacementTemplateData ?? "{}", input.DefaultTemplateData)
 			r.Status.push(status)
 		}
 		return r
@@ -244,7 +277,9 @@ export class Handler {
 
 	updateTemplate(caller: Caller, input: api.UpdateTemplateRequest): api.UpdateTemplateResponse throws Fault {
 		const t = template(caller, input.Template.TemplateName)
-		save(new Tables(caller.regional()).templates, t.name, fromV1(input.Template, t.created))
+		const u = fromV1(input.Template, t.created)
+		u.tags = t.tags
+		save(new Tables(caller.regional()).templates, t.name, u)
 		return new api.UpdateTemplateResponse()
 	}
 
@@ -264,10 +299,13 @@ export class Handler {
 
 	listTemplates(caller: Caller, input: api.ListTemplatesRequest): api.ListTemplatesResponse throws Fault {
 		caller.allow(templateArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).templates.scan(null, 1000000).map(e => e[1]), t => t.name)
+		const [items, next] = paged(all, input.NextToken, min(input.MaxItems ?? 10, 100), "PageToken", false)
 		const r = new api.ListTemplatesResponse()
-		r.TemplatesMetadata = new Tables(caller.regional()).templates.scan().map(e => {
-			return { ...new api.TemplateMetadata(), Name: e[1].name, CreatedTimestamp: e[1].created }
+		r.TemplatesMetadata = items.map(t => {
+			return { ...new api.TemplateMetadata(), Name: t.name, CreatedTimestamp: t.created }
 		})
+		r.NextToken = next
 		return r
 	}
 
@@ -278,69 +316,60 @@ export class Handler {
 		if (t == null) {
 			throw api.templateDoesNotExistException(`Unable to find <${input.TemplateName}> for <${caller.account}>`)
 		}
-		let data: json.Unknown[] = []
-		try {
-			data = json.decode[json.Keys](input.TemplateData).all
-		} catch (e: ParseError) {
+		const data = dataOf(input.TemplateData)
+		if (data == null) {
 			throw api.invalidRenderingParameterException("Template rendering data is invalid")
 		}
-		const lines: string[] = []
-		if (t.subject != null) {
-			lines.push(`Subject: ${render(t.subject!, data)}`)
-		}
-		for (const p of [t.text, t.html]) {
-			if (p != null) {
-				lines.push("")
-				lines.push(render(p!, data))
-			}
-		}
 		const r = new api.TestRenderTemplateResponse()
-		r.RenderedTemplate = lines.join("\r\n")
+		r.RenderedTemplate = mime(rendered(t!, data!))
 		return r
 	}
 
 	createConfigurationSet(caller: Caller,
 		input: api.CreateConfigurationSetRequest): api.CreateConfigurationSetResponse throws Fault {
-		const n = input.ConfigurationSet.Name
-		caller.allow(setArn(caller, n))
-		const t = new Tables(caller.regional()).sets
-		if (t.get(n) != null) {
-			throw api.configurationSetAlreadyExistsException(`Configuration set <${n}> already exists.`)
-		}
-		save(t, n, { ...new ConfigurationSet(), name: n, created: now() })
+		createSet(caller, input.ConfigurationSet.Name, [], false)
 		return new api.CreateConfigurationSetResponse()
 	}
 
 	describeConfigurationSet(caller: Caller,
 		input: api.DescribeConfigurationSetRequest): api.DescribeConfigurationSetResponse throws Fault {
-		const n = input.ConfigurationSetName
-		caller.allow(setArn(caller, n))
-		if (new Tables(caller.regional()).sets.get(n) == null) {
-			throw api.configurationSetDoesNotExistException(`Configuration set <${n}> does not exist.`)
-		}
+		const c = configurationSet(caller, input.ConfigurationSetName, false)
 		const r = new api.DescribeConfigurationSetResponse()
-		r.ConfigurationSet = { ...new api.ConfigurationSet(), Name: n }
+		r.ConfigurationSet = { ...new api.ConfigurationSet(), Name: c.name }
+		if ((input.ConfigurationSetAttributeNames ?? []).some(a => a == "eventDestinations")) {
+			r.EventDestinations = c.destinations.map(toV1)
+		}
 		return r
 	}
 
 	listConfigurationSets(caller: Caller,
 		input: api.ListConfigurationSetsRequest): api.ListConfigurationSetsResponse throws Fault {
 		caller.allow(setArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).sets.scan(null, 1000000).map(e => e[1]), c => c.name)
+		const [items, next] = paged(all, input.NextToken, input.MaxItems ?? 1000, "NextToken", false)
 		const r = new api.ListConfigurationSetsResponse()
-		r.ConfigurationSets = new Tables(caller.regional()).sets.scan().map(e => {
-			return { ...new api.ConfigurationSet(), Name: e[1].name }
+		r.ConfigurationSets = items.map(c => {
+			return { ...new api.ConfigurationSet(), Name: c.name }
 		})
+		r.NextToken = next
 		return r
 	}
 
 	deleteConfigurationSet(caller: Caller,
 		input: api.DeleteConfigurationSetRequest): api.DeleteConfigurationSetResponse throws Fault {
-		const n = input.ConfigurationSetName
-		caller.allow(setArn(caller, n))
-		if (!new Tables(caller.regional()).sets.delete(n)) {
-			throw api.configurationSetDoesNotExistException(`Configuration set <${n}> does not exist.`)
-		}
+		const c = configurationSet(caller, input.ConfigurationSetName, false)
+		new Tables(caller.regional()).sets.delete(c.name)
 		return new api.DeleteConfigurationSetResponse()
+	}
+
+	createConfigurationSetEventDestination(caller: Caller, input: api.CreateConfigurationSetEventDestinationRequest): api.CreateConfigurationSetEventDestinationResponse throws Fault {
+		addDestination(caller, input.ConfigurationSetName, fromV1Destination(input.EventDestination), false)
+		return new api.CreateConfigurationSetEventDestinationResponse()
+	}
+
+	deleteConfigurationSetEventDestination(caller: Caller, input: api.DeleteConfigurationSetEventDestinationRequest): api.DeleteConfigurationSetEventDestinationResponse throws Fault {
+		dropDestination(caller, input.ConfigurationSetName, input.EventDestinationName, false)
+		return new api.DeleteConfigurationSetEventDestinationResponse()
 	}
 
 	getSendQuota(caller: Caller, input: Unit): api.GetSendQuotaResponse throws Fault {
@@ -410,8 +439,10 @@ export class V2 {
 	listEmailIdentities(caller: Caller,
 		input: v2.ListEmailIdentitiesRequest): v2.ListEmailIdentitiesResponse throws Fault {
 		caller.allow(identityArn(caller, "*"))
+		const [items, next] = paged(keyed(identities(caller), i => i.name), input.NextToken, input.PageSize ?? 1000,
+			"NextToken", true)
 		const r = new v2.ListEmailIdentitiesResponse()
-		r.EmailIdentities = identities(caller).map(i => {
+		r.EmailIdentities = items.map(i => {
 			const o = new v2.IdentityInfo()
 			o.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
 			o.IdentityName = i.name
@@ -419,6 +450,7 @@ export class V2 {
 			o.VerificationStatus = "SUCCESS"
 			return o
 		})
+		r.NextToken = next
 		return r
 	}
 
@@ -436,24 +468,21 @@ export class V2 {
 		if (from == null) {
 			throw v2.badRequestException("Missing required parameter: FromEmailAddress")
 		}
-		const t = c.Template
-		if (t != null && t!.TemplateName != null) {
-			templated(caller, t!.TemplateName!)
-		}
 		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!))
 		const simple = c.Simple
+		const t = c.Template
+		const r = new v2.SendEmailResponse()
 		if (simple != null) {
 			s.Subject = simple!.Subject.Data
 			s.Body = parts(simple!.Body.Text?.Data, simple!.Body.Html?.Data)
 		} else if (raw != null) {
 			s.RawData = raw!.Data
 		} else if (t != null) {
-			s.Template = t!.TemplateName
-			s.TemplateData = t!.TemplateData
+			r.MessageId = storeRendered(caller, s, inline(caller, t!), t!.TemplateData ?? "{}", null)
+			return r
 		} else {
 			throw v2.badRequestException("Missing required parameter: Content")
 		}
-		const r = new v2.SendEmailResponse()
 		r.MessageId = store(caller, s)
 		return r
 	}
@@ -464,17 +493,14 @@ export class V2 {
 			throw v2.badRequestException(if (t == null) "Missing required parameter: DefaultContent.Template"
 				else "Missing required parameter: FromEmailAddress")
 		}
-		if (t!.TemplateName != null) {
-			templated(caller, t!.TemplateName!)
-		}
+		const template = inline(caller, t!)
 		const r = new v2.SendBulkEmailResponse()
 		for (const e of input.BulkEmailEntries) {
 			const s = sent(caller, input.FromEmailAddress!, v2Recipients(e.Destination))
-			s.Template = t!.TemplateName
-			s.TemplateData = e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? t!.TemplateData
 			const o = new v2.BulkEmailEntryResult()
 			o.Status = "SUCCESS"
-			o.MessageId = store(caller, s)
+			o.MessageId = storeRendered(caller, s, template,
+				e.ReplacementEmailContent?.ReplacementTemplate?.ReplacementTemplateData ?? "{}", t!.TemplateData)
 			r.BulkEmailEntryResults.push(o)
 		}
 		return r
@@ -535,14 +561,151 @@ export class V2 {
 			SentLast24Hours: lastDay(caller) }
 		return r
 	}
+
+	listEmailTemplates(caller: Caller,
+		input: v2.ListEmailTemplatesRequest): v2.ListEmailTemplatesResponse throws Fault {
+		caller.allow(templateArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).templates.scan(null, 1000000).map(e => e[1]), t => t.name)
+		const [items, next] = paged(all, input.NextToken, min(input.PageSize ?? 10, 100), "PageToken", true)
+		const r = new v2.ListEmailTemplatesResponse()
+		r.TemplatesMetadata = items.map(t => {
+			return { ...new v2.EmailTemplateMetadata(), TemplateName: t.name, CreatedTimestamp: t.created }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	testRenderEmailTemplate(caller: Caller,
+		input: v2.TestRenderEmailTemplateRequest): v2.TestRenderEmailTemplateResponse throws Fault {
+		caller.allow(templateArn(caller, input.TemplateName))
+		const t = new Tables(caller.regional()).templates.get(input.TemplateName)
+		if (t == null) {
+			throw v2.notFoundException(`Unable to find <${input.TemplateName}> for <${caller.account}>`)
+		}
+		const data = dataOf(input.TemplateData)
+		if (data == null) {
+			throw v2.badRequestException("Template rendering data is invalid")
+		}
+		let m = ""
+		try {
+			m = mime(rendered(t!, data!))
+		} catch (f: Fault) {
+			throw v2.badRequestException(f.message)
+		}
+		const r = new v2.TestRenderEmailTemplateResponse()
+		r.RenderedTemplate = m
+		return r
+	}
+
+	createConfigurationSet(caller: Caller,
+		input: v2.CreateConfigurationSetRequest): v2.CreateConfigurationSetResponse throws Fault {
+		createSet(caller, input.ConfigurationSetName, (input.Tags ?? []).map(t => [t.Key, t.Value]), true)
+		return new v2.CreateConfigurationSetResponse()
+	}
+
+	getConfigurationSet(caller: Caller,
+		input: v2.GetConfigurationSetRequest): v2.GetConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		const r = new v2.GetConfigurationSetResponse()
+		r.ConfigurationSetName = c.name
+		r.Tags = c.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		return r
+	}
+
+	listConfigurationSets(caller: Caller,
+		input: v2.ListConfigurationSetsRequest): v2.ListConfigurationSetsResponse throws Fault {
+		caller.allow(setArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).sets.scan(null, 1000000).map(e => e[1]), c => c.name)
+		const [items, next] = paged(all, input.NextToken, input.PageSize ?? 1000, "NextToken", true)
+		const r = new v2.ListConfigurationSetsResponse()
+		r.ConfigurationSets = items.map(c => c.name)
+		r.NextToken = next
+		return r
+	}
+
+	deleteConfigurationSet(caller: Caller,
+		input: v2.DeleteConfigurationSetRequest): v2.DeleteConfigurationSetResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		new Tables(caller.regional()).sets.delete(c.name)
+		return new v2.DeleteConfigurationSetResponse()
+	}
+
+	createConfigurationSetEventDestination(caller: Caller, input: v2.CreateConfigurationSetEventDestinationRequest): v2.CreateConfigurationSetEventDestinationResponse throws Fault {
+		const d = fromV2Destination(input.EventDestination)
+		d.name = input.EventDestinationName
+		addDestination(caller, input.ConfigurationSetName, d, true)
+		return new v2.CreateConfigurationSetEventDestinationResponse()
+	}
+
+	getConfigurationSetEventDestinations(caller: Caller, input: v2.GetConfigurationSetEventDestinationsRequest): v2.GetConfigurationSetEventDestinationsResponse throws Fault {
+		const c = configurationSet(caller, input.ConfigurationSetName, true)
+		const r = new v2.GetConfigurationSetEventDestinationsResponse()
+		r.EventDestinations = c.destinations.map(toV2)
+		return r
+	}
+
+	deleteConfigurationSetEventDestination(caller: Caller, input: v2.DeleteConfigurationSetEventDestinationRequest): v2.DeleteConfigurationSetEventDestinationResponse throws Fault {
+		dropDestination(caller, input.ConfigurationSetName, input.EventDestinationName, true)
+		return new v2.DeleteConfigurationSetEventDestinationResponse()
+	}
+
+	tagResource(caller: Caller, input: v2.TagResourceRequest): v2.TagResourceResponse throws Fault {
+		const added: [string, string][] = input.Tags.map(t => [t.Key, t.Value])
+		retag(caller, input.ResourceArn, tags => {
+			const kept = tags.filter(t => !added.some(a => a[0] == t[0]))
+			for (const a of added) {
+				kept.push(a)
+			}
+			return kept
+		})
+		return new v2.TagResourceResponse()
+	}
+
+	untagResource(caller: Caller, input: v2.UntagResourceRequest): v2.UntagResourceResponse throws Fault {
+		retag(caller, input.ResourceArn, tags => tags.filter(t => !input.TagKeys.some(k => k == t[0])))
+		return new v2.UntagResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: v2.ListTagsForResourceRequest): v2.ListTagsForResourceResponse throws Fault {
+		const r = new v2.ListTagsForResourceResponse()
+		retag(caller, input.ResourceArn, tags => {
+			r.Tags = tags.map(t => {
+				return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+			})
+			return tags
+		})
+		return r
+	}
 }
 
-/// req to v2, as its model routes it: ListEmailIdentities is POST /v2/email/list-identities there, but SDKs of
-/// earlier models GET /v2/email/identities, which AWS still serves, its paging then ignored.
+/// The lists v2's model POSTs to paths of its own, their paging in the body, which SDKs of earlier models GET, paging
+/// in the query, and AWS still serves so.
+const lists: [string, string][] = [["/v2/email/identities", "/v2/email/list-identities"],
+	["/v2/email/configuration-sets", "/v2/email/list-configuration-sets"]]
+
+/// req to v2, as its model routes it.
 export function routed(req: Request): Request {
-	if (req.method == "GET" && (req.url.path == "/v2/email/identities" || req.url.path == "/v2/email/identities/")) {
-		req.method = "POST"
-		req.url.path = "/v2/email/list-identities"
+	if (req.method != "GET") {
+		return req
+	}
+	for (const [listed, path] of lists) {
+		if (req.url.path == listed || req.url.path == `${listed}/`) {
+			const q = req.url.query
+			const b = new v2.ListEmailIdentitiesRequest()
+			b.NextToken = q.get("NextToken")
+			const size = q.get("PageSize")
+			try {
+				b.PageSize = if (size == null) null else parseInt[i32](size!)
+			} catch (e: ParseError) {}
+			req.method = "POST"
+			req.url.path = path
+			try {
+				req.body = new Body(json.encode(b))
+			} catch (e: json.EncodeError) {}
+		}
 	}
 	return req
 }
@@ -616,11 +779,344 @@ function emailTemplate(caller: Caller, name: string): Template throws Fault {
 	return t!
 }
 
-/// Checks that the template of name, which a send uses, exists.
-function templated(caller: Caller, name: string) throws Fault {
-	caller.allow(templateArn(caller, name))
-	if (new Tables(caller.regional()).templates.get(name) == null) {
-		throw api.templateDoesNotExistException(`Template ${name} does not exist.`)
+/// The template a v2 send names, or the one it gives inline.
+function inline(caller: Caller, t: v2.Template): Template throws Fault {
+	const c = t.TemplateContent
+	if (c != null) {
+		return { ...new Template(), subject: c!.Subject, text: c!.Text, html: c!.Html }
+	}
+	const n = t.TemplateName ?? ""
+	caller.allow(templateArn(caller, n))
+	const found = new Tables(caller.regional()).templates.get(n)
+	if (found == null) {
+		throw v2.notFoundException(`Template ${n} does not exist.`)
+	}
+	return found!
+}
+
+/// The id of s, a message of the template t with data, whose attributes fall back to those of fallback unless null:
+/// stored if t renders of them, else only answered, as AWS answers a message it then fails to render.
+function storeRendered(caller: Caller, s: Sent, t: Template, data: string,
+	fallback: string | null): string throws Fault {
+	s.Template = if (t.name == "") null else t.name
+	s.TemplateData = data
+	const given = dataOf(data)
+	const defaults = if (fallback == null) [] else dataOf(fallback!)
+	if (given == null || defaults == null) {
+		return unstored(s)
+	}
+	const merged: json.Unknown[] = []
+	for (const d of given!) {
+		merged.push(d)
+	}
+	for (const d of defaults!) {
+		merged.push(d)
+	}
+	try {
+		rendered(t, merged)
+	} catch (f: Fault) {
+		return unstored(s)
+	}
+	return store(caller, s)
+}
+
+/// The id a message not sent is given.
+function unstored(s: Sent): string throws Fault {
+	s.Id = id(now())
+	return s.Id
+}
+
+/// A template's parts, rendered.
+class Rendered {
+	subject = ""
+	text: string | null = null
+	html: string | null = null
+}
+
+function rendered(t: Template, data: json.Unknown[]): Rendered throws Fault {
+	const r = new Rendered()
+	r.subject = render(t.subject ?? "", data)
+	r.text = if (t.text == null) null else render(t.text!, data)
+	r.html = if (t.html == null) null else render(t.html!, data)
+	return r
+}
+
+/// The members of the JSON object s, null if s is not one.
+function dataOf(s: string): json.Unknown[] | null {
+	try {
+		return json.decode[json.Keys](s).all
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// r as the MIME message AWS renders: a part of each of its text and HTML, alternatives if both.
+function mime(r: Rendered): string throws Fault {
+	const parts: [string, string][] = []
+	if (r.text != null) {
+		parts.push(["text/plain", r.text!])
+	}
+	if (r.html != null) {
+		parts.push(["text/html", r.html!])
+	}
+	const lines = [`Subject: ${r.subject}`, "MIME-Version: 1.0"]
+	if (parts.length == 1) {
+		lines.push(`Content-Type: ${parts[0][0]}; charset=UTF-8`)
+		lines.push("Content-Transfer-Encoding: 7bit")
+		lines.push("")
+		lines.push(parts[0][1])
+		return lines.join("\r\n")
+	}
+	const boundary = `----=_Part_${token(8)}`
+	lines.push("Content-Type: multipart/alternative; ")
+	lines.push(`\tboundary="${boundary}"`)
+	for (const [kind, body] of parts) {
+		lines.push("")
+		lines.push(`--${boundary}`)
+		lines.push(`Content-Type: ${kind}; charset=UTF-8`)
+		lines.push("Content-Transfer-Encoding: 7bit")
+		lines.push("")
+		lines.push(body)
+	}
+	lines.push(`--${boundary}--`)
+	return lines.join("\r\n")
+}
+
+/// xs, each by its key.
+function keyed[V](xs: V[], key: (v: V) => string): [string, V][] {
+	const out: [string, V][] = []
+	for (const x of xs) {
+		out.push([key(x), x])
+	}
+	return out
+}
+
+/// A page of size of all, ordered by key, after the one token names, and the token of the next page, null if none; a
+/// token not of this is answered as v2 or the classic API answers one, as name names it.
+function paged[V](all: [string, V][], token: string | null, size: i32, name: string,
+	ofV2: bool): [V[], string | null] throws Fault {
+	let after: string | null = null
+	if (token != null) {
+		let s = ""
+		try {
+			s = base64.decode(token!)
+		} catch (e: ParseError) {}
+		if (indexOf(s, "ses:") != 0) {
+			const why = `Invalid ${name} <${token!}>.`
+			throw if (ofV2) v2.badRequestException(why) else new Fault(400, "InvalidParameterValue", why)
+		}
+		after = s.slice(4, s.length)
+	}
+	const rest = all.filter(e => after == null || e[0] > after!)
+	const n = if (size < 1) rest.length else size
+	if (rest.length <= n) {
+		return [rest.map(e => e[1]), null]
+	}
+	return [rest.slice(0, n).map(e => e[1]), base64.encode(`ses:${rest[n - 1][0]}`)]
+}
+
+/// Makes the configuration set of name and tags, as v2 or the classic API answers one that exists.
+function createSet(caller: Caller, name: string, tags: [string, string][], ofV2: bool) throws Fault {
+	caller.allow(setArn(caller, name))
+	const t = new Tables(caller.regional()).sets
+	if (t.get(name) != null) {
+		const why = `Configuration set <${name}> already exists.`
+		throw if (ofV2) v2.alreadyExistsException(why) else api.configurationSetAlreadyExistsException(why)
+	}
+	save(t, name, { ...new ConfigurationSet(), name: name, created: now(), tags: tags })
+}
+
+/// The configuration set of name, as v2 or the classic API answers one that does not exist.
+function configurationSet(caller: Caller, name: string, ofV2: bool): ConfigurationSet throws Fault {
+	caller.allow(setArn(caller, name))
+	const c = new Tables(caller.regional()).sets.get(name)
+	if (c == null) {
+		const why = `Configuration set <${name}> does not exist.`
+		throw if (ofV2) v2.notFoundException(why) else api.configurationSetDoesNotExistException(why)
+	}
+	return c!
+}
+
+function addDestination(caller: Caller, set: string, d: Destination, ofV2: bool) throws Fault {
+	const c = configurationSet(caller, set, ofV2)
+	if (c.destinations.some(e => e.name == d.name)) {
+		const why = `Event destination ${d.name} already exists.`
+		throw if (ofV2) v2.alreadyExistsException(why) else api.eventDestinationAlreadyExistsException(why)
+	}
+	c.destinations.push(d)
+	save(new Tables(caller.regional()).sets, c.name, c)
+}
+
+function dropDestination(caller: Caller, set: string, name: string, ofV2: bool) throws Fault {
+	const c = configurationSet(caller, set, ofV2)
+	if (!c.destinations.some(e => e.name == name)) {
+		const why = `No EventDestination found for ${name}`
+		throw if (ofV2) v2.notFoundException(why) else api.eventDestinationDoesNotExistException(why)
+	}
+	c.destinations = c.destinations.filter(e => e.name != name)
+	save(new Tables(caller.regional()).sets, c.name, c)
+}
+
+function fromV1Destination(e: api.EventDestination): Destination {
+	const d = new Destination()
+	d.name = e.Name
+	d.enabled = e.Enabled
+	for (const t of e.MatchingEventTypes) {
+		for (const [one, two] of eventTypes) {
+			if (one == t) {
+				d.types.push(two)
+			}
+		}
+	}
+	d.sns = e.SNSDestination?.TopicARN
+	d.firehoseStream = e.KinesisFirehoseDestination?.DeliveryStreamARN
+	d.firehoseRole = e.KinesisFirehoseDestination?.IAMRoleARN
+	const w = e.CloudWatchDestination
+	if (w != null) {
+		d.dimensions = w!.DimensionConfigurations.map(c => {
+			let source = ""
+			for (const [one, two] of sources) {
+				if (one == c.DimensionValueSource) {
+					source = two
+				}
+			}
+			return { ...new Dimension(), name: c.DimensionName, source: source, fallback: c.DefaultDimensionValue }
+		})
+	}
+	return d
+}
+
+function fromV2Destination(e: v2.EventDestinationDefinition): Destination {
+	const d = new Destination()
+	d.enabled = e.Enabled
+	d.types = (e.MatchingEventTypes ?? []).map(t => t as string)
+	d.sns = e.SnsDestination?.TopicArn
+	d.firehoseStream = e.KinesisFirehoseDestination?.DeliveryStreamArn
+	d.firehoseRole = e.KinesisFirehoseDestination?.IamRoleArn
+	d.eventBus = e.EventBridgeDestination?.EventBusArn
+	d.pinpoint = e.PinpointDestination?.ApplicationArn
+	const w = e.CloudWatchDestination
+	if (w != null) {
+		d.dimensions = w!.DimensionConfigurations.map(c => {
+			return { ...new Dimension(), name: c.DimensionName, source: c.DimensionValueSource as string,
+				fallback: c.DefaultDimensionValue }
+		})
+	}
+	return d
+}
+
+function toV1(d: Destination): api.EventDestination {
+	const e = new api.EventDestination()
+	e.Name = d.name
+	e.Enabled = d.enabled
+	for (const t of d.types) {
+		for (const [one, two] of eventTypes) {
+			if (two == t) {
+				e.MatchingEventTypes.push(one)
+			}
+		}
+	}
+	if (d.sns != null) {
+		e.SNSDestination = { ...new api.SNSDestination(), TopicARN: d.sns! }
+	}
+	if (d.firehoseStream != null) {
+		e.KinesisFirehoseDestination = { ...new api.KinesisFirehoseDestination(), DeliveryStreamARN: d.firehoseStream!,
+			IAMRoleARN: d.firehoseRole ?? "" }
+	}
+	if (d.dimensions != null) {
+		const w = new api.CloudWatchDestination()
+		for (const c of d.dimensions!) {
+			for (const [one, two] of sources) {
+				if (two == c.source) {
+					w.DimensionConfigurations.push({ ...new api.CloudWatchDimensionConfiguration(),
+						DimensionName: c.name, DimensionValueSource: one, DefaultDimensionValue: c.fallback })
+				}
+			}
+		}
+		e.CloudWatchDestination = w
+	}
+	return e
+}
+
+function toV2(d: Destination): v2.EventDestination {
+	const e = new v2.EventDestination()
+	e.Name = d.name
+	e.Enabled = d.enabled
+	for (const t of d.types) {
+		for (const [_, two] of eventTypes) {
+			if (two == t) {
+				e.MatchingEventTypes.push(two)
+			}
+		}
+	}
+	if (d.sns != null) {
+		e.SnsDestination = { ...new v2.SnsDestination(), TopicArn: d.sns! }
+	}
+	if (d.firehoseStream != null) {
+		e.KinesisFirehoseDestination = { ...new v2.KinesisFirehoseDestination(), DeliveryStreamArn: d.firehoseStream!,
+			IamRoleArn: d.firehoseRole ?? "" }
+	}
+	if (d.eventBus != null) {
+		e.EventBridgeDestination = { ...new v2.EventBridgeDestination(), EventBusArn: d.eventBus! }
+	}
+	if (d.pinpoint != null) {
+		e.PinpointDestination = { ...new v2.PinpointDestination(), ApplicationArn: d.pinpoint }
+	}
+	if (d.dimensions != null) {
+		const w = new v2.CloudWatchDestination()
+		for (const c of d.dimensions!) {
+			for (const [_, two] of sources) {
+				if (two == c.source) {
+					w.DimensionConfigurations.push({ ...new v2.CloudWatchDimensionConfiguration(),
+						DimensionName: c.name, DimensionValueSource: two, DefaultDimensionValue: c.fallback })
+				}
+			}
+		}
+		e.CloudWatchDestination = w
+	}
+	return e
+}
+
+/// Sets the tags of the resource of arn, an identity, template or configuration set of the caller's, to what f makes
+/// of them.
+function retag(caller: Caller, arn: string, f: (tags: [string, string][]) => [string, string][]) throws Fault {
+	const prefix = `arn:aws:ses:${caller.region}:`
+	const mine = `${prefix}${caller.account}:`
+	if (indexOf(arn, prefix) != 0) {
+		throw v2.badRequestException("Invalid Resource Arn")
+	}
+	if (indexOf(arn, mine) != 0) {
+		throw v2.badRequestException("Operations on a resource created in a different account is not allowed")
+	}
+	caller.allow(arn)
+	const resource = arn.slice(mine.length, arn.length)
+	const slash = indexOf(resource, "/")
+	const kind = if (slash < 0) resource else resource.slice(0, slash)
+	const name = if (slash < 0) "" else resource.slice(slash + 1, resource.length)
+	const db = new Tables(caller.regional())
+	if (kind == "identity") {
+		const i = db.identities.get(name)
+		if (i == null) {
+			throw v2.notFoundException(`Email identity <${name}> does not exist.`)
+		}
+		i!.tags = f(i!.tags)
+		save(db.identities, name, i!)
+	} else if (kind == "template") {
+		const t = db.templates.get(name)
+		if (t == null) {
+			throw v2.notFoundException(`Template ${name} does not exist.`)
+		}
+		t!.tags = f(t!.tags)
+		save(db.templates, name, t!)
+	} else if (kind == "configuration-set") {
+		const c = db.sets.get(name)
+		if (c == null) {
+			throw v2.notFoundException(`Configuration set <${name}> does not exist.`)
+		}
+		c!.tags = f(c!.tags)
+		save(db.sets, name, c!)
+	} else {
+		throw v2.badRequestException("Invalid Resource Arn")
 	}
 }
 
@@ -714,12 +1210,17 @@ function header(data: string, name: string): string | null {
 /// Stores s, of a new id as AWS shapes one, and answers that id.
 function store(caller: Caller, s: Sent): string throws Fault {
 	const t = now()
-	const h = token(16)
-	const uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
-	s.Id = `0100${hex12(t / millisecond)}-${uuid}-000000`
+	s.Id = id(t)
 	s.Timestamp = rfc3339(t - t % second).slice(0, 19)
 	save(new Tables(caller.regional()).sent, s.Id, s)
 	return s.Id
+}
+
+/// A message id, beginning with the millisecond t is in.
+function id(t: i64): string throws Fault {
+	const h = token(16)
+	const uuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+	return `0100${hex12(t / millisecond)}-${uuid}-000000`
 }
 
 /// How many messages were sent in the last day, as their ids begin with the millisecond they were sent at.

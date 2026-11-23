@@ -82,18 +82,35 @@ test "templates render their {{names}}, and a send of one names it" {
 		["Template.TextPart", "Dear {{ name }}, {{n}}"]]).status == 200
 	assert text(call(g, "CreateTemplate", [["Template.TemplateName", "t"]]), "Code") == "AlreadyExists"
 	const r = call(g, "TestRenderTemplate", [["TemplateName", "t"], ["TemplateData", `{"name": "Ana", "n": 3}`]])
-	assert text(r, "RenderedTemplate") == "Subject: Hi Ana\r\n\r\nDear Ana, 3"
+	assert text(r, "RenderedTemplate")
+		== "Subject: Hi Ana\r\nMIME-Version: 1.0\r\n"
+		+ "Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nDear Ana, 3"
 	const lacking = call(g, "TestRenderTemplate", [["TemplateName", "t"], ["TemplateData", "{}"]])
 	assert text(lacking, "Code") == "MissingRenderingAttribute"
 	const got = callV2(g, "GET", "/v2/email/templates/t")
 	assert got.status == 200 && has(got, `"Subject":"Hi {{name}}"`)
 	assert text(call(g, "GetTemplate", [["TemplateName", "u"]]), "Message") == "Template u does not exist."
 	call(g, "VerifyEmailIdentity", [["EmailAddress", "a@example.com"]])
+	const lacked = call(g, "SendTemplatedEmail",
+		[["Source", "a@example.com"], ["Destination.ToAddresses.member.1", "b@x.net"], ["Template", "t"],
+		["TemplateData", `{"name": "Ana"}`]])
+	assert lacked.status == 200 && !has(internal(g, "GET", "/_aws/ses"), text(lacked, "MessageId")!)
 	assert call(g, "SendTemplatedEmail",
 		[["Source", "a@example.com"], ["Destination.ToAddresses.member.1", "b@x.net"], ["Template", "t"],
-		["TemplateData", `{"name": "Ana"}`]]).status == 200
-	assert has(internal(g, "GET", "/_aws/ses"), `"Template":"t","TemplateData":"{\\"name\\": \\"Ana\\"}"`)
+		["TemplateData", `{"name": "Ana", "n": 1}`]]).status == 200
+	assert has(internal(g, "GET", "/_aws/ses"), `"Template":"t","TemplateData":"{\\"name\\": \\"Ana\\", \\"n\\": 1}"`)
 	assert text(call(g, "GetSendQuota"), "SentLast24Hours") == "1"
+	const bulk = callV2(g, "POST", "/v2/email/outbound-bulk-emails",
+		`{"FromEmailAddress": "a@example.com", `
+		+ `"DefaultContent": {"Template": {"TemplateName": "t", "TemplateData": "{\\"n\\": 2}"}}, "BulkEmailEntries": [`
+		+ `{"Destination": {"ToAddresses": ["b@x.net"]}, "ReplacementEmailContent": {"ReplacementTemplate": `
+		+ `{"ReplacementTemplateData": "{\\"name\\": \\"Bo\\"}"}}}]}`)
+	assert bulk.status == 200 && has(bulk, `"Status":"SUCCESS"`)
+	assert text(call(g, "GetSendQuota"), "SentLast24Hours") == "2"
+	callV2(g, "POST", "/v2/email/templates",
+		`{"TemplateName": "h", "TemplateContent": {"Subject": "S", ` + `"Text": "T", "Html": "<b>{{x}}</b>"}}`)
+	const both = callV2(g, "POST", "/v2/email/templates/h/render", `{"TemplateData": "{\\"x\\": \\"y\\"}"}`)
+	assert both.status == 200 && has(both, "multipart/alternative") && has(both, "<b>y</b>")
 }
 
 test "configuration sets: create, describe, list, delete" {
@@ -104,4 +121,51 @@ test "configuration sets: create, describe, list, delete" {
 	assert call(g, "DeleteConfigurationSet", [["ConfigurationSetName", "c"]]).status == 200
 	assert text(call(g, "DescribeConfigurationSet", [["ConfigurationSetName", "c"]]), "Message")
 		== "Configuration set <c> does not exist."
+}
+
+test "event destinations are one state of both APIs" {
+	const g = stack(new Catalog(0, 0))
+	assert callV2(g, "POST", "/v2/email/configuration-sets",
+		`{"ConfigurationSetName": "c", "Tags": [{"Key": "k", "Value": "v"}]}`).status == 200
+	assert call(g, "CreateConfigurationSetEventDestination",
+		[["ConfigurationSetName", "c"], ["EventDestination.Name", "d"], ["EventDestination.Enabled", "true"],
+		["EventDestination.MatchingEventTypes.member.1", "bounce"],
+		["EventDestination.SNSDestination.TopicARN", "arn:aws:sns:us-east-1:000000000000:t"]]).status == 200
+	const got = callV2(g, "GET", "/v2/email/configuration-sets/c/event-destinations")
+	assert has(got, `"Name":"d"`) && has(got, `"MatchingEventTypes":["BOUNCE"]`) && has(got, `"TopicArn":"arn:aws:sns`)
+	const described = call(g, "DescribeConfigurationSet",
+		[["ConfigurationSetName", "c"], ["ConfigurationSetAttributeNames.member.1", "eventDestinations"]])
+	assert text(described, "TopicARN") == "arn:aws:sns:us-east-1:000000000000:t"
+	assert callV2(g, "DELETE", "/v2/email/configuration-sets/c/event-destinations/d").status == 200
+	assert text(call(g, "DeleteConfigurationSetEventDestination",
+		[["ConfigurationSetName", "c"], ["EventDestinationName", "d"]]), "Code") == "EventDestinationDoesNotExist"
+	assert callV2(g, "GET", "/v2/email/configuration-sets/nope/event-destinations").status == 404
+	assert has(callV2(g, "GET", "/v2/email/configuration-sets"), `"ConfigurationSets":["c"]`)
+}
+
+test "tags and pages" {
+	const g = stack(new Catalog(0, 0))
+	const arn = "arn:aws:ses:us-east-1:000000000000:configuration-set/c"
+	callV2(g, "POST", "/v2/email/configuration-sets", `{"ConfigurationSetName": "c"}`)
+	assert callV2(g, "POST", "/v2/email/tags", `{"ResourceArn": "${arn}", "Tags": [{"Key": "k", "Value": "v"}]}`).status
+		== 200
+	assert has(callV2(g, "GET", `/v2/email/tags?ResourceArn=${escape(arn, "component")}`), `"Key":"k","Value":"v"`)
+	assert callV2(g, "DELETE", `/v2/email/tags?ResourceArn=${escape(arn, "component")}&TagKeys=k`).status == 200
+	assert has(callV2(g, "GET", `/v2/email/tags?ResourceArn=${escape(arn, "component")}`), `"Tags":[]`)
+	const foreign = callV2(g, "GET",
+		"/v2/email/tags?ResourceArn=arn%3Aaws%3Ases%3Aus-east-1%3A111111111111%3Atemplate%2Ft")
+	assert foreign.status == 400
+	for (const n of ["a", "b", "c"]) {
+		callV2(g, "POST", "/v2/email/templates", `{"TemplateName": "${n}", "TemplateContent": {"Subject": "s"}}`)
+		call(g, "VerifyEmailIdentity", [["EmailAddress", `${n}@example.com`]])
+	}
+	const first = callV2(g, "GET", "/v2/email/templates?PageSize=2")
+	assert has(first, `"TemplateName":"b"`) && !has(first, `"TemplateName":"c"`) && has(first, `"NextToken":"`)
+	const page = call(g, "ListIdentities", [["MaxItems", "2"]])
+	const next = text(page, "NextToken")!
+	assert text(call(g, "ListIdentities", [["MaxItems", "2"], ["NextToken", next]]), "member") == "c@example.com"
+	assert text(call(g, "ListIdentities", [["NextToken", "garbage"]]), "Message") == "Invalid NextToken <garbage>."
+	const v2page = callV2(g, "GET", "/v2/email/identities?PageSize=1")
+	assert has(v2page, `"IdentityName":"a@example.com"`) && !has(v2page, "b@example.com") && has(v2page, "NextToken")
+	assert callV2(g, "GET", "/v2/email/identities?NextToken=garbage").status == 400
 }
