@@ -1,0 +1,447 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UpdateDate",
+		"UserId",
+		"RoleId",
+		"PolicyId",
+		"AccessKeyId",
+		"SecretAccessKey"
+	],
+	"steps": [
+		{
+			"name": "create the creator",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-creator</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-creator</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "allow it only to create users, roles and policies",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator",
+				"PolicyName": "create",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"iam:CreateUser\",\"iam:CreateRole\",\"iam:CreatePolicy\"],\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the creator",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator"
+			},
+			"capture": {
+				"creator.key": "AccessKey/AccessKeyId",
+				"creator.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${creator.key}</AccessKeyId>\n      <SecretAccessKey>${creator.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-creator</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the creator, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "creator",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-creator</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-plain"
+			},
+			"as": "creator",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-plain</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-plain</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a user of tags",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-tagged",
+				"Tags.member.1.Key": "team",
+				"Tags.member.1.Value": "a"
+			},
+			"as": "creator",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-creator is not authorized to perform: iam:TagUser on resource: arn:aws:iam::000000000000:user/boberstack-ab-00000000-tagged because no identity-based policy allows the iam:TagUser action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a user of an empty list of tags",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-untagged",
+				"Tags": ""
+			},
+			"as": "creator",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-untagged</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-untagged</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a user of a permissions boundary",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
+			},
+			"as": "creator",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>arn:aws:iam::aws:policy/IAMReadOnlyAccess</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <UserName>boberstack-ab-00000000-bounded</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-bounded</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-plain",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"as": "creator",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-plain</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-plain</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a role of tags",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-tagged",
+				"Tags.member.1.Key": "team",
+				"Tags.member.1.Value": "a",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"as": "creator",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-creator is not authorized to perform: iam:TagRole on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-tagged because no identity-based policy allows the iam:TagRole action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a role of a permissions boundary",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bounded",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/IAMReadOnlyAccess",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"as": "creator",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>arn:aws:iam::aws:policy/IAMReadOnlyAccess</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-bounded</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-bounded</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "it creates a policy of tags",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-tagged",
+				"Tags.member.1.Key": "team",
+				"Tags.member.1.Value": "a",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetUser\",\"Resource\":\"*\"}]}"
+			},
+			"as": "creator",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-creator is not authorized to perform: iam:TagPolicy on resource: policy boberstack-ab-00000000-tagged because no identity-based policy allows the iam:TagPolicy action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the plain user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-plain"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the tagged user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-tagged"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-tagged cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the untagged user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-untagged"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the plain role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-plain"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the tagged role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-tagged"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-tagged cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded role's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRolePermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRolePermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the bounded role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bounded"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the tagged policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "arn:aws:iam::${account}:policy/${prefix}-tagged"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Policy arn:aws:iam::000000000000:policy/boberstack-ab-00000000-tagged was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the creator's key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator",
+				"AccessKeyId": "${creator.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the creator's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator",
+				"PolicyName": "create"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the creator",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-creator"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

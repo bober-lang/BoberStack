@@ -1,0 +1,491 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate"
+	],
+	"steps": [
+		{
+			"name": "create of a URL not https",
+			"service": "iam",
+			"query": {
+				"Action": "CreateOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"Url": "http://${prefix}.example.com",
+				"ThumbprintList.member.1": "0123456789abcdef0123456789abcdef01234567"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidInput</Code>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of a short thumbprint",
+			"service": "iam",
+			"query": {
+				"Action": "CreateOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"Url": "https://${prefix}.example.com",
+				"ThumbprintList.member.1": "0123"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'thumbprintList' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 40, Member must have length greater than or equal to 40]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of a thumbprint not hex",
+			"service": "iam",
+			"query": {
+				"Action": "CreateOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"Url": "https://${prefix}.example.com",
+				"ThumbprintList.member.1": "z123456789abcdef0123456789abcdef01234567"
+			},
+			"capture": {
+				"hexless": "OpenIDConnectProviderArn"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateOpenIDConnectProviderResult>\n    <OpenIDConnectProviderArn>${hexless}</OpenIDConnectProviderArn>\n  </CreateOpenIDConnectProviderResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "get the one of a thumbprint not hex",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${hexless}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetOpenIDConnectProviderResult>\n    <ClientIDList/>\n    <ThumbprintList>\n      <member>z123456789abcdef0123456789abcdef01234567</member>\n    </ThumbprintList>\n    <Url>boberstack-ab-00000000.example.com</Url>\n    <Tags/>\n    <CreateDate>x-x-x:x:x.x</CreateDate>\n  </GetOpenIDConnectProviderResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetOpenIDConnectProviderResponse>\n"
+			},
+			"differs": "AWS dates a provider to the millisecond, as BoberStack does, but a test clock reads a whole second, which has no fraction to write"
+		},
+		{
+			"name": "delete it",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${hexless}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "get a missing provider",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}-none.example.com"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn arn:aws:iam::000000000000:oidc-provider/boberstack-ab-00000000-none.example.com</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get of an ARN not one",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'openIDConnectProviderArn' failed to satisfy constraint: Member must have length greater than or equal to 20</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete a missing provider",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}-none.example.com"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn arn:aws:iam::000000000000:oidc-provider/boberstack-ab-00000000-none.example.com</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create",
+			"service": "iam",
+			"query": {
+				"Action": "CreateOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"Url": "https://${prefix}.example.com/id",
+				"ClientIDList.member.1": "sts.amazonaws.com",
+				"ClientIDList.member.2": "app",
+				"ThumbprintList.member.1": "0123456789abcdef0123456789abcdef01234567",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0"
+			},
+			"capture": {
+				"arn": "OpenIDConnectProviderArn"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateOpenIDConnectProviderResult>\n    <OpenIDConnectProviderArn>${arn}</OpenIDConnectProviderArn>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n  </CreateOpenIDConnectProviderResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "create it again",
+			"service": "iam",
+			"query": {
+				"Action": "CreateOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"Url": "https://${prefix}.example.com/id",
+				"ThumbprintList.member.1": "0123456789abcdef0123456789abcdef01234567"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>An OIDC provider with the URL https://boberstack-ab-00000000.example.com/id already exists. Review the existing providers and resolve the duplicate before trying again.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetOpenIDConnectProviderResult>\n    <ClientIDList>\n      <member>app</member>\n      <member>sts.amazonaws.com</member>\n    </ClientIDList>\n    <ThumbprintList>\n      <member>0123456789abcdef0123456789abcdef01234567</member>\n    </ThumbprintList>\n    <Url>boberstack-ab-00000000.example.com/id</Url>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n    <CreateDate>x-x-x:x:x.x</CreateDate>\n  </GetOpenIDConnectProviderResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetOpenIDConnectProviderResponse>\n"
+			},
+			"differs": "AWS dates a provider to the millisecond, as BoberStack does, but a test clock reads a whole second, which has no fraction to write"
+		},
+		{
+			"name": "add a client id",
+			"service": "iam",
+			"query": {
+				"Action": "AddClientIDToOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ClientID": "other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AddClientIDToOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AddClientIDToOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "add it again",
+			"service": "iam",
+			"query": {
+				"Action": "AddClientIDToOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ClientID": "other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AddClientIDToOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AddClientIDToOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "add one to a missing provider",
+			"service": "iam",
+			"query": {
+				"Action": "AddClientIDToOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}-none.example.com",
+				"ClientID": "other"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn arn:aws:iam::000000000000:oidc-provider/boberstack-ab-00000000-none.example.com</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "remove a client id",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveClientIDFromOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ClientID": "app"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<RemoveClientIDFromOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</RemoveClientIDFromOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "remove one not there",
+			"service": "iam",
+			"query": {
+				"Action": "RemoveClientIDFromOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ClientID": "none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<RemoveClientIDFromOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</RemoveClientIDFromOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "update the thumbprints",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateOpenIDConnectProviderThumbprint",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ThumbprintList.member.1": "ABCDEF0123456789abcdef0123456789abcdef01",
+				"ThumbprintList.member.2": "1111111111111111111111111111111111111111"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateOpenIDConnectProviderThumbprintResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateOpenIDConnectProviderThumbprintResponse>\n"
+			}
+		},
+		{
+			"name": "update with a short one",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateOpenIDConnectProviderThumbprint",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"ThumbprintList.member.1": "abc"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'thumbprintList' failed to satisfy constraint: Member must satisfy constraint: [Member must have length less than or equal to 40, Member must have length greater than or equal to 40]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get it updated",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetOpenIDConnectProviderResult>\n    <ClientIDList>\n      <member>sts.amazonaws.com</member>\n      <member>other</member>\n    </ClientIDList>\n    <ThumbprintList>\n      <member>abcdef0123456789abcdef0123456789abcdef01</member>\n      <member>1111111111111111111111111111111111111111</member>\n    </ThumbprintList>\n    <Url>boberstack-ab-00000000.example.com/id</Url>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n    <CreateDate>x-x-x:x:x.x</CreateDate>\n  </GetOpenIDConnectProviderResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetOpenIDConnectProviderResponse>\n"
+			},
+			"differs": "AWS dates a provider to the millisecond, as BoberStack does, but a test clock reads a whole second, which has no fraction to write"
+		},
+		{
+			"name": "tag",
+			"service": "iam",
+			"query": {
+				"Action": "TagOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"Tags.member.1.Key": "k1",
+				"Tags.member.1.Value": "v1",
+				"Tags.member.2.Key": "K0",
+				"Tags.member.2.Value": "v2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "list the tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListOpenIDConnectProviderTags",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListOpenIDConnectProviderTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListOpenIDConnectProviderTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v2</Value>\n        <Key>K0</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>k1</Key>\n      </member>\n    </Tags>\n  </ListOpenIDConnectProviderTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListOpenIDConnectProviderTagsResponse>\n"
+			}
+		},
+		{
+			"name": "untag",
+			"service": "iam",
+			"query": {
+				"Action": "UntagOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}",
+				"TagKeys.member.1": "k1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "list the tags left",
+			"service": "iam",
+			"query": {
+				"Action": "ListOpenIDConnectProviderTags",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListOpenIDConnectProviderTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListOpenIDConnectProviderTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v2</Value>\n        <Key>K0</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n  </ListOpenIDConnectProviderTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListOpenIDConnectProviderTagsResponse>\n"
+			}
+		},
+		{
+			"name": "tag a missing provider",
+			"service": "iam",
+			"query": {
+				"Action": "TagOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}-none.example.com",
+				"Tags.member.1.Key": "k1",
+				"Tags.member.1.Value": "v1"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenId connect Provider arn:aws:iam::000000000000:oidc-provider/boberstack-ab-00000000-none.example.com cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteOpenIDConnectProviderResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteOpenIDConnectProviderResponse>\n"
+			}
+		},
+		{
+			"name": "get the deleted",
+			"service": "iam",
+			"query": {
+				"Action": "GetOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "${arn}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn ${arn}</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the one of a thumbprint not hex",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}.example.com"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn ${hexless}</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the provider",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteOpenIDConnectProvider",
+				"Version": "2010-05-08",
+				"OpenIDConnectProviderArn": "arn:aws:iam::${account}:oidc-provider/${prefix}.example.com/id"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>OpenIDConnect Provider not found for arn ${arn}</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	]
+}

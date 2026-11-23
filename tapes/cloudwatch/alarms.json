@@ -1,0 +1,499 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"CreationId"
+	],
+	"ignored": [
+		"StateUpdatedTimestamp",
+		"AlarmConfigurationUpdatedTimestamp",
+		"StateTransitionedTimestamp",
+		"Timestamp"
+	],
+	"steps": [
+		{
+			"name": "put an alarm",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-a",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold",
+				"ActionsEnabled": "false",
+				"Tags.member.1.Key": "team",
+				"Tags.member.1.Value": "a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutMetricAlarmResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutMetricAlarmResponse>\n"
+			}
+		},
+		{
+			"name": "describe it",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms>\n      <member>\n        <MetricName>m</MetricName>\n        <AlarmConfigurationUpdatedTimestamp>x-x-x:x:x.x</AlarmConfigurationUpdatedTimestamp>\n        <StateValue>INSUFFICIENT_DATA</StateValue>\n        <Threshold>1.0</Threshold>\n        <StateReason>Unchecked: Initial alarm creation</StateReason>\n        <InsufficientDataActions/>\n        <StateTransitionedTimestamp>x-x-x:x:x.x</StateTransitionedTimestamp>\n        <AlarmActions/>\n        <StateUpdatedTimestamp>x-x-x:x:x.x</StateUpdatedTimestamp>\n        <Period>60</Period>\n        <Statistic>Average</Statistic>\n        <ComparisonOperator>GreaterThanThreshold</ComparisonOperator>\n        <AlarmName>boberstack-ab-00000000-a</AlarmName>\n        <EvaluationPeriods>1</EvaluationPeriods>\n        <ActionsEnabled>false</ActionsEnabled>\n        <Namespace>boberstack-ab-00000000</Namespace>\n        <CreationId>3ca2eccf-89e2-4cac-b8b3-99ff525b54cf/1795404671737</CreationId>\n        <OKActions/>\n        <AlarmArn>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-a</AlarmArn>\n        <Dimensions/>\n      </member>\n    </MetricAlarms>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "describe by prefix",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNamePrefix": "${prefix}",
+				"StateValue": "INSUFFICIENT_DATA"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms>\n      <member>\n        <MetricName>m</MetricName>\n        <AlarmConfigurationUpdatedTimestamp>x-x-x:x:x.x</AlarmConfigurationUpdatedTimestamp>\n        <StateValue>INSUFFICIENT_DATA</StateValue>\n        <Threshold>1.0</Threshold>\n        <StateReason>Unchecked: Initial alarm creation</StateReason>\n        <InsufficientDataActions/>\n        <StateTransitionedTimestamp>x-x-x:x:x.x</StateTransitionedTimestamp>\n        <AlarmActions/>\n        <StateUpdatedTimestamp>x-x-x:x:x.x</StateUpdatedTimestamp>\n        <Period>60</Period>\n        <Statistic>Average</Statistic>\n        <ComparisonOperator>GreaterThanThreshold</ComparisonOperator>\n        <AlarmName>boberstack-ab-00000000-a</AlarmName>\n        <EvaluationPeriods>1</EvaluationPeriods>\n        <ActionsEnabled>false</ActionsEnabled>\n        <Namespace>boberstack-ab-00000000</Namespace>\n        <CreationId>3ca2eccf-89e2-4cac-b8b3-99ff525b54cf/1795404671737</CreationId>\n        <OKActions/>\n        <AlarmArn>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-a</AlarmArn>\n        <Dimensions/>\n      </member>\n    </MetricAlarms>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "set its state",
+			"service": "monitoring",
+			"query": {
+				"Action": "SetAlarmState",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-a",
+				"StateValue": "ALARM",
+				"StateReason": "a test"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<SetAlarmStateResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</SetAlarmStateResponse>\n"
+			}
+		},
+		{
+			"name": "describe it in alarm",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a",
+				"StateValue": "ALARM"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms>\n      <member>\n        <MetricName>m</MetricName>\n        <AlarmConfigurationUpdatedTimestamp>x-x-x:x:x.x</AlarmConfigurationUpdatedTimestamp>\n        <StateValue>ALARM</StateValue>\n        <Threshold>1.0</Threshold>\n        <StateReason>a test</StateReason>\n        <InsufficientDataActions/>\n        <StateTransitionedTimestamp>x-x-x:x:x.x</StateTransitionedTimestamp>\n        <AlarmActions/>\n        <StateUpdatedTimestamp>x-x-x:x:x.x</StateUpdatedTimestamp>\n        <Period>60</Period>\n        <Statistic>Average</Statistic>\n        <ComparisonOperator>GreaterThanThreshold</ComparisonOperator>\n        <AlarmName>boberstack-ab-00000000-a</AlarmName>\n        <EvaluationPeriods>1</EvaluationPeriods>\n        <ActionsEnabled>false</ActionsEnabled>\n        <Namespace>boberstack-ab-00000000</Namespace>\n        <CreationId>3ca2eccf-89e2-4cac-b8b3-99ff525b54cf/1795404671737</CreationId>\n        <OKActions/>\n        <AlarmArn>arn:aws:cloudwatch:eu-north-1:000000000000:alarm:boberstack-ab-00000000-a</AlarmArn>\n        <Dimensions/>\n      </member>\n    </MetricAlarms>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "its history",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarmHistory",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-a",
+				"HistoryItemType": "StateUpdate"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmHistoryResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmHistoryResult>\n    <AlarmHistoryItems>\n      <member>\n        <AlarmType>MetricAlarm</AlarmType>\n        <HistorySummary>Alarm updated from INSUFFICIENT_DATA to ALARM</HistorySummary>\n        <HistoryItemType>StateUpdate</HistoryItemType>\n        <AlarmName>boberstack-ab-00000000-a</AlarmName>\n        <HistoryData>{&quot;version&quot;:&quot;1.0&quot;,&quot;oldState&quot;:{&quot;stateValue&quot;:&quot;INSUFFICIENT_DATA&quot;,&quot;stateReason&quot;:&quot;Unchecked: Initial alarm creation&quot;},&quot;newState&quot;:{&quot;stateValue&quot;:&quot;ALARM&quot;,&quot;stateReason&quot;:&quot;a test&quot;}}</HistoryData>\n        <Timestamp>x-x-x:x:x.x</Timestamp>\n      </member>\n    </AlarmHistoryItems>\n  </DescribeAlarmHistoryResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmHistoryResponse>\n"
+			}
+		},
+		{
+			"name": "its tags",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListTagsForResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListTagsForResourceResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ListTagsForResourceResult>\n    <Tags>\n      <member>\n        <Value>a</Value>\n        <Key>team</Key>\n      </member>\n    </Tags>\n  </ListTagsForResourceResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListTagsForResourceResponse>\n"
+			}
+		},
+		{
+			"name": "tag it",
+			"service": "monitoring",
+			"query": {
+				"Action": "TagResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-a",
+				"Tags.member.1.Key": "env",
+				"Tags.member.1.Value": "b"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagResourceResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <TagResourceResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagResourceResponse>\n"
+			}
+		},
+		{
+			"name": "untag it",
+			"service": "monitoring",
+			"query": {
+				"Action": "UntagResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-a",
+				"TagKeys.member.1": "team"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagResourceResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <UntagResourceResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagResourceResponse>\n"
+			}
+		},
+		{
+			"name": "its tags now",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListTagsForResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListTagsForResourceResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ListTagsForResourceResult>\n    <Tags>\n      <member>\n        <Value>b</Value>\n        <Key>env</Key>\n      </member>\n    </Tags>\n  </ListTagsForResourceResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListTagsForResourceResponse>\n"
+			}
+		},
+		{
+			"name": "disable its actions",
+			"service": "monitoring",
+			"query": {
+				"Action": "DisableAlarmActions",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DisableAlarmActionsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DisableAlarmActionsResponse>\n"
+			}
+		},
+		{
+			"name": "describe a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DescribeAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DescribeAlarmsResult>\n    <LogAlarms/>\n    <CompositeAlarms/>\n    <MetricAlarms/>\n  </DescribeAlarmsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DescribeAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "set the state of a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "SetAlarmState",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-none",
+				"StateValue": "ALARM",
+				"StateReason": "a test"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ResourceNotFound</Code>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "tags of a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListTagsForResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ResourceNotFoundException</Code>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "tag a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "TagResource",
+				"Version": "2010-08-01",
+				"ResourceARN": "arn:aws:cloudwatch:eu-north-1:${account}:alarm:${prefix}-none",
+				"Tags.member.1.Key": "env",
+				"Tags.member.1.Value": "b"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ResourceNotFoundException</Code>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one without a name",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value null at 'alarmName' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of no operator",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-b",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>ComparisonOperator must be one of GreaterThanOrEqualToThreshold, GreaterThanThreshold, LessThanThreshold, LessThanOrEqualToThreshold</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of a bad operator",
+			"service": "monitoring",
+			"differs": "AWS lists the enum in an order of its own, BoberStack in the model's",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-b",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "Bigger"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'Bigger' at 'comparisonOperator' failed to satisfy constraint: Member must satisfy enum value set: [GreaterThanUpperThreshold, LessThanLowerThreshold, GreaterThanThreshold, LessThanThreshold, LessThanOrEqualToThreshold, LessThanLowerOrGreaterThanUpperThreshold, GreaterThanOrEqualToThreshold]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of a bad statistic",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-b",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Most",
+				"Period": "60",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'Most' at 'statistic' failed to satisfy constraint: Member must satisfy enum value set: [Maximum, SampleCount, Sum, Minimum, Average]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of a bad period",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-b",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "61",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>Period must be 10, 20, 30 or a multiple of 60</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of no evaluation periods",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricAlarm",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-b",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"Statistic": "Average",
+				"Period": "60",
+				"EvaluationPeriods": "0",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanThreshold"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value '0' at 'evaluationPeriods' failed to satisfy constraint: Member must have value greater than or equal to 1</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "set a bad state",
+			"service": "monitoring",
+			"query": {
+				"Action": "SetAlarmState",
+				"Version": "2010-08-01",
+				"AlarmName": "${prefix}-a",
+				"StateValue": "RED",
+				"StateReason": "a test"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'RED' at 'stateValue' failed to satisfy constraint: Member must satisfy enum value set: [INSUFFICIENT_DATA, ALARM, OK]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "describe of a bad state",
+			"service": "monitoring",
+			"query": {
+				"Action": "DescribeAlarms",
+				"Version": "2010-08-01",
+				"StateValue": "RED"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'RED' at 'stateValue' failed to satisfy constraint: Member must satisfy enum value set: [INSUFFICIENT_DATA, ALARM, OK]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete it",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		},
+		{
+			"name": "delete a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete what is left",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteAlarms",
+				"Version": "2010-08-01",
+				"AlarmNames.member.1": "${prefix}-a",
+				"AlarmNames.member.2": "${prefix}-b"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAlarmsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAlarmsResponse>\n"
+			}
+		}
+	]
+}

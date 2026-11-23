@@ -1,0 +1,332 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o",
+			"headers": {
+				"x-amz-bucket-object-lock-enabled": "true",
+				"content-md5": "ELC5MY6yoOfvAzpPGPEnCA=="
+			},
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-o.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "create a plain bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-p",
+			"headers": {
+				"content-md5": "ELC5MY6yoOfvAzpPGPEnCA=="
+			},
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-p.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "suspend versioning",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o",
+			"params": {
+				"versioning": ""
+			},
+			"headers": {
+				"content-md5": "orZUUp7E9srl53Od8p1glA=="
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketState</Code><Message>An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put held",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/h",
+			"headers": {
+				"x-amz-object-lock-legal-hold": "ON",
+				"content-md5": "JRDDkBHFvnBBgkI+OmlekQ=="
+			},
+			"body": "h",
+			"capture": {
+				"hv": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${hv}",
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"2510c39011c5be704182423e3a695e91\"",
+					"x-amz-checksum-crc64nvme": "VV2YOezqizA=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get held",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/h",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "1",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"2510c39011c5be704182423e3a695e91\"",
+					"x-amz-version-id": "${hv}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 1,
+				"sha256": "aaa9402664f1a41f40ebbc52c9993eb66aeb366602958fdfaa283b71e64db123"
+			}
+		},
+		{
+			"name": "head held",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/h",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"2510c39011c5be704182423e3a695e91\"",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-version-id": "${hv}",
+					"accept-ranges": "bytes",
+					"content-length": "1",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "put retained",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/r",
+			"headers": {
+				"x-amz-object-lock-mode": "GOVERNANCE",
+				"x-amz-object-lock-retain-until-date": "2026-11-24T00:13:03.000Z",
+				"content-md5": "S0OwruNWJM2VuRAYmz3CMQ=="
+			},
+			"body": "r",
+			"capture": {
+				"rv": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${rv}",
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"4b43b0aee35624cd95b910189b3dc231\"",
+					"x-amz-checksum-crc64nvme": "dXxqJmwrCDY=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "head retained",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/r",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"4b43b0aee35624cd95b910189b3dc231\"",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-version-id": "${rv}",
+					"accept-ranges": "bytes",
+					"content-length": "1",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "retention of retained",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/r",
+			"params": {
+				"retention": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode><RetainUntilDate>2026-11-24T00:13:03.000Z</RetainUntilDate></Retention>"
+			}
+		},
+		{
+			"name": "put a mode without a date",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/x",
+			"headers": {
+				"x-amz-object-lock-mode": "GOVERNANCE",
+				"content-md5": "ndTkYSaMgDT1yFZOFVxnpg=="
+			},
+			"body": "x",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied</Message><ArgumentName>x-amz-object-lock-retain-until-date</ArgumentName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put held in a plain bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-p/h",
+			"headers": {
+				"x-amz-object-lock-legal-hold": "ON",
+				"content-md5": "JRDDkBHFvnBBgkI+OmlekQ=="
+			},
+			"body": "h",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRequest</Code><Message>Bucket is missing ObjectLockConfiguration</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "lock configuration with a default",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o",
+			"params": {
+				"object-lock": ""
+			},
+			"headers": {
+				"content-md5": "KX8zVPpu4gleE1JHJvOt6w=="
+			},
+			"body": "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "lock configuration get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o",
+			"params": {
+				"object-lock": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "hold off",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/h",
+			"params": {
+				"legal-hold": "",
+				"versionId": "${hv}"
+			},
+			"headers": {
+				"content-md5": "VFVLURy793Xk77f+OyG/PA=="
+			},
+			"body": "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>OFF</Status></LegalHold>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${hv}",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "delete held",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/h",
+			"params": {
+				"versionId": "${hv}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${hv}"
+				}
+			}
+		},
+		{
+			"name": "delete retained",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/r",
+			"params": {
+				"versionId": "${rv}"
+			},
+			"headers": {
+				"x-amz-bypass-governance-retention": "true"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${rv}"
+				}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the plain bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-p",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

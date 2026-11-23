@@ -1,0 +1,413 @@
+{
+	"volatile": [
+		"RequestId",
+		"SubmittedAt",
+		"Id"
+	],
+	"ignored": [
+		"NameServer",
+		"Nameserver"
+	],
+	"steps": [
+		{
+			"name": "create the parent zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-p</CallerReference></CreateHostedZoneRequest>",
+			"capture": {
+				"parent": "HostedZone/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${parent}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-p</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "create the zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>z.${prefix}.example.test</Name><CallerReference>${prefix}-z</CallerReference></CreateHostedZoneRequest>",
+			"capture": {
+				"zone": "HostedZone/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>z.boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-z</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "the zone's bare id, as the next after the parent by name",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzonesbyname",
+			"params": {
+				"dnsname": "${prefix}.example.test",
+				"maxitems": "1"
+			},
+			"capture": {
+				"id": "NextHostedZoneId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListHostedZonesByNameResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZones><HostedZone><Id>${parent}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-p</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone></HostedZones><DNSName>boberstack-ab-00000000.example.test</DNSName><IsTruncated>true</IsTruncated><NextDNSName>z.boberstack-ab-00000000.example.test.</NextDNSName><NextHostedZoneId>${id}</NextHostedZoneId><MaxItems>1</MaxItems></ListHostedZonesByNameResponse>"
+			}
+		},
+		{
+			"name": "create records",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.z.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>w.z.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>*.w.z.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"wild\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>c.z.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "create an alias to a record of the zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>al.z.${prefix}.example.test</Name><Type>A</Type><AliasTarget><HostedZoneId>${id}</HostedZoneId><DNSName>www.z.${prefix}.example.test</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list the records",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"ignored": [
+				"Value"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>NS</Type><TTL>172800</TTL><ResourceRecords><ResourceRecord><Value>ns-679.awsdns-20.net.</Value></ResourceRecord><ResourceRecord><Value>ns-212.awsdns-26.com.</Value></ResourceRecord><ResourceRecord><Value>ns-1662.awsdns-15.co.uk.</Value></ResourceRecord><ResourceRecord><Value>ns-1326.awsdns-37.org.</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>SOA</Type><TTL>900</TTL><ResourceRecords><ResourceRecord><Value>ns-679.awsdns-20.net. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>al.z.boberstack-ab-00000000.example.test.</Name><Type>A</Type><AliasTarget><HostedZoneId>${id}</HostedZoneId><DNSName>www.z.boberstack-ab-00000000.example.test.</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet><ResourceRecordSet><Name>c.z.boberstack-ab-00000000.example.test.</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>w.z.boberstack-ab-00000000.example.test.</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>\\052.w.z.boberstack-ab-00000000.example.test.</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>&quot;wild&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>www.z.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "answer a simple record",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "www.z.${prefix}.example.test",
+				"recordtype": "A"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>www.z.boberstack-ab-00000000.example.test</RecordName><RecordType>A</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer a weighted record",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "w.z.${prefix}.example.test",
+				"recordtype": "A"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>w.z.boberstack-ab-00000000.example.test</RecordName><RecordType>A</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer an alias",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "al.z.${prefix}.example.test",
+				"recordtype": "A"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>al.z.boberstack-ab-00000000.example.test</RecordName><RecordType>A</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer by a wildcard",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "any.w.z.${prefix}.example.test",
+				"recordtype": "TXT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>any.w.z.boberstack-ab-00000000.example.test</RecordName><RecordType>TXT</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer a CNAME",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "c.z.${prefix}.example.test",
+				"recordtype": "CNAME"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>c.z.boberstack-ab-00000000.example.test</RecordName><RecordType>CNAME</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer a CNAME asked for A",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "c.z.${prefix}.example.test",
+				"recordtype": "A"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>c.z.boberstack-ab-00000000.example.test</RecordName><RecordType>A</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer a name of no record of the type",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "www.z.${prefix}.example.test",
+				"recordtype": "AAAA"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>www.z.boberstack-ab-00000000.example.test</RecordName><RecordType>AAAA</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer a name of no records",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "nope.z.${prefix}.example.test",
+				"recordtype": "A"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>nope.z.boberstack-ab-00000000.example.test</RecordName><RecordType>A</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "answer the apex's NS",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/testdnsanswer",
+			"params": {
+				"hostedzoneid": "${id}",
+				"recordname": "z.${prefix}.example.test",
+				"recordtype": "NS"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<TestDNSAnswerResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Nameserver>x.x.x.x</Nameserver><RecordName>z.boberstack-ab-00000000.example.test</RecordName><RecordType>NS</RecordType><RecordData/><ResponseCode>REFUSED</ResponseCode><Protocol>UDP</Protocol></TestDNSAnswerResponse>"
+			}
+		},
+		{
+			"name": "the zone's limit of record sets",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzonelimit/${id}/MAX_RRSETS_BY_ZONE",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHostedZoneLimitResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Limit><Type>MAX_RRSETS_BY_ZONE</Type><Value>10000</Value></Limit><Count>7</Count></GetHostedZoneLimitResponse>"
+			}
+		},
+		{
+			"name": "the account's limit of zones",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/accountlimit/MAX_HOSTED_ZONES_BY_OWNER",
+			"volatile": [
+				"Count"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetAccountLimitResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Limit><Type>MAX_HOSTED_ZONES_BY_OWNER</Type><Value>500</Value></Limit><Count>x</Count></GetAccountLimitResponse>"
+			}
+		},
+		{
+			"name": "delete the alias",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>al.z.${prefix}.example.test</Name><Type>A</Type><AliasTarget><HostedZoneId>${id}</HostedZoneId><DNSName>www.z.${prefix}.example.test</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "delete the records",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.z.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.z.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>*.w.z.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"wild\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>c.z.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "delete the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></DeleteHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "delete the parent zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${parent}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></DeleteHostedZoneResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the alias",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>al.z.${prefix}.example.test</Name><Type>A</Type><AliasTarget><HostedZoneId>${id}</HostedZoneId><DNSName>www.z.${prefix}.example.test</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: ${id}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the records",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.z.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.z.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>*.w.z.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"wild\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>c.z.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: ${id}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: ${id}</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the parent zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${parent}",
+			"ignored": ["Message"],
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: x</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	]
+}

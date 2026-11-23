@@ -1,0 +1,562 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate"
+	],
+	"steps": [
+		{
+			"name": "create",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"Path": "/${prefix}/",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}",
+				"Description": "a role",
+				"MaxSessionDuration": "7200",
+				"Tags.member.1.Key": "k0",
+				"Tags.member.1.Value": "v0"
+			},
+			"capture": {
+				"roleId": "Role/RoleId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <Path>/boberstack-ab-00000000/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "create again",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>EntityAlreadyExists</Code>\n    <Message>Role with name boberstack-ab-00000000-role already exists.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of a malformed trust policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bad",
+				"AssumeRolePolicyDocument": "{"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>This policy contains invalid Json</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create of a trust policy without principal",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bad",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sts:AssumeRole\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>Has prohibited field Resource</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create for 100 seconds",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bad",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}",
+				"MaxSessionDuration": "100"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'maxSessionDuration' failed to satisfy constraint: Member must have value greater than or equal to 3600</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create without a trust policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-bad"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'assumeRolePolicyDocument' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create a second",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2",
+				"Path": "/${prefix}/",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"capture": {
+				"role2Id": "Role/RoleId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${role2Id}</RoleId>\n      <Path>/boberstack-ab-00000000/</Path>\n      <RoleName>boberstack-ab-00000000-role2</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role2</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "get",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Description>a role</Description>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <MaxSigninSessionDuration>7200</MaxSigninSessionDuration>\n      <Path>/boberstack-ab-00000000/</Path>\n      <MaxSessionDuration>7200</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "get missing",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRolesResult>\n    <IsTruncated>false</IsTruncated>\n    <Roles>\n      <member>\n        <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n        <RoleId>${roleId}</RoleId>\n        <Description>a role</Description>\n        <MaxSigninSessionDuration>7200</MaxSigninSessionDuration>\n        <Path>/boberstack-ab-00000000/</Path>\n        <MaxSessionDuration>7200</MaxSessionDuration>\n        <RoleName>boberstack-ab-00000000-role</RoleName>\n        <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n      <member>\n        <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n        <RoleId>${role2Id}</RoleId>\n        <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n        <Path>/boberstack-ab-00000000/</Path>\n        <MaxSessionDuration>3600</MaxSessionDuration>\n        <RoleName>boberstack-ab-00000000-role2</RoleName>\n        <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role2</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Roles>\n  </ListRolesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRolesResponse>\n"
+			}
+		},
+		{
+			"name": "list one",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1"
+			},
+			"capture": {
+				"marker": "Marker"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRolesResult>\n    <IsTruncated>true</IsTruncated>\n    <Marker>${marker}</Marker>\n    <Roles>\n      <member>\n        <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n        <RoleId>${roleId}</RoleId>\n        <Description>a role</Description>\n        <MaxSigninSessionDuration>7200</MaxSigninSessionDuration>\n        <Path>/boberstack-ab-00000000/</Path>\n        <MaxSessionDuration>7200</MaxSessionDuration>\n        <RoleName>boberstack-ab-00000000-role</RoleName>\n        <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Roles>\n  </ListRolesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRolesResponse>\n"
+			}
+		},
+		{
+			"name": "list the next",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/",
+				"MaxItems": "1",
+				"Marker": "${marker}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRolesResult>\n    <IsTruncated>false</IsTruncated>\n    <Roles>\n      <member>\n        <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n        <RoleId>${role2Id}</RoleId>\n        <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n        <Path>/boberstack-ab-00000000/</Path>\n        <MaxSessionDuration>3600</MaxSessionDuration>\n        <RoleName>boberstack-ab-00000000-role2</RoleName>\n        <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role2</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Roles>\n  </ListRolesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRolesResponse>\n"
+			}
+		},
+		{
+			"name": "update the trust policy",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAssumeRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UpdateAssumeRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UpdateAssumeRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "update the trust policy, malformed",
+			"service": "iam",
+			"query": {
+				"Action": "UpdateAssumeRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyDocument": "[]"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MalformedPolicyDocument</Code>\n    <Message>This policy contains invalid Json</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get, updated",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22lambda.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Description>a role</Description>\n      <Tags>\n        <member>\n          <Value>v0</Value>\n          <Key>k0</Key>\n        </member>\n      </Tags>\n      <MaxSigninSessionDuration>7200</MaxSigninSessionDuration>\n      <Path>/boberstack-ab-00000000/</Path>\n      <MaxSessionDuration>7200</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "tag",
+			"service": "iam",
+			"query": {
+				"Action": "TagRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"Tags.member.1.Key": "t0",
+				"Tags.member.1.Value": "v0",
+				"Tags.member.2.Key": "t1",
+				"Tags.member.2.Value": "v1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<TagRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</TagRoleResponse>\n"
+			}
+		},
+		{
+			"name": "list tags",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoleTags",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRoleTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRoleTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v0</Value>\n        <Key>t0</Key>\n      </member>\n      <member>\n        <Value>v1</Value>\n        <Key>t1</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n  </ListRoleTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRoleTagsResponse>\n"
+			}
+		},
+		{
+			"name": "untag",
+			"service": "iam",
+			"query": {
+				"Action": "UntagRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"TagKeys.member.1": "t0"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<UntagRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</UntagRoleResponse>\n"
+			}
+		},
+		{
+			"name": "list tags, untagged",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoleTags",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRoleTagsResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRoleTagsResult>\n    <IsTruncated>false</IsTruncated>\n    <Tags>\n      <member>\n        <Value>v1</Value>\n        <Key>t1</Key>\n      </member>\n      <member>\n        <Value>v0</Value>\n        <Key>k0</Key>\n      </member>\n    </Tags>\n  </ListRoleTagsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRoleTagsResponse>\n"
+			}
+		},
+		{
+			"name": "put an inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "inline",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\"],\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "get the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "GetRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRolePolicyResult>\n    <PolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%5B%22s3%3AGetObject%22%2C%22s3%3APutObject%22%5D%2C%22Resource%22%3A%22%2A%22%7D%5D%7D</PolicyDocument>\n    <PolicyName>inline</PolicyName>\n    <RoleName>boberstack-ab-00000000-role</RoleName>\n  </GetRolePolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "list inline policies",
+			"service": "iam",
+			"query": {
+				"Action": "ListRolePolicies",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListRolePoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListRolePoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <PolicyNames>\n      <member>inline</member>\n    </PolicyNames>\n  </ListRolePoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListRolePoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "put an inline policy on missing",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-none",
+				"PolicyName": "inline",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete with an inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete entity, must delete policies first.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the inline policy again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role policy with name inline cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "delete again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete the second",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the inline policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "inline"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the second",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role2"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-role2 cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	]
+}

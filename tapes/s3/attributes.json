@@ -1,0 +1,164 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a",
+			"headers": {
+				"content-md5": "ELC5MY6yoOfvAzpPGPEnCA=="
+			},
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-a.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a/k",
+			"headers": {
+				"x-amz-checksum-sha256": "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+				"content-md5": "kAFQmDzST7DWlj99KOF/cg=="
+			},
+			"body": "abc",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"900150983cd24fb0d6963f7d28e17f72\"",
+					"x-amz-checksum-sha256": "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "attributes",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-a/k",
+			"params": {
+				"attributes": ""
+			},
+			"headers": {
+				"x-amz-object-attributes": "ETag,ObjectSize,Checksum,StorageClass,ObjectParts"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>900150983cd24fb0d6963f7d28e17f72</ETag><Checksum><ChecksumSHA256>ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=</ChecksumSHA256><ChecksumType>FULL_OBJECT</ChecksumType></Checksum><StorageClass>STANDARD</StorageClass><ObjectSize>3</ObjectSize></GetObjectAttributesResponse>"
+			}
+		},
+		{
+			"name": "attributes unknown",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-a/k",
+			"params": {
+				"attributes": ""
+			},
+			"headers": {
+				"x-amz-object-attributes": "Colour"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Invalid attribute name specified.</Message><ArgumentName>x-amz-object-attributes</ArgumentName><ArgumentValue>Colour</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "attributes none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-a/k",
+			"params": {
+				"attributes": ""
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidRequest</Code><Message>The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "attributes missing key",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-a/nokey",
+			"params": {
+				"attributes": ""
+			},
+			"headers": {
+				"x-amz-object-attributes": "ETag"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>nokey</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "restore standard",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-a/k",
+			"params": {
+				"restore": ""
+			},
+			"headers": {
+				"content-md5": "G8ptj/zS71hU1h0WbA5xhQ=="
+			},
+			"body": "<RestoreRequest xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Days>1</Days></RestoreRequest>",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidObjectState</Code><Message>Restore is not allowed for the object's current storage class</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete k",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

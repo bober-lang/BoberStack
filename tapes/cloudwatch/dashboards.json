@@ -1,0 +1,263 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId"
+	],
+	"ignored": [
+		"LastModified"
+	],
+	"steps": [
+		{
+			"name": "put a dashboard",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-d",
+				"DashboardBody": "{\"widgets\":[{\"type\":\"text\",\"x\":0,\"y\":0,\"width\":6,\"height\":3,\"properties\":{\"markdown\":\"hi\"}}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutDashboardResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <PutDashboardResult>\n    <DashboardValidationMessages/>\n  </PutDashboardResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutDashboardResponse>\n"
+			}
+		},
+		{
+			"name": "get it",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-d"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetDashboardResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <GetDashboardResult>\n    <DashboardArn>arn:aws:cloudwatch::000000000000:dashboard/boberstack-ab-00000000-d</DashboardArn>\n    <DashboardBody>{&quot;widgets&quot;:[{&quot;type&quot;:&quot;text&quot;,&quot;x&quot;:0,&quot;y&quot;:0,&quot;width&quot;:6,&quot;height&quot;:3,&quot;properties&quot;:{&quot;markdown&quot;:&quot;hi&quot;}}]}</DashboardBody>\n    <DashboardName>boberstack-ab-00000000-d</DashboardName>\n  </GetDashboardResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetDashboardResponse>\n"
+			}
+		},
+		{
+			"name": "list by prefix",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListDashboards",
+				"Version": "2010-08-01",
+				"DashboardNamePrefix": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ListDashboardsResult>\n    <DashboardEntries>\n      <member>\n        <DashboardArn>arn:aws:cloudwatch::000000000000:dashboard/boberstack-ab-00000000-d</DashboardArn>\n        <Size>130</Size>\n        <LastModified>x-x-x:x:x</LastModified>\n        <DashboardName>boberstack-ab-00000000-d</DashboardName>\n      </member>\n    </DashboardEntries>\n  </ListDashboardsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListDashboardsResponse>\n"
+			},
+			"volatile": [
+				"Size"
+			]
+		},
+		{
+			"name": "put one of a body not JSON",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-e",
+				"DashboardBody": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterInput</Code>\n    <Message>The field DashboardBody must be a valid JSON object</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one without widgets",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-e",
+				"DashboardBody": "{}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterInput</Code>\n    <Message>The dashboard body is invalid, there are 1 validation errors:\n[\n  {\n    &quot;dataPath&quot;: &quot;&quot;,\n    &quot;message&quot;: &quot;Should have required property 'widgets'&quot;\n  }\n]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of a widget without a type",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-e",
+				"DashboardBody": "{\"widgets\":[{\"properties\":{\"markdown\":\"hi\"}}]}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterInput</Code>\n    <Message>The dashboard body is invalid, there are 1 validation errors:\n[\n  {\n    &quot;dataPath&quot;: &quot;/widgets/0&quot;,\n    &quot;message&quot;: &quot;Should have required property 'type'&quot;\n  }\n]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one of a bad name",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix} d",
+				"DashboardBody": "{\"widgets\":[]}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterValue</Code>\n    <Message>The value for field DashboardName contains invalid characters. It can only contain alphanumerics, dash (-) and underscore (_).\n</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put one without a body",
+			"service": "monitoring",
+			"differs": "AWS does not quote the values of this operation, BoberStack's codec does",
+			"query": {
+				"Action": "PutDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-e"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'dashboardBody' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ResourceNotFound</Code>\n    <Message>Dashboard boberstack-ab-00000000-none does not exist</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete it and a missing one",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteDashboards",
+				"Version": "2010-08-01",
+				"DashboardNames.member.1": "${prefix}-d",
+				"DashboardNames.member.2": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DeleteDashboardsResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteDashboardsResponse>\n"
+			}
+		},
+		{
+			"name": "it is gone",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetDashboard",
+				"Version": "2010-08-01",
+				"DashboardName": "${prefix}-d"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ResourceNotFound</Code>\n    <Message>Dashboard boberstack-ab-00000000-d does not exist</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete it",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteDashboards",
+				"Version": "2010-08-01",
+				"DashboardNames.member.1": "${prefix}-d"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DeleteDashboardsResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteDashboardsResponse>\n"
+			}
+		},
+		{
+			"name": "list none",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListDashboards",
+				"Version": "2010-08-01",
+				"DashboardNamePrefix": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ListDashboardsResult>\n    <DashboardEntries/>\n  </ListDashboardsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListDashboardsResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete what is left",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteDashboards",
+				"Version": "2010-08-01",
+				"DashboardNames.member.1": "${prefix}-d"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DeleteDashboardsResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteDashboardsResponse>\n"
+			}
+		},
+		{
+			"name": "delete the other",
+			"service": "monitoring",
+			"query": {
+				"Action": "DeleteDashboards",
+				"Version": "2010-08-01",
+				"DashboardNames.member.1": "${prefix}-e"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteDashboardsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <DeleteDashboardsResult/>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteDashboardsResponse>\n"
+			}
+		}
+	]
+}

@@ -1,0 +1,899 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified",
+		"ActualObjectSize"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-r.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/k",
+			"contentType": "text/plain",
+			"body": "0123456789",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-checksum-crc64nvme": "Ffmx7kz9nB0=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "range of the first five",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=0-4"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-4/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "c565fe03ca9b6242e01dfddefe9bba3d98b270e19cd02fd85ceaf75e2b25bf12"
+			}
+		},
+		{
+			"name": "range from five on",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=5-"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 5-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "f76043a74ec33b6aefbb289050faf7aa8d482095477397e3e63345125d49f527"
+			}
+		},
+		{
+			"name": "range of the last three",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=-3"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 7-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "35a9e381b1a27567549b5f8a6f783c167ebf809f1c4d6a9e367240484d8ce281"
+			}
+		},
+		{
+			"name": "range of one",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=9-9"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "1",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 9-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 1,
+				"sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7"
+			}
+		},
+		{
+			"name": "range past the end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=5-100"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 5-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "f76043a74ec33b6aefbb289050faf7aa8d482095477397e3e63345125d49f527"
+			}
+		},
+		{
+			"name": "range of more than all from the end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=-100"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "range starting past the end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=10-20"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message><RangeRequested>bytes=10-20</RangeRequested><ActualObjectSize>10</ActualObjectSize><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "range reversed",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=5-2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "two ranges",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=0-1,4-5"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "range not of bytes",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "lines=0-1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "range malformed",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=a-b"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "head with a range",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=0-4"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-4/10",
+					"content-length": "5",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "head with a range past the end",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"range": "bytes=10-20"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "part number 1 of a simple object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-9/10",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "part number 2 of a simple object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"params": {
+				"partNumber": "2"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidPartNumber</Code><Message>The requested partnumber is not satisfiable</Message><PartNumberRequested>2</PartNumberRequested><ActualPartCount>1</ActualPartCount><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put empty",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/empty",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+					"x-amz-checksum-crc64nvme": "AAAAAAAAAAA=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "range of an empty object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/empty",
+			"headers": {
+				"range": "bytes=0-4"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message><RangeRequested>bytes=0-4</RangeRequested><ActualObjectSize>0</ActualObjectSize><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get if it matches",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if it matches *",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "*"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if it matches another",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"00000000000000000000000000000000\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get if it matches none of it",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\""
+				}
+			}
+		},
+		{
+			"name": "get if it matches none of another",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "\"00000000000000000000000000000000\""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if modified since the past",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-modified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if modified since the future",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if unmodified since the past",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Unmodified-Since</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get if unmodified since the future",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-unmodified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if it matches, though unmodified since the past",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"781e5e245d69b566979b86e28d23f2c7\"",
+				"if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "get if it matches none of it, though modified since the past",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "\"781e5e245d69b566979b86e28d23f2c7\"",
+				"if-modified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\""
+				}
+			}
+		},
+		{
+			"name": "get if it matches another and none of another",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"00000000000000000000000000000000\"",
+				"if-none-match": "\"00000000000000000000000000000000\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get if modified since a date malformed",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-modified-since": "yesterday"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-type": "text/plain",
+					"content-length": "10"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "head if it matches another",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"00000000000000000000000000000000\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "head if it matches none of it",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 304,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\""
+				}
+			}
+		},
+		{
+			"name": "head if modified since the future",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "get a missing key if it matches",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/none",
+			"headers": {
+				"if-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>none</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if none matches, over it",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "*"
+			},
+			"body": "new",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-None-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if none matches, new",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/new",
+			"headers": {
+				"if-none-match": "*"
+			},
+			"body": "new",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"22af645d1859cb5ca6da0c484f1f37ea\"",
+					"x-amz-checksum-crc64nvme": "nYnBzD+/Oko=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put if it matches another",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"00000000000000000000000000000000\""
+			},
+			"body": "new",
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if it matches, missing",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/none",
+			"headers": {
+				"if-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"body": "new",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>none</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put if it matches",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"body": "new",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"22af645d1859cb5ca6da0c484f1f37ea\"",
+					"x-amz-checksum-crc64nvme": "nYnBzD+/Oko=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put if none matches an ETag",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-r/k",
+			"headers": {
+				"if-none-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"body": "new",
+			"response": {
+				"status": 501,
+				"headers": {
+					"cache-control": "no-store",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NotImplemented</Code><Message>A header you provided implies functionality that is not implemented</Message><Header>If-None-Match</Header><additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get what it put",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-r/k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"22af645d1859cb5ca6da0c484f1f37ea\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete k",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-r/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete new",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-r/new",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete empty",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-r/empty",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete none",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-r/none",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-r",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

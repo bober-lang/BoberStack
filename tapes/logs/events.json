@@ -1,0 +1,1635 @@
+{
+	"volatile": [
+		"creationTime",
+		"firstEventTimestamp",
+		"lastEventTimestamp",
+		"lastIngestionTime",
+		"uploadSequenceToken",
+		"nextSequenceToken",
+		"timestamp",
+		"ingestionTime",
+		"eventId",
+		"nextForwardToken",
+		"nextBackwardToken",
+		"lastUpdatedTime",
+		"revisionId",
+		"UserId",
+		"CreateDate",
+		"RequestId"
+	],
+	"steps": [
+		{
+			"name": "create a group",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "create a stream",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogStream",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "create another",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogStream",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "t"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "no events",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": []
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "1 validation error detected: Value at 'logEvents' failed to satisfy constraint: Member must have length greater than or equal to 1"
+				}
+			}
+		},
+		{
+			"name": "an empty message",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now}",
+						"message": ""
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "1 validation error detected: Value at 'logEvents.1.member.message' failed to satisfy constraint: Member must have length greater than or equal to 1"
+				}
+			}
+		},
+		{
+			"name": "out of order",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now-1000}",
+						"message": "b"
+					},
+					{
+						"timestamp": "${now-2000}",
+						"message": "a"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Log events in a single PutLogEvents request must be in chronological order."
+				}
+			}
+		},
+		{
+			"name": "over a day",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now-90000000}",
+						"message": "a"
+					},
+					{
+						"timestamp": "${now-1000}",
+						"message": "b"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "The batch of log events in a single PutLogEvents request cannot span more than 24 hours."
+				}
+			}
+		},
+		{
+			"name": "to a stream not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "none",
+				"logEvents": [
+					{
+						"timestamp": "${now}",
+						"message": "a"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log stream does not exist."
+				}
+			}
+		},
+		{
+			"name": "to a group not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g9",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now}",
+						"message": "a"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log group does not exist."
+				}
+			}
+		},
+		{
+			"name": "out of order to a stream not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "none",
+				"logEvents": [
+					{
+						"timestamp": "${now-1000}",
+						"message": "b"
+					},
+					{
+						"timestamp": "${now-2000}",
+						"message": "a"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Log events in a single PutLogEvents request must be in chronological order."
+				}
+			}
+		},
+		{
+			"name": "too old, in time and too new",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now-1296000000}",
+						"message": "old"
+					},
+					{
+						"timestamp": "${now-30000}",
+						"message": "ERROR one"
+					},
+					{
+						"timestamp": "${now+10800000}",
+						"message": "new"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"nextSequenceToken": "x",
+					"rejectedLogEventsInfo": {
+						"tooNewLogEventStartIndex": 2,
+						"tooOldLogEventEndIndex": 1
+					}
+				}
+			}
+		},
+		{
+			"name": "all too new",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now+10800000}",
+						"message": "new"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"nextSequenceToken": "x",
+					"rejectedLogEventsInfo": {
+						"tooNewLogEventStartIndex": 0
+					}
+				}
+			}
+		},
+		{
+			"name": "with any sequence token",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"sequenceToken": "1234",
+				"logEvents": [
+					{
+						"timestamp": "${now-20000}",
+						"message": "INFO two"
+					},
+					{
+						"timestamp": "${now-19000}",
+						"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}"
+					},
+					{
+						"timestamp": "${now-18000}",
+						"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}"
+					},
+					{
+						"timestamp": "${now-17000}",
+						"message": "10.0.0.1 - alice [10/Oct/2000:13:55:36 -0700] \"GET /a HTTP/1.0\" 404 512"
+					},
+					{
+						"timestamp": "${now-16000}",
+						"message": "10.0.0.2 - bob [10/Oct/2000:13:55:37 -0700] \"GET /b HTTP/1.0\" 200 2048"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"nextSequenceToken": "x"
+				}
+			}
+		},
+		{
+			"name": "events in t",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "t",
+				"logEvents": [
+					{
+						"timestamp": "${now-25000}",
+						"message": "WARN in t"
+					},
+					{
+						"timestamp": "${now-15000}",
+						"message": "ERROR in t"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"nextSequenceToken": "x"
+				}
+			}
+		},
+		{
+			"name": "the streams",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeLogStreams",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"logStreams": [
+						{
+							"arn": "arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g:log-stream:s",
+							"creationTime": "x",
+							"firstEventTimestamp": "x",
+							"lastEventTimestamp": "x",
+							"lastIngestionTime": "x",
+							"logStreamName": "s",
+							"storedBytes": 0,
+							"uploadSequenceToken": "x"
+						},
+						{
+							"arn": "arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g:log-stream:t",
+							"creationTime": "x",
+							"firstEventTimestamp": "x",
+							"lastEventTimestamp": "x",
+							"lastIngestionTime": "x",
+							"logStreamName": "t",
+							"storedBytes": 0,
+							"uploadSequenceToken": "x"
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "the stream s",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "ERROR one",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "INFO two",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "10.0.0.1 - alice [10/Oct/2000:13:55:36 -0700] \"GET /a HTTP/1.0\" 404 512",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "10.0.0.2 - bob [10/Oct/2000:13:55:37 -0700] \"GET /b HTTP/1.0\" 200 2048",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "the last two",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"limit": 2
+			},
+			"capture": {
+				"back": "nextBackwardToken",
+				"forth": "nextForwardToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "10.0.0.1 - alice [10/Oct/2000:13:55:36 -0700] \"GET /a HTTP/1.0\" 404 512",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "10.0.0.2 - bob [10/Oct/2000:13:55:37 -0700] \"GET /b HTTP/1.0\" 200 2048",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "the two before",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"limit": 2,
+				"nextToken": "${back}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "none after",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"limit": 2,
+				"nextToken": "${forth}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [],
+					"nextBackwardToken": "x",
+					"nextForwardToken": "x"
+				}
+			}
+		},
+		{
+			"name": "the first two",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"limit": 2,
+				"startFromHead": true
+			},
+			"capture": {
+				"head": "nextForwardToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "ERROR one",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "INFO two",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "the next two",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"limit": 2,
+				"startFromHead": true,
+				"nextToken": "${head}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "a time range",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"startTime": "${now-20000}",
+				"endTime": "${now-17000}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "INFO two",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						}
+					],
+					"nextBackwardToken": "b/x/s",
+					"nextForwardToken": "f/x/s"
+				}
+			}
+		},
+		{
+			"name": "a token not given",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"nextToken": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "The specified nextToken is invalid."
+				}
+			}
+		},
+		{
+			"name": "a stream not there",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "none"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log stream does not exist."
+				}
+			}
+		},
+		{
+			"name": "filter all",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"capture": {
+				"all": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "ERROR one",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "INFO two",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "10.0.0.1 - alice [10/Oct/2000:13:55:36 -0700] \"GET /a HTTP/1.0\" 404 512",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "10.0.0.2 - bob [10/Oct/2000:13:55:37 -0700] \"GET /b HTTP/1.0\" 200 2048",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "ERROR in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${all}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter after all",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"nextToken": "${all}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [],
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter a page of two",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"limit": 2
+			},
+			"capture": {
+				"two": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "ERROR one",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${two}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter the next two",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"limit": 2,
+				"nextToken": "${two}"
+			},
+			"capture": {
+				"four": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "INFO two",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${four}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter by stream",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamNames": [
+					"t"
+				]
+			},
+			"capture": {
+				"t": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "ERROR in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${all}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter by stream prefix",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamNamePrefix": "t"
+			},
+			"capture": {
+				"tt": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "ERROR in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${all}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter by names and prefix",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamNames": [
+					"t"
+				],
+				"logStreamNamePrefix": "t"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Cannot call FilterLogEvents with both logStreamNames and logStreamNamePrefix"
+				}
+			}
+		},
+		{
+			"name": "filter by a stream not there",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamNames": [
+					"t",
+					"none"
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log stream does not exist."
+				}
+			}
+		},
+		{
+			"name": "filter a time range",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"startTime": "${now-25000}",
+				"endTime": "${now-18000}"
+			},
+			"capture": {
+				"range": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "INFO two",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${range}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter a range of none",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"startTime": "${now-5000}",
+				"endTime": "${now-3000}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [],
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter a term",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "ERROR"
+			},
+			"capture": {
+				"term": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "ERROR one",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "ERROR in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${all}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter alternatives",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "?WARN ?INFO"
+			},
+			"capture": {
+				"alt": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "INFO two",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${alt}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter an exclusion",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "ERROR -t"
+			},
+			"capture": {
+				"ex": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "ERROR one",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${ex}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter a phrase",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "\"in t\""
+			},
+			"capture": {
+				"phrase": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "WARN in t",
+							"timestamp": "x"
+						},
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "t",
+							"message": "ERROR in t",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${phrase}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter JSON",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "{ $.code >= 500 && $.user.id = 7 }"
+			},
+			"capture": {
+				"json": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"error\", \"code\": 503, \"user\": {\"id\": 7}}",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${json}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter JSON by wildcard",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "{ $.level = \"inf*\" }"
+			},
+			"capture": {
+				"wild": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "{\"level\": \"info\", \"code\": 200, \"user\": {\"id\": 8}}",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${wild}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter space-delimited",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "[ip, id, user, ts, request, status = 4*, size]"
+			},
+			"capture": {
+				"fields": "nextToken"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"events": [
+						{
+							"eventId": "x",
+							"ingestionTime": "x",
+							"logStreamName": "s",
+							"message": "10.0.0.1 - alice [10/Oct/2000:13:55:36 -0700] \"GET /a HTTP/1.0\" 404 512",
+							"timestamp": "x"
+						}
+					],
+					"nextToken": "${fields}",
+					"searchStatistics": {
+						"approximateTotalLogStreamCount": 0,
+						"completedLogStreamCount": 0
+					},
+					"searchedLogStreams": []
+				}
+			}
+		},
+		{
+			"name": "filter a pattern not valid",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterPattern": "{ $.code = "
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "If a filter pattern starts with '{' it must end with '}'"
+				}
+			}
+		},
+		{
+			"name": "filter a group not there",
+			"service": "logs",
+			"target": "Logs_20140328.FilterLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g9"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log group does not exist."
+				}
+			}
+		},
+		{
+			"name": "test a term",
+			"service": "logs",
+			"target": "Logs_20140328.TestMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"filterPattern": "ERROR",
+				"logEventMessages": [
+					"ERROR one",
+					"INFO two",
+					"xERRORx"
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"matches": [
+						{
+							"eventMessage": "ERROR one",
+							"eventNumber": 1,
+							"extractedValues": {}
+						},
+						{
+							"eventMessage": "xERRORx",
+							"eventNumber": 3,
+							"extractedValues": {}
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "test fields",
+			"service": "logs",
+			"target": "Logs_20140328.TestMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"filterPattern": "[ip, id, user, ...]",
+				"logEventMessages": [
+					"10.0.0.1 - alice x y",
+					"one"
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"matches": [
+						{
+							"eventMessage": "10.0.0.1 - alice x y",
+							"eventNumber": 1,
+							"extractedValues": {
+								"$4": "x",
+								"$5": "y",
+								"$ip": "10.0.0.1",
+								"$user": "alice",
+								"$id": "-"
+							}
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "test JSON",
+			"service": "logs",
+			"target": "Logs_20140328.TestMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"filterPattern": "{ $.a[*] = 2 || $.b IS TRUE }",
+				"logEventMessages": [
+					"{\"a\": [1, 2]}",
+					"{\"b\": true}",
+					"{\"b\": false}"
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"matches": [
+						{
+							"eventMessage": "{\"a\": [1, 2]}",
+							"eventNumber": 1,
+							"extractedValues": {}
+						},
+						{
+							"eventMessage": "{\"b\": true}",
+							"eventNumber": 2,
+							"extractedValues": {}
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "test a pattern not valid",
+			"service": "logs",
+			"target": "Logs_20140328.TestMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"filterPattern": "[a, b",
+				"logEventMessages": [
+					"x"
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "If a filter pattern starts with '[' it must end with ']'"
+				}
+			}
+		},
+		{
+			"name": "test a term not valid",
+			"service": "logs",
+			"target": "Logs_20140328.TestMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"filterPattern": "ERROR*",
+				"logEventMessages": [
+					"x"
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Invalid character(s) in term '*'"
+				}
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the group",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		}
+	]
+}

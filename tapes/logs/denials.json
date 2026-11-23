@@ -1,0 +1,230 @@
+{
+	"volatile": [
+		"creationTime",
+		"firstEventTimestamp",
+		"lastEventTimestamp",
+		"lastIngestionTime",
+		"uploadSequenceToken",
+		"nextSequenceToken",
+		"timestamp",
+		"ingestionTime",
+		"eventId",
+		"nextForwardToken",
+		"nextBackwardToken",
+		"lastUpdatedTime",
+		"revisionId",
+		"UserId",
+		"CreateDate",
+		"RequestId"
+	],
+	"steps": [
+		{
+			"name": "create a user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-none</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-none</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "a key of it",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"capture": {
+				"none.key": "AccessKey/AccessKeyId",
+				"none.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${none.key}</AccessKeyId>\n      <SecretAccessKey>${none.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-none</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "none",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-none</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "create a group",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "it creates a group",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g2"
+			},
+			"as": "none",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "AccessDeniedException",
+					"Message": "User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: logs:CreateLogGroup on resource: arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g2 because no identity-based policy allows the logs:CreateLogGroup action"
+				}
+			}
+		},
+		{
+			"name": "it describes groups",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeLogGroups",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupNamePrefix": "/${prefix}/g"
+			},
+			"as": "none",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "AccessDeniedException",
+					"Message": "User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: logs:DescribeLogGroups on resource: arn:aws:logs:us-east-1:000000000000:log-group::log-stream: because no identity-based policy allows the logs:DescribeLogGroups action"
+				}
+			}
+		},
+		{
+			"name": "it puts events",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now}",
+						"message": "a"
+					}
+				]
+			},
+			"as": "none",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "AccessDeniedException",
+					"Message": "User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: logs:PutLogEvents on resource: arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g:log-stream:s because no identity-based policy allows the logs:PutLogEvents action"
+				}
+			}
+		},
+		{
+			"name": "it tags a group",
+			"service": "logs",
+			"target": "Logs_20140328.TagResource",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"resourceArn": "arn:aws:logs:us-east-1:${account}:log-group:/${prefix}/g",
+				"tags": {
+					"a": "b"
+				}
+			},
+			"as": "none",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "AccessDeniedException",
+					"Message": "User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-none is not authorized to perform: logs:TagResource on resource: arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g because no identity-based policy allows the logs:TagResource action"
+				}
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the group",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "clean up the key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none",
+				"AccessKeyId": "${none.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

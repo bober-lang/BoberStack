@@ -1,0 +1,594 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"bytesScanned",
+		"queryId",
+		"creationTime",
+		"nextSequenceToken"
+	],
+	"steps": [
+		{
+			"name": "create the group",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "a stream",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogStream",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"logStreamName": "s"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "a dozen events",
+			"service": "logs",
+			"target": "Logs_20140328.PutLogEvents",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"logStreamName": "s",
+				"logEvents": [
+					{
+						"timestamp": "${now-12000}",
+						"message": "GET /a 200 10"
+					},
+					{
+						"timestamp": "${now-11000}",
+						"message": "GET /a 200 11"
+					},
+					{
+						"timestamp": "${now-10000}",
+						"message": "GET /a 200 12"
+					},
+					{
+						"timestamp": "${now-9000}",
+						"message": "GET /a 200 13"
+					},
+					{
+						"timestamp": "${now-8000}",
+						"message": "GET /a 200 14"
+					},
+					{
+						"timestamp": "${now-7000}",
+						"message": "GET /a 200 15"
+					},
+					{
+						"timestamp": "${now-6000}",
+						"message": "GET /a 200 16"
+					},
+					{
+						"timestamp": "${now-5000}",
+						"message": "GET /a 200 17"
+					},
+					{
+						"timestamp": "${now-4000}",
+						"message": "POST /b 500 40"
+					},
+					{
+						"timestamp": "${now-3000}",
+						"message": "POST /b 500 60"
+					},
+					{
+						"timestamp": "${now-2000}",
+						"message": "{\"level\":\"error\",\"req\":{\"ms\":7}}"
+					},
+					{
+						"timestamp": "${now-1000}",
+						"message": "{\"level\":\"info\",\"req\":{\"ms\":3}}"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"nextSequenceToken": "x"
+				}
+			}
+		},
+		{
+			"name": "the group's fields, once queryable",
+			"service": "logs",
+			"target": "Logs_20140328.GetLogGroupFields",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights"
+			},
+			"unordered": [
+				"logGroupFields"
+			],
+			"untilBody": "\"req.ms\"",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"logGroupFields": []
+				}
+			},
+			"differs": "AWS lists a new log group's fields only minutes after its events can be queried"
+		},
+		{
+			"name": "start: parse and stats by a field",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "parse @message \"* * * *\" as verb, path, status, ms | filter ispresent(verb) | stats count(*) as n, sum(ms) as total, avg(ms), max(ms) by status | sort n desc"
+			},
+			"capture": {
+				"q1": "queryId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryId": "${q1}"
+				}
+			}
+		},
+		{
+			"name": "results: parse and stats by a field",
+			"service": "logs",
+			"target": "Logs_20140328.GetQueryResults",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"queryId": "${q1}"
+			},
+			"untilBody": "\"status\":\"Complete\"",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryLanguage": "CWLI",
+					"results": [
+						[
+							{
+								"field": "status",
+								"value": "200"
+							},
+							{
+								"field": "n",
+								"value": "8"
+							},
+							{
+								"field": "total",
+								"value": "108"
+							},
+							{
+								"field": "avg(ms)",
+								"value": "13.5"
+							},
+							{
+								"field": "max(ms)",
+								"value": "17"
+							}
+						],
+						[
+							{
+								"field": "status",
+								"value": "500"
+							},
+							{
+								"field": "n",
+								"value": "2"
+							},
+							{
+								"field": "total",
+								"value": "100"
+							},
+							{
+								"field": "avg(ms)",
+								"value": "50"
+							},
+							{
+								"field": "max(ms)",
+								"value": "60"
+							}
+						]
+					],
+					"statistics": {
+						"bytesScanned": "x.x",
+						"estimatedBytesSkipped": 0.0,
+						"estimatedRecordsSkipped": 0.0,
+						"logGroupsScanned": 1.0,
+						"recordsMatched": 12.0,
+						"recordsScanned": 12.0,
+						"resultCount": 2.0
+					},
+					"status": "Complete"
+				}
+			}
+		},
+		{
+			"name": "start: JSON fields and functions",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "filter level = 'error' or level = 'info' | fields level, req.ms * 2 as d, toupper(level), strlen(level) | sort d desc"
+			},
+			"capture": {
+				"q2": "queryId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryId": "${q2}"
+				}
+			}
+		},
+		{
+			"name": "results: JSON fields and functions",
+			"service": "logs",
+			"target": "Logs_20140328.GetQueryResults",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"queryId": "${q2}"
+			},
+			"volatile": [
+				"value"
+			],
+			"untilBody": "\"status\":\"Complete\"",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryLanguage": "CWLI",
+					"results": [
+						[
+							{
+								"field": "level",
+								"value": "x"
+							},
+							{
+								"field": "d",
+								"value": "x"
+							},
+							{
+								"field": "toupper(level)",
+								"value": "x"
+							},
+							{
+								"field": "strlen(level)",
+								"value": "x"
+							},
+							{
+								"field": "@ptr",
+								"value": "x:x"
+							}
+						],
+						[
+							{
+								"field": "level",
+								"value": "x"
+							},
+							{
+								"field": "d",
+								"value": "x"
+							},
+							{
+								"field": "toupper(level)",
+								"value": "x"
+							},
+							{
+								"field": "strlen(level)",
+								"value": "x"
+							},
+							{
+								"field": "@ptr",
+								"value": "x:x"
+							}
+						]
+					],
+					"statistics": {
+						"bytesScanned": "x.x",
+						"estimatedBytesSkipped": 0.0,
+						"estimatedRecordsSkipped": 0.0,
+						"logGroupsScanned": 1.0,
+						"recordsMatched": 2.0,
+						"recordsScanned": 12.0,
+						"resultCount": 2.0
+					},
+					"status": "Complete"
+				}
+			}
+		},
+		{
+			"name": "start: newest first, limited",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "fields @timestamp, @message | filter @message like /POST/ | sort @timestamp desc | limit 1"
+			},
+			"capture": {
+				"q3": "queryId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryId": "${q3}"
+				}
+			}
+		},
+		{
+			"name": "results: newest first, limited",
+			"service": "logs",
+			"target": "Logs_20140328.GetQueryResults",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"queryId": "${q3}"
+			},
+			"volatile": [
+				"value"
+			],
+			"untilBody": "\"status\":\"Complete\"",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryLanguage": "CWLI",
+					"results": [
+						[
+							{
+								"field": "@timestamp",
+								"value": "x-x-x x:x:x.x"
+							},
+							{
+								"field": "@message",
+								"value": "x x x x"
+							},
+							{
+								"field": "@ptr",
+								"value": "x:x"
+							}
+						]
+					],
+					"statistics": {
+						"bytesScanned": "x.x",
+						"estimatedBytesSkipped": 0.0,
+						"estimatedRecordsSkipped": 0.0,
+						"logGroupsScanned": 1.0,
+						"recordsMatched": 2.0,
+						"recordsScanned": 12.0,
+						"resultCount": 1.0
+					},
+					"status": "Complete"
+				}
+			}
+		},
+		{
+			"name": "start: counts and percentiles",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "parse @message '* * * *' as verb, path, status, ms | stats count(*) as n, count_distinct(verb) as verbs, pct(ms, 50) as p50"
+			},
+			"capture": {
+				"q4": "queryId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryId": "${q4}"
+				}
+			}
+		},
+		{
+			"name": "results: counts and percentiles",
+			"service": "logs",
+			"target": "Logs_20140328.GetQueryResults",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"queryId": "${q4}"
+			},
+			"untilBody": "\"status\":\"Complete\"",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"queryLanguage": "CWLI",
+					"results": [
+						[
+							{
+								"field": "n",
+								"value": "12"
+							},
+							{
+								"field": "verbs",
+								"value": "2"
+							},
+							{
+								"field": "p50",
+								"value": "14"
+							}
+						]
+					],
+					"statistics": {
+						"bytesScanned": "x.x",
+						"estimatedBytesSkipped": 0.0,
+						"estimatedRecordsSkipped": 0.0,
+						"logGroupsScanned": 1.0,
+						"recordsMatched": 12.0,
+						"recordsScanned": 12.0,
+						"resultCount": 1.0
+					},
+					"status": "Complete"
+				}
+			}
+		},
+		{
+			"name": "malformed: fields a | nope",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "fields a | nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "MalformedQueryException",
+					"message": "unexpected symbol found nope at line 1 and position 93 (Service: AWSLogs; Status Code: 400; Error Code: MalformedQueryException; Request ID: 4ba4cc83-edd3-4482-a601-7109a5fdd8c2; Proxy: null)"
+				}
+			},
+			"volatile": [
+				"message"
+			]
+		},
+		{
+			"name": "malformed: filter (",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "filter ("
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "MalformedQueryException",
+					"message": "unexpected symbol found <EOF> at line 1 and position 90 (Service: AWSLogs; Status Code: 400; Error Code: MalformedQueryException; Request ID: f3583bf9-9ee1-4818-aa4b-e2adc4f2ae5c; Proxy: null)"
+				}
+			},
+			"volatile": [
+				"message"
+			]
+		},
+		{
+			"name": "malformed: stats foo(x)",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "stats foo(x)"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "MalformedQueryException",
+					"message": "Unrecognized function name: foo ([88,93]) (Service: AWSLogs; Status Code: 400; Error Code: MalformedQueryException; Request ID: 494087a2-b9d4-4432-b0d6-cd62f86d6e3b; Proxy: null)"
+				}
+			},
+			"volatile": [
+				"message"
+			]
+		},
+		{
+			"name": "malformed: fields @message | limit x",
+			"service": "logs",
+			"target": "Logs_20140328.StartQuery",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights",
+				"startTime": 1400000000,
+				"endTime": 4000000000,
+				"queryString": "fields @message | limit x"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "MalformedQueryException",
+					"message": "unexpected symbol found x at line 1 and position 106 (Service: AWSLogs; Status Code: 400; Error Code: MalformedQueryException; Request ID: f21db887-9a8f-45e1-8d9e-b8f601484a19; Proxy: null)"
+				}
+			},
+			"volatile": [
+				"message"
+			]
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the group",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/insights"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		}
+	]
+}

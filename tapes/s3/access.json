@@ -1,0 +1,1213 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"last-modified",
+		"LastModified",
+		"UserId",
+		"CreateDate",
+		"RoleId",
+		"Expires",
+		"ServerTime",
+		"StringToSign",
+		"StringToSignBytes",
+		"SignatureProvided"
+	],
+	"ignored": [
+		"CanonicalRequest",
+		"CanonicalRequestBytes"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-b.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put a/x",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/a/x",
+			"contentType": "text/plain",
+			"body": "a/x",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"e2d645f7ae8e44add7bcb2494c6e0ef8\"",
+					"x-amz-checksum-crc64nvme": "ieQ8awqDjVo=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put secret",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/secret",
+			"contentType": "text/plain",
+			"body": "secret",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5ebe2294ecd0e0f08eab7690d2a6ee69\"",
+					"x-amz-checksum-crc64nvme": "57Cg+N2YpVM=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "create a user of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-n"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-n</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-n</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "a key of it",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-n"
+			},
+			"region": "us-east-1",
+			"capture": {
+				"n.key": "AccessKey/AccessKeyId",
+				"n.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${n.key}</AccessKeyId>\n      <SecretAccessKey>${n.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-n</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "create a user",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-u</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-u</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "an identity policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u",
+				"PolicyName": "s3",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\"],\"Resource\":\"arn:aws:s3:::${prefix}-b/a/*\"},{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::${prefix}-b\",\"Condition\":{\"StringLike\":{\"s3:prefix\":\"a/*\"}}}]}"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a key of it",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u"
+			},
+			"region": "us-east-1",
+			"capture": {
+				"u.key": "AccessKey/AccessKeyId",
+				"u.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${u.key}</AccessKeyId>\n      <SecretAccessKey>${u.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-u</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "the user of no policy, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"region": "us-east-1",
+			"as": "n",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-n</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "it lists",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2"
+			},
+			"as": "n",
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-n is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:ListBucket action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it gets an object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"as": "n",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-n is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/a/x\" because no identity-based policy allows the s3:GetObject action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it puts an object",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/a/y",
+			"body": "y",
+			"as": "n",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-n is not authorized to perform: s3:PutObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/a/y\" because no identity-based policy allows the s3:PutObject action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it gets the bucket's location",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"location": ""
+			},
+			"as": "n",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-n is not authorized to perform: s3:GetBucketLocation on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:GetBucketLocation action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it heads the bucket",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-b",
+			"as": "n",
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "the user, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"region": "us-east-1",
+			"as": "u",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-u</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "it gets an object, once the policy works",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"as": "u",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"e2d645f7ae8e44add7bcb2494c6e0ef8\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "1653a06856ec14bc20b4e1dcc951d601eda9f17d7af17cfd4a433cfe93a29b04"
+			}
+		},
+		{
+			"name": "it puts an object under a/",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/a/y",
+			"body": "y",
+			"as": "u",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"415290769594460e2e485922904f345d\"",
+					"x-amz-checksum-crc64nvme": "UtOXylRhbcg=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "it puts an object elsewhere",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/b/y",
+			"body": "y",
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:PutObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/b/y\" because no identity-based policy allows the s3:PutObject action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it lists under a/",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2",
+				"prefix": "a/"
+			},
+			"as": "u",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-b</Name><Prefix>a/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>a/x</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;e2d645f7ae8e44add7bcb2494c6e0ef8&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>a/y</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;415290769594460e2e485922904f345d&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
+			}
+		},
+		{
+			"name": "it lists under b/",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2",
+				"prefix": "b/"
+			},
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:ListBucket action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it lists all",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2"
+			},
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:ListBucket action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it deletes a/y",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/y",
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:DeleteObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/a/y\" because no identity-based policy allows the s3:DeleteObject action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it gets the bucket policy, of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:GetBucketPolicy on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:GetBucketPolicy action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put a bucket policy for the user",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"List\",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-u\"},\"Action\":[\"s3:ListBucket\",\"s3:GetBucketPolicy\"],\"Resource\":\"arn:aws:s3:::${prefix}-b\"},{\"Sid\":\"Read\",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-u\"},\"Action\":[\"s3:GetObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::${prefix}-b/*\"},{\"Sid\":\"Secret\",\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-u\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-b/secret\"}]}",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "it lists all, as the bucket allows",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2"
+			},
+			"as": "u",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-b</Name><Prefix></Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>a/x</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;e2d645f7ae8e44add7bcb2494c6e0ef8&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>a/y</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;415290769594460e2e485922904f345d&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>secret</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;5ebe2294ecd0e0f08eab7690d2a6ee69&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>6</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
+			}
+		},
+		{
+			"name": "it gets the bucket policy",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"as": "u",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/json"
+				},
+				"json": {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Sid": "List",
+							"Effect": "Allow",
+							"Principal": {
+								"AWS": "arn:aws:iam::000000000000:user/boberstack-ab-00000000-u"
+							},
+							"Action": [
+								"s3:ListBucket",
+								"s3:GetBucketPolicy"
+							],
+							"Resource": "arn:aws:s3:::boberstack-ab-00000000-b"
+						},
+						{
+							"Sid": "Read",
+							"Effect": "Allow",
+							"Principal": {
+								"AWS": "arn:aws:iam::000000000000:user/boberstack-ab-00000000-u"
+							},
+							"Action": [
+								"s3:GetObject",
+								"s3:DeleteObject"
+							],
+							"Resource": "arn:aws:s3:::boberstack-ab-00000000-b/*"
+						},
+						{
+							"Sid": "Secret",
+							"Effect": "Deny",
+							"Principal": {
+								"AWS": "arn:aws:iam::000000000000:user/boberstack-ab-00000000-u"
+							},
+							"Action": "s3:GetObject",
+							"Resource": "arn:aws:s3:::boberstack-ab-00000000-b/secret"
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "it gets an object the bucket denies",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/secret",
+			"as": "u",
+			"until": 403,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/secret\" with an explicit deny in a resource-based policy</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "it deletes a/y, as the bucket allows",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/y",
+			"as": "u",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "it gets the policy status",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policyStatus": ""
+			},
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:GetBucketPolicyStatus on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:GetBucketPolicyStatus action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the policy status",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policyStatus": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PolicyStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsPublic>false</IsPublic></PolicyStatus>"
+			}
+		},
+		{
+			"name": "a role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-r",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"region": "us-east-1",
+			"capture": {
+				"roleArn": "Role/Arn"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-r</RoleName>\n      <Arn>${roleArn}</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "its policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-r",
+				"PolicyName": "s3",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-b/*\"}]}"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "assume it",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape"
+			},
+			"region": "us-east-1",
+			"capture": {
+				"r.key": "Credentials/AccessKeyId",
+				"r.secret": "Credentials/SecretAccessKey",
+				"r.token": "Credentials/SessionToken"
+			},
+			"volatile": [
+				"PackedPolicySize",
+				"Expiration",
+				"AssumedRoleId",
+				"SessionTokenSize",
+				"SessionTokenUtilization"
+			],
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <AssumeRoleResult>\n    <AssumedRoleUser>\n      <AssumedRoleId>x:x</AssumedRoleId>\n      <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-r/tape</Arn>\n    </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>${r.key}</AccessKeyId>\n      <SecretAccessKey>${r.secret}</SecretAccessKey>\n      <SessionToken>${r.token}</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <PackedPolicySize>x</PackedPolicySize>\n    <SessionTokenSize>x</SessionTokenSize>\n    <SessionTokenUtilization>x</SessionTokenUtilization>\n  </AssumeRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AssumeRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the session gets an object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"as": "r",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"e2d645f7ae8e44add7bcb2494c6e0ef8\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "1653a06856ec14bc20b4e1dcc951d601eda9f17d7af17cfd4a433cfe93a29b04"
+			}
+		},
+		{
+			"name": "the session lists",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2"
+			},
+			"as": "r",
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-r/tape is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::boberstack-ab-00000000-b\" because no identity-based policy allows the s3:ListBucket action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the session puts",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/a/z",
+			"body": "z",
+			"as": "r",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-r/tape is not authorized to perform: s3:PutObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/a/z\" because no identity-based policy allows the s3:PutObject action</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "an anonymous get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"anonymous": true,
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "an anonymous list",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"list-type": "2"
+			},
+			"anonymous": true,
+			"response": {
+				"status": 403,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a presigned get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"presign": 300,
+			"as": "u",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"e2d645f7ae8e44add7bcb2494c6e0ef8\"",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "1653a06856ec14bc20b4e1dcc951d601eda9f17d7af17cfd4a433cfe93a29b04"
+			}
+		},
+		{
+			"name": "a presigned put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b/a/p",
+			"body": "p",
+			"presign": 300,
+			"as": "u",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"83878c91171338902e0fe0fb97a8c47a\"",
+					"x-amz-checksum-crc64nvme": "i6GLtgxAGsQ=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "a presigned get of the put",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/p",
+			"presign": 300,
+			"as": "u",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "1",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"83878c91171338902e0fe0fb97a8c47a\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 1,
+				"sha256": "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940"
+			}
+		},
+		{
+			"name": "an expired presigned get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"presign": 60,
+			"age": 600,
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Request has expired</Message><X-Amz-Expires>60</X-Amz-Expires><Expires>x-x-x:x:x</Expires><ServerTime>x-x-x:x:x</ServerTime><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a tampered presigned get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"presign": 300,
+			"tamper": {
+				"X-Amz-Expires": "600"
+			},
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message><StringToSignBytes>x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x</StringToSignBytes><SignatureProvided>x</SignatureProvided><CanonicalRequest>GET\n/boberstack-ab-00000000-b/a/x\nX-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Credential=${u.key}%2F20261123%2Feu-north-1%2Fs3%2Faws4_request&amp;X-Amz-Date=20261123T033234Z&amp;X-Amz-Expires=600&amp;X-Amz-SignedHeaders=host\nhost:s3.eu-north-1.amazonaws.com\n\nhost\nUNSIGNED-PAYLOAD</CanonicalRequest><StringToSign>x-x-x\nx\nx-x-x_x\nx</StringToSign><CanonicalRequestBytes>x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x</CanonicalRequestBytes><AWSAccessKeyId>${u.key}</AWSAccessKeyId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a presigned get the bucket denies",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/secret",
+			"presign": 300,
+			"as": "u",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-u is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::boberstack-ab-00000000-b/secret\" with an explicit deny in a resource-based policy</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "the expected owner",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policyStatus": ""
+			},
+			"headers": {
+				"x-amz-expected-bucket-owner": "${account}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PolicyStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsPublic>false</IsPublic></PolicyStatus>"
+			}
+		},
+		{
+			"name": "another expected owner",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policyStatus": ""
+			},
+			"headers": {
+				"x-amz-expected-bucket-owner": "111122223333"
+			},
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "another expected owner of an object",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b/a/x",
+			"headers": {
+				"x-amz-expected-bucket-owner": "111122223333"
+			},
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy of another bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-u\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-other/*\"}]}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>Policy has invalid resource</Message><Detail>arn:aws:s3:::boberstack-ab-00000000-other/*</Detail><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy of a principal not there",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-nobody\"},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-b/*\"}]}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>Invalid principal in policy</Message><Detail>\"AWS\" : \"arn:aws:iam::000000000000:user/boberstack-ab-00000000-nobody\"</Detail><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy of no JSON",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\": ",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>This policy contains invalid Json</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy not an object",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "[]",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>Policies must be valid JSON and the first byte must be '{'</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy of an action not S3's",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-u\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"arn:aws:s3:::${prefix}-b/*\"}]}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>Policy has invalid action</Message><Detail>sqs:SendMessage</Detail><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "a policy of no principal",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"body": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::${prefix}-b/*\"}]}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code><Message>Missing required field Principal</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete the bucket policy",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b",
+			"params": {
+				"policy": ""
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "the policy status of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-b",
+			"params": {
+				"policyStatus": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucketPolicy</Code><Message>The bucket policy does not exist</Message><BucketName>boberstack-ab-00000000-b</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete a/x",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/x",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete a/y",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/y",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete a/p",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/p",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete a/z",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/a/z",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete b/y",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/b/y",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete secret",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b/secret",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-b",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the user's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u",
+				"PolicyName": "s3"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u",
+				"AccessKeyId": "${u.key}"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the other key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-n",
+				"AccessKeyId": "${n.key}"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the other user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-n"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-u"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-r",
+				"PolicyName": "s3"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-r"
+			},
+			"region": "us-east-1",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		}
+	]
+}

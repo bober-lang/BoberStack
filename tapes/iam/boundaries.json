@@ -1,0 +1,760 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UpdateDate",
+		"UserId",
+		"RoleId",
+		"PolicyId",
+		"AccessKeyId",
+		"SecretAccessKey",
+		"RoleLastUsed"
+	],
+	"steps": [
+		{
+			"name": "create the bounding policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreatePolicy",
+				"Version": "2010-05-08",
+				"PolicyName": "${prefix}-bound",
+				"Path": "/${prefix}/",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetUser\",\"Resource\":\"*\"}]}"
+			},
+			"capture": {
+				"policyArn": "Policy/Arn"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreatePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreatePolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>x</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-bound</PolicyName>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>${policyArn}</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </CreatePolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreatePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "create a user bounded by it",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"PermissionsBoundary": "${policyArn}"
+			},
+			"capture": {
+				"aliceId": "User/UserId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>${policyArn}</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "create a user bounded by a missing policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob",
+				"PermissionsBoundary": "arn:aws:iam::${account}:policy/${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Scope ARN: arn:aws:iam::000000000000:policy/boberstack-ab-00000000-none does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get the bounded user",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>${policyArn}</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "the policy counts it",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>1</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>x</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-bound</PolicyName>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>${policyArn}</Arn>\n      <Tags/>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </GetPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "the entities it bounds",
+			"service": "iam",
+			"query": {
+				"Action": "ListEntitiesForPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}",
+				"PolicyUsageFilter": "PermissionsBoundary"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListEntitiesForPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListEntitiesForPolicyResult>\n    <PolicyRoles/>\n    <IsTruncated>false</IsTruncated>\n    <PolicyUsers>\n      <member>\n        <UserName>boberstack-ab-00000000-alice</UserName>\n        <UserId>${aliceId}</UserId>\n      </member>\n    </PolicyUsers>\n    <PolicyGroups/>\n  </ListEntitiesForPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListEntitiesForPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "the entities it is attached to",
+			"service": "iam",
+			"query": {
+				"Action": "ListEntitiesForPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}",
+				"PolicyUsageFilter": "PermissionsPolicy"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListEntitiesForPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListEntitiesForPolicyResult>\n    <PolicyRoles/>\n    <IsTruncated>false</IsTruncated>\n    <PolicyUsers/>\n    <PolicyGroups/>\n  </ListEntitiesForPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListEntitiesForPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "the boundaries of the path",
+			"service": "iam",
+			"query": {
+				"Action": "ListPolicies",
+				"Version": "2010-05-08",
+				"Scope": "Local",
+				"PathPrefix": "/${prefix}/",
+				"PolicyUsageFilter": "PermissionsBoundary"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListPoliciesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ListPoliciesResult>\n    <IsTruncated>false</IsTruncated>\n    <Policies>\n      <member>\n        <PermissionsBoundaryUsageCount>1</PermissionsBoundaryUsageCount>\n        <Path>/boberstack-ab-00000000/</Path>\n        <UpdateDate>x-x-x:x:x</UpdateDate>\n        <DefaultVersionId>v1</DefaultVersionId>\n        <PolicyId>x</PolicyId>\n        <IsAttachable>true</IsAttachable>\n        <PolicyName>boberstack-ab-00000000-bound</PolicyName>\n        <AttachmentCount>0</AttachmentCount>\n        <Arn>${policyArn}</Arn>\n        <CreateDate>x-x-x:x:x</CreateDate>\n      </member>\n    </Policies>\n  </ListPoliciesResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListPoliciesResponse>\n"
+			}
+		},
+		{
+			"name": "delete the policy while it bounds",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}"
+			},
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>DeleteConflict</Code>\n    <Message>Cannot delete a policy attached to entities.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "bound by a missing policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"PermissionsBoundary": "arn:aws:iam::${account}:policy/${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Scope ARN: arn:aws:iam::000000000000:policy/boberstack-ab-00000000-none does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "bound a missing user",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none",
+				"PermissionsBoundary": "${policyArn}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>User boberstack-ab-00000000-none was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "bound by what is no ARN",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"PermissionsBoundary": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'permissionsBoundary' failed to satisfy constraint: Member must have length greater than or equal to 20</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "bound the user by an AWS managed policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "get the user bounded by it",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>arn:aws:iam::aws:policy/IAMReadOnlyAccess</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "the policy no longer counts it",
+			"service": "iam",
+			"query": {
+				"Action": "GetPolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetPolicyResult>\n    <Policy>\n      <PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\n      <Path>/boberstack-ab-00000000/</Path>\n      <UpdateDate>x-x-x:x:x</UpdateDate>\n      <DefaultVersionId>v1</DefaultVersionId>\n      <PolicyId>x</PolicyId>\n      <IsAttachable>true</IsAttachable>\n      <PolicyName>boberstack-ab-00000000-bound</PolicyName>\n      <AttachmentCount>0</AttachmentCount>\n      <Arn>${policyArn}</Arn>\n      <Tags/>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Policy>\n  </GetPolicyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "delete the user's boundary again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Principal ${aliceId} does not have scope</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete a missing user's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>User boberstack-ab-00000000-none was not found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get the unbounded user",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "create a role bounded by the policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PermissionsBoundary": "${policyArn}",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"capture": {
+				"roleId": "Role/RoleId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>${policyArn}</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "get the bounded role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>${policyArn}</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "bound the role by an AWS managed policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/IAMReadOnlyAccess"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutRolePermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutRolePermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "bound a missing role",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-none",
+				"PermissionsBoundary": "${policyArn}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "bound the role by a missing policy",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PermissionsBoundary": "arn:aws:iam::aws:policy/${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Scope ARN: arn:aws:iam::aws:policy/boberstack-ab-00000000-none does not exist or is not attachable.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "get the role bounded by it",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>arn:aws:iam::aws:policy/IAMReadOnlyAccess</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRolePermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRolePermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "delete the role's boundary again",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Principal ${roleId} does not have scope</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "delete a missing role's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The role with name boberstack-ab-00000000-none cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "create the user the boundary narrows",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PermissionsBoundary": "${policyArn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <PermissionsBoundary>\n        <PermissionsBoundaryArn>${policyArn}</PermissionsBoundaryArn>\n        <PermissionsBoundaryType>Policy</PermissionsBoundaryType>\n      </PermissionsBoundary>\n      <UserName>boberstack-ab-00000000-carol</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-carol</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "allow it to get users and list roles",
+			"service": "iam",
+			"query": {
+				"Action": "PutUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "wide",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"iam:GetUser\",\"iam:ListRoles\"],\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a key of carol",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"capture": {
+				"carol.key": "AccessKey/AccessKeyId",
+				"carol.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${carol.key}</AccessKeyId>\n      <SecretAccessKey>${carol.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-carol</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "carol, once her key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "carol",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-carol</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "carol gets alice, as both allow",
+			"service": "iam",
+			"query": {
+				"Action": "GetUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"as": "carol",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-alice</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-alice</Arn>\n      <UserId>${aliceId}</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </GetUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetUserResponse>\n"
+			}
+		},
+		{
+			"name": "carol lists roles, as her boundary does not allow",
+			"service": "iam",
+			"query": {
+				"Action": "ListRoles",
+				"Version": "2010-05-08",
+				"PathPrefix": "/${prefix}/"
+			},
+			"as": "carol",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-carol is not authorized to perform: iam:ListRoles on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000/ because no permissions boundary allows the iam:ListRoles action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up carol's key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"AccessKeyId": "${carol.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up carol's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPolicy",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol",
+				"PolicyName": "wide"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPolicyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up carol's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserPermissionsBoundaryResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserPermissionsBoundaryResponse>\n"
+			}
+		},
+		{
+			"name": "clean up carol",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-carol"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePermissionsBoundary",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Principal ${roleId} does not have scope</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "clean up alice's boundary",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUserPermissionsBoundary",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>Principal ${aliceId} does not have scope</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up alice",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-alice"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		},
+		{
+			"name": "clean up bob, never made",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-bob"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>NoSuchEntity</Code>\n    <Message>The user with name boberstack-ab-00000000-bob cannot be found.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeletePolicy",
+				"Version": "2010-05-08",
+				"PolicyArn": "${policyArn}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeletePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeletePolicyResponse>\n"
+			}
+		}
+	]
+}

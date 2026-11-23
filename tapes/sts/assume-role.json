@@ -1,0 +1,286 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"Expiration",
+		"AccessKeyId",
+		"SecretAccessKey",
+		"SessionToken"
+	],
+	"steps": [
+		{
+			"name": "caller identity",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:root</Arn>\n    <UserId>000000000000</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "create role",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"capture": {
+				"roleId": "RoleId",
+				"roleArn": "Role/Arn"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>${roleId}</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>${roleArn}</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "assume role",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape-session"
+			},
+			"capture": {
+				"session.key": "Credentials/AccessKeyId",
+				"session.secret": "Credentials/SecretAccessKey",
+				"session.token": "Credentials/SessionToken"
+			},
+			"volatile": [
+				"PackedPolicySize",
+				"SessionTokenSize",
+				"SessionTokenUtilization"
+			],
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <AssumeRoleResult>\n    <AssumedRoleUser>\n      <AssumedRoleId>${roleId}:tape-session</AssumedRoleId>\n      <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/tape-session</Arn>\n    </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>${session.key}</AccessKeyId>\n      <SecretAccessKey>${session.secret}</SecretAccessKey>\n      <SessionToken>${session.token}</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <PackedPolicySize>21</PackedPolicySize>\n    <SessionTokenSize>888</SessionTokenSize>\n    <SessionTokenUtilization>21</SessionTokenUtilization>\n  </AssumeRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AssumeRoleResponse>\n"
+			}
+		},
+		{
+			"name": "assume role for 15 minutes",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape-session",
+				"DurationSeconds": "900"
+			},
+			"volatile": [
+				"PackedPolicySize",
+				"SessionTokenSize",
+				"SessionTokenUtilization"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <AssumeRoleResult>\n    <AssumedRoleUser>\n      <AssumedRoleId>${roleId}:tape-session</AssumedRoleId>\n      <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/tape-session</Arn>\n    </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>x</AccessKeyId>\n      <SecretAccessKey>x</SecretAccessKey>\n      <SessionToken>x</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <PackedPolicySize>21</PackedPolicySize>\n    <SessionTokenSize>888</SessionTokenSize>\n    <SessionTokenUtilization>21</SessionTokenUtilization>\n  </AssumeRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AssumeRoleResponse>\n"
+			}
+		},
+		{
+			"name": "assume missing role",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-missing",
+				"RoleSessionName": "tape-session"
+			},
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:root is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-missing</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role with a bad session name",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "bad name"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'bad name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]*</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role with a short session name",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "a"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'a' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role without a session name",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role for 10 seconds",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape-session",
+				"DurationSeconds": "10"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value '10' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role for 2 hours, past the role's maximum",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape-session",
+				"DurationSeconds": "7200"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>The requested DurationSeconds exceeds the MaxSessionDuration set for this role.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role for 13 hours",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "${roleArn}",
+				"RoleSessionName": "tape-session",
+				"DurationSeconds": "46800"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value '46800' at 'durationSeconds' failed to satisfy constraint: Member must have value less than or equal to 43200</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "assume role by a malformed ARN",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "not-an-arn",
+				"RoleSessionName": "tape-session"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value 'not-an-arn' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "session token",
+			"service": "sts",
+			"query": {
+				"Action": "GetSessionToken",
+				"Version": "2011-06-15"
+			},
+			"as": "session",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>Cannot call GetSessionToken with session credentials</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "unknown action",
+			"service": "sts",
+			"query": {
+				"Action": "GetNothing",
+				"Version": "2011-06-15"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://webservices.amazon.com/AWSFault/2005-15-09\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidAction</Code>\n    <Message>Could not find operation GetNothing for version 2011-06-15</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		}
+	]
+}

@@ -1,0 +1,441 @@
+{
+	"volatile": [
+		"RequestId",
+		"SubmittedAt",
+		"NameServer",
+		"Id"
+	],
+	"steps": [
+		{
+			"name": "create the zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-r</CallerReference></CreateHostedZoneRequest>",
+			"capture": {
+				"zone": "HostedZone/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-r</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "create records",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>WWW.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>*.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"wild\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>b.a.${prefix}.example.test</Name><Type>A</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>z.${prefix}.example.test.</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>10 mail.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>a.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"apex\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"volatile": [
+				"Value"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>NS</Type><TTL>172800</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.x.</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>SOA</Type><TTL>900</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>&quot;apex&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>\\052.boberstack-ab-00000000.example.test.</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>&quot;wild&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>a.boberstack-ab-00000000.example.test.</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>b.a.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>www.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list two",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"params": {
+				"maxitems": "2"
+			},
+			"volatile": [
+				"Value"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>NS</Type><TTL>172800</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.x.</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>SOA</Type><TTL>900</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>true</IsTruncated><NextRecordName>boberstack-ab-00000000.example.test.</NextRecordName><NextRecordType>TXT</NextRecordType><MaxItems>2</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list from a name",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"params": {
+				"name": "b.a.${prefix}.example.test",
+				"maxitems": "2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>b.a.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>www.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>true</IsTruncated><NextRecordName>z.boberstack-ab-00000000.example.test.</NextRecordName><NextRecordType>MX</NextRecordType><MaxItems>2</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list from a name and type",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"params": {
+				"name": "www.${prefix}.example.test",
+				"type": "AAAA"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>10 mail.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list from a type alone",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"params": {
+				"type": "A"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create one that exists",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.9</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to create resource record set [name='www.boberstack-ab-00000000.example.test.', type='A'] but it already exists]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete one that is not",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>v.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.9</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='v.boberstack-ab-00000000.example.test.', type='A'] but it was not found]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete one of other values",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='www.boberstack-ab-00000000.example.test.', type='A'] but the values provided do not match the current values]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete one of another TTL",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>301</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='www.boberstack-ab-00000000.example.test.', type='A'] but the values provided do not match the current values]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a CNAME beside other data",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[RRSet of type CNAME with DNS name www.boberstack-ab-00000000.example.test. is not permitted as it conflicts with other records with the same DNS name in zone boberstack-ab-00000000.example.test.]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "other data beside a CNAME",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>a.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"t\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[RRSet of type TXT with DNS name a.boberstack-ab-00000000.example.test. is not permitted because a conflicting RRSet of type CNAME with the same DNS name already exists in zone boberstack-ab-00000000.example.test.]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a CNAME at the apex",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[RRSet of type CNAME with DNS name boberstack-ab-00000000.example.test. is not permitted at apex in zone boberstack-ab-00000000.example.test.]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a name outside the zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.example.org</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[RRSet with DNS name www.example.org. is not permitted in zone boberstack-ab-00000000.example.test.]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the SOA",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>${prefix}.example.test</Name><Type>SOA</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='boberstack-ab-00000000.example.test.', type='SOA'] but the rdata provided is invalid]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "two errors",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.9</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>v.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.9</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to create resource record set [name='www.boberstack-ab-00000000.example.test.', type='A'] but it already exists, Tried to delete resource record set [name='v.boberstack-ab-00000000.example.test.', type='A'] but it was not found]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a batch that fails whole",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>c.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.5</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.9</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to create resource record set [name='www.boberstack-ab-00000000.example.test.', type='A'] but it already exists]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "upsert",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>UPSERT</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.7</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>UPSERT</Action><ResourceRecordSet><Name>c.${prefix}.example.test</Name><Type>AAAA</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>2001:db8::1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "weighted",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>CREATE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>two</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "weighted beside simple",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>c.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>three</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "a set identifier alone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>s.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>x</SetIdentifier><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid request: Expected exactly one of [Weight, Region, Failover, GeoLocation, MultiValueAnswer, GeoProximityLocation, CidrRoutingConfig, or AZAffinity], but found none in Change with [Action=CREATE, Name=s.boberstack-ab-00000000.example.test, Type=A, SetIdentifier=x]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a weight without a set identifier",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>s.${prefix}.example.test</Name><Type>A</Type><Weight>1</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid request: Missing field 'SetIdentifier' in Change with [Action=CREATE, Name=s.boberstack-ab-00000000.example.test, Type=A, SetIdentifier=null]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "an A of a bad address",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>s.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>not.an.address</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Invalid Resource Record: 'FATAL problem: ARRDATAIllegalIPv4Address (Value is not a valid IPv4 address) encountered with 'not.an.address'']</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "a record without a TTL",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>s.${prefix}.example.test</Name><Type>A</Type><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and ResourceRecords], or TrafficPolicyInstanceId], but found none in Change with [Action=CREATE, Name=s.boberstack-ab-00000000.example.test, Type=A, SetIdentifier=null]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "list after",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"volatile": [
+				"Value"
+			],
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>NS</Type><TTL>172800</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.x.</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>SOA</Type><TTL>900</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>&quot;apex&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>\\052.boberstack-ab-00000000.example.test.</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>&quot;wild&quot;</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>a.boberstack-ab-00000000.example.test.</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>b.a.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>c.boberstack-ab-00000000.example.test.</Name><Type>A</Type><SetIdentifier>three</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>c.boberstack-ab-00000000.example.test.</Name><Type>AAAA</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x:x::x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>w.boberstack-ab-00000000.example.test.</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>w.boberstack-ab-00000000.example.test.</Name><Type>A</Type><SetIdentifier>two</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>www.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x.x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>x x.x.x</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "list from an identifier",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"params": {
+				"name": "w.${prefix}.example.test",
+				"type": "A",
+				"identifier": "two"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>w.boberstack-ab-00000000.example.test.</Name><Type>A</Type><SetIdentifier>two</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>www.boberstack-ab-00000000.example.test.</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.7</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>z.boberstack-ab-00000000.example.test.</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>10 mail.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.7</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>*.${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"wild\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>b.a.${prefix}.example.test</Name><Type>A</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.3</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>z.${prefix}.example.test</Name><Type>MX</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>10 mail.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>a.${prefix}.example.test</Name><Type>CNAME</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>www.example.com</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>${prefix}.example.test</Name><Type>TXT</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>\"apex\"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>c.${prefix}.example.test</Name><Type>AAAA</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>2001:db8::1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>two</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change><Change><Action>DELETE</Action><ResourceRecordSet><Name>c.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>three</SetIdentifier><Weight>20</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "delete the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></DeleteHostedZoneResponse>"
+			}
+		}
+	]
+}

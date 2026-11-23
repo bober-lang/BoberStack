@@ -1,0 +1,284 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l",
+			"headers": {
+				"x-amz-bucket-object-lock-enabled": "true",
+				"content-md5": "ELC5MY6yoOfvAzpPGPEnCA=="
+			},
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-l.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "lock get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-l",
+			"params": {
+				"object-lock": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
+			}
+		},
+		{
+			"name": "put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"headers": {
+				"content-md5": "SfaKXIST7CwL9ImCHCH8Ow=="
+			},
+			"body": "hi",
+			"capture": {
+				"v": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${v}",
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"49f68a5c8493ec2c0bf489821c21fc3b\"",
+					"x-amz-checksum-crc64nvme": "o0c0JXzxWEE=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "retention get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"retention": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchObjectLockConfiguration</Code><Message>The specified object does not have a ObjectLock configuration</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "hold get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchObjectLockConfiguration</Code><Message>The specified object does not have a ObjectLock configuration</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "retention bogus",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"retention": ""
+			},
+			"headers": {
+				"content-md5": "3Gcims/fi6C1iid0ucsHiA=="
+			},
+			"body": "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>BOGUS</Mode><RetainUntilDate>2099-01-01T00:00:00.000Z</RetainUntilDate></Retention>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "hold bogus",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"headers": {
+				"content-md5": "yRdj0dOTemoEmxvR60ZfqA=="
+			},
+			"body": "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>MAYBE</Status></LegalHold>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "hold on",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"headers": {
+				"content-md5": "erOisiAmIIzsh/Ze2QqGXw=="
+			},
+			"body": "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>ON</Status></LegalHold>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${v}",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "hold get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>ON</Status></LegalHold>"
+			}
+		},
+		{
+			"name": "delete held",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"versionId": "${v}"
+			},
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied because object protected by object lock.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "hold off",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"headers": {
+				"content-md5": "VFVLURy793Xk77f+OyG/PA=="
+			},
+			"body": "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>OFF</Status></LegalHold>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${v}",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "hold get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>OFF</Status></LegalHold>"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"versionId": "${v}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v}"
+				}
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "hold off",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"legal-hold": "",
+				"versionId": "${v}"
+			},
+			"headers": {
+				"content-md5": "VFVLURy793Xk77f+OyG/PA=="
+			},
+			"body": "<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>OFF</Status></LegalHold>",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message><Key>k</Key><VersionId>${v}</VersionId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete the version",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-l/k",
+			"params": {
+				"versionId": "${v}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v}"
+				}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-l",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

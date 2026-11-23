@@ -1,0 +1,45 @@
+import { Gateway } from "../core/gateway"
+import * as query from "../core/protocol/query"
+import * as api from "../services/iam/api"
+import { Catalog } from "../services/iam/catalog"
+import * as iam from "../services/iam/iam"
+import { identify } from "../services/iam/identities"
+import * as stsApi from "../services/sts/api"
+import * as sts from "../services/sts/sts"
+import { replay } from "../tools/tape/tape"
+import { catalog_text } from "../services/iam/catalog.c"
+
+/// A gateway of IAM, of every AWS managed policy, which the catalog's text costs this test's build; and of STS, which
+/// a tape's users call to learn that their keys work.
+function gateway(catalog: Catalog): Gateway {
+	const g = new Gateway()
+	const h = new iam.Handler(catalog)
+	const s = new sts.Handler()
+	g.identify = identify(catalog)
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	g.faults.set(api.signingName, (f, id, _) => query.error(f, id, api.ns))
+	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	g.faults.set(stsApi.signingName, (f, id, _) => query.error(f, id, stsApi.ns))
+	return g
+}
+
+/// The AWS managed policies.
+function managed(): Catalog {
+	const text = new u64[](2)
+	catalog_text(text)
+	return new Catalog(text[0], text[1])
+}
+
+const catalog = managed()
+
+test "IAM tapes replay" {
+	for (const tape of ["tapes/iam/users.json", "tapes/iam/roles.json", "tapes/iam/policies.json",
+		"tapes/iam/managed.json", "tapes/iam/enforcement.json", "tapes/iam/boundaries.json", "tapes/iam/dependent.json",
+		"tapes/iam/groups.json", "tapes/iam/profiles.json", "tapes/iam/oidc.json", "tapes/iam/password.json",
+		"tapes/iam/keys.json", "tapes/iam/simulation.json", "tapes/iam/summary.json"]) {
+		test `${tape}` {
+			const differences = replay(tape, gateway(catalog))
+			assert differences == []
+		}
+	}
+}

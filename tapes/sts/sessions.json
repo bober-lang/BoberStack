@@ -1,0 +1,459 @@
+{
+	"volatile": [
+		"RequestId",
+		"CreateDate",
+		"UserId",
+		"RoleId",
+		"AssumedRoleId",
+		"AccessKeyId",
+		"SecretAccessKey",
+		"SessionToken",
+		"Expiration"
+	],
+	"steps": [
+		{
+			"name": "create the caller, of no policy",
+			"service": "iam",
+			"query": {
+				"Action": "CreateUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-caller"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateUserResult>\n    <User>\n      <Path>/</Path>\n      <UserName>boberstack-ab-00000000-caller</UserName>\n      <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller</Arn>\n      <UserId>x</UserId>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </User>\n  </CreateUserResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateUserResponse>\n"
+			}
+		},
+		{
+			"name": "a key of the caller",
+			"service": "iam",
+			"query": {
+				"Action": "CreateAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-caller"
+			},
+			"capture": {
+				"caller.key": "AccessKey/AccessKeyId",
+				"caller.secret": "AccessKey/SecretAccessKey"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateAccessKeyResult>\n    <AccessKey>\n      <AccessKeyId>${caller.key}</AccessKeyId>\n      <SecretAccessKey>${caller.secret}</SecretAccessKey>\n      <UserName>boberstack-ab-00000000-caller</UserName>\n      <Status>Active</Status>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </AccessKey>\n  </CreateAccessKeyResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "a role trusting the caller, once IAM knows it",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:user/${prefix}-caller\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Auser%2Fboberstack-ab-00000000-caller%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "allow the role to get roles",
+			"service": "iam",
+			"query": {
+				"Action": "PutRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "roles",
+				"PolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetRole\",\"Resource\":\"*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<PutRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</PutRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "a role trusting the account",
+			"service": "iam",
+			"query": {
+				"Action": "CreateRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-other",
+				"AssumeRolePolicyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${account}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<CreateRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <CreateRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <Path>/</Path>\n      <RoleName>boberstack-ab-00000000-other</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-other</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </CreateRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</CreateRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the caller, once its key works",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "caller",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller</Arn>\n    <UserId>x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "the caller assumes the role",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-role",
+				"RoleSessionName": "plain",
+				"DurationSeconds": "900"
+			},
+			"capture": {
+				"plain.key": "Credentials/AccessKeyId",
+				"plain.secret": "Credentials/SecretAccessKey",
+				"plain.token": "Credentials/SessionToken"
+			},
+			"volatile": [
+				"PackedPolicySize",
+				"SessionTokenSize",
+				"SessionTokenUtilization"
+			],
+			"as": "caller",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <AssumeRoleResult>\n    <AssumedRoleUser>\n      <AssumedRoleId>x:x</AssumedRoleId>\n      <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/plain</Arn>\n    </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>${plain.key}</AccessKeyId>\n      <SecretAccessKey>${plain.secret}</SecretAccessKey>\n      <SessionToken>${plain.token}</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <PackedPolicySize>17</PackedPolicySize>\n    <SessionTokenSize>736</SessionTokenSize>\n    <SessionTokenUtilization>17</SessionTokenUtilization>\n  </AssumeRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AssumeRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the session is the role's",
+			"service": "sts",
+			"query": {
+				"Action": "GetCallerIdentity",
+				"Version": "2011-06-15"
+			},
+			"as": "plain",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <GetCallerIdentityResult>\n    <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/plain</Arn>\n    <UserId>x:x</UserId>\n    <Account>000000000000</Account>\n  </GetCallerIdentityResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+			}
+		},
+		{
+			"name": "the session gets its role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"as": "plain",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Auser%2Fboberstack-ab-00000000-caller%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the session gets the other role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-other"
+			},
+			"as": "plain",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Aroot%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-other</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-other</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the session lists users, which its role does not allow",
+			"service": "iam",
+			"query": {
+				"Action": "ListUsers",
+				"Version": "2010-05-08"
+			},
+			"as": "plain",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/plain is not authorized to perform: iam:ListUsers on resource: arn:aws:iam::000000000000:user/ because no identity-based policy allows the iam:ListUsers action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the session assumes its role again, which trusts the caller only",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-role",
+				"RoleSessionName": "again",
+				"DurationSeconds": "900"
+			},
+			"as": "plain",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/plain is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-role. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the caller assumes the role, limited by a session policy",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-role",
+				"RoleSessionName": "limited",
+				"DurationSeconds": "900",
+				"Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:GetRole\",\"Resource\":\"arn:aws:iam::${account}:role/${prefix}-role\"}]}"
+			},
+			"capture": {
+				"limited.key": "Credentials/AccessKeyId",
+				"limited.secret": "Credentials/SecretAccessKey",
+				"limited.token": "Credentials/SessionToken"
+			},
+			"volatile": [
+				"PackedPolicySize",
+				"SessionTokenSize",
+				"SessionTokenUtilization"
+			],
+			"as": "caller",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <AssumeRoleResult>\n    <AssumedRoleUser>\n      <AssumedRoleId>x:x</AssumedRoleId>\n      <Arn>arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/limited</Arn>\n    </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>${limited.key}</AccessKeyId>\n      <SecretAccessKey>${limited.secret}</SecretAccessKey>\n      <SessionToken>${limited.token}</SessionToken>\n      <Expiration>x-x-x:x:x</Expiration>\n    </Credentials>\n    <PackedPolicySize>20</PackedPolicySize>\n    <SessionTokenSize>852</SessionTokenSize>\n    <SessionTokenUtilization>20</SessionTokenUtilization>\n  </AssumeRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</AssumeRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the limited session gets its role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"as": "limited",
+			"until": 200,
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <GetRoleResult>\n    <Role>\n      <AssumeRolePolicyDocument>%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22AWS%22%3A%22arn%3Aaws%3Aiam%3A%3A000000000000%3Auser%2Fboberstack-ab-00000000-caller%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D</AssumeRolePolicyDocument>\n      <RoleId>x</RoleId>\n      <MaxSigninSessionDuration>3600</MaxSigninSessionDuration>\n      <Path>/</Path>\n      <MaxSessionDuration>3600</MaxSessionDuration>\n      <RoleLastUsed/>\n      <RoleName>boberstack-ab-00000000-role</RoleName>\n      <Arn>arn:aws:iam::000000000000:role/boberstack-ab-00000000-role</Arn>\n      <CreateDate>x-x-x:x:x</CreateDate>\n    </Role>\n  </GetRoleResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetRoleResponse>\n"
+			}
+		},
+		{
+			"name": "the limited session gets the other role",
+			"service": "iam",
+			"query": {
+				"Action": "GetRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-other"
+			},
+			"as": "limited",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:sts::000000000000:assumed-role/boberstack-ab-00000000-role/limited is not authorized to perform: iam:GetRole on resource: role boberstack-ab-00000000-other because no session policy allows the iam:GetRole action. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the caller assumes the role, with tags its trust does not allow",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-role",
+				"RoleSessionName": "tagged",
+				"Tags.member.1.Key": "team",
+				"Tags.member.1.Value": "a"
+			},
+			"as": "caller",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller is not authorized to perform: sts:TagSession on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-role. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the caller assumes the role trusting the account, of no policy that allows it",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-other",
+				"RoleSessionName": "other"
+			},
+			"as": "caller",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-other. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the caller assumes a role that is not",
+			"service": "sts",
+			"query": {
+				"Action": "AssumeRole",
+				"Version": "2011-06-15",
+				"RoleArn": "arn:aws:iam::${account}:role/${prefix}-missing",
+				"RoleSessionName": "missing"
+			},
+			"as": "caller",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::000000000000:role/boberstack-ab-00000000-missing</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "the caller takes a federation token",
+			"service": "sts",
+			"query": {
+				"Action": "GetFederationToken",
+				"Version": "2011-06-15",
+				"Name": "ff"
+			},
+			"as": "caller",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>AccessDenied</Code>\n    <Message>User: arn:aws:iam::000000000000:user/boberstack-ab-00000000-caller is not authorized to perform: sts:GetFederationToken on resource: arn:aws:sts::000000000000:federated-user/ff. Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/0000000000000000000000000 for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: 0000000000000000000000000</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the role's policy",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRolePolicy",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role",
+				"PolicyName": "roles"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRolePolicyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-role"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the other role",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteRole",
+				"Version": "2010-05-08",
+				"RoleName": "${prefix}-other"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteRoleResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteRoleResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the caller's key",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteAccessKey",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-caller",
+				"AccessKeyId": "${caller.key}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteAccessKeyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteAccessKeyResponse>\n"
+			}
+		},
+		{
+			"name": "clean up the caller",
+			"service": "iam",
+			"query": {
+				"Action": "DeleteUser",
+				"Version": "2010-05-08",
+				"UserName": "${prefix}-caller"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<DeleteUserResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\">\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</DeleteUserResponse>\n"
+			}
+		}
+	]
+}

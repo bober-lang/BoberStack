@@ -1,0 +1,309 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId"
+	],
+	"steps": [
+		{
+			"name": "put data without a namespace",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricData",
+				"Version": "2010-08-01",
+				"MetricData.member.1.MetricName": "m",
+				"MetricData.member.1.Value": "1"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MissingParameter</Code>\n    <Message>The parameter Namespace is required.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put no data",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricData",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MissingParameter</Code>\n    <Message>At least one MetricDatum object must be present in the request.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put data without a metric name",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricData",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricData.member.1.Value": "1"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MissingParameter</Code>\n    <Message>The parameter MetricData.member.1.MetricName is required.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "put data of a bad unit",
+			"service": "monitoring",
+			"query": {
+				"Action": "PutMetricData",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricData.member.1.MetricName": "m",
+				"MetricData.member.1.Value": "1",
+				"MetricData.member.1.Unit": "Apples"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterValue</Code>\n    <Message>The parameter MetricData.member.1.Unit must be a value in the set [ Megabits, Terabits, Gigabits, Count, Bytes, Gigabytes, Gigabytes/Second, Kilobytes, Kilobits/Second, Terabytes, Terabits/Second, Bytes/Second, Percent, Megabytes, Megabits/Second, Milliseconds, Microseconds, Kilobytes/Second, Gigabits/Second, Megabytes/Second, Bits, Bits/Second, Count/Second, Seconds, Kilobits, Terabytes/Second, None ].</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics without a metric name",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Period": "60",
+				"Statistics.member.1": "Average"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MissingParameter</Code>\n    <Message>The parameter MetricName is required.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics without a period",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Statistics.member.1": "Average"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>MissingParameter</Code>\n    <Message>The parameter Period is required.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics of a bad statistic",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Period": "60",
+				"Statistics.member.1": "Most"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterValue</Code>\n    <Message>The parameter Statistics.member.1.&lt;list element&gt; must be a value in the set [SampleCount, Average, Sum, Minimum, Maximum].</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics of a bad period",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Period": "61",
+				"Statistics.member.1": "Average"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterValue</Code>\n    <Message>The parameter Period must be a multiple of 60.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics of none",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Period": "60"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterCombination</Code>\n    <Message>At least one of the parameters Statistics and ExtendedStatistics must be specified.</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "statistics of no data",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricStatistics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}",
+				"MetricName": "m",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"Period": "60",
+				"Statistics.member.1": "Average"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<GetMetricStatisticsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <GetMetricStatisticsResult>\n    <Datapoints/>\n    <Label>m</Label>\n  </GetMetricStatisticsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</GetMetricStatisticsResponse>\n"
+			}
+		},
+		{
+			"name": "data without queries",
+			"service": "monitoring",
+			"differs": "AWS does not quote the values of this operation, BoberStack's codec does",
+			"query": {
+				"Action": "GetMetricData",
+				"Version": "2010-08-01",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'metricDataQueries' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "data without a start",
+			"service": "monitoring",
+			"differs": "AWS does not quote the values of this operation, BoberStack's codec does",
+			"query": {
+				"Action": "GetMetricData",
+				"Version": "2010-08-01",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"MetricDataQueries.member.1.Id": "a",
+				"MetricDataQueries.member.1.Expression": "1"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'startTime' failed to satisfy constraint: Member must not be null</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "data of a bad id",
+			"service": "monitoring",
+			"query": {
+				"Action": "GetMetricData",
+				"Version": "2010-08-01",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"MetricDataQueries.member.1.Id": "A",
+				"MetricDataQueries.member.1.Expression": "1"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>The value for parameter MetricDataQueries.member.1.Id is not matching the expected pattern ^[a-z][a-zA-Z0-9_]*$.\n</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "data of a bad order",
+			"service": "monitoring",
+			"differs": "AWS does not quote the values of this operation, BoberStack's codec does",
+			"query": {
+				"Action": "GetMetricData",
+				"Version": "2010-08-01",
+				"StartTime": "2026-01-01T00:00:00Z",
+				"EndTime": "2026-01-01T01:00:00Z",
+				"MetricDataQueries.member.1.Id": "a",
+				"MetricDataQueries.member.1.Expression": "1",
+				"ScanBy": "Sideways"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>ValidationError</Code>\n    <Message>1 validation error detected: Value at 'scanBy' failed to satisfy constraint: Member must satisfy enum value set: [TimestampAscending, TimestampDescending]</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list metrics of a bad activity",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListMetrics",
+				"Version": "2010-08-01",
+				"RecentlyActive": "PT1H"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ErrorResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <Error>\n    <Type>Sender</Type>\n    <Code>InvalidParameterValue</Code>\n    <Message>Request parameter recentlyActive value is invalid</Message>\n  </Error>\n  <RequestId>x-x-x-x-x</RequestId>\n</ErrorResponse>\n"
+			}
+		},
+		{
+			"name": "list metrics of none",
+			"service": "monitoring",
+			"query": {
+				"Action": "ListMetrics",
+				"Version": "2010-08-01",
+				"Namespace": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<ListMetricsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\">\n  <ListMetricsResult>\n    <Metrics/>\n  </ListMetricsResult>\n  <ResponseMetadata>\n    <RequestId>x-x-x-x-x</RequestId>\n  </ResponseMetadata>\n</ListMetricsResponse>\n"
+			}
+		}
+	]
+}
