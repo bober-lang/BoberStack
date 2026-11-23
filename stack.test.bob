@@ -1804,3 +1804,84 @@ test "CloudFormation pages ListStacks and DescribeStacks by 100, and refuses a N
 		assert fails(res, 400, "ValidationError", "Invalid NextToken")
 	}
 }
+
+test "CloudFormation makes a group with policies, a user in it, policies of it, an instance profile, and deletes them" {
+	const g = gateway()
+	const allow = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}`
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"RoleName": "pr",`
+		+ `"AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",`
+		+ `"Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}}},`
+		+ `"P": {"Type": "AWS::IAM::InstanceProfile", "Properties": {"InstanceProfileName": "ip", "Path": "/a/",`
+		+ `"Roles": [{"Ref": "R"}]}},`
+		+ `"G": {"Type": "AWS::IAM::Group", "Properties": {"GroupName": "gr", "Policies": [{"PolicyName": "own",`
+		+ `"PolicyDocument": ${allow}}], "ManagedPolicyArns": [{"Ref": "M"}]}},`
+		+ `"M": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}}},`
+		+ `"N": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}, "Groups": [{"Ref": "G"}]}},`
+		+ `"I": {"Type": "AWS::IAM::Policy", "Properties": {"PolicyName": "in", "PolicyDocument": ${allow},`
+		+ `"Groups": [{"Ref": "G"}]}},`
+		+ `"U": {"Type": "AWS::IAM::User", "Properties": {"UserName": "gu", "Groups": [{"Ref": "G"}]}}},`
+		+ `"Outputs": {"G": {"Value": {"Fn::GetAtt": ["G", "Arn"]}}, "P": {"Value": {"Fn::GetAtt": ["P", "Arn"]}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "grp"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_NAMED_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "grp"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", ":group/gr</OutputValue>") >= 0
+	assert indexOf(res.body.whole ?? "", ":instance-profile/a/ip</OutputValue>") >= 0
+	res = query(g, "iam", [["Action", "GetInstanceProfile"], ["InstanceProfileName", "ip"]])
+	assert indexOf(res.body.whole ?? "", "<RoleName>pr</RoleName>") >= 0
+	res = query(g, "iam", [["Action", "GetGroup"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "<UserName>gu</UserName>") >= 0
+	res = query(g, "iam", [["Action", "ListGroupPolicies"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "<member>own</member>") >= 0
+	assert indexOf(res.body.whole ?? "", "<member>in</member>") >= 0
+	res = query(g, "iam", [["Action", "ListAttachedGroupPolicies"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "grp-M-") >= 0
+	assert indexOf(res.body.whole ?? "", "grp-N-") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "grp"]]).status == 200
+	assert query(g, "iam", [["Action", "GetGroup"], ["GroupName", "gr"]]).status == 404
+	assert query(g, "iam", [["Action", "GetInstanceProfile"], ["InstanceProfileName", "ip"]]).status == 404
+	assert query(g, "iam", [["Action", "GetRole"], ["RoleName", "pr"]]).status == 404
+}
+
+test "CloudFormation tags a stack's resources aws:cloudformation:stack-name, stack-id and logical-id, but a KMS key" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "tq"}},`
+		+ `"T": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "tt"}}, "K": {"Type": "AWS::KMS::Key"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "tags"], ["TemplateBody", template]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "tags"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = call(g, "sqs", "ListQueueTags",
+		`{"QueueUrl": "http://sqs.us-east-1.localhost.localstack.cloud:4566/${account}/tq"}`)
+	const body = res.body.whole ?? ""
+	assert indexOf(body, `"aws:cloudformation:stack-name":"tags"`) >= 0
+	assert indexOf(body, `"aws:cloudformation:logical-id":"Q"`) >= 0
+	assert indexOf(body, `"aws:cloudformation:stack-id":"arn:aws:cloudformation:us-east-1:${account}:stack/tags/`) >= 0
+	res = query(g, "sns", [["Action", "ListTagsForResource"], ["ResourceArn", `arn:aws:sns:us-east-1:${account}:tt`]])
+	assert indexOf(res.body.whole ?? "", "<Value>T</Value>") >= 0
+}
+
+test "CloudFormation makes a schedule group and a schedule in it, and deletes them" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue"},`
+		+ `"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "scheduler.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"G": {"Type": "AWS::Scheduler::ScheduleGroup", "Properties": {"Name": "sg"}},`
+		+ `"S": {"Type": "AWS::Scheduler::Schedule", "Properties": {"Name": "s", "GroupName": {"Ref": "G"},`
+		+ `"ScheduleExpression": "rate(1 hour)", "FlexibleTimeWindow": {"Mode": "FLEXIBLE",`
+		+ `"MaximumWindowInMinutes": "5"}, "Target": {"Arn": {"Fn::GetAtt": ["Q", "Arn"]},`
+		+ `"RoleArn": {"Fn::GetAtt": ["R", "Arn"]}, "RetryPolicy": {"MaximumRetryAttempts": 2}}}}},`
+		+ `"Outputs": {"S": {"Value": {"Fn::GetAtt": ["S", "Arn"]}}, "G": {"Value": {"Fn::GetAtt": ["G", "Arn"]}}}}`
+	for (const _ of [1, 2]) {
+		assert query(g, "cloudformation",
+			[["Action", "CreateStack"], ["StackName", "sch"], ["TemplateBody", template],
+			["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+		const res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "sch"]])
+		assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+		assert indexOf(res.body.whole ?? "", ":schedule/sg/s</OutputValue>") >= 0
+		assert indexOf(res.body.whole ?? "", ":schedule-group/sg</OutputValue>") >= 0
+		assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "sch"]]).status == 200
+	}
+}

@@ -13,14 +13,17 @@
 //!   "TemplateURL must reference a valid S3 object to which you have access.".
 //! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SQS::QueuePolicy,
 //!   AWS::SNS::Topic, AWS::SNS::Subscription, AWS::S3::Bucket, AWS::Logs::LogGroup, AWS::DynamoDB::Table,
-//!   AWS::IAM::Role (with Policies and ManagedPolicyArns), AWS::IAM::Policy and AWS::IAM::ManagedPolicy (of Roles
-//!   and Users; IAM has no groups or instance profiles here), AWS::IAM::User, AWS::CloudWatch::Alarm,
-//!   AWS::KinesisFirehose::DeliveryStream, AWS::KMS::Key, AWS::KMS::Alias, AWS::SNS::TopicPolicy, AWS::S3::BucketPolicy, AWS::Events::Rule,
-//!   AWS::StepFunctions::StateMachine, AWS::Kinesis::Stream, AWS::Logs::LogStream, AWS::SecretsManager::Secret (with
-//!   GenerateSecretString), AWS::SSM::Parameter and AWS::Lambda's Function, Version, Alias, Permission, Url,
-//!   EventSourceMapping and LayerVersion (of S3 content); any other fails its resource, CREATE_FAILED, and the stack
-//!   rolls back. Their properties are those of each service's create call. A resource's Tags, and then the stack's,
-//!   are given to each create call that takes tags (not a bucket's); the aws:cloudformation: tags AWS adds are not.
+//!   AWS::IAM::Role and AWS::IAM::Group (with Policies and ManagedPolicyArns), AWS::IAM::Policy and
+//!   AWS::IAM::ManagedPolicy (of Roles, Users and Groups), AWS::IAM::User (with Groups), AWS::IAM::InstanceProfile,
+//!   AWS::CloudWatch::Alarm, AWS::KinesisFirehose::DeliveryStream, AWS::KMS::Key, AWS::KMS::Alias,
+//!   AWS::SNS::TopicPolicy, AWS::S3::BucketPolicy, AWS::Events::Rule, AWS::StepFunctions::StateMachine,
+//!   AWS::Scheduler::ScheduleGroup, AWS::Scheduler::Schedule (without its StartDate and EndDate),
+//!   AWS::Kinesis::Stream, AWS::Logs::LogStream, AWS::SecretsManager::Secret (with GenerateSecretString),
+//!   AWS::SSM::Parameter and AWS::Lambda's Function, Version, Alias, Permission, Url, EventSourceMapping and
+//!   LayerVersion (of S3 content); any other fails its resource, CREATE_FAILED, and the stack rolls back.
+//!   Their properties are those of each service's create call. A resource's Tags, and then the stack's, are given to
+//!   each create call that takes tags (not a bucket's), then aws:cloudformation:stack-name, stack-id and logical-id,
+//!   but to a KMS key, which refuses aws: tags of any caller.
 //! - A function's inline ZipFile is zipped as index.py for a Python runtime, else index.js, stored rather than
 //!   deflated, so its CodeSha256 and CodeSize are not AWS's.
 //! - A change set's Modify is of a resource whose definition changes or refers to a parameter whose value changes,
@@ -33,7 +36,7 @@
 //!   UPDATE_COMPLETE_CLEANUP_IN_PROGRESS, which the model's ResourceStatus lacks, is not recorded.
 //! - Fn::GetAZs gives the region's a, b and c; a failed resource's reason is the handler's message quoted as AWS quotes
 //!   a resource handler's, without its RequestToken and HandlerErrorCode.
-//! - Nothing is paged: each list is answered whole.
+//! - DescribeStacks, ListStacks and DescribeStackEvents are paged by 100; the other lists are answered whole.
 
 import * as api from "./api"
 
@@ -51,6 +54,7 @@ import * as lambdaApi from "../lambda/api"
 import * as logsApi from "../logs/api"
 import * as s3Api from "../s3/api"
 import * as s3Handler from "../s3/s3"
+import * as schedulerApi from "../scheduler/api"
 import * as secretsmanagerApi from "../secretsmanager/api"
 import * as snsApi from "../sns/api"
 import * as ssmApi from "../ssm/api"
@@ -185,11 +189,14 @@ export class Handler {
 	stepfunctions: sfnApi.SFN
 	cloudwatch: cloudwatchApi.CloudWatch
 	firehose: firehoseApi.Firehose
+	scheduler: schedulerApi.Scheduler
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Handler.Handler, logs: logsApi.CloudWatchLogs, iam: iamApi.IAM,
 		dynamodb: dynamodbApi.DynamoDB, ssm: ssmApi.SSM, lambda: lambdaApi.Lambda, kms: kmsApi.KMS,
 		kinesis: kinesisApi.Kinesis, secretsmanager: secretsmanagerApi.SecretsManager, events: eventsApi.EventBridge,
-		stepfunctions: sfnApi.SFN, cloudwatch: cloudwatchApi.CloudWatch, firehose: firehoseApi.Firehose) {
+		stepfunctions: sfnApi.SFN, cloudwatch: cloudwatchApi.CloudWatch, firehose: firehoseApi.Firehose,
+		scheduler: schedulerApi.Scheduler) {
+		this.scheduler = scheduler
 		this.cloudwatch = cloudwatch
 		this.firehose = firehose
 		this.events = events
@@ -962,7 +969,7 @@ export class Handler {
 				}
 			}
 			q.Attributes = attrs
-			q.tags = tagged(s, p)
+			q.tags = tagged(s, r, p)
 			c.actions = ["sqs:CreateQueue"]
 			const url = this.sqs.createQueue(c, q).QueueUrl ?? ""
 			const arn = `arn:aws:sqs:${c.region}:${c.account}:${name}`
@@ -984,7 +991,7 @@ export class Handler {
 				}
 			}
 			q.Attributes = attrs
-			q.Tags = tagged(s, p).map(t => ({ ...new snsApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new snsApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["sns:CreateTopic"]
 			const arn = this.sns.createTopic(c, q).TopicArn ?? ""
 			r.physical = arn
@@ -1009,7 +1016,7 @@ export class Handler {
 			const name = p.str("LogGroupName") ?? physical(s, r, 512, false)
 			const q = new logsApi.CreateLogGroupRequest()
 			q.logGroupName = name
-			q.tags = tagged(s, p)
+			q.tags = tagged(s, r, p)
 			c.actions = ["logs:CreateLogGroup"]
 			this.logs.createLogGroup(c, q)
 			r.physical = name
@@ -1024,7 +1031,7 @@ export class Handler {
 			if (streams != null) {
 				streams!.set("StreamEnabled", boolean(true))
 			}
-			const tags = tagged(s, p)
+			const tags = tagged(s, r, p)
 			p.set("Tags", nul())
 			const made = json.decode[dynamodbApi.CreateTableInput](write(p))
 			made.Tags = tags.map(t => ({ ...new dynamodbApi.Tag(), Key: t[0], Value: t[1] }))
@@ -1045,7 +1052,7 @@ export class Handler {
 			q.Path = p.str("Path")
 			q.Description = p.str("Description")
 			q.AssumeRolePolicyDocument = document(p.get("AssumeRolePolicyDocument"))
-			q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["iam:CreateRole"]
 			const role = this.iam.createRole(c, q).Role
 			r.physical = name
@@ -1078,7 +1085,7 @@ export class Handler {
 			q.Type = if (p.str("Type") == "StringList") "StringList" else "String"
 			q.Description = p.str("Description")
 			q.AllowedPattern = p.str("AllowedPattern")
-			q.Tags = tagged(s, p).map(t => ({ ...new ssmApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new ssmApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["ssm:PutParameter"]
 			this.ssm.putParameter(c, q)
 			r.physical = name
@@ -1150,7 +1157,7 @@ export class Handler {
 				q.Path = p.str("Path")
 				q.Description = p.str("Description")
 				q.PolicyDocument = doc
-				q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
+				q.Tags = tagged(s, r, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 				c.actions = ["iam:CreatePolicy"]
 				const made = this.iam.createPolicy(c, q).Policy
 				arn = made?.Arn ?? ""
@@ -1190,6 +1197,23 @@ export class Handler {
 				}
 				r.parts.push([`user/${x.text}`, name])
 			}
+			for (const x of p.get("Groups")?.items ?? []) {
+				if (managed) {
+					const a = new iamApi.AttachGroupPolicyRequest()
+					a.GroupName = x.text
+					a.PolicyArn = arn
+					c.actions = ["iam:AttachGroupPolicy"]
+					this.iam.attachGroupPolicy(c, a)
+				} else {
+					const i = new iamApi.PutGroupPolicyRequest()
+					i.GroupName = x.text
+					i.PolicyName = name
+					i.PolicyDocument = doc
+					c.actions = ["iam:PutGroupPolicy"]
+					this.iam.putGroupPolicy(c, i)
+				}
+				r.parts.push([`group/${x.text}`, name])
+			}
 			r.physical = if (managed) arn else physical(s, r, 128, false)
 			r.ref = r.physical
 			return
@@ -1203,7 +1227,7 @@ export class Handler {
 			q.State = if (p.str("State") == "DISABLED") "DISABLED" else "ENABLED"
 			q.Description = p.str("Description")
 			q.RoleArn = p.str("RoleArn")
-			q.Tags = tagged(s, p).map(t => ({ ...new eventsApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new eventsApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["events:PutRule"]
 			const arn = this.events.putRule(c, q).RuleArn ?? ""
 			const targets = p.get("Targets")?.items ?? []
@@ -1236,7 +1260,7 @@ export class Handler {
 			q.definition = definition
 			q.roleArn = p.str("RoleArn") ?? ""
 			q.type = if (p.str("StateMachineType") == "EXPRESS") "EXPRESS" else "STANDARD"
-			q.tags = tagged(s, p).map(t => ({ ...new sfnApi.Tag(), key: t[0], value: t[1] }))
+			q.tags = tagged(s, r, p).map(t => ({ ...new sfnApi.Tag(), key: t[0], value: t[1] }))
 			c.actions = ["states:CreateStateMachine"]
 			const arn = this.stepfunctions.createStateMachine(c, q).stateMachineArn
 			r.physical = arn
@@ -1247,7 +1271,7 @@ export class Handler {
 		if (r.kind == "AWS::CloudWatch::Alarm") {
 			const name = p.str("AlarmName") ?? physical(s, r, 255, false)
 			p.set("AlarmName", str(name))
-			const tags = tagged(s, p)
+			const tags = tagged(s, r, p)
 			p.set("Tags", nul())
 			numeric(p, ["Period", "EvaluationPeriods", "DatapointsToAlarm", "Threshold"])
 			const q = json.decode[cloudwatchApi.PutMetricAlarmInput](write(p))
@@ -1262,7 +1286,7 @@ export class Handler {
 		if (r.kind == "AWS::KinesisFirehose::DeliveryStream") {
 			const name = p.str("DeliveryStreamName") ?? physical(s, r, 64, false)
 			p.set("DeliveryStreamName", str(name))
-			const tags = tagged(s, p)
+			const tags = tagged(s, r, p)
 			p.set("Tags", nul())
 			numeric(p, ["IntervalInSeconds", "SizeInMBs"])
 			const q = json.decode[firehoseApi.CreateDeliveryStreamInput](write(p))
@@ -1278,12 +1302,93 @@ export class Handler {
 			const q = new iamApi.CreateUserRequest()
 			q.UserName = p.str("UserName") ?? physical(s, r, 64, false)
 			q.Path = p.str("Path")
-			q.Tags = tagged(s, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new iamApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["iam:CreateUser"]
 			const u = this.iam.createUser(c, q).User
 			r.physical = q.UserName
 			r.ref = r.physical
 			r.attributes = [["Arn", u?.Arn ?? ""]]
+			for (const x of p.get("Groups")?.items ?? []) {
+				const a = new iamApi.AddUserToGroupRequest()
+				a.GroupName = x.text
+				a.UserName = q.UserName
+				c.actions = ["iam:AddUserToGroup"]
+				this.iam.addUserToGroup(c, a)
+				r.parts.push([x.text, ""])
+			}
+			return
+		}
+		if (r.kind == "AWS::Scheduler::ScheduleGroup") {
+			const q = new schedulerApi.CreateScheduleGroupInput()
+			q.Name = p.str("Name") ?? physical(s, r, 64, false)
+			q.Tags = tagged(s, r, p).map(t => ({ ...new schedulerApi.Tag(), Key: t[0], Value: t[1] }))
+			c.actions = ["scheduler:CreateScheduleGroup"]
+			const arn = this.scheduler.createScheduleGroup(c, q).ScheduleGroupArn
+			r.physical = q.Name
+			r.ref = q.Name
+			r.attributes = [["Arn", arn]]
+			return
+		}
+		if (r.kind == "AWS::Scheduler::Schedule") {
+			const name = p.str("Name") ?? physical(s, r, 64, false)
+			p.set("Name", str(name))
+			p.set("StartDate", nul())
+			p.set("EndDate", nul())
+			numeric(p, ["MaximumWindowInMinutes", "MaximumEventAgeInSeconds", "MaximumRetryAttempts", "TaskCount"])
+			const q = json.decode[schedulerApi.CreateScheduleInput](write(p))
+			c.actions = ["scheduler:CreateSchedule"]
+			const arn = this.scheduler.createSchedule(c, q).ScheduleArn
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", arn]]
+			r.parts = [[q.GroupName ?? "", ""]]
+			return
+		}
+		if (r.kind == "AWS::IAM::Group") {
+			const q = new iamApi.CreateGroupRequest()
+			q.GroupName = p.str("GroupName") ?? physical(s, r, 128, false)
+			q.Path = p.str("Path")
+			c.actions = ["iam:CreateGroup"]
+			const g = this.iam.createGroup(c, q).Group
+			r.physical = q.GroupName
+			r.ref = r.physical
+			r.attributes = [["Arn", g.Arn]]
+			for (const x of p.get("Policies")?.items ?? []) {
+				const i = new iamApi.PutGroupPolicyRequest()
+				i.GroupName = q.GroupName
+				i.PolicyName = x.str("PolicyName") ?? ""
+				i.PolicyDocument = document(x.get("PolicyDocument"))
+				c.actions = ["iam:PutGroupPolicy"]
+				this.iam.putGroupPolicy(c, i)
+				r.parts.push(["inline", i.PolicyName])
+			}
+			for (const x of p.get("ManagedPolicyArns")?.items ?? []) {
+				const a = new iamApi.AttachGroupPolicyRequest()
+				a.GroupName = q.GroupName
+				a.PolicyArn = x.text
+				c.actions = ["iam:AttachGroupPolicy"]
+				this.iam.attachGroupPolicy(c, a)
+				r.parts.push(["managed", x.text])
+			}
+			return
+		}
+		if (r.kind == "AWS::IAM::InstanceProfile") {
+			const q = new iamApi.CreateInstanceProfileRequest()
+			q.InstanceProfileName = p.str("InstanceProfileName") ?? physical(s, r, 128, false)
+			q.Path = p.str("Path")
+			c.actions = ["iam:CreateInstanceProfile"]
+			const made = this.iam.createInstanceProfile(c, q).InstanceProfile
+			r.physical = q.InstanceProfileName
+			r.ref = r.physical
+			r.attributes = [["Arn", made.Arn]]
+			for (const x of p.get("Roles")?.items ?? []) {
+				const a = new iamApi.AddRoleToInstanceProfileRequest()
+				a.InstanceProfileName = q.InstanceProfileName
+				a.RoleName = x.text
+				c.actions = ["iam:AddRoleToInstanceProfile"]
+				this.iam.addRoleToInstanceProfile(c, a)
+				r.parts.push([x.text, ""])
+			}
 			return
 		}
 		if (r.kind == "AWS::KMS::Key") {
@@ -1292,7 +1397,7 @@ export class Handler {
 			if (p.get("KeyPolicy") != null) {
 				q.Policy = document(p.get("KeyPolicy"))
 			}
-			q.Tags = tagged(s, p).map(t => ({ ...new kmsApi.Tag(), TagKey: t[0], TagValue: t[1] }))
+			q.Tags = tagged(s, r, p, false).map(t => ({ ...new kmsApi.Tag(), TagKey: t[0], TagValue: t[1] }))
 			c.actions = ["kms:CreateKey"]
 			const k = this.kms.createKey(c, q).KeyMetadata
 			r.physical = k?.KeyId ?? ""
@@ -1345,7 +1450,7 @@ export class Handler {
 			} else {
 				q.ShardCount = (p.get("ShardCount")?.number() ?? 1.0) as i32
 			}
-			q.Tags = tagged(s, p)
+			q.Tags = tagged(s, r, p)
 			c.actions = ["kinesis:CreateStream"]
 			this.kinesis.createStream(c, q)
 			r.physical = q.StreamName
@@ -1376,7 +1481,7 @@ export class Handler {
 					q.SecretString = password
 				}
 			}
-			q.Tags = tagged(s, p).map(t => ({ ...new secretsmanagerApi.Tag(), Key: t[0], Value: t[1] }))
+			q.Tags = tagged(s, r, p).map(t => ({ ...new secretsmanagerApi.Tag(), Key: t[0], Value: t[1] }))
 			c.actions = ["secretsmanager:CreateSecret"]
 			const made = this.secretsmanager.createSecret(c, q)
 			r.physical = made.ARN ?? ""
@@ -1397,7 +1502,22 @@ export class Handler {
 			this.logs.deleteLogStream(c, q)
 		} else if (r.kind == "AWS::IAM::ManagedPolicy" || r.kind == "AWS::IAM::Policy") {
 			for (const [role, name] of r.parts) {
-				if (startsWith(role, "user/")) {
+				if (startsWith(role, "group/")) {
+					const group = role.slice(6, role.length)
+					if (r.kind == "AWS::IAM::ManagedPolicy") {
+						const q = new iamApi.DetachGroupPolicyRequest()
+						q.GroupName = group
+						q.PolicyArn = r.physical
+						c.actions = ["iam:DetachGroupPolicy"]
+						this.iam.detachGroupPolicy(c, q)
+					} else {
+						const q = new iamApi.DeleteGroupPolicyRequest()
+						q.GroupName = group
+						q.PolicyName = name
+						c.actions = ["iam:DeleteGroupPolicy"]
+						this.iam.deleteGroupPolicy(c, q)
+					}
+				} else if (startsWith(role, "user/")) {
 					const user = role.slice(5, role.length)
 					if (r.kind == "AWS::IAM::ManagedPolicy") {
 						const q = new iamApi.DetachUserPolicyRequest()
@@ -1464,10 +1584,60 @@ export class Handler {
 			c.actions = ["firehose:DeleteDeliveryStream"]
 			this.firehose.deleteDeliveryStream(c, q)
 		} else if (r.kind == "AWS::IAM::User") {
+			for (const [group, _] of r.parts) {
+				const g = new iamApi.RemoveUserFromGroupRequest()
+				g.GroupName = group
+				g.UserName = r.physical
+				c.actions = ["iam:RemoveUserFromGroup"]
+				this.iam.removeUserFromGroup(c, g)
+			}
 			const q = new iamApi.DeleteUserRequest()
 			q.UserName = r.physical
 			c.actions = ["iam:DeleteUser"]
 			this.iam.deleteUser(c, q)
+		} else if (r.kind == "AWS::Scheduler::ScheduleGroup") {
+			const q = new schedulerApi.DeleteScheduleGroupInput()
+			q.Name = r.physical
+			c.actions = ["scheduler:DeleteScheduleGroup"]
+			this.scheduler.deleteScheduleGroup(c, q)
+		} else if (r.kind == "AWS::Scheduler::Schedule") {
+			const q = new schedulerApi.DeleteScheduleInput()
+			q.Name = r.physical
+			q.GroupName = if (r.parts[0][0] == "") null else r.parts[0][0]
+			c.actions = ["scheduler:DeleteSchedule"]
+			this.scheduler.deleteSchedule(c, q)
+		} else if (r.kind == "AWS::IAM::Group") {
+			for (const [part, name] of r.parts) {
+				if (part == "inline") {
+					const q = new iamApi.DeleteGroupPolicyRequest()
+					q.GroupName = r.physical
+					q.PolicyName = name
+					c.actions = ["iam:DeleteGroupPolicy"]
+					this.iam.deleteGroupPolicy(c, q)
+				} else {
+					const q = new iamApi.DetachGroupPolicyRequest()
+					q.GroupName = r.physical
+					q.PolicyArn = name
+					c.actions = ["iam:DetachGroupPolicy"]
+					this.iam.detachGroupPolicy(c, q)
+				}
+			}
+			const q = new iamApi.DeleteGroupRequest()
+			q.GroupName = r.physical
+			c.actions = ["iam:DeleteGroup"]
+			this.iam.deleteGroup(c, q)
+		} else if (r.kind == "AWS::IAM::InstanceProfile") {
+			for (const [role, _] of r.parts) {
+				const a = new iamApi.RemoveRoleFromInstanceProfileRequest()
+				a.InstanceProfileName = r.physical
+				a.RoleName = role
+				c.actions = ["iam:RemoveRoleFromInstanceProfile"]
+				this.iam.removeRoleFromInstanceProfile(c, a)
+			}
+			const q = new iamApi.DeleteInstanceProfileRequest()
+			q.InstanceProfileName = r.physical
+			c.actions = ["iam:DeleteInstanceProfile"]
+			this.iam.deleteInstanceProfile(c, q)
 		} else if (r.kind == "AWS::KMS::Key") {
 			const q = new kmsApi.ScheduleKeyDeletionRequest()
 			q.KeyId = r.physical
@@ -1517,7 +1687,7 @@ export class Handler {
 				const ext = if (startsWith(p.str("Runtime") ?? "", "python")) "py" else "js"
 				code!.set("ZipFile", str(base64.encode(zipped(`index.${ext}`, inline!))))
 			}
-			const tags = tagged(s, p)
+			const tags = tagged(s, r, p)
 			p.set("Tags", nul())
 			const q = json.decode[lambdaApi.CreateFunctionRequest](write(p))
 			q.Tags = tags
@@ -2309,8 +2479,9 @@ function generated(g: Json): string throws Fault {
 	return out
 }
 
-/// The tags of r's properties p, a list of Key and Value or an object, and then those of s that p does not name.
-function tagged(s: Stack, p: Json): [string, string][] {
+/// The tags of r's properties p, a list of Key and Value or an object, then those of s that p does not name, then, if
+/// aws, the aws:cloudformation: ones AWS gives each resource of a stack.
+function tagged(s: Stack, r: Made, p: Json, aws = true): [string, string][] {
 	const own = p.get("Tags")
 	const out: [string, string][] = if (own == null) []
 		else if (own!.kind == "object") own!.keys.map(e => [e[0], text(e[1])] as [string, string])
@@ -2319,6 +2490,11 @@ function tagged(s: Stack, p: Json): [string, string][] {
 		if (!out.some(t => t[0] == k)) {
 			out.push([k, v])
 		}
+	}
+	if (aws) {
+		out.push(["aws:cloudformation:stack-name", s.name])
+		out.push(["aws:cloudformation:stack-id", s.id])
+		out.push(["aws:cloudformation:logical-id", r.logical])
 	}
 	return out
 }
