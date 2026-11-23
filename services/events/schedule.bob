@@ -1,0 +1,312 @@
+//! AWS's schedule expressions, one grammar for EventBridge's scheduled rules and Scheduler's schedules: rate(n unit),
+//! its unit plural unless n is 1; cron of six fields (minutes, hours, day of month, month, day of week, year) with
+//! `, - * /` in each, `? L W` in the day of month and `? L #` in the day of week, exactly one of the two `?`; and
+//! Scheduler's at(yyyy-mm-ddThh:mm:ss). A cron reading that a time zone skips does not fire, and one it reads twice
+//! fires at the later, as Scheduler documents. A range whose end is below its start wraps, as 20-2 hours do.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { endsWith, startsWith } from "std/algo"
+import { isDigit } from "std/ascii"
+import { lower, ParseError, parseInt, split } from "std/string"
+import { Date, DateTime, daysInMonth, day, hour, minute, parseDateTime, Zone } from "std/time"
+
+const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+const weekdays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+const first = 1970
+const last = 2199
+
+export class Expression {
+	/// A rate's period; 0 for a cron or an at.
+	every: i64 = 0
+	/// An at's reading of the wall clock.
+	at: DateTime | null = null
+	minutes = new bool[](60)
+	hours = new bool[](24)
+	/// By day 1 to 31, of a day of month "set".
+	days = new bool[](32)
+	months = new bool[](13)
+	years = new bool[](last - first + 1)
+	/// By day 1 (Sunday) to 7, of a day of week "set".
+	weekdays = new bool[](8)
+	/// The day of month: "set", "?", "L", "LW" or "W", the weekday nearest near.
+	monthDay = "set"
+	near = 0
+	/// The day of week: "set", "?", "L", the last weekday of the month, or "#", its nth.
+	weekDay = "set"
+	weekday = 0
+	nth = 0
+}
+
+/// s as an expression, null if it is none; at() only if at.
+export function parse(s: string, at = false): Expression | null {
+	const e = new Expression()
+	if (at && startsWith(s, "at(") && endsWith(s, ")")) {
+		return if (s.length == 23 && s[13] == "T"[0] && reading(e, s.slice(3, 22))) e else null
+	}
+	if (startsWith(s, "rate(") && endsWith(s, ")")) {
+		return if (rate(e, s.slice(5, s.length - 1))) e else null
+	}
+	if (!startsWith(s, "cron(") || !endsWith(s, ")")) {
+		return null
+	}
+	const f = split(s.slice(5, s.length - 1), " ").filter(f => f != "")
+	if (f.length != 6 || !field(f[0], e.minutes, 0, 59, []) || !field(f[1], e.hours, 0, 23, [])
+		|| !field(f[3], e.months, 1, 12, months) || !years(f[5], e.years)) {
+		return null
+	}
+	if ((f[2] == "?") == (f[4] == "?")) {
+		return null
+	}
+	return if (monthDay(e, f[2]) && weekDay(e, f[4])) e else null
+}
+
+/// The first instant after t at which e fires in zone, null if none does; a rate fires at from and every period from
+/// there.
+export function next(e: Expression, t: i64, zone: Zone, from: i64): i64 | null {
+	if (e.every > 0) {
+		return if (from > t) from else from + ((t - from) / e.every + 1) * e.every
+	}
+	if (e.at != null) {
+		const i = zone.instant(e.at!)
+		return if (i > t) i else null
+	}
+	// A day before, as a reading twice of the day before may still be ahead.
+	const start = zone.civil(t).date.addDays(-1)
+	for (let y = if (start.year < first) first else start.year; y <= last; y++) {
+		if (!e.years[y - first]) {
+			continue
+		}
+		for (let m = 1; m <= 12; m++) {
+			if (!e.months[m] || y == start.year && m < start.month) {
+				continue
+			}
+			const n = daysInMonth(y, m)
+			for (let d = 1; d <= n; d++) {
+				if (y == start.year && m == start.month && d < start.day || !matches(e, y, m, d, n)) {
+					continue
+				}
+				const date = new Date(y, m, d)
+				for (let h = 0; h < 24; h++) {
+					for (let i = 0; i < 60; i++) {
+						if (!e.hours[h] || !e.minutes[i]) {
+							continue
+						}
+						const at = zone.instants(new DateTime(date, h, i))
+						if (at.length > 0 && at[at.length - 1] > t) {
+							return at[at.length - 1]
+						}
+					}
+				}
+			}
+		}
+	}
+	return null
+}
+
+/// What is due when, in a table of a store: each entry keyed by its instant, as 19 digits, and the item's own key.
+export class Due {
+	private table: Table[string]
+
+	constructor(store: Store, name: string) { this.table = new Table[string](store, name) }
+	put(at: i64, key: string) throws Fault { this.table.put(`${digits(at)}\x00${key}`, key) }
+
+	delete(at: i64 | null, key: string) throws Fault {
+		if (at != null) {
+			this.table.delete(`${digits(at!)}\x00${key}`)
+		}
+	}
+
+	/// The items due at t or before, earliest first, with their instants.
+	until(t: i64): [i64, string][] {
+		const out: [i64, string][] = []
+		let after: string | null = null
+		while (true) {
+			const page = this.table.scan(after, 100)
+			for (const [k, v] of page) {
+				const at = instant(k)
+				if (at > t) {
+					return out
+				}
+				out.push([at, v])
+			}
+			if (page.length < 100) {
+				return out
+			}
+			after = page[page.length - 1][0]
+		}
+	}
+}
+
+function digits(t: i64): string {
+	let s = `${t}`
+	while (s.length < 19) {
+		s = "0" + s
+	}
+	return s
+}
+
+function instant(k: string): i64 {
+	let t: i64 = 0
+	for (let i = 0; i < 19; i++) {
+		t = t * 10 + ((k[i] - "0"[0]) as i64)
+	}
+	return t
+}
+
+function rate(e: Expression, s: string): bool {
+	const words = split(s, " ")
+	if (words.length != 2 || words[0].length == 0 || words[0].length > 9 || !words[0].every(isDigit)) {
+		return false
+	}
+	const n = number(words[0])
+	const unit = if (n == 1) words[1] else if (endsWith(words[1], "s")) words[1].slice(0, words[1].length - 1) else ""
+	const each: i64 = if (unit == "minute") minute else if (unit == "hour") hour else if (unit == "day") day else 0
+	e.every = (n as i64) * each
+	return e.every > 0
+}
+
+function reading(e: Expression, s: string): bool {
+	try {
+		e.at = parseDateTime(s)
+	} catch (p: ParseError) {
+		return false
+	}
+	return true
+}
+
+/// Sets in set the values that s names, of min to max, by number or by names, which start at min.
+function field(s: string, set: bool[], min: i32, max: i32, names: string[]): bool {
+	for (const item of split(s, ",")) {
+		const slash = split(item, "/")
+		if (slash.length > 2) {
+			return false
+		}
+		const step = if (slash.length == 2) value(slash[1], 1, max - min + 1, []) else 1
+		const range = slash[0]
+		let from = min
+		let to = max
+		if (range != "*") {
+			const dash = split(range, "-")
+			if (dash.length > 2) {
+				return false
+			}
+			from = value(dash[0], min, max, names)
+			// a/s runs from a to the end.
+			to = if (dash.length == 2) value(dash[1], min, max, names) else if (slash.length == 2) max else from
+		}
+		if (step < 0 || from < 0 || to < 0) {
+			return false
+		}
+		const span = if (to >= from) to - from else to + max - min + 1 - from
+		for (let i = 0; i <= span; i += step) {
+			const v = from + i
+			set[if (v > max) v - (max - min + 1) else v] = true
+		}
+	}
+	return true
+}
+
+/// The years, 1970 to 2199, whose ranges do not wrap.
+function years(s: string, set: bool[]): bool {
+	const all = new bool[](last + 1)
+	for (const item of split(s, ",")) {
+		const dash = split(split(item, "/")[0], "-")
+		if (dash.length == 2 && value(dash[0], first, last, []) > value(dash[1], first, last, [])) {
+			return false
+		}
+	}
+	if (!field(s, all, first, last, [])) {
+		return false
+	}
+	for (let y = first; y <= last; y++) {
+		set[y - first] = all[y]
+	}
+	return true
+}
+
+function monthDay(e: Expression, s: string): bool {
+	if (s == "?" || s == "L" || s == "LW") {
+		e.monthDay = s
+		return true
+	}
+	if (endsWith(s, "W")) {
+		e.monthDay = "W"
+		e.near = value(s.slice(0, s.length - 1), 1, 31, [])
+		return e.near > 0
+	}
+	return field(s, e.days, 1, 31, [])
+}
+
+function weekDay(e: Expression, s: string): bool {
+	if (s == "?") {
+		e.weekDay = s
+		return true
+	}
+	if (s == "L") {
+		e.weekdays[7] = true
+		return true
+	}
+	if (endsWith(s, "L")) {
+		e.weekDay = "L"
+		e.weekday = value(s.slice(0, s.length - 1), 1, 7, weekdays)
+		return e.weekday > 0
+	}
+	const hash = split(s, "#")
+	if (hash.length == 2) {
+		e.weekDay = "#"
+		e.weekday = value(hash[0], 1, 7, weekdays)
+		e.nth = value(hash[1], 1, 5, [])
+		return e.weekday > 0 && e.nth > 0
+	}
+	return hash.length == 1 && field(s, e.weekdays, 1, 7, weekdays)
+}
+
+/// The number or name s is, of min to max; -1 if it is neither.
+function value(s: string, min: i32, max: i32, names: string[]): i32 {
+	const named = names.indexOf(lower(s))
+	if (named >= 0) {
+		return min + named
+	}
+	if (s.length == 0 || s.length > 4 || !s.every(isDigit)) {
+		return -1
+	}
+	const n = number(s)
+	return if (n < min || n > max) -1 else n
+}
+
+function number(s: string): i32 {
+	try {
+		return parseInt(s)
+	} catch (p: ParseError) {
+		return -1
+	}
+}
+
+/// Whether e fires on day d of month m of year y, which has n days.
+function matches(e: Expression, y: i32, m: i32, d: i32, n: i32): bool {
+	const w = new Date(y, m, d).weekday() % 7 + 1
+	switch (e.monthDay) {
+		case "set": return e.days[d]
+		case "L": return d == n
+		case "LW": return d == weekdayNear(y, m, n, n)
+		case "W": return d == weekdayNear(y, m, if (e.near > n) n else e.near, n)
+	}
+	switch (e.weekDay) {
+		case "L": return w == e.weekday && d + 7 > n
+		case "#": return w == e.weekday && (d - 1) / 7 + 1 == e.nth
+		default: return e.weekdays[w]
+	}
+}
+
+/// The weekday of month m nearest day d, within the month of n days.
+function weekdayNear(y: i32, m: i32, d: i32, n: i32): i32 {
+	const w = new Date(y, m, d).weekday()
+	if (w == 6) {
+		return if (d == 1) 3 else d - 1
+	}
+	if (w == 7) {
+		return if (d == n) d - 2 else d + 1
+	}
+	return d
+}

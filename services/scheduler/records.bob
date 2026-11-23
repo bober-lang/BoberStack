@@ -2,6 +2,7 @@
 //! and name.
 
 import { Store, Table } from "../../core/state/store"
+import { Due } from "../events/schedule"
 import * as api from "./api"
 
 export class Group {
@@ -28,13 +29,18 @@ export class Schedule {
 	after: api.ActionAfterCompletion = "NONE"
 	created: i64 = 0
 	modified: i64 = 0
+	/// When it fires next, as Tables.due holds it; null when disabled or done.
+	next: i64 | null = null
 }
 
 export class Tables {
 	groups: Table[Group]
 	schedules: Table[Schedule]
+	/// The schedules by when they fire next, by their key in schedules.
+	due: Due
 
 	constructor(s: Store) {
+		this.due = new Due(s, "scheduler/due")
 		this.groups = new Table[Group](s, "scheduler/groups")
 		this.schedules = new Table[Schedule](s, "scheduler/schedules")
 	}

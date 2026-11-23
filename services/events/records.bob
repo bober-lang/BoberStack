@@ -1,6 +1,7 @@
 //! EventBridge's state in an account's regional tree; rules and targets are keyed within their bus and rule.
 
 import { Store, Table } from "../../core/state/store"
+import { Due } from "./schedule"
 
 export class Bus {
 	name = ""
@@ -15,8 +16,10 @@ export class Rule {
 	name = ""
 	bus = ""
 	pattern: string | null = null
-	/// Stored, never fired.
 	schedule: string | null = null
+	/// When a scheduled rule, enabled, fires next, as Tables.due holds it; and where its rate counts from.
+	next: i64 | null = null
+	since: i64 = 0
 	state = "ENABLED"
 	description: string | null = null
 	role: string | null = null
@@ -86,8 +89,11 @@ export class Tables {
 	replays: Table[Replay]
 	connections: Table[Connection]
 	destinations: Table[Destination]
+	/// The scheduled rules by when they fire next, by their key in rules.
+	due: Due
 
 	constructor(s: Store) {
+		this.due = new Due(s, "events/due")
 		this.connections = new Table[Connection](s, "events/connections")
 		this.destinations = new Table[Destination](s, "events/destinations")
 		this.buses = new Table[Bus](s, "events/buses")

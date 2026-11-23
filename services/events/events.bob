@@ -6,13 +6,16 @@
 //! - Targets other than SQS, SNS, Kinesis, Firehose, Step Functions, Logs and buses are stored but sent nothing.
 //!   Connections and API destinations are state only, always AUTHORIZED and ACTIVE; no HTTP is sent, no secret kept.
 //! - A log event is stamped with the time of delivery, not the event's time.
-//! - There are no timers: delivery is never retried, schedules never fire, and archives keep events past retention.
+//! - A rule's schedule (./schedule) fires at the gateway's tick, up to a second late; a tick that comes late fires each
+//!   due rule once, not once for each instant missed. A rate fires first a period after the minute PutRule set it in.
+//! - Delivery is never retried, and archives keep events past retention.
 //! - A replay is done within StartReplay's request, COMPLETED when described, and so can never be cancelled.
-//! - Partner event sources, endpoints, Pipes and Scheduler are not implemented.
+//! - Partner event sources, endpoints and Pipes are not implemented; Scheduler is a service of its own.
 
 import { Archive, busArn, Bus, Connection, Destination, Replay, ruleArn, Rule, Tables, Target, within } from "./records"
 import * as api from "./api"
 import { list, matches, member, members, str, validate } from "./pattern"
+import * as schedule from "./schedule"
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { uuid } from "../../core/random"
@@ -31,7 +34,7 @@ import { endsWith, indexOf, startsWith } from "std/algo"
 import { isDigit, lbrace, lbracket } from "std/ascii"
 import * as std from "std/encoding/json"
 import { ParseError, parseInt, split } from "std/string"
-import { millisecond, rfc3339, second } from "std/time"
+import { millisecond, minute, rfc3339, second, utc } from "std/time"
 import { Decodable } from "std/types"
 
 const principal = "events.amazonaws.com"
@@ -223,11 +226,12 @@ export class Handler {
 		if (input.EventPattern == null && input.ScheduleExpression == null) {
 			throw validation("Parameter(s) EventPattern or ScheduleExpression must be specified.")
 		}
+		const e = if (input.ScheduleExpression == null) null else schedule.parse(input.ScheduleExpression!)
 		if (input.ScheduleExpression != null) {
 			if (name != "default") {
 				throw validation("ScheduleExpression is supported only on the default event bus.")
 			}
-			if (!schedule(input.ScheduleExpression!)) {
+			if (e == null) {
 				throw validation("Parameter ScheduleExpression is not valid.")
 			}
 		}
@@ -240,6 +244,12 @@ export class Handler {
 		r.state = input.State ?? "ENABLED"
 		r.description = input.Description
 		r.role = input.RoleArn
+		// A rule put again on the same schedule keeps its time.
+		if (was != null && was.schedule == r.schedule && r.state != "DISABLED") {
+			r.next = was.next
+			r.since = was.since
+		}
+		timed(db, k, was, r, now())
 		db.rules.put(k, r)
 		const out = new api.PutRuleResponse()
 		out.RuleArn = arn
@@ -300,6 +310,7 @@ export class Handler {
 		if (all(db.targets, within(k, "")).length > 0) {
 			throw validation("Rule can't be deleted since it has targets.")
 		}
+		db.due.delete(db.rules.get(k)!.next, k)
 		db.rules.delete(k)
 		return new Unit()
 	}
@@ -958,6 +969,25 @@ export class Handler {
 		}
 	}
 
+	/// Fires the scheduled rules due by t in the caller's region, each once however many of its instants t is past.
+	tick(caller: Caller, t: i64) throws Fault {
+		const db = new Tables(caller.regional())
+		for (const [at, k] of db.due.until(t)) {
+			const r = db.rules.get(k)!
+			db.due.delete(at, k)
+			r.next = schedule.next(schedule.parse(r.schedule!)!, t, utc, r.since)
+			if (r.next != null) {
+				db.due.put(r.next!, k)
+			}
+			db.rules.put(k, r)
+			const arn = ruleArn(caller.region, caller.account, r)
+			const event = eventOf(caller, uuid(), t, "aws.events", "Scheduled Event", [arn], "{}")
+			for (const [_, x] of all(db.targets, within(k, ""))) {
+				this.deliver(caller, db, r, given(x), event, [r.bus])
+			}
+		}
+	}
+
 	private deliver(caller: Caller, db: Tables, r: Rule, t: api.Target, event: string, visited: string[]) throws Fault {
 		const source = ruleArn(caller.region, caller.account, r)
 		const body = inputOf(t, event, r.name, source)
@@ -1252,8 +1282,11 @@ function allowed(caller: Caller, name: string, given: string | null, context: Co
 
 function setState(caller: Caller, name: string, given: string | null, state: string): Unit throws Fault {
 	const r = allowed(caller, name, given)
+	const was = { ...r }
 	r.state = state
-	tables(caller).rules.put(within(r.bus, r.name), r)
+	const db = tables(caller)
+	timed(db, within(r.bus, r.name), was, r, now())
+	db.rules.put(within(r.bus, r.name), r)
 	return new Unit()
 }
 
@@ -1265,26 +1298,22 @@ function stateOf(s: string): api.RuleState {
 	}
 }
 
-/// Whether s is a schedule expression: rate(n unit), unit plural unless n is 1, or cron of six fields.
-export function schedule(s: string): bool {
-	if (startsWith(s, "cron(") && endsWith(s, ")")) {
-		return split(s.slice(5, s.length - 1), " ").filter(f => f != "").length == 6
+/// Files rule r, of key k, by when it fires next if it is scheduled and enabled, and unfiles it as it was; a rule
+/// enabled anew counts from t, so that it does not fire for the time it was off.
+function timed(db: Tables, k: string, was: Rule | null, r: Rule, t: i64) throws Fault {
+	db.due.delete(was?.next ?? null, k)
+	const e = if (r.schedule == null || r.state == "DISABLED") null else schedule.parse(r.schedule!)
+	if (e == null) {
+		r.next = null
+		return
 	}
-	if (!startsWith(s, "rate(") || !endsWith(s, ")")) {
-		return false
+	if (r.next == null) {
+		r.since = t - t % minute + e!.every
+		r.next = schedule.next(e!, t, utc, r.since)
 	}
-	const words = split(s.slice(5, s.length - 1), " ")
-	if (words.length != 2 || words[0].length == 0 || words[0].length > 9 || !words[0].every(isDigit)) {
-		return false
+	if (r.next != null) {
+		db.due.put(r.next!, k)
 	}
-	let n = 0
-	try {
-		n = parseInt(words[0])
-	} catch (e: ParseError) {
-		return false
-	}
-	const unit = if (n == 1) words[1] else if (endsWith(words[1], "s")) words[1].slice(0, words[1].length - 1) else ""
-	return n > 0 && (unit == "minute" || unit == "hour" || unit == "day")
 }
 
 function checkTarget(t: api.Target) throws Fault {

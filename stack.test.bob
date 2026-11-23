@@ -14,7 +14,7 @@ import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
 import { Request, Response } from "std/http"
 import { ParseError } from "std/string"
-import { millisecond } from "std/time"
+import { millisecond, minute, rfc3339, second } from "std/time"
 import { escape } from "std/url"
 
 const account = "000000000000"
@@ -1924,4 +1924,123 @@ test "CloudFormation makes a schedule group and a schedule in it, and deletes th
 		assert indexOf(res.body.whole ?? "", ":schedule-group/sg</OutputValue>") >= 0
 		assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "sch"]]).status == 200
 	}
+}
+
+/// Runs what is due at instant t, as main's fiber does each second.
+function tick(g: Gateway, t: i64) {
+	try {
+		g.tick(t)
+	} catch (f: Fault) {
+		assert f.message == ""
+	}
+}
+
+function attribute(m: sqsApi.Message, name: string): string | null {
+	const found = (m.MessageAttributes ?? []).find(a => a[0] == name)
+	return if (found == null) null else found[1].StringValue
+}
+
+test "a scheduled rule fires into a queue at the tick: once however late, never while disabled or once deleted" {
+	const g = gateway()
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/every"
+	queue(g, "ticked", sendable("ticked", "events.amazonaws.com", rule))
+	const t = now()
+	assert call(g, "events", "PutRule", `{"Name":"every","ScheduleExpression":"rate(1 minute)"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"every","Targets":[{"Id":"1","Arn":"${queueArn("ticked")}"}]}`).status == 200
+	tick(g, t)
+	assert bodies(g, "ticked") == []
+	tick(g, t + 10 * minute)
+	const [fired] = bodies(g, "ticked")
+	assert indexOf(fired, `"version":"0"`) >= 0 && indexOf(fired, `"detail-type":"Scheduled Event"`) >= 0
+		&& indexOf(fired, `"source":"aws.events"`) >= 0 && indexOf(fired, `"resources":["${rule}"],"detail":{}`) >= 0
+		&& indexOf(fired, `"time":"${rfc3339(t + 10 * minute - (t + 10 * minute) % second)}"`) >= 0
+	tick(g, t + 10 * minute)
+	assert bodies(g, "ticked") == []
+	tick(g, t + 11 * minute)
+	assert bodies(g, "ticked").length == 1
+	assert call(g, "events", "DisableRule", `{"Name":"every"}`).status == 200
+	tick(g, t + 20 * minute)
+	assert bodies(g, "ticked") == []
+	// Enabled again, it counts from then; put again on its schedule, it keeps its time.
+	assert call(g, "events", "EnableRule", `{"Name":"every"}`).status == 200
+	assert call(g, "events", "PutRule", `{"Name":"every","ScheduleExpression":"rate(1 minute)"}`).status == 200
+	tick(g, t + 30 * minute)
+	assert bodies(g, "ticked").length == 1
+	assert call(g, "events", "RemoveTargets", `{"Rule":"every","Ids":["1"]}`).status == 200
+	assert call(g, "events", "DeleteRule", `{"Name":"every"}`).status == 200
+	tick(g, t + 40 * minute)
+	assert bodies(g, "ticked") == []
+	g.close()
+}
+
+function schedule(g: Gateway, name: string, body: string): Response {
+	const req = new Request("POST", `http://localhost:4566/schedules/${name}`, body)
+	req.headers.set("content-type", "application/json")
+	sign(req, body, "scheduler", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "Scheduler fires its schedules' targets at the tick, as their role: at() then deleted, rates once however late" {
+	const g = gateway()
+	role(g, "sched", "scheduler.amazonaws.com", policy([statement("Allow", `"sqs:SendMessage"`, "*")]))
+	const r = "arn:aws:iam::000000000000:role/sched"
+	for (const q of ["once", "often", "off", "dlq", "window"]) {
+		queue(g, q)
+	}
+	const t = now() - now() % second
+	const at = rfc3339(t + 2 * minute).slice(0, 19)
+	const off = `"FlexibleTimeWindow":{"Mode":"OFF"}`
+	const input = json.quoted(`{"arn":"<aws.scheduler.schedule-arn>","at":"<aws.scheduler.scheduled-time>",`
+		+ `"n":<aws.scheduler.attempt-number>}`)
+	assert schedule(g, "once",
+		`{"ScheduleExpression":"at(${at})","ActionAfterCompletion":"DELETE",${off},`
+		+ `"Target":{"Arn":"${queueArn("once")}","RoleArn":"${r}","Input":${input}}}`).status == 200
+	assert schedule(g, "often",
+		`{"ScheduleExpression":"rate(5 minutes)",${off},`
+		+ `"Target":{"Arn":"${queueArn("often")}","RoleArn":"${r}"}}`).status == 200
+	assert schedule(g, "off",
+		`{"ScheduleExpression":"rate(1 minute)","State":"DISABLED",${off},`
+		+ `"Target":{"Arn":"${queueArn("off")}","RoleArn":"${r}"}}`).status == 200
+	const dead = `"DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}`
+	assert schedule(g, "missing",
+		`{"ScheduleExpression":"rate(1 hour)",${off},`
+		+ `"Target":{"Arn":"${queueArn("missing")}","RoleArn":"${r}",${dead},"Input":"lost"}}`).status == 200
+	assert schedule(g, "universal",
+		`{"ScheduleExpression":"rate(1 hour)",${off},`
+		+ `"Target":{"Arn":"arn:aws:scheduler:::aws-sdk:sqs:sendMessage","RoleArn":"${r}",${dead}}}`).status == 200
+	// Every minute from its start, before its end, then deleted.
+	assert schedule(g, "window",
+		`{"ScheduleExpression":"rate(1 minute)","ActionAfterCompletion":"DELETE",${off},`
+		+ `"StartDate":${(t + 5 * minute) / second},"EndDate":${(t + 7 * minute) / second},`
+		+ `"Target":{"Arn":"${queueArn("window")}","RoleArn":"${r}"}}`).status == 200
+	// A rate with no start fires at once.
+	tick(g, now())
+	assert bodies(g, "often") == ["{}"] && bodies(g, "once") == []
+	const failed = received(g, "dlq")
+	assert failed.length == 2
+	const lost = failed.find(m => m.Body == "lost")!
+	const arn = "arn:aws:scheduler:us-east-1:000000000000:schedule/default/missing"
+	assert attribute(lost, "ERROR_CODE") == "QueueDoesNotExist" && attribute(lost, "SCHEDULE_ARN") == arn
+		&& attribute(lost, "TARGET_ARN") == queueArn("missing") && attribute(lost, "RETRY_ATTEMPTS") == "0"
+		&& attribute(lost, "EXECUTION_ID")!.length == 16
+	const universal = failed.find(m => m.Body == "{}")!
+	assert attribute(universal, "ERROR_CODE") == "NotImplemented"
+	tick(g, t + 5 * minute)
+	assert bodies(g, "window") == ["{}"]
+	tick(g, t + 6 * minute)
+	assert bodies(g, "window") == ["{}"]
+	tick(g, t + 10 * minute)
+	assert bodies(g, "window") == [] && bodies(g, "often") == ["{}"]
+	const once = arn.slice(0, arn.length - 7) + "once"
+	assert bodies(g, "once") == [`{"arn":"${once}","at":"${at}Z","n":1}`]
+	const gone = new Request("GET", "http://localhost:4566/schedules/once", "")
+	sign(gone, "", "scheduler", "us-east-1", "test", "test", "", "20150626T140000Z")
+	assert g.handle(gone).status == 404
+	const ended = new Request("GET", "http://localhost:4566/schedules/window", "")
+	sign(ended, "", "scheduler", "us-east-1", "test", "test", "", "20150626T140000Z")
+	assert g.handle(ended).status == 404
+	tick(g, t + 20 * minute)
+	assert bodies(g, "once") == [] && bodies(g, "often").length == 1 && bodies(g, "off") == []
+	g.close()
 }
