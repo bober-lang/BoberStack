@@ -38,10 +38,24 @@ export class Settings {
 	lock: api.ObjectLockConfiguration | null = null
 	mfaDelete: api.MFADeleteStatus | null = null
 	notification = new api.NotificationConfiguration()
+	replication: api.ReplicationConfiguration | null = null
+	/// By Id, in the order put.
+	metrics: api.MetricsConfiguration[] = []
+	inventory: api.InventoryConfiguration[] = []
+	analytics: api.AnalyticsConfiguration[] = []
+	tiering: api.IntelligentTieringConfiguration[] = []
 }
 
 /// The configuration of the bucket of f.
 export function settings(f: Found): Settings throws Fault { return table(f).get(f.bucket.name) ?? new Settings() }
+
+/// Throws S3's refusal of a retention or legal hold unless the bucket of f has Object Lock.
+export function locking(f: Found) throws Fault {
+	if (!f.bucket.locked && settings(f).lock?.ObjectLockEnabled != "Enabled") {
+		throw new Fault(400, "InvalidRequest", "Bucket is missing Object Lock Configuration")
+	}
+}
+
 /// Drops the configuration of the bucket of f, deleted.
 export function forget(f: Found) throws Fault { table(f).delete(f.bucket.name) }
 
@@ -331,6 +345,222 @@ export class Config {
 		return new Unit()
 	}
 
+	putBucketMetricsConfiguration(caller: Caller, input: api.PutBucketMetricsConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutMetricsConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		s.metrics = s.metrics.filter(c => c.Id != input.Id)
+		s.metrics.push({ ...input.MetricsConfiguration, Id: input.Id })
+		save(f, s)
+		return new Unit()
+	}
+
+	getBucketMetricsConfiguration(caller: Caller,
+		input: api.GetBucketMetricsConfigurationRequest): api.GetBucketMetricsConfigurationOutput throws Fault {
+		caller.actions = ["s3:GetMetricsConfiguration"]
+		const c = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).metrics.find(c => c.Id == input.Id)
+		if (c == null) {
+			throw noConfiguration()
+		}
+		return { ...new api.GetBucketMetricsConfigurationOutput(), MetricsConfiguration: c }
+	}
+
+	deleteBucketMetricsConfiguration(caller: Caller,
+		input: api.DeleteBucketMetricsConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutMetricsConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		if (!s.metrics.some(c => c.Id == input.Id)) {
+			throw noConfiguration()
+		}
+		s.metrics = s.metrics.filter(c => c.Id != input.Id)
+		save(f, s)
+		return new Unit()
+	}
+
+	listBucketMetricsConfigurations(caller: Caller,
+		input: api.ListBucketMetricsConfigurationsRequest): api.ListBucketMetricsConfigurationsOutput throws Fault {
+		caller.actions = ["s3:GetMetricsConfiguration"]
+		const all = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).metrics
+		const [from, to] = page(all.map(c => c.Id), input.ContinuationToken)
+		return { ...new api.ListBucketMetricsConfigurationsOutput(), IsTruncated: to < all.length,
+			ContinuationToken: input.ContinuationToken, NextContinuationToken: next(all.map(c => c.Id), to),
+			MetricsConfigurationList: if (to > from) all.slice(from, to) else null }
+	}
+
+	putBucketInventoryConfiguration(caller: Caller,
+		input: api.PutBucketInventoryConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutInventoryConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		s.inventory = s.inventory.filter(c => c.Id != input.Id)
+		s.inventory.push({ ...input.InventoryConfiguration, Id: input.Id })
+		save(f, s)
+		return new Unit()
+	}
+
+	getBucketInventoryConfiguration(caller: Caller,
+		input: api.GetBucketInventoryConfigurationRequest): api.GetBucketInventoryConfigurationOutput throws Fault {
+		caller.actions = ["s3:GetInventoryConfiguration"]
+		const c = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).inventory.find(c => c.Id == input.Id)
+		if (c == null) {
+			throw noConfiguration()
+		}
+		return { ...new api.GetBucketInventoryConfigurationOutput(), InventoryConfiguration: c }
+	}
+
+	deleteBucketInventoryConfiguration(caller: Caller,
+		input: api.DeleteBucketInventoryConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutInventoryConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		if (!s.inventory.some(c => c.Id == input.Id)) {
+			throw noConfiguration()
+		}
+		s.inventory = s.inventory.filter(c => c.Id != input.Id)
+		save(f, s)
+		return new Unit()
+	}
+
+	listBucketInventoryConfigurations(caller: Caller,
+		input: api.ListBucketInventoryConfigurationsRequest): api.ListBucketInventoryConfigurationsOutput throws Fault {
+		caller.actions = ["s3:GetInventoryConfiguration"]
+		const all = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).inventory
+		const [from, to] = page(all.map(c => c.Id), input.ContinuationToken)
+		return { ...new api.ListBucketInventoryConfigurationsOutput(), IsTruncated: to < all.length,
+			ContinuationToken: input.ContinuationToken, NextContinuationToken: next(all.map(c => c.Id), to),
+			InventoryConfigurationList: if (to > from) all.slice(from, to) else null }
+	}
+
+	putBucketAnalyticsConfiguration(caller: Caller,
+		input: api.PutBucketAnalyticsConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutAnalyticsConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		s.analytics = s.analytics.filter(c => c.Id != input.Id)
+		s.analytics.push({ ...input.AnalyticsConfiguration, Id: input.Id })
+		save(f, s)
+		return new Unit()
+	}
+
+	getBucketAnalyticsConfiguration(caller: Caller,
+		input: api.GetBucketAnalyticsConfigurationRequest): api.GetBucketAnalyticsConfigurationOutput throws Fault {
+		caller.actions = ["s3:GetAnalyticsConfiguration"]
+		const c = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).analytics.find(c => c.Id == input.Id)
+		if (c == null) {
+			throw noConfiguration()
+		}
+		return { ...new api.GetBucketAnalyticsConfigurationOutput(), AnalyticsConfiguration: c }
+	}
+
+	deleteBucketAnalyticsConfiguration(caller: Caller,
+		input: api.DeleteBucketAnalyticsConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutAnalyticsConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		if (!s.analytics.some(c => c.Id == input.Id)) {
+			throw noConfiguration()
+		}
+		s.analytics = s.analytics.filter(c => c.Id != input.Id)
+		save(f, s)
+		return new Unit()
+	}
+
+	listBucketAnalyticsConfigurations(caller: Caller,
+		input: api.ListBucketAnalyticsConfigurationsRequest): api.ListBucketAnalyticsConfigurationsOutput throws Fault {
+		caller.actions = ["s3:GetAnalyticsConfiguration"]
+		const all = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).analytics
+		const [from, to] = page(all.map(c => c.Id), input.ContinuationToken)
+		return { ...new api.ListBucketAnalyticsConfigurationsOutput(), IsTruncated: to < all.length,
+			ContinuationToken: input.ContinuationToken, NextContinuationToken: next(all.map(c => c.Id), to),
+			AnalyticsConfigurationList: if (to > from) all.slice(from, to) else null }
+	}
+
+	putBucketIntelligentTieringConfiguration(caller: Caller,
+		input: api.PutBucketIntelligentTieringConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutIntelligentTieringConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		s.tiering = s.tiering.filter(c => c.Id != input.Id)
+		s.tiering.push({ ...input.IntelligentTieringConfiguration, Id: input.Id })
+		save(f, s)
+		return new Unit()
+	}
+
+	getBucketIntelligentTieringConfiguration(caller: Caller, input: api.GetBucketIntelligentTieringConfigurationRequest): api.GetBucketIntelligentTieringConfigurationOutput throws Fault {
+		caller.actions = ["s3:GetIntelligentTieringConfiguration"]
+		const c = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).tiering.find(c => c.Id == input.Id)
+		if (c == null) {
+			throw noConfiguration()
+		}
+		return { ...new api.GetBucketIntelligentTieringConfigurationOutput(), IntelligentTieringConfiguration: c }
+	}
+
+	deleteBucketIntelligentTieringConfiguration(caller: Caller,
+		input: api.DeleteBucketIntelligentTieringConfigurationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutIntelligentTieringConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		if (!s.tiering.some(c => c.Id == input.Id)) {
+			throw noConfiguration()
+		}
+		s.tiering = s.tiering.filter(c => c.Id != input.Id)
+		save(f, s)
+		return new Unit()
+	}
+
+	listBucketIntelligentTieringConfigurations(caller: Caller,
+		input: api.ListBucketIntelligentTieringConfigurationsRequest): api.ListBucketIntelligentTieringConfigurationsOutput throws Fault {
+		caller.actions = ["s3:GetIntelligentTieringConfiguration"]
+		const all = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).tiering
+		const [from, to] = page(all.map(c => c.Id), input.ContinuationToken)
+		return { ...new api.ListBucketIntelligentTieringConfigurationsOutput(), IsTruncated: to < all.length,
+			ContinuationToken: input.ContinuationToken, NextContinuationToken: next(all.map(c => c.Id), to),
+			IntelligentTieringConfigurationList: if (to > from) all.slice(from, to) else null }
+	}
+
+	putBucketReplication(caller: Caller, input: api.PutBucketReplicationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutReplicationConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (f.bucket.versioning != "Enabled") {
+			throw new Fault(400, "InvalidRequest",
+				"Versioning must be 'Enabled' on the bucket to apply a replication " + "policy")
+		}
+		const s = settings(f)
+		s.replication = input.ReplicationConfiguration
+		save(f, s)
+		return new Unit()
+	}
+
+	getBucketReplication(caller: Caller,
+		input: api.GetBucketReplicationRequest): api.GetBucketReplicationOutput throws Fault {
+		caller.actions = ["s3:GetReplicationConfiguration"]
+		const r = settings(found(caller, input.Bucket, input.ExpectedBucketOwner)).replication
+		if (r == null) {
+			throw missing("ReplicationConfigurationNotFoundError", "The replication configuration was not found",
+				input.Bucket)
+		}
+		return { ...new api.GetBucketReplicationOutput(), ReplicationConfiguration: r }
+	}
+
+	deleteBucketReplication(caller: Caller, input: api.DeleteBucketReplicationRequest): Unit throws Fault {
+		caller.actions = ["s3:PutReplicationConfiguration"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = settings(f)
+		s.replication = null
+		save(f, s)
+		return new Unit()
+	}
+
+	/// Refused, as S3 refuses it in every region it opened since 2019.
+	getObjectTorrent(caller: Caller, input: api.GetObjectTorrentRequest): api.GetObjectTorrentOutput throws Fault {
+		caller.actions = ["s3:GetObjectTorrent"]
+		found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		throw new Fault(405, "RequestTorrentNotSupportedInRegion",
+			"The torrent request is not supported in this region: ", true, member("Region", caller.region))
+	}
+
+	/// Kept and returned only: no website endpoint serves it.
 	putBucketWebsite(caller: Caller, input: api.PutBucketWebsiteRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketWebsite"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
@@ -428,7 +658,8 @@ export class Config {
 		input: api.GetObjectLockConfigurationRequest): api.GetObjectLockConfigurationOutput throws Fault {
 		caller.actions = ["s3:GetBucketObjectLockConfiguration"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
-		const l = settings(f).lock
+		const enabled = { ...new api.ObjectLockConfiguration(), ObjectLockEnabled: "Enabled" }
+		const l = settings(f).lock ?? (if (f.bucket.locked) enabled else null)
 		if (l == null) {
 			throw missing("ObjectLockConfigurationNotFoundError",
 				"Object Lock configuration does not exist for this bucket", input.Bucket)
@@ -775,6 +1006,26 @@ function sseC(): api.BlockedEncryptionTypes {
 function missing(code: string, message: string, bucket: string): Fault {
 	return new Fault(404, code, message, true, member("BucketName", bucket))
 }
+
+function noConfiguration(): Fault {
+	return new Fault(404, "NoSuchConfiguration", "The specified configuration does not exist.")
+}
+
+/// The configurations a list answers of those of ids, from the continuation token given, the Id it starts at: at most
+/// 100, as S3 answers; the token of the next is its Id.
+function page(ids: string[], token: string | null): [i32, i32] throws Fault {
+	let from = 0
+	if (token != null) {
+		from = ids.indexOf(token!)
+		if (from < 0) {
+			throw argument("The continuation token provided is incorrect", "continuation-token", token!)
+		}
+	}
+	return [from, if (from + 100 < ids.length) from + 100 else ids.length]
+}
+
+/// The continuation token of the configurations of ids from the index to, null if none are left.
+function next(ids: string[], to: i32): string | null { return if (to < ids.length) ids[to] else null }
 
 function aclsDisabled(): Fault {
 	return new Fault(400, "AccessControlListNotSupported", "The bucket does not allow ACLs")

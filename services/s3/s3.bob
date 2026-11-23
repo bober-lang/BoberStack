@@ -27,7 +27,9 @@ import { Blob, Table } from "../../core/state/store"
 import { decryptAs, encryptAs, sealer } from "../kms/kms"
 import * as api from "./api"
 import { arn, authorize, bucketPolicy, Found, found, member, noSuchBucket, noSuchKey, owner } from "./common"
-import { acl, Config, exposed, forget, mfaDelete, preflight, publicPolicy, settings, versioned } from "./config"
+
+import { acl, Config, exposed, forget, locking, mfaDelete, preflight, publicPolicy, settings,
+	versioned } from "./config"
 
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
 	version, Version } from "./records"
@@ -40,6 +42,7 @@ import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
+import * as xml from "std/encoding/xml"
 import { crc32 } from "std/hash/crc32"
 import { Body, Request, Response } from "std/http"
 import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
@@ -47,8 +50,9 @@ import { second } from "std/time"
 import { escape, Query, unescape } from "std/url"
 
 /// The subresources of a bucket whose GET S3 answers of no content type.
-const untyped = ["cors", "encryption", "lifecycle", "notification", "ownershipControls", "policyStatus",
-	"publicAccessBlock", "requestPayment", "versioning"]
+const untyped = ["analytics", "cors", "encryption", "intelligent-tiering", "inventory", "lifecycle", "metrics",
+	"notification", "object-lock", "ownershipControls", "policyStatus", "publicAccessBlock", "requestPayment",
+	"versioning"]
 
 /// The smallest part of a multipart upload but its last.
 const smallest: i64 = 5242880
@@ -64,6 +68,8 @@ export class Handler {
 	partial = false
 	/// The Content-Type of the answer being made where S3's differs from the protocol's, "" for none.
 	typed: string | null = null
+	/// The version id the answer being made names where S3's model has no member for it.
+	versionId: string | null = null
 
 	createBucket(caller: Caller, input: api.CreateBucketRequest): api.CreateBucketOutput throws Fault {
 		const name = input.Bucket
@@ -91,6 +97,10 @@ export class Handler {
 		if (input.ObjectOwnership != null) {
 			caller.actions.push("s3:PutBucketOwnershipControls")
 		}
+		const locked = input.ObjectLockEnabledForBucket == true
+		if (locked) {
+			caller.actions.append(["s3:PutBucketObjectLockConfiguration", "s3:PutBucketVersioning"])
+		}
 		caller.allow(arn(name), null, [], `"${arn(name)}"`)
 		const home = given ?? "us-east-1"
 		if (there != null) {
@@ -109,7 +119,8 @@ export class Handler {
 		} else {
 			const t = now()
 			put(all, name, { ...new Place(), account: caller.account, region: home, created: t - t % second })
-			const b = { ...new Bucket(), name: name, owner: caller.account, region: home, created: t - t % second }
+			const b = { ...new Bucket(), name: name, owner: caller.account, region: home, created: t - t % second,
+				versioning: if (locked) "Enabled" else "", locked: locked }
 			put(new Tables(caller.tree(`${caller.account}/${home}`)).buckets, name, b)
 		}
 		const r = new api.CreateBucketOutput()
@@ -326,7 +337,7 @@ export class Handler {
 	deleteObject(caller: Caller, input: api.DeleteObjectRequest): api.DeleteObjectOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:DeleteObject" else "s3:DeleteObjectVersion"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
-		const [id, marker] = remove(caller, f, input.Key, input.VersionId)
+		const [id, marker] = remove(caller, f, input.Key, input.VersionId, input.BypassGovernanceRetention)
 		this.notify(caller, f, if (marker) "ObjectRemoved:DeleteMarkerCreated" else "ObjectRemoved:Delete",
 			{ ...new Version(), key: input.Key, id: id ?? "null", order: f.bucket.next })
 		const r = new api.DeleteObjectOutput()
@@ -348,7 +359,7 @@ export class Handler {
 			caller.actions = [if (o.VersionId == null) "s3:DeleteObject" else "s3:DeleteObjectVersion"]
 			try {
 				authorize(caller, f.bucket, arn(input.Bucket, o.Key))
-				const [id, marker] = remove(caller, f, o.Key, o.VersionId)
+				const [id, marker] = remove(caller, f, o.Key, o.VersionId, input.BypassGovernanceRetention)
 				this.notify(caller, f, if (marker) "ObjectRemoved:DeleteMarkerCreated" else "ObjectRemoved:Delete",
 					{ ...new Version(), key: o.Key, id: id ?? "null", order: f.bucket.next })
 				if (input.Delete.Quiet != true) {
@@ -906,6 +917,128 @@ export class Handler {
 		return { ...new api.DeleteObjectTaggingOutput(), VersionId: versionOf(f.bucket, v) }
 	}
 
+	/// Of the attributes asked, given in one header or several; of the parts only their count, as S3 gives no part's
+	/// size or checksum for an upload that had none.
+	getObjectAttributes(caller: Caller,
+		input: api.GetObjectAttributesRequest): api.GetObjectAttributesOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:GetObjectAttributes" else "s3:GetObjectVersionAttributes"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const asked: string[] = []
+		for (const h of input.ObjectAttributes) {
+			asked.append(split(h, ",").map(a => trim(a)))
+		}
+		const known = ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"]
+		if (asked.length == 0 || asked.some(a => !known.includes(a))) {
+			throw new Fault(400, "InvalidArgument", "Invalid attribute name specified.")
+		}
+		const v = object(f, input.Key, input.VersionId)
+		const r = new api.GetObjectAttributesOutput()
+		r.LastModified = v.modified
+		r.VersionId = versionOf(f.bucket, v)
+		if (asked.includes("ETag")) {
+			r.ETag = replace(v.etag, "\"", "")
+		}
+		if (asked.includes("StorageClass")) {
+			r.StorageClass = "STANDARD"
+		}
+		if (asked.includes("ObjectSize")) {
+			r.ObjectSize = v.size
+		}
+		if (asked.includes("Checksum") && v.algorithm != "") {
+			const c = { ...new api.Checksum(), ChecksumType: if (v.parts > 0) "COMPOSITE" else "FULL_OBJECT" }
+			if (v.algorithm == "CRC32") {
+				c.ChecksumCRC32 = v.checksum
+			} else if (v.algorithm == "CRC32C") {
+				c.ChecksumCRC32C = v.checksum
+			} else if (v.algorithm == "CRC64NVME") {
+				c.ChecksumCRC64NVME = v.checksum
+			} else if (v.algorithm == "SHA1") {
+				c.ChecksumSHA1 = v.checksum
+			} else {
+				c.ChecksumSHA256 = v.checksum
+			}
+			r.Checksum = c
+		}
+		if (asked.includes("ObjectParts") && v.parts > 0) {
+			r.ObjectParts = { ...new api.GetObjectAttributesParts(), TotalPartsCount: v.parts }
+		}
+		return r
+	}
+
+	/// Lengthened, or made COMPLIANCE, by anyone allowed; shortened or lifted while it holds only in GOVERNANCE, by one
+	/// who bypasses it.
+	putObjectRetention(caller: Caller,
+		input: api.PutObjectRetentionRequest): api.PutObjectRetentionOutput throws Fault {
+		caller.actions = ["s3:PutObjectRetention"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		locking(f)
+		const v = object(f, input.Key, input.VersionId)
+		const r = input.Retention ?? new api.ObjectLockRetention()
+		if ((r.Mode == null) != (r.RetainUntilDate == null)
+			|| (r.Mode != null && r.Mode != "GOVERNANCE" && r.Mode != "COMPLIANCE")) {
+			throw new Fault(400, "MalformedXML",
+				"The XML you provided was not well-formed or did not validate against our published schema")
+		}
+		const t = now()
+		if (r.RetainUntilDate != null && r.RetainUntilDate! <= t) {
+			throw new Fault(400, "InvalidArgument", "The retain until date must be in the future!", true,
+				member("ArgumentName", "RetainUntilDate"))
+		}
+		if (v.mode != null && v.until > t
+			&& (r.Mode == null || r.RetainUntilDate! < v.until || (v.mode == "COMPLIANCE" && r.Mode != "COMPLIANCE"))) {
+			bypass(caller, f, input.Key, v, input.BypassGovernanceRetention)
+		}
+		v.mode = r.Mode
+		v.until = r.RetainUntilDate ?? 0
+		retag(f, v)
+		return new api.PutObjectRetentionOutput()
+	}
+
+	getObjectRetention(caller: Caller,
+		input: api.GetObjectRetentionRequest): api.GetObjectRetentionOutput throws Fault {
+		caller.actions = ["s3:GetObjectRetention"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		locking(f)
+		const v = object(f, input.Key, input.VersionId)
+		if (v.mode == null) {
+			throw unlocked()
+		}
+		this.typed = ""
+		return { ...new api.GetObjectRetentionOutput(),
+			Retention: { ...new api.ObjectLockRetention(), Mode: v.mode, RetainUntilDate: v.until } }
+	}
+
+	putObjectLegalHold(caller: Caller,
+		input: api.PutObjectLegalHoldRequest): api.PutObjectLegalHoldOutput throws Fault {
+		caller.actions = ["s3:PutObjectLegalHold"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		locking(f)
+		const v = object(f, input.Key, input.VersionId)
+		const s = input.LegalHold?.Status
+		if (s != "ON" && s != "OFF") {
+			throw new Fault(400, "MalformedXML",
+				"The XML you provided was not well-formed or did not validate against our published schema")
+		}
+		v.hold = s
+		retag(f, v)
+		this.versionId = versionOf(f.bucket, v)
+		return new api.PutObjectLegalHoldOutput()
+	}
+
+	getObjectLegalHold(caller: Caller,
+		input: api.GetObjectLegalHoldRequest): api.GetObjectLegalHoldOutput throws Fault {
+		caller.actions = ["s3:GetObjectLegalHold"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		locking(f)
+		const v = object(f, input.Key, input.VersionId)
+		if (v.hold == null) {
+			throw unlocked()
+		}
+		this.typed = ""
+		return { ...new api.GetObjectLegalHoldOutput(),
+			LegalHold: { ...new api.ObjectLockLegalHold(), Status: v.hold } }
+	}
+
 	putBucketTagging(caller: Caller, input: api.PutBucketTaggingRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketTagging"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
@@ -1114,6 +1247,10 @@ export function serve(h: Handler, caller: Caller, req: Request): Response throws
 		}
 	}
 	h.typed = null
+	if (h.versionId != null && res!.status < 300) {
+		res!.headers.set("x-amz-version-id", h.versionId!)
+	}
+	h.versionId = null
 	if (region != null && res!.status != 404) {
 		res!.headers.set("x-amz-bucket-region", region!)
 	}
@@ -1201,6 +1338,36 @@ function screen(req: Request) throws Fault | IoError {
 			} catch (e: ParseError) {
 				req.headers.delete(h)
 			}
+		}
+	}
+	if (req.method == "PUT" && (q.has("publicAccessBlock") || q.has("encryption"))) {
+		req.body = new Body(flagged(body))
+	}
+}
+
+/// The flags of a configuration as S3 reads them.
+const flags = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets", "BucketKeyEnabled"]
+
+/// body, a configuration, with each flag's text true or false as S3 reads it: true if it is true in any case or 1,
+/// trimmed, else false; body as it is if it is no XML.
+function flagged(body: string): string {
+	try {
+		const doc = xml.parse(body)
+		setFlags(doc)
+		return xml.serialize(doc)
+	} catch (e: ParseError) {
+		return body
+	}
+}
+
+/// Sets the text of each flag below n as S3 reads it.
+function setFlags(n: xml.Node): void {
+	for (const c of n.children) {
+		if (c.kind == "element" && flags.includes(c.name)) {
+			const v = lower(trim(c.children.filter(t => t.kind == "text").map(t => t.data).join("")))
+			c.children = [new xml.Node("text", "", if (v == "true" || v == "1") "true" else "false")]
+		} else {
+			setFlags(c)
 		}
 	}
 }
@@ -1369,11 +1536,19 @@ function malformed(id: string) throws Fault {
 
 /// Deletes key's version id, or the key itself if null: by a delete marker in a versioned bucket. Its version id, if
 /// the bucket is versioned, and whether it is, or was, a delete marker.
-function remove(caller: Caller, f: Found, key: string, id: string | null): [string | null, bool] throws Fault {
+function remove(caller: Caller, f: Found, key: string, id: string | null,
+	bypassing: bool | null): [string | null, bool] throws Fault {
 	const b = f.bucket
 	if (id != null) {
 		for (const [k, v] of f.db.versions.scan(null, 100000, `${path(b.name, key)}\x00`)) {
 			if (v.id == id!) {
+				const why = "Access Denied because object protected by object lock."
+				if (v.hold == "ON") {
+					throw new Fault(403, "AccessDenied", why)
+				}
+				if (v.mode != null && v.until > now()) {
+					bypass(caller, f, key, v, bypassing, why)
+				}
 				drop(f.db, f.db.versions, "s3/versions", k)
 				restore(f.db, b.name, key)
 				return [id, v.marker]
@@ -1390,6 +1565,23 @@ function remove(caller: Caller, f: Found, key: string, id: string | null): [stri
 	const marker = { ...new Version(), key: key, marker: true }
 	write(caller, f, marker, "")
 	return [marker.id, true]
+}
+
+/// Throws AccessDenied, saying why, unless the retention of v, key's version, is GOVERNANCE, bypassing it is asked
+/// and the caller may.
+function bypass(caller: Caller, f: Found, key: string, v: Version, bypassing: bool | null,
+	why: string = "Access Denied"): void throws Fault {
+	if (v.mode == "COMPLIANCE" || bypassing != true) {
+		throw new Fault(403, "AccessDenied", why)
+	}
+	caller.actions = ["s3:BypassGovernanceRetention"]
+	authorize(caller, f.bucket, arn(f.bucket.name, key))
+}
+
+/// S3's answer for a version of no retention or legal hold.
+function unlocked(): Fault {
+	return new Fault(404, "NoSuchObjectLockConfiguration",
+		"The specified object does not have a ObjectLock configuration")
 }
 
 /// The upload id of key in bucket, ended or not, and its key of the uploads; null if none.
