@@ -1,0 +1,549 @@
+//! Event patterns: their validation, faults in EventBridge's words but for where in the pattern the fault is, and
+//! matching by the content-filtering language. Letters are compared ignoring case in ASCII only.
+
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { backslash, isDigit, lbrace, lbracket, minus, quote, star } from "std/ascii"
+import * as std from "std/encoding/json"
+import { lower, ParseError, parseInt, split } from "std/string"
+import { Fault } from "../../core/fault"
+import { invalidEventPatternException } from "./api"
+
+export function validate(p: string) throws Fault {
+	let top: std.Unknown[] = []
+	try {
+		top = std.decode[std.Keys](p).all
+	} catch (e: ParseError) {
+		const lead = p.slice(0, 1)
+		throw invalid(if (lead == "{" || lead == "") "Malformed JSON" else "Filter is not an object")
+	}
+	object(top)
+}
+
+export function matches(p: string, event: string): bool { return fits(members(p), event) }
+
+function invalid(why: string): Fault {
+	return invalidEventPatternException(`Event pattern is not valid. Reason: ${why}`)
+}
+
+function object(fs: std.Unknown[]): void throws Fault {
+	if (fs.length == 0) {
+		throw invalid("Empty objects are not allowed")
+	}
+	for (const [k, v] of fs) {
+		if (k == "$or") {
+			or(v.text)
+		} else if (v.text.length > 0 && v.text[0] == lbrace) {
+			object(members(v.text))
+		} else if (v.text.length > 0 && v.text[0] == lbracket) {
+			matchers(v.text)
+		} else {
+			throw invalid(`"${k}" must be an object or an array`)
+		}
+	}
+}
+
+function or(v: string): void throws Fault {
+	if (v.length == 0 || v[0] != lbracket) {
+		throw invalid("It must be an Array followed with $or.")
+	}
+	const alternatives = list(v)
+	for (const a of alternatives) {
+		if (a[0] != lbrace) {
+			throw invalid("Only JSON object is allowed in array of $or relationship.")
+		}
+		object(members(a))
+	}
+	if (alternatives.length < 2) {
+		throw invalid("There must have at least 2 Objects in $or relationship.")
+	}
+}
+
+function matchers(v: string): void throws Fault {
+	const ms = list(v)
+	if (ms.length == 0) {
+		throw invalid("Empty arrays are not allowed")
+	}
+	for (const m of ms) {
+		if (m[0] == lbracket) {
+			throw invalid("Match value must be String, number, true, false, or null")
+		}
+		if (m[0] == lbrace) {
+			expression(members(m))
+		}
+	}
+}
+
+function expression(fs: std.Unknown[]): void throws Fault {
+	if (fs.length == 0) {
+		throw invalid("Match expression name not found")
+	}
+	const [k, v] = fs[0]
+	switch (k) {
+		case "prefix", "suffix": affix(k, v.text)
+		case "equals-ignore-case": text(v.text, "equals-ignore-case match pattern must be a string")
+		case "wildcard": wildcard(v.text)
+		case "anything-but": anythingBut(v.text)
+		case "numeric": numeric(v.text)
+		case "cidr": cidr(v.text)
+		case "exists": if (v.text != "true" && v.text != "false") {
+			throw invalid("exists match pattern must be either true or false.")
+		}
+		default: throw invalid(`Unrecognized match type ${k}`)
+	}
+	if (fs.length > 1) {
+		throw invalid("Only one key allowed in match expression")
+	}
+}
+
+function text(v: string, why: string): string throws Fault {
+	const s = str(v)
+	if (s == null) {
+		throw invalid(why)
+	}
+	return s
+}
+
+function affix(k: string, v: string) throws Fault {
+	if (v[0] != lbrace) {
+		text(v, `${k} match pattern must be a string`)
+		return
+	}
+	const fs = members(v)
+	if (fs.length == 0 || fs[0][0] != "equals-ignore-case") {
+		throw invalid(`Unsupported ${k} pattern: ${if (fs.length == 0) "" else fs[0][0]}`)
+	}
+	text(fs[0][1].text, "equals-ignore-case match pattern must be a string")
+}
+
+/// Validates a wildcard: * matches any characters, \* a star and \\ a backslash.
+function wildcard(v: string) throws Fault {
+	const s = text(v, "wildcard match pattern must be a string")
+	let starred = false
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == backslash) {
+			if (i + 1 == s.length || s[i + 1] != star && s[i + 1] != backslash) {
+				throw invalid(`Invalid escape character at pos ${i + 1}`)
+			}
+			i++
+			starred = false
+		} else if (s[i] == star) {
+			if (starred) {
+				throw invalid(`Consecutive wildcard characters at pos ${i}`)
+			}
+			starred = true
+		} else {
+			starred = false
+		}
+	}
+}
+
+function anythingBut(v: string) throws Fault {
+	if (v[0] == lbracket) {
+		const xs = list(v)
+		if (xs.some(x => x[0] != quote && !numeral(x))) {
+			throw invalid("Inside anything but list, start|null|boolean is not supported.")
+		}
+		if (xs.length == 0 || xs.some(x => (x[0] == quote) != (xs[0][0] == quote))) {
+			throw invalid("Inside anything but list, either all values are number or string, mixed type is not supported")
+		}
+		return
+	}
+	if (v[0] != lbrace) {
+		if (v[0] != quote && !numeral(v)) {
+			throw invalid("Value of anything-but must be an array or single string/number value.")
+		}
+		return
+	}
+	const fs = members(v)
+	if (fs.length == 0) {
+		throw invalid("Anything-But expression name not found")
+	}
+	const [k, w] = fs[0]
+	const xs = if (w.text[0] == lbracket) list(w.text) else [w.text]
+	switch (k) {
+		case "prefix", "suffix": for (const x of xs) {
+			text(x, "prefix/suffix match pattern must be a string")
+		}
+		case "wildcard": for (const x of xs) {
+			wildcard(x)
+		}
+		case "equals-ignore-case": for (const x of xs) {
+			if (x[0] != quote) {
+				throw invalid(if (w.text[0] == lbracket) "Inside anything-but/equals-ignore-case list, number|start|null|boolean is not supported."
+					else "equals-ignore-case match pattern must be a string")
+			}
+		}
+		default: throw invalid(`Unsupported anything-but pattern: ${k}`)
+	}
+	if (fs.length > 1) {
+		throw invalid("Too many elements in numeric expression")
+	}
+}
+
+function numeric(v: string) throws Fault {
+	if (v[0] != lbracket) {
+		throw invalid("Value of numeric must be an array.")
+	}
+	const xs = list(v)
+	const first = operator(xs, 0)
+	const low = bound(xs, 0, first)
+	if (xs.length == 2) {
+		return
+	}
+	if (first == "=" || first == "<" || first == "<=") {
+		throw invalid("Too many elements in numeric expression")
+	}
+	const second = operator(xs, 2)
+	if (second != "<" && second != "<=") {
+		throw invalid(`Bad numeric range operator: ${second}`)
+	}
+	if (bound(xs, 2, second) <= low) {
+		throw invalid("Bottom must be less than top")
+	}
+	if (xs.length > 4) {
+		throw invalid("Too many terms in numeric range expression")
+	}
+}
+
+function operator(xs: string[], i: i32): string throws Fault {
+	const op = if (i < xs.length) str(xs[i]) else null
+	if (op == null) {
+		throw invalid(`Invalid member in numeric match: ${if (i < xs.length) xs[i] else "]"}`)
+	}
+	if (op != "=" && op != "<" && op != "<=" && op != ">" && op != ">=") {
+		throw invalid(`Unrecognized numeric range operator: ${op}`)
+	}
+	return op
+}
+
+function bound(xs: string[], i: i32, op: string): f64 throws Fault {
+	const n = if (i + 1 < xs.length) number(xs[i + 1]) else null
+	if (n == null) {
+		throw invalid(`Value of ${if (op == "=") "equals" else op} must be numeric`)
+	}
+	return n
+}
+
+function cidr(v: string) throws Fault {
+	const s = text(v, "prefix match pattern must be a string")
+	const parts = split(s, "/")
+	if (parts.length != 2) {
+		throw invalid("Malformed CIDR, one '/' required")
+	}
+	const ip = parts[0]
+	const v6 = indexOf(ip, ":") >= 0
+	if (v6) {
+		if (address(ip) == null) {
+			throw invalid(`Invalid IP address: ${ip}`)
+		}
+	} else {
+		const octets = split(ip, ".")
+		if (octets.length != 4) {
+			throw invalid(`Nonstandard IP address: ${ip}`)
+		}
+		if (address(ip) == null) {
+			throw invalid(`Invalid IP address: ${ip}`)
+		}
+	}
+	const bits = digits(parts[1])
+	if (v6 && (bits == null || bits! >= 128)) {
+		throw invalid("IPv6 mask bits must be < 128")
+	}
+	if (!v6 && (bits == null || bits! >= 32)) {
+		throw invalid("IPv4 mask bits must be < 32")
+	}
+}
+
+/// Whether the event's members fit the pattern's members fs; an array in the event matches where any of its items does.
+function fits(fs: std.Unknown[], event: string): bool {
+	const at = members(event)
+	for (const [k, v] of fs) {
+		if (k == "$or") {
+			if (!list(v.text).some(o => fits(members(o), event))) {
+				return false
+			}
+			continue
+		}
+		const found = at.find(e => e[0] == k)
+		const values = if (found == null) []
+			else if (found[1].text[0] == lbracket) list(found[1].text)
+			else [found[1].text]
+		if (v.text[0] == lbrace) {
+			const objects = values.filter(x => x[0] == lbrace)
+			const sub = members(v.text)
+			if (if (objects.length == 0) !fits(sub, "{}") else !objects.some(o => fits(sub, o))) {
+				return false
+			}
+			continue
+		}
+		const scalars = values.filter(x => x[0] != lbrace && x[0] != lbracket)
+		if (!list(v.text).some(m => test(m, scalars))) {
+			return false
+		}
+	}
+	return true
+}
+
+function test(m: string, xs: string[]): bool {
+	if (m[0] != lbrace) {
+		return xs.some(x => same(m, x))
+	}
+	const [k, w] = members(m)[0]
+	switch (k) {
+		case "prefix": return xs.some(x => affixed(w.text, x, (s, a) => startsWith(s, a)))
+		case "suffix": return xs.some(x => affixed(w.text, x, (s, a) => endsWith(s, a)))
+		case "equals-ignore-case": return xs.some(x => folded(x) == folded(w.text))
+		case "wildcard": return xs.some(x => wild(str(w.text) ?? "", x))
+		case "exists": return (w.text == "true") == (xs.length > 0)
+		case "numeric": return xs.some(x => inRange(list(w.text), x))
+		case "cidr": return xs.some(x => within(str(w.text) ?? "", x))
+		default: return xs.some(x => !excluded(w.text, x)) // anything-but
+	}
+}
+
+function affixed(w: string, x: string, has: (s: string, affix: string) => bool): bool {
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	if (w[0] != lbrace) {
+		return has(s, str(w) ?? "")
+	}
+	return has(lower(s), lower(str(members(w)[0][1].text) ?? ""))
+}
+
+function excluded(w: string, x: string): bool {
+	if (w[0] == lbracket) {
+		return list(w).some(y => same(y, x))
+	}
+	if (w[0] != lbrace) {
+		return same(w, x)
+	}
+	const [k, v] = members(w)[0]
+	const ys = if (v.text[0] == lbracket) list(v.text) else [v.text]
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	switch (k) {
+		case "prefix": return ys.some(y => startsWith(s, str(y) ?? ""))
+		case "suffix": return ys.some(y => endsWith(s, str(y) ?? ""))
+		case "wildcard": return ys.some(y => wild(str(y) ?? "", x))
+		default: return ys.some(y => folded(y) == lower(s)) // equals-ignore-case
+	}
+}
+
+/// Whether the scalars a and b are the same value: strings by their text, numbers by their value.
+function same(a: string, b: string): bool {
+	if (numeral(a) && numeral(b)) {
+		return number(a) == number(b)
+	}
+	if (a[0] == quote && b[0] == quote) {
+		return str(a) == str(b)
+	}
+	return a == b
+}
+
+function folded(x: string): string | null {
+	const s = str(x)
+	return if (s == null) null else lower(s)
+}
+
+function wild(p: string, x: string): bool {
+	const s = str(x)
+	if (s == null) {
+		return false
+	}
+	const pieces: string[] = [""]
+	for (let i = 0; i < p.length; i++) {
+		if (p[i] == backslash && i + 1 < p.length) {
+			i++
+			pieces[pieces.length - 1] += p.slice(i, i + 1)
+		} else if (p[i] == star) {
+			pieces.push("")
+		} else {
+			pieces[pieces.length - 1] += p.slice(i, i + 1)
+		}
+	}
+	const head = pieces[0]
+	if (pieces.length == 1) {
+		return s == head
+	}
+	const tail = pieces[pieces.length - 1]
+	if (s.length < head.length + tail.length || !startsWith(s, head) || !endsWith(s, tail)) {
+		return false
+	}
+	let at = head.length
+	const end = s.length - tail.length
+	for (const piece of pieces.slice(1, pieces.length - 1)) {
+		const i = indexOf(s.slice(0, end), piece, at)
+		if (i < 0) {
+			return false
+		}
+		at = i + piece.length
+	}
+	return true
+}
+
+function inRange(xs: string[], x: string): bool {
+	const n = number(x)
+	if (n == null) {
+		return false
+	}
+	for (let i = 0; i + 1 < xs.length; i += 2) {
+		if (!compare(n!, str(xs[i]) ?? "", number(xs[i + 1]) ?? 0.0)) {
+			return false
+		}
+	}
+	return true
+}
+
+function compare(n: f64, op: string, b: f64): bool {
+	switch (op) {
+		case "=": return n == b
+		case "<": return n < b
+		case "<=": return n <= b
+		case ">": return n > b
+		default: return n >= b
+	}
+}
+
+function within(c: string, x: string): bool {
+	const s = str(x)
+	const parts = split(c, "/")
+	const ip = if (s == null) null else address(s)
+	const net = address(parts[0])
+	const bits = digits(parts[1])
+	if (ip == null || net == null || bits == null || ip.length != net.length) {
+		return false
+	}
+	for (let i = 0; i < bits!; i++) {
+		const mask = (128 >> (i % 8)) as u8
+		if ((ip[i / 8] & mask) != (net[i / 8] & mask)) {
+			return false
+		}
+	}
+	return true
+}
+
+export function address(s: string): u8[] | null {
+	if (indexOf(s, ":") < 0) {
+		const octets = split(s, ".")
+		if (octets.length != 4) {
+			return null
+		}
+		const out: u8[] = []
+		for (const o of octets) {
+			const n = digits(o)
+			if (n == null || n! > 255) {
+				return null
+			}
+			out.push(n! as u8)
+		}
+		return out
+	}
+	const halves = split(s, "::")
+	if (halves.length > 2) {
+		return null
+	}
+	const head = groups(halves[0])
+	const tail = if (halves.length == 2) groups(halves[1]) else []
+	if (head == null || tail == null) {
+		return null
+	}
+	const missing = 8 - head.length - tail.length
+	if (missing < 0 || halves.length == 1 && missing != 0 || halves.length == 2 && missing == 0) {
+		return null
+	}
+	const all: i32[] = []
+	all.append(head)
+	for (let i = 0; i < missing; i++) {
+		all.push(0)
+	}
+	all.append(tail)
+	const out: u8[] = []
+	for (const g of all) {
+		out.push((g >> 8) as u8)
+		out.push((g & 255) as u8)
+	}
+	return out
+}
+
+function groups(s: string): i32[] | null {
+	if (s == "") {
+		return []
+	}
+	const out: i32[] = []
+	for (const g of split(s, ":")) {
+		if (g.length < 1 || g.length > 4) {
+			return null
+		}
+		try {
+			out.push(parseInt(g, 16))
+		} catch (e: ParseError) {
+			return null
+		}
+	}
+	return out
+}
+
+function digits(s: string): i32 | null {
+	if (s.length < 1 || s.length > 9 || !s.every(isDigit)) {
+		return null
+	}
+	try {
+		return parseInt(s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function numeral(x: string): bool { return x.length > 0 && (x[0] == minus || isDigit(x[0])) }
+
+function number(x: string): f64 | null {
+	if (!numeral(x)) {
+		return null
+	}
+	try {
+		return std.decode[f64](x)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+export function str(x: string): string | null {
+	if (x.length == 0 || x[0] != quote) {
+		return null
+	}
+	try {
+		return std.decode[string](x)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+export function members(v: string): std.Unknown[] {
+	try {
+		return std.decode[std.Keys](v).all
+	} catch (e: ParseError) {
+		return []
+	}
+}
+
+export function member(v: string, k: string): string | null {
+	for (const [key, x] of members(v)) {
+		if (key == k) {
+			return x.text
+		}
+	}
+	return null
+}
+
+/// The JSON of each item of the JSON array v; none if v is no array.
+export function list(v: string): string[] {
+	try {
+		return std.decode[std.Raw[]](v).map(x => x.text)
+	} catch (e: ParseError) {
+		return []
+	}
+}

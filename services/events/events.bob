@@ -1,0 +1,1501 @@
+//! Amazon EventBridge: event buses and their resource policies, rules, targets, archives and replays. PutEvents
+//! delivers within the request by calling the other services' handlers directly, as a session of the target's role or
+//! as their policies allow EventBridge; a delivery the target refuses goes to its dead-letter queue, or is dropped.
+//! The events of AWS's own services, as S3's, are put on the default bus by emit, unauthorized. Where AWS differs:
+//!
+//! - Targets other than SQS, SNS, Kinesis, Firehose, Step Functions, Logs and buses are stored but sent nothing.
+//!   Connections and API destinations are state only, always AUTHORIZED and ACTIVE; no HTTP is sent, no secret kept.
+//! - A log event is stamped with the time of delivery, not the event's time.
+//! - There are no timers: delivery is never retried, schedules never fire, and archives keep events past retention.
+//! - A replay is done within StartReplay's request, COMPLETED when described, and so can never be cancelled.
+//! - Partner event sources, endpoints, Pipes and Scheduler are not implemented.
+
+import { Archive, busArn, Bus, Connection, Destination, Replay, ruleArn, Rule, Tables, Target, within } from "./records"
+import * as api from "./api"
+import { list, matches, member, members, str, validate } from "./pattern"
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { uuid } from "../../core/random"
+import { result } from "../../core/protocol/json"
+import * as json from "../../core/protocol/json"
+import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as firehoseApi from "../firehose/api"
+import * as kinesisApi from "../kinesis/api"
+import * as logsApi from "../logs/api"
+import * as snsApi from "../sns/api"
+import * as sqsApi from "../sqs/api"
+import { actAs, passRole } from "../sts/sts"
+import * as sfnApi from "../stepfunctions/api"
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { isDigit, lbrace, lbracket } from "std/ascii"
+import * as std from "std/encoding/json"
+import { ParseError, parseInt, split } from "std/string"
+import { millisecond, rfc3339, second } from "std/time"
+import { Decodable } from "std/types"
+
+const principal = "events.amazonaws.com"
+const exceeded = "The requested resource exceeds the maximum number allowed."
+
+export class Handler {
+	...api.Unimplemented
+
+	sqs: sqsApi.SQS
+	sns: snsApi.SNS
+	kinesis: kinesisApi.Kinesis | null = null
+	firehose: firehoseApi.Firehose | null = null
+	logs: logsApi.CloudWatchLogs | null = null
+	states: sfnApi.SFN | null = null
+
+	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS) {
+		this.sqs = sqs
+		this.sns = sns
+	}
+
+	createEventBus(caller: Caller, input: api.CreateEventBusRequest): api.CreateEventBusResponse throws Fault {
+		const arn = busArn(caller.region, caller.account, input.Name)
+		const tags = tagged([], input.Tags ?? [])
+		// TagResource is authorized only of a bus made with tags.
+		caller.actions = if (tags.length == 0) ["events:CreateEventBus"]
+			else ["events:CreateEventBus", "events:TagResource"]
+		caller.allow(arn, null, requestTags(tags))
+		if (input.EventSourceName != null) {
+			throw api.resourceNotFoundException(`Event source ${input.EventSourceName} does not exist.`)
+		}
+		if (indexOf(input.Name, "/") >= 0) {
+			throw validation("Event bus name must not contain '/'.")
+		}
+		const db = tables(caller)
+		if (db.buses.get(input.Name) != null) {
+			throw api.resourceAlreadyExistsException(`Event bus ${input.Name} already exists.`)
+		}
+		const b = new Bus()
+		b.name = input.Name
+		b.description = input.Description
+		b.created = now()
+		b.modified = b.created
+		b.tags = tags
+		db.buses.put(b.name, b)
+		const r = new api.CreateEventBusResponse()
+		r.EventBusArn = arn
+		r.Description = b.description
+		return r
+	}
+
+	deleteEventBus(caller: Caller, input: api.DeleteEventBusRequest): Unit throws Fault {
+		caller.allow(busArn(caller.region, caller.account, input.Name))
+		if (input.Name == "default") {
+			throw validation("Cannot delete event bus default.")
+		}
+		const db = tables(caller)
+		for (const [k, _] of all(db.rules, within(input.Name, ""))) {
+			db.rules.delete(k)
+		}
+		for (const [k, _] of all(db.targets, within(input.Name, ""))) {
+			db.targets.delete(k)
+		}
+		db.buses.delete(input.Name)
+		return new Unit()
+	}
+
+	describeEventBus(caller: Caller, input: api.DescribeEventBusRequest): api.DescribeEventBusResponse throws Fault {
+		const name = busName(caller, input.Name)
+		caller.allow(busArn(caller.region, caller.account, name))
+		const b = bus(tables(caller), name)
+		const r = new api.DescribeEventBusResponse()
+		r.Name = b.name
+		r.Arn = busArn(caller.region, caller.account, b.name)
+		r.Description = b.description
+		r.Policy = b.policy
+		r.CreationTime = b.created
+		r.LastModifiedTime = b.modified
+		return r
+	}
+
+	listEventBuses(caller: Caller, input: api.ListEventBusesRequest): api.ListEventBusesResponse throws Fault {
+		caller.allow(busArn(caller.region, caller.account, "*"))
+		const buses = all(tables(caller).buses, input.NamePrefix ?? "").map(e => e[1])
+		const [page, next] = part(buses, input.NextToken, input.Limit)
+		const r = new api.ListEventBusesResponse()
+		r.EventBuses = page.map(b => {
+			const w = new api.EventBus()
+			w.Name = b.name
+			w.Arn = busArn(caller.region, caller.account, b.name)
+			w.Description = b.description
+			w.Policy = b.policy
+			w.CreationTime = b.created
+			w.LastModifiedTime = b.modified
+			return w
+		})
+		r.NextToken = next
+		return r
+	}
+
+	putPermission(caller: Caller, input: api.PutPermissionRequest): Unit throws Fault {
+		caller.allow(busArn(caller.region, caller.account, input.EventBusName ?? "default"))
+		const db = tables(caller)
+		const b = bus(db, input.EventBusName ?? "default")
+		const arn = busArn(caller.region, caller.account, b.name)
+		if (input.Policy != null) {
+			try {
+				auth.parse(input.Policy!, "resource")
+			} catch (f: Fault) {
+				throw validation("Parameter Policy is not valid.")
+			}
+			b.policy = input.Policy
+		} else {
+			if (input.Action == null || input.Principal == null || input.StatementId == null) {
+				throw validation("Parameter(s) Action, Principal and StatementId must be specified.")
+			}
+			const sid = input.StatementId!
+			const statements = statementsOf(b.policy)
+			if (statements.some(s => sidOf(s) == sid)) {
+				throw api.resourceAlreadyExistsException("Statement with the provided id already exists.")
+			}
+			const who = if (input.Principal == "*") `"*"`
+				else `{"AWS":${std.quoted(`arn:aws:iam::${input.Principal}:root`)}}`
+			const c = input.Condition
+			const condition = if (c == null) ""
+				else `,"Condition":{${std.quoted(c.Type)}:{${std.quoted(c.Key)}:${std.quoted(c.Value)}}}`
+			statements.push(`{"Sid":${std.quoted(sid)},"Effect":"Allow","Principal":${who},`
+				+ `"Action":${std.quoted(input.Action!)},"Resource":${std.quoted(arn)}${condition}}`)
+			b.policy = policyOf(statements)
+		}
+		b.modified = now()
+		db.buses.put(b.name, b)
+		return new Unit()
+	}
+
+	removePermission(caller: Caller, input: api.RemovePermissionRequest): Unit throws Fault {
+		caller.allow(busArn(caller.region, caller.account, input.EventBusName ?? "default"))
+		const db = tables(caller)
+		const b = bus(db, input.EventBusName ?? "default")
+		if (input.RemoveAllPermissions) {
+			b.policy = null
+		} else {
+			if (input.StatementId == null) {
+				throw validation("Parameter StatementId must be specified.")
+			}
+			if (b.policy == null) {
+				throw api.resourceNotFoundException("EventBus does not have a policy.")
+			}
+			const statements = statementsOf(b.policy)
+			const kept = statements.filter(s => sidOf(s) != input.StatementId)
+			if (kept.length == statements.length) {
+				throw api.resourceNotFoundException("Statement with the provided id does not exist.")
+			}
+			b.policy = if (kept.length == 0) null else policyOf(kept)
+		}
+		b.modified = now()
+		db.buses.put(b.name, b)
+		return new Unit()
+	}
+
+	putRule(caller: Caller, input: api.PutRuleRequest): api.PutRuleResponse throws Fault {
+		if (input.EventPattern != null) {
+			validate(input.EventPattern!)
+		}
+		const name = busName(caller, input.EventBusName)
+		const r = new Rule()
+		r.name = input.Name
+		r.bus = name
+		const arn = ruleArn(caller.region, caller.account, r)
+		const tags = tagged([], input.Tags ?? [])
+		// TagResource is authorized of a rule made with tags.
+		caller.actions = if (tags.length == 0) ["events:PutRule"] else ["events:PutRule", "events:TagResource"]
+		const context = requestTags(tags)
+		if (input.RoleArn != null) {
+			passRole(caller, input.RoleArn!, principal)
+		}
+		if (input.EventPattern != null) {
+			const source = member(input.EventPattern!, "source")
+			const detailType = member(input.EventPattern!, "detail-type")
+			if (source != null) {
+				context.push(["events:source", texts(source!)])
+			}
+			if (detailType != null) {
+				context.push(["events:detail-type", texts(detailType!)])
+			}
+		}
+		caller.allow(arn, null, context)
+		const db = tables(caller)
+		bus(db, name)
+		if (input.EventPattern == null && input.ScheduleExpression == null) {
+			throw validation("Parameter(s) EventPattern or ScheduleExpression must be specified.")
+		}
+		if (input.ScheduleExpression != null) {
+			if (name != "default") {
+				throw validation("ScheduleExpression is supported only on the default event bus.")
+			}
+			if (!schedule(input.ScheduleExpression!)) {
+				throw validation("Parameter ScheduleExpression is not valid.")
+			}
+		}
+		const k = within(name, input.Name)
+		const was = db.rules.get(k)
+		// Tags are those the rule was made with: AWS ignores those of an update.
+		r.tags = if (was == null) tagged([], input.Tags ?? []) else was.tags
+		r.pattern = input.EventPattern
+		r.schedule = input.ScheduleExpression
+		r.state = input.State ?? "ENABLED"
+		r.description = input.Description
+		r.role = input.RoleArn
+		db.rules.put(k, r)
+		const out = new api.PutRuleResponse()
+		out.RuleArn = arn
+		return out
+	}
+
+	describeRule(caller: Caller, input: api.DescribeRuleRequest): api.DescribeRuleResponse throws Fault {
+		const r = allowed(caller, input.Name, input.EventBusName)
+		const w = new api.DescribeRuleResponse()
+		w.Name = r.name
+		w.Arn = ruleArn(caller.region, caller.account, r)
+		w.EventPattern = r.pattern
+		w.ScheduleExpression = r.schedule
+		w.State = stateOf(r.state)
+		w.Description = r.description
+		w.RoleArn = r.role
+		w.EventBusName = r.bus
+		w.CreatedBy = caller.account
+		return w
+	}
+
+	listRules(caller: Caller, input: api.ListRulesRequest): api.ListRulesResponse throws Fault {
+		const name = busName(caller, input.EventBusName)
+		caller.allow(rules(caller, name))
+		const db = tables(caller)
+		const b = bus(db, name)
+		const rules = all(db.rules, within(b.name, input.NamePrefix ?? "")).map(e => e[1])
+		const [page, next] = part(rules, input.NextToken, input.Limit)
+		const out = new api.ListRulesResponse()
+		out.Rules = page.map(r => {
+			const w = new api.Rule()
+			w.Name = r.name
+			w.Arn = ruleArn(caller.region, caller.account, r)
+			w.EventPattern = r.pattern
+			w.State = stateOf(r.state)
+			w.Description = r.description
+			w.ScheduleExpression = r.schedule
+			w.RoleArn = r.role
+			w.EventBusName = r.bus
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	deleteRule(caller: Caller, input: api.DeleteRuleRequest): Unit throws Fault {
+		const name = busName(caller, input.EventBusName)
+		const r = new Rule()
+		r.name = input.Name
+		r.bus = name
+		caller.allow(ruleArn(caller.region, caller.account, r))
+		const db = tables(caller)
+		const k = within(name, input.Name)
+		if (db.rules.get(k) == null) {
+			return new Unit()
+		}
+		// Force lets only a managed rule's owner delete it, and no rule here is managed.
+		if (all(db.targets, within(k, "")).length > 0) {
+			throw validation("Rule can't be deleted since it has targets.")
+		}
+		db.rules.delete(k)
+		return new Unit()
+	}
+
+	enableRule(caller: Caller, input: api.EnableRuleRequest): Unit throws Fault {
+		return setState(caller, input.Name, input.EventBusName, "ENABLED")
+	}
+
+	disableRule(caller: Caller, input: api.DisableRuleRequest): Unit throws Fault {
+		return setState(caller, input.Name, input.EventBusName, "DISABLED")
+	}
+
+	listRuleNamesByTarget(caller: Caller,
+		input: api.ListRuleNamesByTargetRequest): api.ListRuleNamesByTargetResponse throws Fault {
+		const name = busName(caller, input.EventBusName)
+		caller.allow(rules(caller, name))
+		const db = tables(caller)
+		const b = bus(db, name)
+		const names: string[] = []
+		for (const [k, t] of all(db.targets, within(b.name, ""))) {
+			const rule = split(k, "\x00")[1]
+			if (t.arn == input.TargetArn && (names.length == 0 || names[names.length - 1] != rule)) {
+				names.push(rule)
+			}
+		}
+		const [page, next] = part(names, input.NextToken, input.Limit)
+		const out = new api.ListRuleNamesByTargetResponse()
+		out.RuleNames = page
+		out.NextToken = next
+		return out
+	}
+
+	putTargets(caller: Caller, input: api.PutTargetsRequest): api.PutTargetsResponse throws Fault {
+		caller.actions = ["events:PutTargets"]
+		const r = allowed(caller, input.Rule, input.EventBusName, [["events:TargetArn", input.Targets.map(t => t.Arn)]])
+		for (const t of input.Targets) {
+			if (t.RoleArn != null) {
+				passRole(caller, t.RoleArn!, principal)
+			}
+		}
+		const db = tables(caller)
+		const k = within(r.bus, r.name)
+		const ids = all(db.targets, within(k, "")).map(e => e[1].id)
+		for (const t of input.Targets) {
+			checkTarget(t)
+			if (!ids.some(id => id == t.Id)) {
+				ids.push(t.Id)
+			}
+		}
+		if (ids.length > 5) {
+			throw api.limitExceededException(exceeded)
+		}
+		for (const t of input.Targets) {
+			const rec = new Target()
+			rec.id = t.Id
+			rec.arn = t.Arn
+			rec.given = result(t)
+			db.targets.put(within(k, t.Id), rec)
+		}
+		const out = new api.PutTargetsResponse()
+		out.FailedEntries = []
+		return out
+	}
+
+	removeTargets(caller: Caller, input: api.RemoveTargetsRequest): api.RemoveTargetsResponse throws Fault {
+		const r = allowed(caller, input.Rule, input.EventBusName)
+		const db = tables(caller)
+		for (const id of input.Ids) {
+			db.targets.delete(within(within(r.bus, r.name), id))
+		}
+		const out = new api.RemoveTargetsResponse()
+		out.FailedEntries = []
+		return out
+	}
+
+	listTargetsByRule(caller: Caller, input: api.ListTargetsByRuleRequest): api.ListTargetsByRuleResponse throws Fault {
+		const r = allowed(caller, input.Rule, input.EventBusName)
+		const targets = all(tables(caller).targets, within(within(r.bus, r.name), "")).map(e => e[1])
+		const [page, next] = part(targets, input.NextToken, input.Limit)
+		const out = new api.ListTargetsByRuleResponse()
+		out.Targets = page.map(t => given(t))
+		out.NextToken = next
+		return out
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): api.TagResourceResponse throws Fault {
+		caller.allow(input.ResourceARN)
+		retag(caller, input.ResourceARN, tags => tagged(tags, input.Tags))
+		return new api.TagResourceResponse()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): api.UntagResourceResponse throws Fault {
+		caller.allow(input.ResourceARN)
+		retag(caller, input.ResourceARN, tags => tags.filter(t => !input.TagKeys.some(k => k == t[0])))
+		return new api.UntagResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		caller.allow(input.ResourceARN)
+		let tags: [string, string][] = []
+		retag(caller, input.ResourceARN, t => {
+			tags = t
+			return t
+		})
+		const out = new api.ListTagsForResourceResponse()
+		out.Tags = tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return out
+	}
+
+	testEventPattern(caller: Caller, input: api.TestEventPatternRequest): api.TestEventPatternResponse throws Fault {
+		validate(input.EventPattern)
+		caller.allow("*")
+		const fields = members(input.Event)
+		for (const f of ["id", "account", "source", "time", "region", "resources", "detail-type"]) {
+			if (!fields.some(e => e[0] == f)) {
+				throw validation("Parameter Event is not valid.")
+			}
+		}
+		const out = new api.TestEventPatternResponse()
+		out.Result = matches(input.EventPattern, input.Event)
+		return out
+	}
+
+	createArchive(caller: Caller, input: api.CreateArchiveRequest): api.CreateArchiveResponse throws Fault {
+		const arn = archiveArn(caller, input.ArchiveName)
+		caller.allow(arn)
+		if (input.EventPattern != null) {
+			validate(input.EventPattern!)
+		}
+		const db = tables(caller)
+		const name = busName(caller, input.EventSourceArn)
+		bus(db, name)
+		if (db.archives.get(input.ArchiveName) != null) {
+			throw api.resourceAlreadyExistsException(`Archive ${input.ArchiveName} already exists.`)
+		}
+		const a = new Archive()
+		a.name = input.ArchiveName
+		a.bus = name
+		a.description = input.Description
+		a.pattern = input.EventPattern
+		a.retention = input.RetentionDays ?? 0
+		a.created = now()
+		db.archives.put(a.name, a)
+		const out = new api.CreateArchiveResponse()
+		out.ArchiveArn = arn
+		out.State = "ENABLED"
+		out.CreationTime = a.created
+		return out
+	}
+
+	describeArchive(caller: Caller, input: api.DescribeArchiveRequest): api.DescribeArchiveResponse throws Fault {
+		const a = archive(caller, input.ArchiveName)
+		const out = new api.DescribeArchiveResponse()
+		out.ArchiveArn = archiveArn(caller, a.name)
+		out.ArchiveName = a.name
+		out.EventSourceArn = busArn(caller.region, caller.account, a.bus)
+		out.Description = a.description
+		out.EventPattern = a.pattern
+		out.State = "ENABLED"
+		out.RetentionDays = a.retention
+		out.EventCount = a.events.length as i64
+		out.SizeBytes = sizeOf(a)
+		out.CreationTime = a.created
+		return out
+	}
+
+	listArchives(caller: Caller, input: api.ListArchivesRequest): api.ListArchivesResponse throws Fault {
+		caller.allow(archiveArn(caller, "*"))
+		const archives = all(tables(caller).archives, input.NamePrefix ?? "").map(e => e[1]).filter(a => (input.EventSourceArn
+			== null || busArn(caller.region, caller.account, a.bus) == input.EventSourceArn)
+			&& (input.State == null || input.State == "ENABLED"))
+		const [page, next] = part(archives, input.NextToken, input.Limit)
+		const out = new api.ListArchivesResponse()
+		out.Archives = page.map(a => {
+			const w = new api.Archive()
+			w.ArchiveName = a.name
+			w.EventSourceArn = busArn(caller.region, caller.account, a.bus)
+			w.State = "ENABLED"
+			w.RetentionDays = a.retention
+			w.EventCount = a.events.length as i64
+			w.SizeBytes = sizeOf(a)
+			w.CreationTime = a.created
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateArchive(caller: Caller, input: api.UpdateArchiveRequest): api.UpdateArchiveResponse throws Fault {
+		const a = archive(caller, input.ArchiveName)
+		if (input.EventPattern != null) {
+			validate(input.EventPattern!)
+			a.pattern = input.EventPattern
+		}
+		if (input.Description != null) {
+			a.description = input.Description
+		}
+		if (input.RetentionDays != null) {
+			a.retention = input.RetentionDays!
+		}
+		tables(caller).archives.put(a.name, a)
+		const out = new api.UpdateArchiveResponse()
+		out.ArchiveArn = archiveArn(caller, a.name)
+		out.State = "ENABLED"
+		out.CreationTime = a.created
+		return out
+	}
+
+	deleteArchive(caller: Caller, input: api.DeleteArchiveRequest): api.DeleteArchiveResponse throws Fault {
+		archive(caller, input.ArchiveName)
+		tables(caller).archives.delete(input.ArchiveName)
+		return new api.DeleteArchiveResponse()
+	}
+
+	startReplay(caller: Caller, input: api.StartReplayRequest): api.StartReplayResponse throws Fault {
+		caller.allow(replayArn(caller, input.ReplayName))
+		const db = tables(caller)
+		const prefix = archiveArn(caller, "")
+		const a = db.archives.get(if (startsWith(input.EventSourceArn,
+			prefix)) input.EventSourceArn.slice(prefix.length, input.EventSourceArn.length)
+			else "")
+		if (a == null) {
+			throw api.resourceNotFoundException(`Archive ${input.EventSourceArn} does not exist.`)
+		}
+		if (db.replays.get(input.ReplayName) != null) {
+			throw api.resourceAlreadyExistsException(`Replay ${input.ReplayName} already exists.`)
+		}
+		if (input.EventEndTime <= input.EventStartTime) {
+			throw validation("Parameter EventEndTime is not valid. Reason: EventStartTime must be before EventEndTime.")
+		}
+		if (input.Destination.Arn != busArn(caller.region, caller.account, a.bus)) {
+			throw validation("Parameter Destination.Arn is not valid. Reason: Cross event bus replay is not permitted.")
+		}
+		const p = new Replay()
+		p.name = input.ReplayName
+		p.archive = a.name
+		p.description = input.Description
+		p.start = input.EventStartTime
+		p.end = input.EventEndTime
+		p.destination = input.Destination.Arn
+		p.filters = input.Destination.FilterArns ?? []
+		p.started = now()
+		const name = `"replay-name":${std.quoted(p.name)},`
+		for (const [t, event] of a.events) {
+			if (t >= p.start && t < p.end) {
+				p.last = t
+				this.route(caller, db, a.bus, `{${name}${event.slice(1, event.length)}`, [], p.filters)
+			}
+		}
+		db.replays.put(p.name, p)
+		const out = new api.StartReplayResponse()
+		out.ReplayArn = replayArn(caller, p.name)
+		out.State = "STARTING"
+		out.ReplayStartTime = p.started
+		return out
+	}
+
+	describeReplay(caller: Caller, input: api.DescribeReplayRequest): api.DescribeReplayResponse throws Fault {
+		const p = replay(caller, input.ReplayName)
+		const out = new api.DescribeReplayResponse()
+		out.ReplayName = p.name
+		out.ReplayArn = replayArn(caller, p.name)
+		out.Description = p.description
+		out.State = "COMPLETED"
+		out.EventSourceArn = archiveArn(caller, p.archive)
+		const d = new api.ReplayDestination()
+		d.Arn = p.destination
+		d.FilterArns = if (p.filters.length == 0) null else p.filters
+		out.Destination = d
+		out.EventStartTime = p.start
+		out.EventEndTime = p.end
+		out.EventLastReplayedTime = p.last
+		out.ReplayStartTime = p.started
+		out.ReplayEndTime = p.started
+		return out
+	}
+
+	listReplays(caller: Caller, input: api.ListReplaysRequest): api.ListReplaysResponse throws Fault {
+		caller.allow(replayArn(caller, "*"))
+		const replays = all(tables(caller).replays, input.NamePrefix ?? "").map(e => e[1]).filter(p => (input.EventSourceArn
+			== null || archiveArn(caller, p.archive) == input.EventSourceArn)
+			&& (input.State == null || input.State == "COMPLETED"))
+		const [page, next] = part(replays, input.NextToken, input.Limit)
+		const out = new api.ListReplaysResponse()
+		out.Replays = page.map(p => {
+			const w = new api.Replay()
+			w.ReplayName = p.name
+			w.EventSourceArn = archiveArn(caller, p.archive)
+			w.State = "COMPLETED"
+			w.EventStartTime = p.start
+			w.EventEndTime = p.end
+			w.EventLastReplayedTime = p.last
+			w.ReplayStartTime = p.started
+			w.ReplayEndTime = p.started
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	cancelReplay(caller: Caller, input: api.CancelReplayRequest): api.CancelReplayResponse throws Fault {
+		replay(caller, input.ReplayName)
+		throw api.illegalStatusException(`Replay ${input.ReplayName} is not in a valid state for this operation.`)
+	}
+
+	createConnection(caller: Caller, input: api.CreateConnectionRequest): api.CreateConnectionResponse throws Fault {
+		const db = tables(caller)
+		const c = new Connection()
+		c.name = input.Name
+		c.id = uuid()
+		caller.allow(connectionArn(caller, c))
+		if (db.connections.get(c.name) != null) {
+			throw api.resourceAlreadyExistsException(`Connection ${c.name} already exists.`)
+		}
+		const a = input.AuthParameters
+		const p = new api.ConnectionAuthResponseParameters()
+		if (a.BasicAuthParameters != null) {
+			p.BasicAuthParameters = { ...new api.ConnectionBasicAuthResponseParameters(),
+				Username: a.BasicAuthParameters!.Username }
+		}
+		if (a.ApiKeyAuthParameters != null) {
+			p.ApiKeyAuthParameters = { ...new api.ConnectionApiKeyAuthResponseParameters(),
+				ApiKeyName: a.ApiKeyAuthParameters!.ApiKeyName }
+		}
+		if (a.OAuthParameters != null) {
+			const o = new api.ConnectionOAuthResponseParameters()
+			o.ClientParameters = { ...new api.ConnectionOAuthClientResponseParameters(),
+				ClientID: a.OAuthParameters!.ClientParameters.ClientID }
+			o.AuthorizationEndpoint = a.OAuthParameters!.AuthorizationEndpoint
+			o.HttpMethod = a.OAuthParameters!.HttpMethod
+			o.OAuthHttpParameters = unsecret(a.OAuthParameters!.OAuthHttpParameters)
+			p.OAuthParameters = o
+		}
+		p.InvocationHttpParameters = unsecret(a.InvocationHttpParameters)
+		const kinds: [api.ConnectionAuthorizationType, bool][] = [["BASIC", a.BasicAuthParameters != null],
+			["API_KEY", a.ApiKeyAuthParameters != null], ["OAUTH_CLIENT_CREDENTIALS", a.OAuthParameters != null]]
+		for (const [k, given] of kinds) {
+			if (given != (k == input.AuthorizationType)) {
+				throw validation(`Parameter(s) AuthParameters are not valid for AuthorizationType ${input.AuthorizationType}.`)
+			}
+		}
+		c.description = input.Description
+		c.kind = input.AuthorizationType
+		c.parameters = result(p)
+		c.created = now()
+		c.modified = c.created
+		db.connections.put(c.name, c)
+		const out = new api.CreateConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "AUTHORIZED"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		return out
+	}
+
+	describeConnection(caller: Caller,
+		input: api.DescribeConnectionRequest): api.DescribeConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		const out = new api.DescribeConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.Name = c.name
+		out.Description = c.description
+		out.ConnectionState = "AUTHORIZED"
+		out.AuthorizationType = authorization(c.kind)
+		out.AuthParameters = json.decode[api.ConnectionAuthResponseParameters](c.parameters, api.validation)
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	listConnections(caller: Caller, input: api.ListConnectionsRequest): api.ListConnectionsResponse throws Fault {
+		caller.allow(`arn:aws:events:${caller.region}:${caller.account}:connection/*`)
+		const found = all(tables(caller).connections, input.NamePrefix ?? "").map(e => e[1]).filter(c => input.ConnectionState
+			== null || input.ConnectionState == "AUTHORIZED")
+		const [page, next] = part(found, input.NextToken, input.Limit)
+		const out = new api.ListConnectionsResponse()
+		out.Connections = page.map(c => {
+			const w = new api.Connection()
+			w.ConnectionArn = connectionArn(caller, c)
+			w.Name = c.name
+			w.ConnectionState = "AUTHORIZED"
+			w.AuthorizationType = authorization(c.kind)
+			w.CreationTime = c.created
+			w.LastModifiedTime = c.modified
+			w.LastAuthorizedTime = c.modified
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateConnection(caller: Caller, input: api.UpdateConnectionRequest): api.UpdateConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		const p = json.decode[api.ConnectionAuthResponseParameters](c.parameters, api.validation)
+		const a = input.AuthParameters
+		if (a != null) {
+			if (a.BasicAuthParameters?.Username != null) {
+				p.BasicAuthParameters = { ...new api.ConnectionBasicAuthResponseParameters(),
+					Username: a.BasicAuthParameters!.Username }
+			}
+			if (a.ApiKeyAuthParameters?.ApiKeyName != null) {
+				p.ApiKeyAuthParameters = { ...new api.ConnectionApiKeyAuthResponseParameters(),
+					ApiKeyName: a.ApiKeyAuthParameters!.ApiKeyName }
+			}
+			if (a.OAuthParameters != null) {
+				const o = p.OAuthParameters ?? new api.ConnectionOAuthResponseParameters()
+				if (a.OAuthParameters!.ClientParameters?.ClientID != null) {
+					o.ClientParameters = { ...new api.ConnectionOAuthClientResponseParameters(),
+						ClientID: a.OAuthParameters!.ClientParameters!.ClientID }
+				}
+				o.AuthorizationEndpoint = a.OAuthParameters!.AuthorizationEndpoint ?? o.AuthorizationEndpoint
+				o.HttpMethod = a.OAuthParameters!.HttpMethod ?? o.HttpMethod
+				if (a.OAuthParameters!.OAuthHttpParameters != null) {
+					o.OAuthHttpParameters = unsecret(a.OAuthParameters!.OAuthHttpParameters)
+				}
+				p.OAuthParameters = o
+			}
+			if (a.InvocationHttpParameters != null) {
+				p.InvocationHttpParameters = unsecret(a.InvocationHttpParameters)
+			}
+		}
+		if (input.Description != null) {
+			c.description = input.Description
+		}
+		if (input.AuthorizationType != null) {
+			c.kind = input.AuthorizationType!
+		}
+		c.parameters = result(p)
+		c.modified = now()
+		tables(caller).connections.put(c.name, c)
+		const out = new api.UpdateConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "AUTHORIZED"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	deleteConnection(caller: Caller, input: api.DeleteConnectionRequest): api.DeleteConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		tables(caller).connections.delete(c.name)
+		const out = new api.DeleteConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "DELETING"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	createApiDestination(caller: Caller,
+		input: api.CreateApiDestinationRequest): api.CreateApiDestinationResponse throws Fault {
+		const db = tables(caller)
+		const d = new Destination()
+		d.name = input.Name
+		d.id = uuid()
+		caller.allow(destinationArn(caller, d))
+		if (db.destinations.get(d.name) != null) {
+			throw api.resourceAlreadyExistsException(`An api-destination ${d.name} already exists.`)
+		}
+		if (!db.connections.scan(null, 2147483647, "").some(e => connectionArn(caller, e[1]) == input.ConnectionArn)) {
+			throw api.resourceNotFoundException(`Connection ${input.ConnectionArn} does not exist.`)
+		}
+		d.description = input.Description
+		d.connection = input.ConnectionArn
+		d.endpoint = input.InvocationEndpoint
+		d.method = input.HttpMethod
+		d.rate = input.InvocationRateLimitPerSecond
+		d.created = now()
+		d.modified = d.created
+		db.destinations.put(d.name, d)
+		const out = new api.CreateApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.ApiDestinationState = "ACTIVE"
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	describeApiDestination(caller: Caller,
+		input: api.DescribeApiDestinationRequest): api.DescribeApiDestinationResponse throws Fault {
+		const d = destination(caller, input.Name)
+		const out = new api.DescribeApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.Name = d.name
+		out.Description = d.description
+		out.ApiDestinationState = "ACTIVE"
+		out.ConnectionArn = d.connection
+		out.InvocationEndpoint = d.endpoint
+		out.HttpMethod = method(d.method)
+		out.InvocationRateLimitPerSecond = d.rate ?? 300
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	listApiDestinations(caller: Caller,
+		input: api.ListApiDestinationsRequest): api.ListApiDestinationsResponse throws Fault {
+		caller.allow(`arn:aws:events:${caller.region}:${caller.account}:api-destination/*`)
+		const found = all(tables(caller).destinations, input.NamePrefix ?? "").map(e => e[1]).filter(d => input.ConnectionArn
+			== null || d.connection == input.ConnectionArn)
+		const [page, next] = part(found, input.NextToken, input.Limit)
+		const out = new api.ListApiDestinationsResponse()
+		out.ApiDestinations = page.map(d => {
+			const w = new api.ApiDestination()
+			w.ApiDestinationArn = destinationArn(caller, d)
+			w.Name = d.name
+			w.ApiDestinationState = "ACTIVE"
+			w.ConnectionArn = d.connection
+			w.InvocationEndpoint = d.endpoint
+			w.HttpMethod = method(d.method)
+			w.InvocationRateLimitPerSecond = d.rate ?? 300
+			w.CreationTime = d.created
+			w.LastModifiedTime = d.modified
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateApiDestination(caller: Caller,
+		input: api.UpdateApiDestinationRequest): api.UpdateApiDestinationResponse throws Fault {
+		const d = destination(caller, input.Name)
+		d.description = input.Description ?? d.description
+		d.connection = input.ConnectionArn ?? d.connection
+		d.endpoint = input.InvocationEndpoint ?? d.endpoint
+		d.method = input.HttpMethod ?? d.method
+		d.rate = input.InvocationRateLimitPerSecond ?? d.rate
+		d.modified = now()
+		tables(caller).destinations.put(d.name, d)
+		const out = new api.UpdateApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.ApiDestinationState = "ACTIVE"
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	deleteApiDestination(caller: Caller,
+		input: api.DeleteApiDestinationRequest): api.DeleteApiDestinationResponse throws Fault {
+		destination(caller, input.Name)
+		tables(caller).destinations.delete(input.Name)
+		return new api.DeleteApiDestinationResponse()
+	}
+
+	putEvents(caller: Caller, input: api.PutEventsRequest): api.PutEventsResponse throws Fault {
+		let size = 0
+		for (const e of input.Entries) {
+			size += (if (e.Time == null) 0 else 14) + (e.Source ?? "").length + (e.DetailType ?? "").length
+				+ (e.Detail ?? "").length
+			for (const r of e.Resources ?? []) {
+				size += r.length
+			}
+		}
+		if (size > 256 * 1024) {
+			throw validation("Total size of the entries in the request is over the limit.")
+		}
+		const db = tables(caller)
+		// The request is authorized as a whole, on each bus it names, of each entry's source and detail type.
+		for (const e of input.Entries) {
+			let name = ""
+			try {
+				name = busName(caller, e.EventBusName)
+			} catch (f: Fault) {
+				continue
+			}
+			const context: Context = []
+			if (e.Source != null) {
+				context.push(["events:source", e.Source!])
+			}
+			if (e.DetailType != null) {
+				context.push(["events:detail-type", e.DetailType!])
+			}
+			caller.allow(busArn(caller.region, caller.account, name), db.buses.get(name)?.policy ?? null, context)
+		}
+		const out = new api.PutEventsResponse()
+		out.Entries = []
+		for (const e of input.Entries) {
+			const w = new api.PutEventsResultEntry()
+			try {
+				w.EventId = this.putEvent(caller, db, e)
+			} catch (f: Fault) {
+				w.ErrorCode = f.code
+				w.ErrorMessage = f.message
+				out.FailedEntryCount++
+			}
+			out.Entries!.push(w)
+		}
+		return out
+	}
+
+	private putEvent(caller: Caller, db: Tables, e: api.PutEventsRequestEntry): string throws Fault {
+		if (e.Source == null) {
+			throw required("Source")
+		}
+		if (e.DetailType == null) {
+			throw required("DetailType")
+		}
+		if (e.Detail == null) {
+			throw required("Detail")
+		}
+		if (e.Detail!.length == 0 || e.Detail![0] != lbrace || (members(e.Detail!).length == 0 && e.Detail != "{}")) {
+			throw new Fault(400, "MalformedDetail", "Detail is malformed.")
+		}
+		let name = ""
+		try {
+			name = busName(caller, e.EventBusName)
+		} catch (f: Fault) {
+			throw new Fault(400, "NotFound", f.message)
+		}
+		const b = db.buses.get(name)
+		if (b == null) {
+			throw new Fault(400, "NotFound", `Event bus ${name} does not exist.`)
+		}
+		if (startsWith(e.Source!, "aws.")) {
+			throw new Fault(400, "NotAuthorizedForSourceException", "Not authorized for the source.")
+		}
+		const id = uuid()
+		this.route(caller, db, name,
+			eventOf(caller, id, e.Time ?? now(), e.Source!, e.DetailType!, e.Resources ?? [], e.Detail!), [])
+		return id
+	}
+
+	/// Puts an AWS service's event on the default bus and delivers it as PutEvents does. Nothing authorizes it: AWS needs
+	/// no bus policy for its own services' events.
+	emit(caller: Caller, source: string, detailType: string, resources: string[], detail: string) throws Fault {
+		this.route(caller, tables(caller), "default",
+			eventOf(caller, uuid(), now(), source, detailType, resources, detail), [])
+	}
+
+	/// visited holds the buses the event has passed through; an event not replayed is kept by the archives it matches.
+	private route(caller: Caller, db: Tables, name: string, event: string, visited: string[],
+		only: string[] = []) throws Fault {
+		visited.push(name)
+		if (member(event, "replay-name") == null) {
+			for (const [k, a] of all(db.archives, "")) {
+				if (a.bus == name && (a.pattern == null || matches(a.pattern!, event))) {
+					a.events.push([now(), event])
+					db.archives.put(k, a)
+				}
+			}
+		}
+		for (const [_, r] of all(db.rules, within(name, ""))) {
+			if (r.state == "DISABLED" || r.pattern == null || !matches(r.pattern!, event)) {
+				continue
+			}
+			if (only.length > 0 && !only.some(o => o == ruleArn(caller.region, caller.account, r))) {
+				continue
+			}
+			for (const [_, t] of all(db.targets, within(within(name, r.name), ""))) {
+				this.deliver(caller, db, r, given(t), event, visited)
+			}
+		}
+	}
+
+	private deliver(caller: Caller, db: Tables, r: Rule, t: api.Target, event: string, visited: string[]) throws Fault {
+		const source = ruleArn(caller.region, caller.account, r)
+		const body = inputOf(t, event, r.name, source)
+		try {
+			const [service, region, account, resource] = parts(t.Arn)
+			if (service == "events" && region == caller.region && account == caller.account
+				&& startsWith(resource, "event-bus/")) {
+				const next = resource.slice(10, resource.length)
+				const b = db.buses.get(next)
+				if (!visited.some(v => v == next)) {
+					const c = if (t.RoleArn == null) caller.internal(principal, source, ["events:PutEvents"])
+						else assumed(caller, t.RoleArn!, source, ["events:PutEvents"])
+					c.allow(t.Arn, b?.policy ?? null)
+					if (b == null) {
+						throw api.resourceNotFoundException(`Event bus ${next} does not exist.`)
+					}
+					this.route(caller, db, next, event, visited)
+				}
+			} else if (service == "events" && region == caller.region && startsWith(resource, "event-bus/")) {
+				const next = resource.slice(10, resource.length)
+				const c = if (t.RoleArn == null) caller.internal(principal, source, ["events:PutEvents"])
+					else assumed(caller, t.RoleArn!, source, ["events:PutEvents"])
+				const there = caller.internal(principal, source, [])
+				there.account = account
+				const far = tables(there)
+				const b = far.buses.get(next)
+				c.allow(t.Arn, b?.policy ?? null)
+				if (b == null) {
+					throw api.resourceNotFoundException(`Event bus ${next} does not exist.`)
+				}
+				this.route(there, far, next, event, [])
+			} else if (service == "states" && this.states != null) {
+				const m = new sfnApi.StartExecutionInput()
+				m.stateMachineArn = t.Arn
+				m.input = body
+				this.states!.startExecution(assumed(caller, t.RoleArn ?? "", source, ["states:StartExecution"]), m)
+			} else if (service == "kinesis" && this.kinesis != null) {
+				const m = new kinesisApi.PutRecordInput()
+				m.StreamARN = t.Arn
+				m.Data = body
+				const path = t.KinesisParameters?.PartitionKeyPath
+				const key = if (path == null) null else pick(event, path!)
+				m.PartitionKey = if (key == null) idOf(event) else str(key!) ?? key!
+				this.kinesis!.putRecord(assumed(caller, t.RoleArn ?? "", source, ["kinesis:PutRecord"]), m)
+			} else if (service == "firehose" && this.firehose != null) {
+				const m = new firehoseApi.PutRecordInput()
+				m.DeliveryStreamName = resource.slice(indexOf(resource, "/") + 1, resource.length)
+				m.Record.Data = body
+				this.firehose!.putRecord(assumed(caller, t.RoleArn ?? "", source, ["firehose:PutRecord"]), m)
+			} else if (service == "logs" && this.logs != null) {
+				this.log(caller, source, resource, body, idOf(event))
+			} else {
+				this.send(caller, source, t.Arn, body, t.SqsParameters?.MessageGroupId ?? null, idOf(event))
+			}
+		} catch (f: Fault) {
+			const dlq = t.DeadLetterConfig?.Arn ?? null
+			if (dlq == null) {
+				return
+			}
+			try {
+				this.send(caller, source, dlq!, body, null, idOf(event),
+					[["ERROR_CODE", f.code], ["ERROR_MESSAGE", f.message], ["RULE_ARN", source], ["TARGET_ARN", t.Arn]])
+			} catch (g: Fault) {} // dropped, as by AWS when its dead-letter queue refuses it too
+		}
+	}
+
+	/// Puts body as a log event in a stream named by the event's id, as the account's resource policies allow EventBridge.
+	private log(caller: Caller, source: string, resource: string, body: string, id: string) throws Fault {
+		const g = split(resource, ":")[1]
+		const c = caller.internal(principal, source, ["logs:CreateLogStream"])
+		const s = new logsApi.CreateLogStreamRequest()
+		s.logGroupName = g
+		s.logStreamName = id
+		this.logs!.createLogStream(c, s)
+		c.actions = ["logs:PutLogEvents"]
+		const e = new logsApi.InputLogEvent()
+		e.timestamp = now() / millisecond
+		e.message = body
+		const p = new logsApi.PutLogEventsRequest()
+		p.logGroupName = g
+		p.logStreamName = id
+		p.logEvents = [e]
+		this.logs!.putLogEvents(c, p)
+	}
+
+	/// Sends body to the queue or topic of arn, deduplicated by the event's id; to anything else, nothing.
+	private send(caller: Caller, source: string, arn: string, body: string, group: string | null, id: string,
+		attributes: [string, string][] = []) throws Fault {
+		const [service, _, account, resource] = parts(arn)
+		if (service == "sqs") {
+			const m = new sqsApi.SendMessageRequest()
+			m.QueueUrl = `${caller.endpoint}/${account}/${resource}`
+			m.MessageBody = body
+			if (attributes.length > 0) {
+				m.MessageAttributes = attributes.map(a => {
+					const v = new sqsApi.MessageAttributeValue()
+					v.DataType = "String"
+					v.StringValue = a[1]
+					return [a[0], v]
+				})
+			}
+			if (endsWith(resource, ".fifo")) {
+				m.MessageGroupId = group
+				m.MessageDeduplicationId = id
+			}
+			this.sqs.sendMessage(caller.internal(principal, source, ["sqs:SendMessage"]), m)
+		} else if (service == "sns") {
+			const m = new snsApi.PublishInput()
+			m.TopicArn = arn
+			m.Message = body
+			this.sns.publish(caller.internal(principal, source, ["sns:Publish"]), m)
+		}
+	}
+}
+
+function eventOf(caller: Caller, id: string, t: i64, source: string, detailType: string, resources: string[],
+	detail: string): string {
+	return `{"version":"0","id":${std.quoted(id)},"detail-type":${std.quoted(detailType)},`
+		+ `"source":${std.quoted(source)},"account":${std.quoted(caller.account)},`
+		+ `"time":${std.quoted(rfc3339(t - t % second))},"region":${std.quoted(caller.region)},`
+		+ `"resources":[${resources.map(r => std.quoted(r)).join(",")}],"detail":${detail}}`
+}
+
+function archiveArn(caller: Caller, name: string): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:archive/${name}`
+}
+
+function replayArn(caller: Caller, name: string): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:replay/${name}`
+}
+
+function archive(caller: Caller, name: string): Archive throws Fault {
+	caller.allow(archiveArn(caller, name))
+	const a = tables(caller).archives.get(name)
+	if (a == null) {
+		throw api.resourceNotFoundException(`Archive ${name} does not exist.`)
+	}
+	return a!
+}
+
+function replay(caller: Caller, name: string): Replay throws Fault {
+	caller.allow(replayArn(caller, name))
+	const p = tables(caller).replays.get(name)
+	if (p == null) {
+		throw api.resourceNotFoundException(`Replay ${name} does not exist.`)
+	}
+	return p!
+}
+
+function connectionArn(caller: Caller, c: Connection): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:connection/${c.name}/${c.id}`
+}
+
+function destinationArn(caller: Caller, d: Destination): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:api-destination/${d.name}/${d.id}`
+}
+
+function connection(caller: Caller, name: string): Connection throws Fault {
+	caller.allow(`arn:aws:events:${caller.region}:${caller.account}:connection/${name}`)
+	const c = tables(caller).connections.get(name)
+	if (c == null) {
+		throw api.resourceNotFoundException(`Failed to describe the connection(s). Connection '${name}' does not exist.`)
+	}
+	return c!
+}
+
+function destination(caller: Caller, name: string): Destination throws Fault {
+	caller.allow(`arn:aws:events:${caller.region}:${caller.account}:api-destination/${name}`)
+	const d = tables(caller).destinations.get(name)
+	if (d == null) {
+		throw api.resourceNotFoundException(`Failed to describe the api-destination(s). An api-destination '${name}' does not exist.`)
+	}
+	return d!
+}
+
+function unsecret(p: api.ConnectionHttpParameters | null): api.ConnectionHttpParameters | null {
+	if (p == null) {
+		return null
+	}
+	for (const h of p.HeaderParameters ?? []) {
+		if (h.IsValueSecret) {
+			h.Value = null
+		}
+	}
+	for (const q of p.QueryStringParameters ?? []) {
+		if (q.IsValueSecret) {
+			q.Value = null
+		}
+	}
+	for (const b of p.BodyParameters ?? []) {
+		if (b.IsValueSecret) {
+			b.Value = null
+		}
+	}
+	return p
+}
+
+function authorization(s: string): api.ConnectionAuthorizationType {
+	return if (s == "API_KEY") "API_KEY"
+		else if (s == "OAUTH_CLIENT_CREDENTIALS") "OAUTH_CLIENT_CREDENTIALS"
+		else "BASIC"
+}
+
+function method(s: string): api.ApiDestinationHttpMethod {
+	switch (s) {
+		case "GET": return "GET"
+		case "HEAD": return "HEAD"
+		case "OPTIONS": return "OPTIONS"
+		case "PUT": return "PUT"
+		case "PATCH": return "PATCH"
+		case "DELETE": return "DELETE"
+		default: return "POST"
+	}
+}
+
+function sizeOf(a: Archive): i64 {
+	let n: i64 = 0
+	for (const [_, e] of a.events) {
+		n += e.length as i64
+	}
+	return n
+}
+
+/// The ARN that names every rule of the bus named name, as a listing's access denied names it.
+function rules(caller: Caller, name: string): string {
+	const r = new Rule()
+	r.name = "*"
+	r.bus = name
+	return ruleArn(caller.region, caller.account, r)
+}
+
+function texts(v: string): string[] {
+	const out: string[] = []
+	for (const x of if (v.length > 0 && v[0] == lbracket) list(v) else [v]) {
+		const t = str(x)
+		if (t != null) {
+			out.push(t!)
+		}
+	}
+	return out
+}
+
+/// The caller's regional tables, where the default bus is from the first request on.
+function tables(caller: Caller): Tables throws Fault {
+	const db = new Tables(caller.regional())
+	if (db.buses.get("default") == null) {
+		const b = new Bus()
+		b.name = "default"
+		b.created = now()
+		b.modified = b.created
+		db.buses.put("default", b)
+	}
+	return db
+}
+
+function busName(caller: Caller, given: string | null): string throws Fault {
+	const g = given ?? "default"
+	if (!startsWith(g, "arn:")) {
+		return g
+	}
+	const prefix = busArn(caller.region, caller.account, "")
+	if (!startsWith(g, prefix)) {
+		throw api.resourceNotFoundException(`Event bus ${g} does not exist.`)
+	}
+	return g.slice(prefix.length, g.length)
+}
+
+function bus(db: Tables, name: string): Bus throws Fault {
+	const b = db.buses.get(name)
+	if (b == null) {
+		throw api.resourceNotFoundException(`Event bus ${name} does not exist.`)
+	}
+	return b
+}
+
+function allowed(caller: Caller, name: string, given: string | null, context: Context = []): Rule throws Fault {
+	const b = busName(caller, given)
+	const r = new Rule()
+	r.name = name
+	r.bus = b
+	const db = tables(caller)
+	const found = db.rules.get(within(b, name))
+	const keys = resourceTags(found?.tags ?? [])
+	keys.append(context)
+	caller.allow(ruleArn(caller.region, caller.account, r), null, keys)
+	bus(db, b)
+	if (found == null) {
+		throw api.resourceNotFoundException(`Rule ${name} does not exist on EventBus ${b}.`)
+	}
+	return found
+}
+
+function setState(caller: Caller, name: string, given: string | null, state: string): Unit throws Fault {
+	const r = allowed(caller, name, given)
+	r.state = state
+	tables(caller).rules.put(within(r.bus, r.name), r)
+	return new Unit()
+}
+
+function stateOf(s: string): api.RuleState {
+	switch (s) {
+		case "DISABLED": return "DISABLED"
+		case "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS": return "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"
+		default: return "ENABLED"
+	}
+}
+
+/// Whether s is a schedule expression: rate(n unit), unit plural unless n is 1, or cron of six fields.
+export function schedule(s: string): bool {
+	if (startsWith(s, "cron(") && endsWith(s, ")")) {
+		return split(s.slice(5, s.length - 1), " ").filter(f => f != "").length == 6
+	}
+	if (!startsWith(s, "rate(") || !endsWith(s, ")")) {
+		return false
+	}
+	const words = split(s.slice(5, s.length - 1), " ")
+	if (words.length != 2 || words[0].length == 0 || words[0].length > 9 || !words[0].every(isDigit)) {
+		return false
+	}
+	let n = 0
+	try {
+		n = parseInt(words[0])
+	} catch (e: ParseError) {
+		return false
+	}
+	const unit = if (n == 1) words[1] else if (endsWith(words[1], "s")) words[1].slice(0, words[1].length - 1) else ""
+	return n > 0 && (unit == "minute" || unit == "hour" || unit == "day")
+}
+
+function checkTarget(t: api.Target) throws Fault {
+	if (!startsWith(t.Arn, "arn:") || split(t.Arn, ":").length < 6) {
+		throw validation("Provided Arn is not in correct format.")
+	}
+	const forms: i32 = (if (t.Input == null) 0 else 1) + (if (t.InputPath == null) 0 else 1)
+		+ (if (t.InputTransformer == null) 0 else 1)
+	if (forms > 1) {
+		throw validation(`Only one of Input, InputPath, or InputTransformer must be provided for target ${t.Id}.`)
+	}
+	if (t.Input != null && t.Input!.length > 0 && list(`[${t.Input}]`).length != 1) {
+		throw validation(`Input for target ${t.Id} is not valid JSON.`)
+	}
+	const [service, _, __, resource] = parts(t.Arn)
+	if (service == "sqs" && endsWith(resource, ".fifo") && t.SqsParameters?.MessageGroupId == null) {
+		throw validation(`Parameter(s) SqsParameters must be specified for target: ${t.Id}.`)
+	}
+	if ((service == "kinesis" || service == "firehose" || service == "states") && t.RoleArn == null) {
+		throw validation(`Parameter(s) RoleArn must be specified for target: ${t.Id}.`)
+	}
+}
+
+/// EventBridge in a session of role on behalf of the rule source; a fault if the role does not let it.
+function assumed(caller: Caller, role: string, source: string, actions: string[]): Caller throws Fault {
+	const c = actAs(caller, principal, role, source, actions, caller.requestId)
+	if (c == null) {
+		throw new Fault(403, "AccessDenied", `${principal} may not assume ${role}`)
+	}
+	return c!
+}
+
+function parts(a: string): [string, string, string, string] {
+	const p = split(a, ":")
+	if (p.length < 6) {
+		return ["", "", "", ""]
+	}
+	return [p[2], p[3], p[4], p.slice(5, p.length).join(":")]
+}
+
+function given(t: Target): api.Target {
+	try {
+		return json.decode[api.Target](t.given, api.validation)
+	} catch (f: Fault) {
+		return new api.Target() // stored as it decoded
+	}
+}
+
+export function inputOf(t: api.Target, event: string, rule: string, arn: string): string {
+	if (t.Input != null) {
+		return t.Input!
+	}
+	if (t.InputPath != null) {
+		return pick(event, t.InputPath!) ?? ""
+	}
+	const x = t.InputTransformer
+	if (x == null) {
+		return event
+	}
+	const values: [string, string | null][] = [["aws.events.rule-arn", std.quoted(arn)],
+		["aws.events.rule-name", std.quoted(rule)], ["aws.events.event", event], ["aws.events.event.json", event],
+		["aws.events.event.ingestion-time", std.quoted(rfc3339(now() - now() % second))]]
+	for (const [k, p] of x.InputPathsMap ?? []) {
+		values.push([k, pick(event, p)])
+	}
+	return render(x.InputTemplate, values)
+}
+
+/// Within a string, a placeholder becomes the text of a string, else its JSON, escaped; outside one, the JSON or null.
+function render(template: string, values: [string, string | null][]): string {
+	let out = ""
+	let quoted = false
+	let i = 0
+	while (i < template.length) {
+		const c = template.slice(i, i + 1)
+		const close = if (c == "<") indexOf(template, ">", i) else -1
+		const found = if (close < 0) null else values.find(v => v[0] == template.slice(i + 1, close))
+		if (found == null) {
+			if (c == "\"") {
+				quoted = !quoted
+			} else if (c == "\\" && i + 1 < template.length) {
+				out += c
+				i++
+				out += template.slice(i, i + 1)
+				i++
+				continue
+			}
+			out += c
+			i++
+			continue
+		}
+		const v = found[1]
+		if (!quoted) {
+			out += v ?? "null"
+		} else {
+			const s = if (v == null) "" else str(v!) ?? v!
+			const q = std.quoted(s)
+			out += q.slice(1, q.length - 1)
+		}
+		i = close + 1
+	}
+	return out
+}
+
+export function pick(v: string, p: string): string | null {
+	if (!startsWith(p, "$")) {
+		return null
+	}
+	let at: string | null = v
+	for (const step of split(p.slice(1, p.length), ".")) {
+		if (step == "" || at == null) {
+			continue
+		}
+		const bracket = indexOf(step, "[")
+		const key = if (bracket < 0) step else step.slice(0, bracket)
+		if (key != "") {
+			at = member(at!, key)
+		}
+		let rest = if (bracket < 0) "" else step.slice(bracket, step.length)
+		while (at != null && startsWith(rest, "[")) {
+			const end = indexOf(rest, "]")
+			let n = -1
+			try {
+				n = parseInt(rest.slice(1, end))
+			} catch (e: ParseError) {}
+			const items = list(at!)
+			at = if (n >= 0 && n < items.length) items[n] else null
+			rest = rest.slice(end + 1, rest.length)
+		}
+	}
+	return at
+}
+
+function idOf(event: string): string { return str(member(event, "id") ?? "") ?? "" }
+
+function statementsOf(p: string | null): string[] {
+	if (p == null) {
+		return []
+	}
+	const s = member(p!, "Statement")
+	return if (s == null) [] else if (s.length > 0 && s[0] == lbracket) list(s).map(x => compact(x)) else [s]
+}
+
+/// The statement x with no space between its members, as AWS answers a policy, where Raw keeps the spaces sent.
+function compact(x: string): string {
+	try {
+		return std.encode(std.decode[std.Keys](x))
+	} catch (e: ParseError | std.EncodeError) {
+		return x
+	}
+}
+
+function sidOf(s: string): string { return str(member(s, "Sid") ?? "") ?? "" }
+
+function policyOf(statements: string[]): string {
+	return `{"Version":"2012-10-17","Statement":[${statements.join(",")}]}`
+}
+
+function retag(caller: Caller, a: string, edit: (tags: [string, string][]) => [string, string][]) throws Fault {
+	const db = tables(caller)
+	const prefix = `arn:aws:events:${caller.region}:${caller.account}:`
+	const resource = if (startsWith(a, prefix)) a.slice(prefix.length, a.length) else ""
+	if (startsWith(resource, "event-bus/")) {
+		const b = bus(db, resource.slice(10, resource.length))
+		b.tags = edit(b.tags)
+		db.buses.put(b.name, b)
+		return
+	}
+	if (!startsWith(resource, "rule/")) {
+		throw validation(`Parameter ResourceARN is not valid.`)
+	}
+	const path = split(resource.slice(5, resource.length), "/")
+	const name = path[path.length - 1]
+	const b = if (path.length == 1) "default" else path.slice(0, path.length - 1).join("/")
+	bus(db, b)
+	const r = db.rules.get(within(b, name))
+	if (r == null) {
+		throw api.resourceNotFoundException(`Rule ${name} does not exist on EventBus ${b}.`)
+	}
+	r.tags = edit(r.tags)
+	db.rules.put(within(b, name), r)
+}
+
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	out.append(given.map(g => [g.Key, g.Value]))
+	return out
+}
+
+function all[V extends Decodable](t: Table[V], prefix: string): [string, V][] {
+	return t.scan(null, 2147483647, prefix)
+}
+
+/// A page of up to limit (100 if null) items, from the index that token is; and the next page's token.
+function part[T](items: T[], token: string | null, limit: i32 | null): [T[], string | null] throws Fault {
+	let from = 0
+	try {
+		from = if (token == null) 0 else parseInt(token!)
+	} catch (e: ParseError) {
+		throw validation("The NextToken is not valid.")
+	}
+	if (from < 0 || from > items.length) {
+		throw validation("The NextToken is not valid.")
+	}
+	const n = limit ?? 100
+	const to = if (from + n < items.length) from + n else items.length
+	return [items.slice(from, to), if (to < items.length) `${to}` else null]
+}
+
+function required(m: string): Fault {
+	return new Fault(400, "InvalidArgument", `Parameter ${m} is not valid. Reason: ${m} is a required argument.`)
+}
+
+function validation(why: string): Fault { return new Fault(400, api.validation.code, why) }

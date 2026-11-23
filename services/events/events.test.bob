@@ -1,0 +1,341 @@
+import { sign } from "../../core/auth/sigv4"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import * as snsApi from "../sns/api"
+import * as sqsApi from "../sqs/api"
+import * as api from "./api"
+import { Handler, inputOf, pick } from "./events"
+import { list, member, str } from "./pattern"
+import { endsWith } from "std/algo"
+import { Request, Response } from "std/http"
+
+class Sent {
+	arn = ""
+	source = ""
+	to = ""
+	body = ""
+	group: string | null = null
+}
+
+/// Queues that take every message but those to a URL that ends with refuse.
+class Queues {
+	...sqsApi.Unimplemented
+
+	sent: Sent[] = []
+	refuse = "-"
+
+	sendMessage(caller: Caller, input: sqsApi.SendMessageRequest): sqsApi.SendMessageResult throws Fault {
+		if (endsWith(input.QueueUrl, this.refuse)) {
+			throw new Fault(400, "AWS.SimpleQueueService.NonExistentQueue", "The specified queue does not exist.")
+		}
+		this.sent.push({ ...new Sent(), arn: caller.arn, source: caller.source, to: input.QueueUrl,
+			body: input.MessageBody, group: input.MessageGroupId })
+		return new sqsApi.SendMessageResult()
+	}
+}
+
+class Topics {
+	...snsApi.Unimplemented
+
+	sent: Sent[] = []
+
+	publish(caller: Caller, input: snsApi.PublishInput): snsApi.PublishResponse throws Fault {
+		this.sent.push({ ...new Sent(), arn: caller.arn, source: caller.source, to: input.TopicArn ?? "",
+			body: input.Message })
+		return new snsApi.PublishResponse()
+	}
+}
+
+class World {
+	g = new Gateway()
+	sqs = new Queues()
+	sns = new Topics()
+
+	constructor() {
+		const h = new Handler(this.sqs, this.sns)
+		this.g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	}
+
+	call(op: string, body: string): Response {
+		const req = new Request("POST", "http://localhost:4566/", body)
+		req.headers.set("content-type", "application/x-amz-json-1.1")
+		req.headers.set("x-amz-target", `AWSEvents.${op}`)
+		sign(req, body, "events", "us-east-1", "test", "test", "", "20150626T140000Z")
+		return this.g.handle(req)
+	}
+
+	ok(op: string, body: string): string {
+		const res = this.call(op, body)
+		const text = res.body.whole ?? ""
+		if (res.status != 200) {
+			throw new Fault(500, "TestFailure", `${op} ${body}: ${res.status} ${text}`)
+		}
+		return text
+	}
+
+	fails(op: string, body: string, code: string, message: string): bool {
+		const res = this.call(op, body)
+		const text = res.body.whole ?? ""
+		return res.status == 400 && field(text, "__type") == code && field(text, "message") == message
+	}
+}
+
+function raw(o: string, k: string): string { return member(o, k) ?? "" }
+function field(o: string, k: string): string { return str(raw(o, k)) ?? "" }
+
+const queue = "arn:aws:sqs:us-east-1:000000000000:q"
+const url = "http://localhost:4566/000000000000/q"
+
+test "the default bus, and buses made, described, listed and deleted" {
+	const w = new World()
+	const d = w.ok("DescribeEventBus", "{}")
+	assert field(d, "Name") == "default" && field(d, "Arn") == "arn:aws:events:us-east-1:000000000000:event-bus/default"
+	const c = w.ok("CreateEventBus", `{"Name":"orders","Description":"d","Tags":[{"Key":"k","Value":"v"}]}`)
+	assert field(c, "EventBusArn") == "arn:aws:events:us-east-1:000000000000:event-bus/orders"
+	assert w.fails("CreateEventBus", `{"Name":"orders"}`, "ResourceAlreadyExistsException",
+		"Event bus orders already exists.")
+	assert w.fails("DescribeEventBus", `{"Name":"x"}`, "ResourceNotFoundException", "Event bus x does not exist.")
+	assert field(w.ok("DescribeEventBus", `{"Name":"arn:aws:events:us-east-1:000000000000:event-bus/orders"}`),
+		"Description") == "d"
+	const tags = w.ok("ListTagsForResource", `{"ResourceARN":"arn:aws:events:us-east-1:000000000000:event-bus/orders"}`)
+	assert raw(tags, "Tags") == `[{"Key":"k","Value":"v"}]`
+	const l = list(raw(w.ok("ListEventBuses", `{"Limit":1}`), "EventBuses"))
+	assert l.length == 1 && field(l[0], "Name") == "default"
+	const next = w.ok("ListEventBuses", `{"Limit":1}`)
+	assert field(next, "NextToken") == "1"
+	assert field(list(raw(w.ok("ListEventBuses", `{"NextToken":"1"}`), "EventBuses"))[0], "Name") == "orders"
+	assert list(raw(w.ok("ListEventBuses", `{"NamePrefix":"or"}`), "EventBuses")).length == 1
+	assert w.fails("DeleteEventBus", `{"Name":"default"}`, "ValidationException", "Cannot delete event bus default.")
+	w.ok("PutRule", `{"Name":"r","EventBusName":"orders","EventPattern":"{\\"source\\":[\\"a\\"]}"}`)
+	w.ok("DeleteEventBus", `{"Name":"orders"}`)
+	w.ok("DeleteEventBus", `{"Name":"orders"}`)
+	w.ok("CreateEventBus", `{"Name":"orders"}`)
+	assert raw(w.ok("ListRules", `{"EventBusName":"orders"}`), "Rules") == "[]"
+}
+
+test "rules" {
+	const w = new World()
+	const p = `{\\"source\\":[\\"com.shop\\"]}`
+	assert field(w.ok("PutRule", `{"Name":"r","EventPattern":"${p}","Description":"x"}`), "RuleArn")
+		== "arn:aws:events:us-east-1:000000000000:rule/r"
+	w.ok("CreateEventBus", `{"Name":"b"}`)
+	assert field(w.ok("PutRule", `{"Name":"r","EventBusName":"b","EventPattern":"${p}"}`), "RuleArn")
+		== "arn:aws:events:us-east-1:000000000000:rule/b/r"
+	assert w.fails("PutRule", `{"Name":"r","EventPattern":"{\\"a\\":\\"x\\"}"}`, "InvalidEventPatternException",
+		"Event pattern is not valid. Reason: \"a\" must be an object or an array")
+	assert w.fails("PutRule", `{"Name":"r"}`, "ValidationException",
+		"Parameter(s) EventPattern or ScheduleExpression must be specified.")
+	assert w.fails("PutRule", `{"Name":"r","EventBusName":"nope","EventPattern":"${p}"}`, "ResourceNotFoundException",
+		"Event bus nope does not exist.")
+	assert w.fails("PutRule", `{"Name":"s","ScheduleExpression":"rate(0 minutes)"}`, "ValidationException",
+		"Parameter ScheduleExpression is not valid.")
+	assert w.fails("PutRule", `{"Name":"s","ScheduleExpression":"rate(2 minute)"}`, "ValidationException",
+		"Parameter ScheduleExpression is not valid.")
+	assert w.fails("PutRule", `{"Name":"s","EventBusName":"b","ScheduleExpression":"rate(1 minute)"}`,
+		"ValidationException", "ScheduleExpression is supported only on the default event bus.")
+	w.ok("PutRule", `{"Name":"s","ScheduleExpression":"rate(5 minutes)","State":"DISABLED"}`)
+	w.ok("PutRule", `{"Name":"c","ScheduleExpression":"cron(0 12 * * ? *)"}`)
+	const d = w.ok("DescribeRule", `{"Name":"s"}`)
+	assert field(d, "State") == "DISABLED" && field(d, "ScheduleExpression") == "rate(5 minutes)"
+		&& field(d, "EventBusName") == "default" && field(d, "CreatedBy") == "000000000000"
+	w.ok("EnableRule", `{"Name":"s"}`)
+	assert field(w.ok("DescribeRule", `{"Name":"s"}`), "State") == "ENABLED"
+	w.ok("DisableRule", `{"Name":"r","EventBusName":"b"}`)
+	assert field(w.ok("DescribeRule", `{"Name":"r","EventBusName":"b"}`), "State") == "DISABLED"
+	assert w.fails("DescribeRule", `{"Name":"x"}`, "ResourceNotFoundException",
+		"Rule x does not exist on EventBus default.")
+	const rules = list(raw(w.ok("ListRules", "{}"), "Rules")).map(r => field(r, "Name"))
+	assert rules == ["c", "r", "s"]
+	const page = w.ok("ListRules", `{"Limit":2}`)
+	assert list(raw(page, "Rules")).length == 2 && field(page, "NextToken") == "2"
+	assert list(raw(w.ok("ListRules", `{"NamePrefix":"s"}`), "Rules")).length == 1
+	w.ok("DeleteRule", `{"Name":"s"}`)
+	w.ok("DeleteRule", `{"Name":"s"}`)
+	assert list(raw(w.ok("ListRules", "{}"), "Rules")).length == 2
+}
+
+test "targets" {
+	const w = new World()
+	w.ok("PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"a\\"]}"}`)
+	assert w.fails("PutTargets", `{"Rule":"x","Targets":[{"Id":"1","Arn":"${queue}"}]}`, "ResourceNotFoundException",
+		"Rule x does not exist on EventBus default.")
+	assert w.fails("PutTargets", `{"Rule":"r","Targets":[{"Id":"1","Arn":"q"}]}`, "ValidationException",
+		"Provided Arn is not in correct format.")
+	assert w.fails("PutTargets", `{"Rule":"r","Targets":[{"Id":"1","Arn":"${queue}.fifo"}]}`, "ValidationException",
+		"Parameter(s) SqsParameters must be specified for target: 1.")
+	w.ok("PutTargets", `{"Rule":"r","Targets":[{"Id":"1","Arn":"${queue}","Input":"{}"},{"Id":"2","Arn":"${queue}2"}]}`)
+	w.ok("PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"3","Arn":"${queue}"},{"Id":"4","Arn":"${queue}"},`
+		+ `{"Id":"5","Arn":"${queue}"}]}`)
+	assert w.fails("PutTargets", `{"Rule":"r","Targets":[{"Id":"6","Arn":"${queue}"}]}`, "LimitExceededException",
+		"The requested resource exceeds the maximum number allowed.")
+	w.ok("PutTargets", `{"Rule":"r","Targets":[{"Id":"5","Arn":"${queue}3"}]}`)
+	const ts = list(raw(w.ok("ListTargetsByRule", `{"Rule":"r"}`), "Targets"))
+	assert ts.length == 5 && field(ts[0], "Input") == "{}" && field(ts[4], "Arn") == `${queue}3`
+	assert raw(w.ok("ListRuleNamesByTarget", `{"TargetArn":"${queue}"}`), "RuleNames") == `["r"]`
+	assert w.fails("DeleteRule", `{"Name":"r"}`, "ValidationException", "Rule can't be deleted since it has targets.")
+	const removed = w.ok("RemoveTargets", `{"Rule":"r","Ids":["1","2","3","4","5"]}`)
+	assert raw(removed, "FailedEntryCount") == "0"
+	w.ok("DeleteRule", `{"Name":"r"}`)
+}
+
+test "PutEvents delivers the envelope to the targets of the rules it matches" {
+	const w = new World()
+	w.ok("PutRule",
+		`{"Name":"r","EventPattern":"{\\"source\\":[\\"com.shop\\"],\\"detail\\":{\\"n\\":[{\\"numeric\\":[\\">\\",1]}]}}"}`)
+	w.ok("PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"q","Arn":"${queue}"},`
+		+ `{"Id":"t","Arn":"arn:aws:sns:us-east-1:000000000000:t"},{"Id":"l","Arn":"arn:aws:lambda:us-east-1:000000000000:function:f"}]}`)
+	w.ok("PutRule", `{"Name":"off","State":"DISABLED","EventPattern":"{\\"source\\":[\\"com.shop\\"]}"}`)
+	w.ok("PutTargets", `{"Rule":"off","Targets":[{"Id":"q","Arn":"${queue}"}]}`)
+	const out = w.ok("PutEvents",
+		`{"Entries":[{"Source":"com.shop","DetailType":"Order","Detail":"{\\"n\\":2}",`
+		+ `"Resources":["arn:x"]},{"Source":"com.shop","DetailType":"Order","Detail":"{\\"n\\":1}"},`
+		+ `{"Source":"other","DetailType":"Order","Detail":"{\\"n\\":5}"}]}`)
+	assert raw(out, "FailedEntryCount") == "0"
+	const ids = list(raw(out, "Entries")).map(e => field(e, "EventId"))
+	assert ids.length == 3 && ids[0].length == 36 && ids[0] != ids[1]
+	assert w.sqs.sent.length == 1 && w.sns.sent.length == 1
+	const m = w.sqs.sent[0]
+	assert m.to == url && m.source == "arn:aws:events:us-east-1:000000000000:rule/r"
+	assert m.body
+		== `{"version":"0","id":"${ids[0]}","detail-type":"Order","source":"com.shop",`
+		+ `"account":"000000000000","time":"2015-06-26T14:00:00Z","region":"us-east-1","resources":["arn:x"],`
+		+ `"detail":{"n":2}}`
+	assert w.sns.sent[0].to == "arn:aws:sns:us-east-1:000000000000:t" && w.sns.sent[0].body == m.body
+}
+
+test "PutEvents entries that fail" {
+	const w = new World()
+	const out = w.ok("PutEvents",
+		`{"Entries":[{"DetailType":"t","Detail":"{}"},{"Source":"s","Detail":"{}"},`
+		+ `{"Source":"s","DetailType":"t"},{"Source":"s","DetailType":"t","Detail":"[1]"},`
+		+ `{"Source":"s","DetailType":"t","Detail":"{}","EventBusName":"nope"},{"Source":"s","DetailType":"t","Detail":"{}"}]}`)
+	assert raw(out, "FailedEntryCount") == "5"
+	const es = list(raw(out, "Entries"))
+	assert field(es[0], "ErrorCode") == "InvalidArgument"
+		&& field(es[0], "ErrorMessage") == "Parameter Source is not valid. Reason: Source is a required argument."
+	assert field(es[1], "ErrorMessage")
+		== "Parameter DetailType is not valid. Reason: DetailType is a required argument."
+	assert field(es[2], "ErrorMessage") == "Parameter Detail is not valid. Reason: Detail is a required argument."
+	assert field(es[3], "ErrorCode") == "MalformedDetail" && field(es[3], "ErrorMessage") == "Detail is malformed."
+	assert field(es[4], "ErrorCode") == "NotFound" && field(es[4], "ErrorMessage") == "Event bus nope does not exist."
+	assert field(es[5], "EventId").length == 36 && raw(es[5], "ErrorCode") == ""
+	let big = "x"
+	while (big.length < 256 * 1024) {
+		big += big
+	}
+	assert w.fails("PutEvents", `{"Entries":[{"Source":"s","DetailType":"t","Detail":"{\\"a\\":\\"${big}\\"}"}]}`,
+		"ValidationException", "Total size of the entries in the request is over the limit.")
+}
+
+test "input, input path and input transformer" {
+	const w = new World()
+	w.ok("PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"a\\"]}"}`)
+	w.ok("PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"1","Arn":"${queue}","Input":"{\\"fixed\\":true}"},`
+		+ `{"Id":"2","Arn":"${queue}","InputPath":"$.detail.items[0]"},`
+		+ `{"Id":"3","Arn":"${queue}","InputTransformer":{"InputPathsMap":{"n":"$.detail.n","s":"$.detail.items[1].sku",`
+		+ `"o":"$.detail.o","m":"$.missing"},"InputTemplate":"{\\"n\\":<n>,\\"s\\":\\"sku <s>\\",\\"o\\":<o>,\\"m\\":<m>,`
+		+ `\\"rule\\":\\"<aws.events.rule-name>\\"}"}},`
+		+ `{"Id":"4","Arn":"${queue}","InputTransformer":{"InputPathsMap":{"s":"$.source"},"InputTemplate":"\\"from <s>\\""}}]}`)
+	w.ok("PutEvents",
+		`{"Entries":[{"Source":"a","DetailType":"t",`
+		+ `"Detail":"{\\"n\\":3,\\"o\\":{\\"k\\":\\"v\\"},\\"items\\":[{\\"sku\\":\\"x\\"},{\\"sku\\":\\"y\\\\\\"z\\"}]}"}]}`)
+	const bodies = w.sqs.sent.map(s => s.body)
+	assert bodies[0] == `{"fixed":true}`
+	assert bodies[1] == `{"sku":"x"}`
+	assert bodies[2] == `{"n":3,"s":"sku y\\"z","o":{"k":"v"},"m":null,"rule":"r"}`
+	assert bodies[3] == `"from a"`
+}
+
+test "a refused delivery goes to the dead-letter queue, or is dropped" {
+	const w = new World()
+	w.sqs.refuse = "/gone"
+	w.ok("PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"a\\"]}"}`)
+	w.ok("PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"1","Arn":"arn:aws:sqs:us-east-1:000000000000:gone",`
+		+ `"Input":"\\"x\\"","DeadLetterConfig":{"Arn":"${queue}"},"RetryPolicy":{"MaximumRetryAttempts":3}},`
+		+ `{"Id":"2","Arn":"arn:aws:sqs:us-east-1:000000000000:gone"}]}`)
+	const out = w.ok("PutEvents", `{"Entries":[{"Source":"a","DetailType":"t","Detail":"{}"}]}`)
+	assert raw(out, "FailedEntryCount") == "0"
+	assert w.sqs.sent.length == 1 && w.sqs.sent[0].to == url && w.sqs.sent[0].body == `"x"`
+}
+
+test "a FIFO queue gets the group and the event's id to deduplicate by" {
+	const w = new World()
+	w.ok("PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"a\\"]}"}`)
+	w.ok("PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"1","Arn":"${queue}.fifo","SqsParameters":{"MessageGroupId":"g"}}]}`)
+	w.ok("PutEvents", `{"Entries":[{"Source":"a","DetailType":"t","Detail":"{}"}]}`)
+	assert w.sqs.sent.length == 1 && w.sqs.sent[0].to == `${url}.fifo` && w.sqs.sent[0].group == "g"
+}
+
+test "an event goes on to another bus, and not back" {
+	const w = new World()
+	w.ok("CreateEventBus", `{"Name":"b"}`)
+	// b takes what EventBridge puts on it; default, which has no policy, does not.
+	w.ok("PutPermission",
+		`{"EventBusName":"b","Policy":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":`
+		+ `\\"Allow\\",\\"Principal\\":{\\"Service\\":\\"events.amazonaws.com\\"},\\"Action\\":\\"events:PutEvents\\",`
+		+ `\\"Resource\\":\\"arn:aws:events:us-east-1:000000000000:event-bus/b\\"}]}"}`)
+	const p = `{\\"source\\":[\\"a\\"]}`
+	w.ok("PutRule", `{"Name":"on","EventPattern":"${p}"}`)
+	w.ok("PutTargets", `{"Rule":"on","Targets":[{"Id":"1","Arn":"arn:aws:events:us-east-1:000000000000:event-bus/b"}]}`)
+	w.ok("PutRule", `{"Name":"back","EventBusName":"b","EventPattern":"${p}"}`)
+	w.ok("PutTargets",
+		`{"Rule":"back","EventBusName":"b","Targets":[`
+		+ `{"Id":"1","Arn":"arn:aws:events:us-east-1:000000000000:event-bus/default"},{"Id":"2","Arn":"${queue}"}]}`)
+	w.ok("PutEvents", `{"Entries":[{"Source":"a","DetailType":"t","Detail":"{}"}]}`)
+	assert w.sqs.sent.length == 1 && w.sqs.sent[0].source == "arn:aws:events:us-east-1:000000000000:rule/b/back"
+}
+
+test "resource policies" {
+	const w = new World()
+	w.ok("PutPermission", `{"Action":"events:PutEvents","Principal":"111122223333","StatementId":"s1"}`)
+	assert w.fails("PutPermission", `{"Action":"events:PutEvents","Principal":"*","StatementId":"s1"}`,
+		"ResourceAlreadyExistsException", "Statement with the provided id already exists.")
+	w.ok("PutPermission", `{"Action":"events:PutEvents","Principal":"*","StatementId":"s2"}`)
+	const policy = field(w.ok("DescribeEventBus", "{}"), "Policy")
+	assert list(raw(policy, "Statement")).map(s => field(s, "Sid")) == ["s1", "s2"]
+	assert field(list(raw(policy, "Statement"))[0], "Resource")
+		== "arn:aws:events:us-east-1:000000000000:event-bus/default"
+	w.ok("RemovePermission", `{"StatementId":"s1"}`)
+	assert w.fails("RemovePermission", `{"StatementId":"s1"}`, "ResourceNotFoundException",
+		"Statement with the provided id does not exist.")
+	w.ok("RemovePermission", `{"RemoveAllPermissions":true}`)
+	assert raw(w.ok("DescribeEventBus", "{}"), "Policy") == ""
+	assert w.fails("RemovePermission", `{"StatementId":"s2"}`, "ResourceNotFoundException",
+		"EventBus does not have a policy.")
+}
+
+test "tags on rules" {
+	const w = new World()
+	const arn = field(w.ok("PutRule",
+		`{"Name":"r","EventPattern":"{\\"source\\":[\\"a\\"]}","Tags":[{"Key":"a","Value":"1"}]}`), "RuleArn")
+	w.ok("TagResource", `{"ResourceARN":"${arn}","Tags":[{"Key":"b","Value":"2"},{"Key":"a","Value":"3"}]}`)
+	w.ok("UntagResource", `{"ResourceARN":"${arn}","TagKeys":["b"]}`)
+	assert raw(w.ok("ListTagsForResource", `{"ResourceARN":"${arn}"}`), "Tags") == `[{"Key":"a","Value":"3"}]`
+	assert w.fails("TagResource", `{"ResourceARN":"${arn}x","Tags":[]}`, "ResourceNotFoundException",
+		"Rule rx does not exist on EventBus default.")
+}
+
+test "TestEventPattern" {
+	const w = new World()
+	const e = `{\\"id\\":\\"1\\",\\"account\\":\\"1\\",\\"source\\":\\"a\\",\\"time\\":\\"t\\",\\"region\\":\\"r\\",`
+		+ `\\"resources\\":[],\\"detail-type\\":\\"d\\",\\"detail\\":{\\"x\\":1}}`
+	assert raw(w.ok("TestEventPattern", `{"EventPattern":"{\\"detail\\":{\\"x\\":[1]}}","Event":"${e}"}`), "Result")
+		== "true"
+	assert raw(w.ok("TestEventPattern", `{"EventPattern":"{\\"source\\":[\\"b\\"]}","Event":"${e}"}`), "Result")
+		== "false"
+	assert w.fails("TestEventPattern", `{"EventPattern":"{\\"source\\":[\\"b\\"]}","Event":"{}"}`,
+		"ValidationException", "Parameter Event is not valid.")
+}
+
+test "paths" {
+	const v = `{"a":{"b":[1,{"c":"d"}]}}`
+	assert pick(v, "$") == v && pick(v, "$.a.b[1].c") == `"d"` && pick(v, "$.a.b[2]") == null && pick(v, "$.x") == null
+	const t = new api.Target()
+	assert inputOf(t, v, "r", "arn") == v
+}

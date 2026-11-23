@@ -1,0 +1,111 @@
+//! EventBridge's state in an account's regional tree; rules and targets are keyed within their bus and rule.
+
+import { Store, Table } from "../../core/state/store"
+
+export class Bus {
+	name = ""
+	description: string | null = null
+	policy: string | null = null
+	created: i64 = 0
+	modified: i64 = 0
+	tags: [string, string][] = []
+}
+
+export class Rule {
+	name = ""
+	bus = ""
+	pattern: string | null = null
+	/// Stored, never fired.
+	schedule: string | null = null
+	state = "ENABLED"
+	description: string | null = null
+	role: string | null = null
+	tags: [string, string][] = []
+}
+
+/// A rule's target; given is the wire's Target JSON as PutTargets took it, which ListTargetsByRule gives back.
+export class Target {
+	id = ""
+	arn = ""
+	given = ""
+}
+
+/// An archive of the events put on a bus that match its pattern, each with when it was put, in nanoseconds.
+export class Archive {
+	name = ""
+	bus = ""
+	description: string | null = null
+	pattern: string | null = null
+	retention = 0
+	created: i64 = 0
+	events: [i64, string][] = []
+}
+
+/// A replay of an archive's events to the destination bus, to the rules of the ARNs filters or, if none, all; done
+/// when it was started.
+export class Replay {
+	name = ""
+	archive = ""
+	description: string | null = null
+	start: i64 = 0
+	end: i64 = 0
+	destination = ""
+	filters: string[] = []
+	started: i64 = 0
+	last: i64 | null = null
+}
+
+/// A connection: parameters as DescribeConnection gives them, no secret among them; and the UUID its ARN ends in.
+export class Connection {
+	name = ""
+	description: string | null = null
+	kind = "BASIC"
+	parameters = ""
+	id = ""
+	created: i64 = 0
+	modified: i64 = 0
+}
+
+export class Destination {
+	name = ""
+	description: string | null = null
+	connection = ""
+	endpoint = ""
+	method = "POST"
+	rate: i32 | null = null
+	id = ""
+	created: i64 = 0
+	modified: i64 = 0
+}
+
+export class Tables {
+	buses: Table[Bus]
+	rules: Table[Rule]
+	targets: Table[Target]
+	archives: Table[Archive]
+	replays: Table[Replay]
+	connections: Table[Connection]
+	destinations: Table[Destination]
+
+	constructor(s: Store) {
+		this.connections = new Table[Connection](s, "events/connections")
+		this.destinations = new Table[Destination](s, "events/destinations")
+		this.buses = new Table[Bus](s, "events/buses")
+		this.rules = new Table[Rule](s, "events/rules")
+		this.targets = new Table[Target](s, "events/targets")
+		this.archives = new Table[Archive](s, "events/archives")
+		this.replays = new Table[Replay](s, "events/replays")
+	}
+}
+
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+export function busArn(region: string, account: string, name: string): string {
+	return `arn:aws:events:${region}:${account}:event-bus/${name}`
+}
+
+/// The ARN of rule r: the default bus's rules' without the bus's name.
+export function ruleArn(region: string, account: string, r: Rule): string {
+	const bus = if (r.bus == "default") "" else `${r.bus}/`
+	return `arn:aws:events:${region}:${account}:rule/${bus}${r.name}`
+}
