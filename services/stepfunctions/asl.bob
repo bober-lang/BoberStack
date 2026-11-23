@@ -388,6 +388,9 @@ export class Execution {
 		if (kind == "states" && startsWith(op, "activity:")) {
 			return this.activity(resource, eff)
 		}
+		if (startsWith(resource, "arn:aws:lambda:")) {
+			return this.function(resource, eff)
+		}
 		const named: [string, Json][] = [["resourceType", str(kind)], ["resource", str(op)]]
 		const scheduled = named.slice(0, 2)
 		scheduled.push(["region", str(this.region())])
@@ -406,6 +409,24 @@ export class Execution {
 			failed.push(["error", str(f.error)])
 			failed.push(["cause", str(f.cause)])
 			this.host.event("TaskFailed", "taskFailedEventDetails", obj(failed))
+			throw f
+		}
+	}
+
+	/// The result of the task of the Lambda function of the ARN resource given eff, its events recorded as of a function
+	/// AWS invokes itself.
+	private function(resource: string, eff: Json): Json throws Failure {
+		this.host.event("LambdaFunctionScheduled", "lambdaFunctionScheduledEventDetails",
+			obj([["resource", str(resource)], ["input", str(write(eff))], ["inputDetails", truncated()]]))
+		this.host.event("LambdaFunctionStarted", "", obj([]))
+		try {
+			const out = this.host.task(resource, eff)
+			this.host.event("LambdaFunctionSucceeded", "lambdaFunctionSucceededEventDetails",
+				obj([["output", str(write(out))], ["outputDetails", truncated()]]))
+			return out
+		} catch (f: Failure) {
+			this.host.event("LambdaFunctionFailed", "lambdaFunctionFailedEventDetails",
+				obj([["error", str(f.error)], ["cause", str(f.cause)]]))
 			throw f
 		}
 	}

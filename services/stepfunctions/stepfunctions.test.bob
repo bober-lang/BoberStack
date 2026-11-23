@@ -112,7 +112,7 @@ test "a machine runs to its end within StartExecution" {
 		`"type":"ExecutionSucceeded"`, `"nextToken":"1"`)
 	assert ok(sfn(g, "GetExecutionHistory", `{"executionArn":"${e}"}`), `"type":"ExecutionStarted"`,
 		`"type":"MapIterationStarted"`, `"resourceType":"sqs","resource":"sendMessage"`, `"type":"TaskFailed"`,
-		`"cause":"BoberStack has no Lambda to invoke"`, `"type":"SucceedStateEntered"`)
+		`"error":"Lambda.AWSLambdaException"`, `Error Code: AccessDeniedException;`, `"type":"SucceedStateEntered"`)
 	assert fails(sfn(g, "StartExecution", `{"stateMachineArn":"${machine}","name":"e"}`), "ExecutionAlreadyExists", e)
 	assert ok(sfn(g, "ListExecutions", `{"stateMachineArn":"${machine}","statusFilter":"SUCCEEDED"}`), `"name":"e"`)
 	assert ok(sfn(g, "DescribeStateMachineForExecution", `{"executionArn":"${e}"}`), `"roleArn":"${role}"`)
@@ -235,7 +235,8 @@ test "versions, aliases and TestState" {
 		+ `"End":true}}}`
 	assert ok(sfn(g, "TestState",
 		`{"definition":${json.quoted(full)},"stateName":"B","roleArn":"${role}","input":"{}","inspectionLevel":"DEBUG"}`),
-		`"status":"CAUGHT_ERROR"`, `"nextState":"A"`, `"errorDetails":{"catchIndex":1}`, `"error":"States.TaskFailed"`)
+		`"status":"CAUGHT_ERROR"`, `"nextState":"A"`, `"errorDetails":{"catchIndex":1}`,
+		`"error":"Lambda.AWSLambdaException"`)
 }
 
 /// The task token of the answer res of GetActivityTask.

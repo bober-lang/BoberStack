@@ -24,8 +24,13 @@
 //!   .waitForTaskToken; and the aws-sdk integration kinesis:putRecord. Their results are the service's output without
 //!   AWS's SdkHttpMetadata and SdkResponseMetadata. A failed call is named of the service and the fault's code with
 //!   Exception after it, as SQS.QueueDoesNotExistException, which is the SDK's name where the code is its exception's
-//!   name less Exception. A Lambda task fails with States.TaskFailed; any other resource the same way. A task runs as a
-//!   session of the role, which must trust states.amazonaws.com.
+//!   name less Exception. Any other resource fails with States.TaskFailed. A task runs as a session of the role, which
+//!   must trust states.amazonaws.com.
+//! - A Lambda task, lambda:invoke (also .waitForTaskToken), aws-sdk:lambda:invoke or the function's ARN, calls Lambda's
+//!   handler as the role. A refusal fails it as Lambda.ResourceNotFoundException and the like, Lambda.AWSLambdaException
+//!   if access is denied, with AWS's cause. No function runs here, so every function that exists answers its error:
+//!   the task fails with the payload's errorType, NotImplemented, the payload its cause; the aws-sdk task has it in its
+//!   output's FunctionError and Payload.
 //! - A nested .sync execution runs within its parent's request; one that pauses keeps the parent RUNNING, and the
 //!   request that ends it, by its last token or StopExecution, continues the parent. Its dates are milliseconds since
 //!   the epoch.
@@ -51,6 +56,7 @@ import { boolean, Json, JsonError, nul, num, obj, parse, str, write } from "./va
 import * as dynamodbApi from "../dynamodb/api"
 import * as eventsApi from "../events/api"
 import * as kinesisApi from "../kinesis/api"
+import * as lambdaApi from "../lambda/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import { actAs, passRole } from "../sts/sts"
@@ -80,6 +86,7 @@ export class Handler {
 	dynamodb: dynamodbApi.DynamoDB
 	events: eventsApi.EventBridge
 	kinesis: kinesisApi.Kinesis | null = null
+	lambda: lambdaApi.Lambda | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, dynamodb: dynamodbApi.DynamoDB, events: eventsApi.EventBridge) {
 		this.sqs = sqs
@@ -559,6 +566,14 @@ export class Handler {
 	}
 
 	listExecutions(caller: Caller, input: api.ListExecutionsInput): api.ListExecutionsOutput throws Fault {
+		if (input.stateMachineArn != null && input.mapRunArn != null) {
+			throw api.validationException("Cannot provide both a StateMachine ARN and a MapRun ARN")
+		}
+		if (input.mapRunArn != null) {
+			// No map run is kept: a Map state's iterations run within its execution.
+			caller.allow(input.mapRunArn!)
+			throw api.resourceNotFound(`Resource not found: '${input.mapRunArn!}'`)
+		}
 		if (input.stateMachineArn == null) {
 			throw api.validationException("Must provide a StateMachine ARN or MapRun ARN")
 		}
@@ -576,7 +591,8 @@ export class Handler {
 		}
 		// A version's or alias's ARN lists the executions started by it.
 		const all = db.executions.scan(null, 2147483647, `${name}\x00`).map(e => e[1]).filter(e => (input.statusFilter
-			== null || e.status == input.statusFilter) && (qualifier == "" || e.version == arn || e.alias == arn))
+			== null || e.status == input.statusFilter) && (qualifier == "" || e.version == arn || e.alias == arn)
+			&& (input.redriveFilter == null || (input.redriveFilter == "REDRIVEN") == (e.redrives > 0)))
 		const [page, next] = part(all, input.nextToken, input.maxResults)
 		const out = new api.ListExecutionsOutput()
 		out.executions = page.map(e => {
@@ -587,6 +603,10 @@ export class Handler {
 			w.status = statusOf(e.status)
 			w.startDate = e.started
 			w.stopDate = e.stopped
+			w.stateMachineVersionArn = e.version
+			w.stateMachineAliasArn = e.alias
+			w.redriveCount = e.redrives
+			w.redriveDate = e.redriven
 			return w
 		})
 		out.nextToken = next
@@ -933,6 +953,9 @@ export class Handler {
 		const p = write(parameters)
 		const prefix = "arn:aws:states:::"
 		const op = if (startsWith(resource, prefix)) resource.slice(prefix.length, resource.length) else ""
+		if (op == "lambda:invoke" || op == "aws-sdk:lambda:invoke" || isLambda(resource)) {
+			return this.invoke(c, op, resource, parameters)
+		}
 		try {
 			switch (op) {
 				case "sqs:sendMessage":
@@ -986,10 +1009,72 @@ export class Handler {
 		if (startsWith(op, "states:")) {
 			throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
 		}
-		if (startsWith(op, "lambda:") || isLambda(resource)) {
-			throw new asl.Failure("States.TaskFailed", "BoberStack has no Lambda to invoke")
-		}
 		throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
+	}
+
+	/// The result of the Lambda task op, lambda:invoke, aws-sdk:lambda:invoke or "" for the function's ARN resource
+	/// itself, of parameters, invoked as the session c by Lambda's handler. A call Lambda refuses fails with
+	/// Lambda.<its exception>, AWSLambdaException where Lambda models none, its cause as AWS words it; a function's error
+	/// fails the optimized task and the ARN's with its errorType, Lambda.Unknown if it has none, its cause the payload,
+	/// and is the aws-sdk task's output.
+	private invoke(c: Caller, op: string, resource: string, parameters: Json): Json throws asl.Failure {
+		const sdk = op == "aws-sdk:lambda:invoke"
+		const r = new lambdaApi.InvocationRequest()
+		let payload: Json | null = parameters
+		if (op == "") {
+			r.FunctionName = resource
+		} else {
+			r.FunctionName = parameters.str("FunctionName") ?? ""
+			r.Qualifier = parameters.str("Qualifier")
+			const t = parameters.str("InvocationType")
+			r.InvocationType = if (t == "Event") "Event" else if (t == "DryRun") "DryRun" else null
+			payload = parameters.get("Payload")
+		}
+		r.Payload = if (payload == null) null else if (payload.kind == "string") payload.text else write(payload!)
+		if (this.lambda == null) {
+			throw new asl.Failure("Lambda.ServiceException", "Lambda is not served")
+		}
+		let out = new lambdaApi.InvocationResponse()
+		try {
+			c.actions = ["lambda:InvokeFunction"]
+			out = this.lambda!.invoke(c, r)
+		} catch (f: Fault) {
+			const parts = split(f.code, ".")
+			const last = parts[parts.length - 1]
+			const code = if (endsWith(last, "Exception")) last else `${last}Exception`
+			const modeled = endsWith(code, "Exception") && code != "AccessDeniedException"
+			let id = ""
+			try {
+				id = uuid()
+			} catch (g: Fault) {} // no randomness: no request ID
+			throw new asl.Failure(`Lambda.${if (modeled) code else "AWSLambdaException"}`,
+				if (sdk) `${f.message} (Service: Lambda, Status Code: ${f.status}, Request ID: ${id})`
+				else `${f.message} (Service: AWSLambda; Status Code: ${f.status}; Error Code: ${code}; `
+				+ `Request ID: ${id}; Proxy: null)`)
+		}
+		let result: Json = nul()
+		try {
+			result = parse(out.Payload ?? "null")
+		} catch (j: JsonError) {
+			result = str(out.Payload ?? "")
+		}
+		if (out.FunctionError != null && !sdk) {
+			throw new asl.Failure(if (result.kind == "object") result.str("errorType") ?? "Lambda.Unknown"
+				else "Lambda.Unknown", out.Payload ?? "")
+		}
+		if (op == "") {
+			return result
+		}
+		const keys: [string, Json][] = []
+		if (out.ExecutedVersion != null) {
+			keys.push(["ExecutedVersion", str(out.ExecutedVersion!)])
+		}
+		if (out.FunctionError != null) {
+			keys.push(["FunctionError", str(out.FunctionError!)])
+		}
+		keys.push(["Payload", if (sdk) str(out.Payload ?? "") else result])
+		keys.push(["StatusCode", num(out.StatusCode as f64)])
+		return obj(keys)
 	}
 
 	/// The result of the nested execution the Task op, states:startExecution with or without .sync or .sync:2, starts of
