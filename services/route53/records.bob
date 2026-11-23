@@ -1,0 +1,68 @@
+//! Route 53's state in an account's tree: its hosted zones by id, each with its record sets; the caller references
+//! that made them; and the changes submitted, by id.
+
+import { Store, Table } from "../../core/state/store"
+
+export class Zone {
+	id = ""
+	/// Normalised: lower case, its trailing dot, escaped as AWS escapes it.
+	name = ""
+	reference = ""
+	comment: string | null = null
+	isPrivate = false
+	/// The VPCs of a private zone: each its region and id.
+	vpcs: [string, string][] = []
+	nameServers: string[] = []
+	records: Record[] = []
+	tags: [string, string][] = []
+	created: i64 = 0
+}
+
+/// A record set: its name normalised as the zone's, its type, and how it routes.
+export class Record {
+	name = ""
+	type = ""
+	setIdentifier: string | null = null
+	weight: i64 | null = null
+	region: string | null = null
+	continent: string | null = null
+	country: string | null = null
+	subdivision: string | null = null
+	failover: string | null = null
+	multiValue: bool | null = null
+	ttl: i64 | null = null
+	values: string[] | null = null
+	alias: Alias | null = null
+	healthCheck: string | null = null
+}
+
+export class Alias {
+	zone = ""
+	name = ""
+	evaluate = false
+}
+
+/// A change submitted: when, and its comment.
+export class Change {
+	id = ""
+	submitted: i64 = 0
+	comment: string | null = null
+}
+
+/// The zone a caller reference made: its id.
+export class Reference {
+	zone = ""
+}
+
+/// Route 53's tables in the account's tree s.
+export class Tables {
+	zones: Table[Zone]
+	references: Table[Reference]
+	changes: Table[Change]
+
+	constructor(s: Store) {
+		this.zones = new Table[Zone](s, "route53/zones")
+		this.references = new Table[Reference](s, "route53/references")
+		this.changes = new Table[Change](s, "route53/changes")
+	}
+}

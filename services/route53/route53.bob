@@ -1,0 +1,748 @@
+//! Amazon Route 53: public and private hosted zones, their record sets, changes and tags.
+//!
+//! Route 53 is global: requests are signed for us-east-1 and its state is in the account's tree. A zone is made with
+//! its NS and SOA record sets and a delegation set of four name servers, one of each of AWS's top-level domains. A
+//! change is answered PENDING, as AWS answers it, and is INSYNC from then on: nothing runs between requests, so there
+//! is no propagation to wait for. There is no DNS server: record sets are stored and validated, never served, and
+//! routing policies, alias targets and health checks route nothing. Private zones take any VPC id, which AWS checks
+//! with EC2. A request's XML is decoded by the model, not by Route 53's schema: an element out of order is taken, and a
+//! missing one is answered by the model's validation, not by the schema's message; validation names the model's
+//! members, where AWS names some otherwise, as resourceId for an Id. Health checks, delegation sets, traffic policies,
+//! DNSSEC, query logging and the rest are not implemented.
+
+import { Fault } from "../../core/fault"
+import * as restxml from "../../core/protocol/restxml"
+import { Caller } from "../../core/service"
+import * as api from "./api"
+import { Alias, Change, Record, Reference, Tables, Zone } from "./records"
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit } from "std/ascii"
+import { bytes } from "std/crypto/random"
+import { encode, EncodeError } from "std/encoding/json"
+import { Body, Request, Response } from "std/http"
+import { min } from "std/math"
+import { lower, ParseError, parseInt, replace, split } from "std/string"
+
+/// What a zone's SOA names after its first name server.
+const soa = "awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	createHostedZone(caller: Caller, input: api.CreateHostedZoneRequest): api.CreateHostedZoneResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		domain(input.Name)
+		const name = normal(input.Name)
+		if (name == "example.com." || endsWith(name, ".example.com.")) {
+			throw api.invalidDomainName(`${input.Name} is reserved by AWS!`)
+		}
+		if (t.references.get(input.CallerReference) != null) {
+			throw api.hostedZoneAlreadyExists("A hosted zone has already been created with the specified caller reference.")
+		}
+		const z = new Zone()
+		z.id = id("Z")
+		z.name = name
+		z.reference = input.CallerReference
+		z.comment = input.HostedZoneConfig?.Comment
+		z.created = now()
+		if (input.VPC != null) {
+			z.isPrivate = true
+			z.vpcs = [[input.VPC!.VPCRegion ?? "", input.VPC!.VPCId ?? ""]]
+		}
+		z.nameServers = nameServers()
+		const ns = new Record()
+		ns.name = name
+		ns.type = "NS"
+		ns.ttl = 172800
+		ns.values = z.nameServers.map(n => `${n}.`)
+		const s = new Record()
+		s.name = name
+		s.type = "SOA"
+		s.ttl = 900
+		s.values = [`${z.nameServers[0]}. ${soa}`]
+		z.records = [ns, s]
+		put(t, z)
+		try {
+			t.references.put(input.CallerReference, reference(z.id))
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `${e}`)
+		}
+		const out = new api.CreateHostedZoneResponse()
+		out.HostedZone = zoneOf(z)
+		out.ChangeInfo = submit(t, null)
+		out.DelegationSet = delegation(z) ?? new api.DelegationSet()
+		if (z.isPrivate) {
+			out.VPC = input.VPC
+		}
+		out.Location = `${caller.endpoint}/2013-04-01/hostedzone/${z.id}`
+		return out
+	}
+
+	getHostedZone(caller: Caller, input: api.GetHostedZoneRequest): api.GetHostedZoneResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const z = zone(new Tables(caller.store()), input.Id)
+		const out = new api.GetHostedZoneResponse()
+		out.HostedZone = zoneOf(z)
+		out.DelegationSet = delegation(z)
+		if (z.isPrivate) {
+			out.VPCs = z.vpcs.map(v => vpc(v))
+		}
+		return out
+	}
+
+	getHostedZoneCount(caller: Caller,
+		input: api.GetHostedZoneCountRequest): api.GetHostedZoneCountResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetHostedZoneCountResponse()
+		out.HostedZoneCount = all(new Tables(caller.store())).length
+		return out
+	}
+
+	listHostedZones(caller: Caller, input: api.ListHostedZonesRequest): api.ListHostedZonesResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const zs = all(new Tables(caller.store())).filter(z => input.Marker == null
+			|| z.id >= input.Marker!).filter(z => input.HostedZoneType == null || z.isPrivate)
+		const out = new api.ListHostedZonesResponse()
+		out.HostedZones = zs.slice(0, min(max, zs.length)).map(z => zoneOf(z))
+		out.Marker = input.Marker ?? ""
+		out.MaxItems = max
+		if (zs.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = zs[max].id
+		}
+		return out
+	}
+
+	listHostedZonesByName(caller: Caller,
+		input: api.ListHostedZonesByNameRequest): api.ListHostedZonesByNameResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		let from = ""
+		if (input.DNSName != null) {
+			domain(input.DNSName!)
+			from = key(normal(input.DNSName!))
+		}
+		const zs = all(new Tables(caller.store()))
+		sortBy(zs, (a, b) => key(a.name) < key(b.name) || key(a.name) == key(b.name) && a.id < b.id)
+		const after = input.HostedZoneId
+		const listed = zs.filter(z => key(z.name) > from || key(z.name) == from && (after == null || z.id >= after!))
+		const out = new api.ListHostedZonesByNameResponse()
+		out.HostedZones = listed.slice(0, min(max, listed.length)).map(z => zoneOf(z))
+		out.DNSName = input.DNSName
+		out.HostedZoneId = input.HostedZoneId
+		out.MaxItems = max
+		if (listed.length > max) {
+			out.IsTruncated = true
+			out.NextDNSName = listed[max].name
+			out.NextHostedZoneId = listed[max].id
+		}
+		return out
+	}
+
+	listHostedZonesByVPC(caller: Caller,
+		input: api.ListHostedZonesByVPCRequest): api.ListHostedZonesByVPCResponse throws Fault {
+		caller.allow("*")
+		const out = new api.ListHostedZonesByVPCResponse()
+		for (const z of all(new Tables(caller.store()))) {
+			if (z.vpcs.some(v => v[0] == input.VPCRegion && v[1] == input.VPCId)) {
+				const s = new api.HostedZoneSummary()
+				s.HostedZoneId = z.id
+				s.Name = z.name
+				s.Owner.OwningAccount = caller.account
+				out.HostedZoneSummaries.push(s)
+			}
+		}
+		out.MaxItems = items(input.MaxItems)
+		return out
+	}
+
+	updateHostedZoneComment(caller: Caller,
+		input: api.UpdateHostedZoneCommentRequest): api.UpdateHostedZoneCommentResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
+		z.comment = input.Comment
+		put(t, z)
+		const out = new api.UpdateHostedZoneCommentResponse()
+		out.HostedZone = zoneOf(z)
+		return out
+	}
+
+	deleteHostedZone(caller: Caller, input: api.DeleteHostedZoneRequest): api.DeleteHostedZoneResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
+		if (z.records.some(r => !apex(z, r))) {
+			throw api.hostedZoneNotEmpty("The specified hosted zone contains resource record sets other than the default "
+				+ "SOA and NS records and so cannot be deleted. Delete all non-default records and try again.")
+		}
+		t.zones.delete(z.id)
+		const out = new api.DeleteHostedZoneResponse()
+		out.ChangeInfo = submit(t, null)
+		return out
+	}
+
+	associateVPCWithHostedZone(caller: Caller,
+		input: api.AssociateVPCWithHostedZoneRequest): api.AssociateVPCWithHostedZoneResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		if (!z.isPrivate) {
+			throw api.publicZoneVPCAssociation(`Public hosted zone ${z.id} cannot be associated with a VPC.`)
+		}
+		const v: [string, string] = [input.VPC.VPCRegion ?? "", input.VPC.VPCId ?? ""]
+		if (z.vpcs.some(w => w[0] == v[0] && w[1] == v[1])) {
+			throw api.conflictingDomainExists(`The VPC ${v[1]} in ${v[0]} region is already associated with the hosted zone.`)
+		}
+		z.vpcs.push(v)
+		put(t, z)
+		const out = new api.AssociateVPCWithHostedZoneResponse()
+		out.ChangeInfo = submit(t, input.Comment)
+		return out
+	}
+
+	disassociateVPCFromHostedZone(caller: Caller,
+		input: api.DisassociateVPCFromHostedZoneRequest): api.DisassociateVPCFromHostedZoneResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		const region = input.VPC.VPCRegion ?? ""
+		const vpcId = input.VPC.VPCId ?? ""
+		const kept = z.vpcs.filter(w => w[0] != region || w[1] != vpcId)
+		if (kept.length == z.vpcs.length) {
+			throw api.vpcAssociationNotFound(`The specified VPC ${vpcId} and hosted zone ${z.id} are not currently associated.`)
+		}
+		if (kept.length == 0) {
+			throw api.lastVPCAssociation("The VPC that you're trying to disassociate from the private hosted zone is the last "
+				+ "VPC that is associated with the hosted zone. Amazon Route 53 doesn't support disassociating the last VPC "
+				+ "from a hosted zone.")
+		}
+		z.vpcs = kept
+		put(t, z)
+		const out = new api.DisassociateVPCFromHostedZoneResponse()
+		out.ChangeInfo = submit(t, input.Comment)
+		return out
+	}
+
+	changeResourceRecordSets(caller: Caller,
+		input: api.ChangeResourceRecordSetsRequest): api.ChangeResourceRecordSetsResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		for (const c of input.ChangeBatch.Changes) {
+			shaped(c)
+		}
+		const errors: string[] = []
+		for (const c of input.ChangeBatch.Changes) {
+			const why = apply(z, c.Action, record(c.ResourceRecordSet))
+			if (why != null) {
+				errors.push(why!)
+			}
+		}
+		if (errors.length > 0) {
+			// of no members: the generated fault would write an empty structure into the error
+			throw new Fault(400, "InvalidChangeBatch", `[${errors.join(", ")}]`)
+		}
+		put(t, z)
+		const out = new api.ChangeResourceRecordSetsResponse()
+		out.ChangeInfo = submit(t, input.ChangeBatch.Comment)
+		return out
+	}
+
+	listResourceRecordSets(caller: Caller,
+		input: api.ListResourceRecordSetsRequest): api.ListResourceRecordSetsResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const z = zone(new Tables(caller.store()), input.HostedZoneId)
+		if (input.StartRecordName == null && input.StartRecordType != null) {
+			throw api.invalidInput("")
+		}
+		const max = items(input.MaxItems)
+		let rs = z.records
+		if (input.StartRecordName != null) {
+			const from = order(normal(input.StartRecordName!), input.StartRecordType ?? "",
+				input.StartRecordIdentifier ?? "")
+			rs = rs.filter(r => order(r.name, r.type, r.setIdentifier ?? "") >= from)
+		}
+		const out = new api.ListResourceRecordSetsResponse()
+		out.ResourceRecordSets = rs.slice(0, min(max, rs.length)).map(r => wire(r))
+		out.MaxItems = max
+		if (rs.length > max) {
+			const next = rs[max]
+			out.IsTruncated = true
+			out.NextRecordName = next.name
+			out.NextRecordType = next.type as api.RRType
+			out.NextRecordIdentifier = next.setIdentifier
+		}
+		return out
+	}
+
+	getChange(caller: Caller, input: api.GetChangeRequest): api.GetChangeResponse throws Fault {
+		caller.allow(`arn:aws:route53:::change/${input.Id}`)
+		const c = new Tables(caller.store()).changes.get(input.Id)
+		if (c == null) {
+			throw api.noSuchChange(`Could not find resource with ID: ${input.Id}`)
+		}
+		const out = new api.GetChangeResponse()
+		out.ChangeInfo = info(c!)
+		out.ChangeInfo.Status = "INSYNC"
+		return out
+	}
+
+	changeTagsForResource(caller: Caller,
+		input: api.ChangeTagsForResourceRequest): api.ChangeTagsForResourceResponse throws Fault {
+		const t = new Tables(caller.store())
+		const z = tagged(caller, t, input.ResourceType, input.ResourceId)
+		const removed = input.RemoveTagKeys ?? []
+		let tags = z.tags.filter(g => !removed.includes(g[0]))
+		for (const g of input.AddTags ?? []) {
+			const k = g.Key ?? ""
+			tags = tags.filter(h => h[0] != k)
+			tags.push([k, g.Value ?? ""])
+		}
+		z.tags = tags
+		put(t, z)
+		return new api.ChangeTagsForResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		const z = tagged(caller, new Tables(caller.store()), input.ResourceType, input.ResourceId)
+		const out = new api.ListTagsForResourceResponse()
+		out.ResourceTagSet = tagSet(input.ResourceType, z)
+		return out
+	}
+
+	listTagsForResources(caller: Caller,
+		input: api.ListTagsForResourcesRequest): api.ListTagsForResourcesResponse throws Fault {
+		const t = new Tables(caller.store())
+		const out = new api.ListTagsForResourcesResponse()
+		for (const r of input.ResourceIds) {
+			out.ResourceTagSets.push(tagSet(input.ResourceType, tagged(caller, t, input.ResourceType, r)))
+		}
+		return out
+	}
+}
+
+/// Serves req to h, answering in text/xml, as Route 53 does.
+export function serve(h: Handler, caller: Caller, req: Request): Response throws IoError {
+	return typed(api.handle(h, caller, req))
+}
+
+/// The answer of the fault f to the request requestId, as Route 53 words it.
+export function error(f: Fault, requestId: string): Response { return typed(restxml.error(api.service, f, requestId)) }
+
+/// res, its body typed text/xml if it has one, and an error of it of Route 53's namespace and of no empty message.
+function typed(res: Response): Response {
+	if (res.headers.has("content-type")) {
+		res.headers.set("content-type", "text/xml")
+	}
+	if (res.status >= 400) {
+		try {
+			let body = replace(res.body.text(), "<ErrorResponse>", `<ErrorResponse xmlns="${api.service.ns}">`)
+			body = replace(replace(body, "<Message></Message>", ""), "<Message/>", "")
+			res.body = new Body(body)
+		} catch (e: IoError) {
+			// an error's body is a string, which reads without fail
+		}
+	}
+	return res
+}
+
+/// The ARN of the hosted zone of id.
+function arn(id: string): string { return `arn:aws:route53:::hostedzone/${bare(id)}` }
+/// id without the /hostedzone/ that an SDK may leave on it.
+function bare(id: string): string { return if (startsWith(id, "/hostedzone/")) id.slice(12, id.length) else id }
+
+/// The zone of id, else NoSuchHostedZone.
+function zone(t: Tables, id: string): Zone throws Fault {
+	const z = t.zones.get(bare(id))
+	if (z == null) {
+		throw api.noSuchHostedZone(`No hosted zone found with ID: ${bare(id)}`)
+	}
+	return z!
+}
+
+/// The zone of id that tags are asked of, after the caller may; only hosted zones are.
+function tagged(caller: Caller, t: Tables, kind: api.TagResourceType, id: string): Zone throws Fault {
+	if (kind != "hostedzone") {
+		throw notImplementedTags(kind)
+	}
+	caller.allow(arn(id))
+	return zone(t, id)
+}
+
+/// The fault of tags of a kind of resource that is not implemented.
+function notImplementedTags(kind: string): Fault {
+	return new Fault(501, "NotImplemented", `Tags of a ${kind} are not implemented`)
+}
+
+/// The tags of z, of kind, as the API gives them.
+function tagSet(kind: api.TagResourceType, z: Zone): api.ResourceTagSet {
+	const s = new api.ResourceTagSet()
+	s.ResourceType = kind
+	s.ResourceId = z.id
+	s.Tags = z.tags.map(g => {
+		const tag = new api.Tag()
+		tag.Key = g[0]
+		tag.Value = g[1]
+		return tag
+	})
+	return s
+}
+
+/// Every zone, by id.
+function all(t: Tables): Zone[] { return t.zones.scan(null, 1000000).map(e => e[1]) }
+
+/// Stores z, its record sets in AWS's order.
+function put(t: Tables, z: Zone) throws Fault {
+	sortBy(z.records,
+		(a, b) => order(a.name, a.type, a.setIdentifier ?? "") < order(b.name, b.type, b.setIdentifier ?? ""))
+	try {
+		t.zones.put(z.id, z)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `${e}`)
+	}
+}
+
+function reference(zone: string): Reference {
+	const r = new Reference()
+	r.zone = zone
+	return r
+}
+
+/// A change submitted now, of comment, stored; PENDING, as AWS answers it.
+function submit(t: Tables, comment: string | null): api.ChangeInfo throws Fault {
+	const c = new Change()
+	c.id = id("C")
+	c.submitted = now()
+	c.comment = comment
+	try {
+		t.changes.put(c.id, c)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `${e}`)
+	}
+	return info(c)
+}
+
+function info(c: Change): api.ChangeInfo {
+	const i = new api.ChangeInfo()
+	i.Id = `/change/${c.id}`
+	i.SubmittedAt = c.submitted
+	i.Comment = c.comment
+	return i
+}
+
+/// The max items asked for, 100 if none.
+function items(n: i32 | null): i32 { return if (n == null || n! <= 0) 100 else n! }
+
+/// A new id of the prefix p, as AWS's: 20 upper-case letters and digits after it.
+function id(p: string): string throws Fault {
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	let b = ""
+	try {
+		b = bytes(20)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	const out: u8[] = []
+	for (let i = 0; i < 20; i++) {
+		out.push(alphabet[(b[i] as i32) % alphabet.length])
+	}
+	return p + fromBytes(out)
+}
+
+/// Four name servers, as AWS's: of .com, .net, .org and .co.uk.
+function nameServers(): string[] throws Fault {
+	let b = ""
+	try {
+		b = bytes(8)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	const out: string[] = []
+	const tlds = ["com", "net", "org", "co.uk"]
+	for (let i = 0; i < 4; i++) {
+		const n = ((b[2 * i] as i32) * 8 + (b[2 * i + 1] as i32) % 8) % 2048
+		const d = (b[2 * i + 1] as i32) % 64
+		out.push(`ns-${n}.awsdns-${if (d < 10) "0" else ""}${d}.${tlds[i]}`)
+	}
+	return out
+}
+
+/// The zone z as the API gives it.
+function zoneOf(z: Zone): api.HostedZone {
+	const h = new api.HostedZone()
+	h.Id = `/hostedzone/${z.id}`
+	h.Name = z.name
+	h.CallerReference = z.reference
+	const c = new api.HostedZoneConfig()
+	c.Comment = z.comment
+	c.PrivateZone = z.isPrivate
+	c.HostedZoneTier = "STANDARD"
+	h.Config = c
+	h.ResourceRecordSetCount = z.records.length
+	const f = new api.HostedZoneFeatures()
+	f.AcceleratedRecoveryStatus = "DISABLED"
+	const history = new api.ChangeHistoryFeature()
+	history.Status = "DISABLED"
+	f.ChangeHistory = history
+	const guardrails: [api.ChangeGuardrailName, api.ChangeGuardrailStatus][] = [["NS_OCCLUSION_CHECK", "DISABLED"],
+		["NS_DELEGATION_AUTHORITY_CHECK", "ENABLED"], ["NS_FORMAT_CHECK", "ENABLED"],
+		["ALIAS_TARGET_CHECK", "DISABLED"], ["ACTIVE_RECORD_CHECK", "DISABLED"],
+		["ACTIVE_DELEGATION_CHECK", "DISABLED"]]
+	f.ChangeGuardrails = guardrails.map(g => {
+		const r = new api.ChangeGuardrail()
+		r.Name = g[0]
+		r.Status = g[1]
+		return r
+	})
+	h.Features = f
+	return h
+}
+
+/// The delegation set of z, null for a private zone.
+function delegation(z: Zone): api.DelegationSet | null {
+	if (z.isPrivate) {
+		return null
+	}
+	const d = new api.DelegationSet()
+	d.NameServers = z.nameServers
+	return d
+}
+
+function vpc(v: [string, string]): api.VPC {
+	const out = new api.VPC()
+	out.VPCRegion = v[0] as api.VPCRegion
+	out.VPCId = v[1]
+	return out
+}
+
+/// Throws InvalidDomainName unless name, as given, has no empty label.
+function domain(name: string) throws Fault {
+	const trimmed = if (endsWith(name, ".") && name != ".") name.slice(0, name.length - 1) else name
+	if (split(trimmed, ".").some(l => l == "")) {
+		throw api.invalidDomainName(`FATAL problem: DomainLabelEmpty (Domain label is empty) encountered with '${name}'`)
+	}
+}
+
+/// name as Route 53 holds it: lower case, of a trailing dot, each character but letters, digits, - and _ escaped as
+/// \ and its octal code, as * is \052.
+export function normal(name: string): string {
+	const s = lower(name)
+	let out = ""
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		if (c == "\\"[0] && i + 3 < s.length && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3])) {
+			out += s.slice(i, i + 4)
+			i += 3
+		} else if (isAlphanumeric(c) || c == "-"[0] || c == "_"[0] || c == "."[0]) {
+			out += s.slice(i, i + 1)
+		} else {
+			const n = c as i32
+			out += `\\${n / 64}${n / 8 % 8}${n % 8}`
+		}
+	}
+	return if (endsWith(out, ".")) out else out + "."
+}
+
+/// The key that orders names as AWS lists them: by their labels from the last, each unescaped.
+function key(name: string): string {
+	const labels = split(name, ".").filter(l => l != "").map(l => unescaped(l))
+	labels.reverse()
+	return labels.join("\x01")
+}
+
+/// The key that orders record sets: by name, then type, then set identifier.
+function order(name: string, kind: string, set: string): string { return `${key(name)}\x00${kind}\x00${set}` }
+
+/// label with each \ddd as its character.
+function unescaped(label: string): string {
+	let out = ""
+	for (let i = 0; i < label.length; i++) {
+		if (label[i] == "\\"[0] && i + 3 < label.length && isDigit(label[i + 1])) {
+			const n = ((label[i + 1] as i32) - 48) * 64 + ((label[i + 2] as i32) - 48) * 8
+				+ ((label[i + 3] as i32) - 48)
+			out += fromBytes([n as u8])
+			i += 3
+		} else {
+			out += label.slice(i, i + 1)
+		}
+	}
+	return out
+}
+
+/// Whether r is one of z's own NS and SOA.
+function apex(z: Zone, r: Record): bool { return r.name == z.name && (r.type == "NS" || r.type == "SOA") }
+
+/// Throws InvalidInput unless c's record set is of one form: an alias, a TTL with values, or a traffic policy's; and
+/// of a set identifier exactly when it routes by a policy.
+function shaped(c: api.Change) throws Fault {
+	const r = c.ResourceRecordSet
+	const at = `Change with [Action=${c.Action}, Name=${r.Name}, Type=${r.Type}, SetIdentifier=${r.SetIdentifier ?? "null"}]`
+	const plain = r.TTL != null && r.ResourceRecords != null
+	const forms = [r.AliasTarget != null, plain, r.TrafficPolicyInstanceId != null].filter(p => p).length
+	if (forms != 1) {
+		const found = if (forms == 0) "none" else "more than one"
+		throw api.invalidInput("Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and ResourceRecords], "
+			+ `or TrafficPolicyInstanceId], but found ${found} in ${at}`)
+	}
+	const policies = [r.Weight != null, r.Region != null, r.Failover != null, r.GeoLocation != null,
+		r.MultiValueAnswer != null, r.GeoProximityLocation != null, r.CidrRoutingConfig != null,
+		r.AZAffinity != null].filter(p => p).length
+	if (r.SetIdentifier == null && policies > 0) {
+		throw api.invalidInput(`Invalid request: Missing field 'SetIdentifier' in ${at}`)
+	}
+	if (r.SetIdentifier != null && policies != 1) {
+		const found = if (policies == 0) "none" else "more than one"
+		throw api.invalidInput("Invalid request: Expected exactly one of [Weight, Region, Failover, GeoLocation, "
+			+ "MultiValueAnswer, GeoProximityLocation, CidrRoutingConfig, or AZAffinity], but found "
+			+ `${found} in ${at}`)
+	}
+}
+
+/// The record set s as stored.
+function record(s: api.ResourceRecordSet): Record {
+	const r = new Record()
+	r.name = normal(s.Name)
+	r.type = s.Type
+	r.setIdentifier = s.SetIdentifier
+	r.weight = s.Weight
+	r.region = s.Region
+	r.continent = s.GeoLocation?.ContinentCode
+	r.country = s.GeoLocation?.CountryCode
+	r.subdivision = s.GeoLocation?.SubdivisionCode
+	r.failover = s.Failover
+	r.multiValue = s.MultiValueAnswer
+	r.ttl = s.TTL
+	r.values = s.ResourceRecords?.map(v => v.Value)
+	if (s.AliasTarget != null) {
+		const a = new Alias()
+		a.zone = bare(s.AliasTarget!.HostedZoneId)
+		a.name = normal(s.AliasTarget!.DNSName)
+		a.evaluate = s.AliasTarget!.EvaluateTargetHealth
+		r.alias = a
+	}
+	r.healthCheck = s.HealthCheckId
+	return r
+}
+
+/// The record set r as the API gives it.
+function wire(r: Record): api.ResourceRecordSet {
+	const s = new api.ResourceRecordSet()
+	s.Name = r.name
+	s.Type = r.type as api.RRType
+	s.SetIdentifier = r.setIdentifier
+	s.Weight = r.weight
+	if (r.region != null) {
+		s.Region = r.region! as api.ResourceRecordSetRegion
+	}
+	if (r.continent != null || r.country != null || r.subdivision != null) {
+		const g = new api.GeoLocation()
+		g.ContinentCode = r.continent
+		g.CountryCode = r.country
+		g.SubdivisionCode = r.subdivision
+		s.GeoLocation = g
+	}
+	if (r.failover != null) {
+		s.Failover = r.failover! as api.ResourceRecordSetFailover
+	}
+	s.MultiValueAnswer = r.multiValue
+	s.TTL = r.ttl
+	s.ResourceRecords = r.values?.map(v => {
+		const out = new api.ResourceRecord()
+		out.Value = v
+		return out
+	})
+	if (r.alias != null) {
+		const a = new api.AliasTarget()
+		a.HostedZoneId = r.alias!.zone
+		a.DNSName = r.alias!.name
+		a.EvaluateTargetHealth = r.alias!.evaluate
+		s.AliasTarget = a
+	}
+	s.HealthCheckId = r.healthCheck
+	return s
+}
+
+/// Whether a and b are the same record set: of the same name, type and set identifier.
+function same(a: Record, b: Record): bool {
+	return a.name == b.name && a.type == b.type && a.setIdentifier == b.setIdentifier
+}
+
+/// Whether a and b hold the same, as a DELETE must name what is there.
+function equal(a: Record, b: Record): bool {
+	try {
+		return encode(a) == encode(b)
+	} catch (e: EncodeError) {
+		return false
+	}
+}
+
+/// Applies the action to r in z; or why it cannot, as AWS words it in an InvalidChangeBatch, z then as it was.
+function apply(z: Zone, action: api.ChangeAction, r: Record): string | null {
+	const named = `[name='${r.name}', type='${r.type}']`
+	if (r.name != z.name && !endsWith(r.name, `.${z.name}`)) {
+		return `RRSet with DNS name ${r.name} is not permitted in zone ${z.name}`
+	}
+	if (r.type == "A" && r.values != null) {
+		for (const v of r.values!) {
+			if (!ipv4(v)) {
+				return "Invalid Resource Record: 'FATAL problem: ARRDATAIllegalIPv4Address (Value is not a valid IPv4 "
+					+ `address) encountered with '${v}''`
+			}
+		}
+	}
+	const there = z.records.filter(o => same(o, r)).at(0)
+	if (action == "DELETE") {
+		if (there == null) {
+			return `Tried to delete resource record set ${named} but it was not found`
+		}
+		if (!equal(there!, r)) {
+			return if (r.type == "SOA") `Tried to delete resource record set ${named} but the rdata provided is invalid`
+				else `Tried to delete resource record set ${named} but the values provided do not match the current values`
+		}
+		if (apex(z, r)) {
+			return if (r.type == "SOA") "A HostedZone must contain exactly one SOA record."
+				else "A HostedZone must contain at least one NS record for the zone itself."
+		}
+		z.records = z.records.filter(o => !same(o, r))
+		return null
+	}
+	if (action == "CREATE" && there != null) {
+		return `Tried to create resource record set ${named} but it already exists`
+	}
+	if (r.type == "CNAME" && r.name == z.name) {
+		return `RRSet of type CNAME with DNS name ${r.name} is not permitted at apex in zone ${z.name}`
+	}
+	const others = z.records.filter(o => o.name == r.name && !same(o, r))
+	if (r.type == "CNAME" && others.some(o => o.type != "CNAME")) {
+		return `RRSet of type CNAME with DNS name ${r.name} is not permitted as it conflicts with other records with the `
+			+ `same DNS name in zone ${z.name}`
+	}
+	if (r.type != "CNAME" && others.some(o => o.type == "CNAME")) {
+		return `RRSet of type ${r.type} with DNS name ${r.name} is not permitted because a conflicting RRSet of type `
+			+ `CNAME with the same DNS name already exists in zone ${z.name}`
+	}
+	z.records = z.records.filter(o => !same(o, r))
+	z.records.push(r)
+	return null
+}
+
+/// Whether v is a dotted IPv4 address.
+function ipv4(v: string): bool {
+	const parts = split(v, ".")
+	return parts.length == 4
+		&& parts.every(p => p.length > 0 && p.length <= 3 && parseIntOr(p) >= 0 && parseIntOr(p) <= 255)
+}
+
+/// p as a number, -1 if it is none.
+function parseIntOr(p: string): i32 {
+	try {
+		return parseInt(p) as i32
+	} catch (e: ParseError) {
+		return -1
+	}
+}

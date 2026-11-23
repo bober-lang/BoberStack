@@ -1,0 +1,362 @@
+{
+	"volatile": [
+		"RequestId",
+		"SubmittedAt",
+		"Id"
+	],
+	"steps": [
+		{
+			"name": "create",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-1</CallerReference><HostedZoneConfig><Comment>first</Comment></HostedZoneConfig></CreateHostedZoneRequest>",
+			"capture": {
+				"zone": "HostedZone/Id",
+				"change": "ChangeInfo/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><Comment>first</Comment><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>${change}</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "create again of the same reference",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-1</CallerReference><HostedZoneConfig><Comment>first</Comment></HostedZoneConfig></CreateHostedZoneRequest>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HostedZoneAlreadyExists</Code><Message>A hosted zone has already been created with the specified caller reference.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create another name of the same reference",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>other.${prefix}.example.test</Name><CallerReference>${prefix}-1</CallerReference></CreateHostedZoneRequest>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HostedZoneAlreadyExists</Code><Message>A hosted zone has already been created with the specified caller reference.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "get the change",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${change}",
+			"differs": "BoberStack has no background work: a change is INSYNC at once",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetChangeResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>${change}</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></GetChangeResponse>"
+			}
+		},
+		{
+			"name": "get",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><Comment>first</Comment><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><DelegationSet><NameServers><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x</NameServer><NameServer>x-x.x-x.x.x</NameServer><NameServer>x-x.x-x.x</NameServer></NameServers></DelegationSet><HostedZoneDeletionProtectionEnabled>false</HostedZoneDeletionProtectionEnabled></GetHostedZoneResponse>"
+			},
+			"differs": "the model has no HostedZoneDeletionProtectionEnabled, which AWS answers"
+		},
+		{
+			"name": "list",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzone",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListHostedZonesResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZones><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><Comment>first</Comment><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone></HostedZones><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListHostedZonesResponse>"
+			},
+			"differs": "the model requires Marker, which AWS leaves out where none was given"
+		},
+		{
+			"name": "list by name",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzonesbyname",
+			"params": {
+				"dnsname": "${prefix}.example.test"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListHostedZonesByNameResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZones><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><Comment>first</Comment><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone></HostedZones><DNSName>boberstack-ab-00000000.example.test</DNSName><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListHostedZonesByNameResponse>"
+			}
+		},
+		{
+			"name": "count",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzonecount",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHostedZoneCountResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZoneCount>1</HostedZoneCount></GetHostedZoneCountResponse>"
+			}
+		},
+		{
+			"name": "update the comment",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}",
+			"body": "<UpdateHostedZoneCommentRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Comment>second</Comment></UpdateHostedZoneCommentRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<UpdateHostedZoneCommentResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><Comment>second</Comment><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone></UpdateHostedZoneCommentResponse>"
+			}
+		},
+		{
+			"name": "remove the comment",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}",
+			"body": "<UpdateHostedZoneCommentRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></UpdateHostedZoneCommentRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<UpdateHostedZoneCommentResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-1</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone></UpdateHostedZoneCommentResponse>"
+			}
+		},
+		{
+			"name": "list the records",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}/rrset",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceRecordSets><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>NS</Type><TTL>172800</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.x.</Value></ResourceRecord><ResourceRecord><Value>x-x.x-x.x.</Value></ResourceRecord></ResourceRecords></ResourceRecordSet><ResourceRecordSet><Name>boberstack-ab-00000000.example.test.</Name><Type>SOA</Type><TTL>900</TTL><ResourceRecords><ResourceRecord><Value>x-x.x-x.x. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems></ListResourceRecordSetsResponse>"
+			},
+			"ignored": [
+				"Value"
+			]
+		},
+		{
+			"name": "create a record",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>/change/C06329383105OWGLKLCQ5</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "delete it while it holds a record",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HostedZoneNotEmpty</Code><Message>The specified hosted zone contains resource record sets other than the default SOA and NS records and so cannot be deleted. Delete all non-default records and try again.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the record",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>www.${prefix}.example.test</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>/change/C0894864216JNUBBSG6C5</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "delete the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>/change/C07830553J7MURAO73QM9</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></DeleteHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "get it deleted",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: Z00268201FKBZRKOW8FJX</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"volatile": [
+				"Message"
+			]
+		},
+		{
+			"name": "get a change that is not",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/change/CNOPE123",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchChange</Code><Message>Could not find resource with ID: CNOPE123</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "get a zone of an id too long",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzone/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>1 validation error detected: Value 'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' at 'resourceId' failed to satisfy constraint: Member must have length less than or equal to 32</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"differs": "validation names the model's member, id, where AWS names it resourceId"
+		},
+		{
+			"name": "create of a name AWS reserves",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.com</Name><CallerReference>${prefix}-5</CallerReference></CreateHostedZoneRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidDomainName</Code><Message>boberstack-ab-00000000.example.com is reserved by AWS!</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create without a name",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-2</CallerReference></CreateHostedZoneRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid XML ; javax.xml.stream.XMLStreamException: org.xml.sax.SAXParseException; lineNumber: 1; columnNumber: 139; cvc-complex-type.2.4.b: The content of element 'CreateHostedZoneRequest' is not complete. One of '{&quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:Name, &quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:VPC, &quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:HostedZoneConfig, &quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:DelegationSetId, &quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:EnablePublicDNSFallback, &quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:ChangeGuardrails}' is expected.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"differs": "AWS checks the XML against its schema first, whose messages this does not word"
+		},
+		{
+			"name": "create of a name with an empty label",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>a..example.com</Name><CallerReference>${prefix}-3</CallerReference></CreateHostedZoneRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidDomainName</Code><Message>FATAL problem: DomainLabelEmpty (Domain label is empty) encountered with 'a..example.com'</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create of a private zone without a VPC region",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><VPC><VPCId>vpc-1</VPCId></VPC><CallerReference>${prefix}-4</CallerReference></CreateHostedZoneRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid XML ; javax.xml.stream.XMLStreamException: org.xml.sax.SAXParseException; lineNumber: 1; columnNumber: 153; cvc-complex-type.2.4.b: The content of element 'VPC' is not complete. One of '{&quot;https://route53.amazonaws.com/doc/2013-04-01/&quot;:VPCRegion}' is expected.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"differs": "AWS checks the XML against its schema, which requires VPCRegion; the model does not"
+		},
+		{
+			"name": "list by name of an empty label",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/hostedzonesbyname",
+			"params": {
+				"dnsname": "a..b"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidDomainName</Code><Message>FATAL problem: DomainLabelEmpty (Domain label is empty) encountered with 'a..b'</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete it again",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHostedZone</Code><Message>No hosted zone found with ID: Z00268201FKBZRKOW8FJX</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"volatile": [
+				"Message"
+			]
+		}
+	],
+	"ignored": [
+		"NameServer"
+	]
+}
