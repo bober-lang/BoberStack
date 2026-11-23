@@ -1,4 +1,6 @@
-import { generate, ModelError, vectors } from "./main"
+import { generate, ModelError, runnable, vectors } from "./main"
+import { compile } from "std/regex"
+import { ParseError } from "std/string"
 
 test "services/sts/api.bob is what models/sts.json generates" {
 	assert generate(readFile("models/sts.json")!, "models/sts.json", "services/sts/api.bob")
@@ -24,6 +26,66 @@ test "services/sqs/api.bob is what models/sqs.json generates" {
 		== readFile("services/sqs/api.bob")
 }
 
+test "services/dynamodb/api.bob is what models/dynamodb.json generates" {
+	assert generate(readFile("models/dynamodb.json")!, "models/dynamodb.json", "services/dynamodb/api.bob")
+		== readFile("services/dynamodb/api.bob")
+}
+
+test "services/dynamodbstreams/api.bob is what models/dynamodbstreams.json generates" {
+	const api = "services/dynamodbstreams/api.bob"
+	assert generate(readFile("models/dynamodbstreams.json")!, "models/dynamodbstreams.json", api) == readFile(api)
+}
+
+test "services/sns/api.bob is what models/sns.json generates" {
+	assert generate(readFile("models/sns.json")!, "models/sns.json", "services/sns/api.bob")
+		== readFile("services/sns/api.bob")
+}
+
+test "services/events/api.bob is what models/eventbridge.json generates" {
+	assert generate(readFile("models/eventbridge.json")!, "models/eventbridge.json", "services/events/api.bob")
+		== readFile("services/events/api.bob")
+}
+
+test "services/acm/api.bob is what models/acm.json generates" {
+	const api = "services/acm/api.bob"
+	assert generate(readFile("models/acm.json")!, "models/acm.json", api) == readFile(api)
+}
+
+test "services/secretsmanager/api.bob is what models/secretsmanager.json generates" {
+	const api = "services/secretsmanager/api.bob"
+	assert generate(readFile("models/secretsmanager.json")!, "models/secretsmanager.json", api) == readFile(api)
+}
+
+test "services/ssm/api.bob is what models/ssm.json generates" {
+	assert generate(readFile("models/ssm.json")!, "models/ssm.json", "services/ssm/api.bob")
+		== readFile("services/ssm/api.bob")
+}
+
+test "services/logs/api.bob is what models/cloudwatchlogs.json generates" {
+	const api = "services/logs/api.bob"
+	assert generate(readFile("models/cloudwatchlogs.json")!, "models/cloudwatchlogs.json", api) == readFile(api)
+}
+
+test "services/kms/api.bob is what models/kms.json generates" {
+	assert generate(readFile("models/kms.json")!, "models/kms.json", "services/kms/api.bob")
+		== readFile("services/kms/api.bob")
+}
+
+test "services/kinesis/api.bob is what models/kinesis.json generates" {
+	assert generate(readFile("models/kinesis.json")!, "models/kinesis.json", "services/kinesis/api.bob")
+		== readFile("services/kinesis/api.bob")
+}
+
+test "services/firehose/api.bob is what models/firehose.json generates" {
+	assert generate(readFile("models/firehose.json")!, "models/firehose.json", "services/firehose/api.bob")
+		== readFile("services/firehose/api.bob")
+}
+
+test "services/lambda/api.bob is what models/lambda.json generates" {
+	assert generate(readFile("models/lambda.json")!, "models/lambda.json", "services/lambda/api.bob")
+		== readFile("services/lambda/api.bob")
+}
+
 /// Whether the API and tests in the directory dir are what the model, of protocol test vectors, generates; and their
 /// tally.
 function fresh(model: string, dir: string, tally: string): bool throws ModelError {
@@ -34,7 +96,7 @@ function fresh(model: string, dir: string, tally: string): bool throws ModelErro
 }
 
 test "protocoltests/json10 is what models/awsjson10-tests.json generates" {
-	assert fresh("models/awsjson10-tests.json", "protocoltests/json10", "73 vectors: 39 tests, 34 skipped")
+	assert fresh("models/awsjson10-tests.json", "protocoltests/json10", "73 vectors: 43 tests, 30 skipped")
 }
 
 test "protocoltests/json10querycompatible is what models/awsjson10-querycompatible-tests.json generates" {
@@ -43,7 +105,7 @@ test "protocoltests/json10querycompatible is what models/awsjson10-querycompatib
 }
 
 test "protocoltests/json11 is what models/awsjson11-tests.json generates" {
-	assert fresh("models/awsjson11-tests.json", "protocoltests/json11", "122 vectors: 95 tests, 27 skipped")
+	assert fresh("models/awsjson11-tests.json", "protocoltests/json11", "122 vectors: 96 tests, 26 skipped")
 }
 
 test "a model it cannot express" {
@@ -53,6 +115,126 @@ test "a model it cannot express" {
 		{"U": {"target": "a#U"}}}, "a#U": {"type": "document"}}}`
 	assert generate(document, "m.json", "api.bob") throws new ModelError("a#U: a document")
 	const rest = `{"smithy": "2.0", "shapes": {"a#S": {"type": "service", "version": "1", "traits": {"aws.protocols#restXml": {}}}}}`
-	const why = "a#S: not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
+	const why = "a#S: not an awsQuery service of an XML namespace, an awsJson or REST one, of sigv4, or has resources"
 	assert generate(rest, "m.json", "api.bob") throws new ModelError(why)
+}
+
+test "protocoltests/restxml is what models/restxml-tests.json generates" {
+	assert fresh("models/restxml-tests.json", "protocoltests/restxml", "184 vectors: 139 tests, 45 skipped")
+}
+
+test "protocoltests/restjson is what models/restjson-tests.json generates" {
+	assert fresh("models/restjson-tests.json", "protocoltests/restjson", "267 vectors: 176 tests, 91 skipped")
+}
+
+test "services/stepfunctions/api.bob is what models/sfn.json generates" {
+	const api = "services/stepfunctions/api.bob"
+	assert generate(readFile("models/sfn.json")!, "models/sfn.json", api) == readFile(api)
+}
+
+test "services/cloudformation/api.bob is what models/cloudformation.json generates" {
+	const api = "services/cloudformation/api.bob"
+	assert generate(readFile("models/cloudformation.json")!, "models/cloudformation.json", api) == readFile(api)
+}
+
+test "services/s3/api.bob is what models/s3.json generates" {
+	assert generate(readFile("models/s3.json")!, "models/s3.json", "services/s3/api.bob")
+		== readFile("services/s3/api.bob")
+}
+
+test "services/route53/api.bob is what models/route53.json generates" {
+	assert generate(readFile("models/route53.json")!, "models/route53.json", "services/route53/api.bob")
+		== readFile("services/route53/api.bob")
+}
+
+test "services/cloudwatch/api.bob is what models/cloudwatch.json generates" {
+	assert generate(readFile("models/cloudwatch.json")!, "models/cloudwatch.json", "services/cloudwatch/api.bob")
+		== readFile("services/cloudwatch/api.bob")
+}
+
+test "services/ses/api.bob is what models/ses.json generates" {
+	assert generate(readFile("models/ses.json")!, "models/ses.json", "services/ses/api.bob")
+		== readFile("services/ses/api.bob")
+}
+
+test "services/ses/v2/api.bob is what models/sesv2.json generates" {
+	assert generate(readFile("models/sesv2.json")!, "models/sesv2.json", "services/ses/v2/api.bob")
+		== readFile("services/ses/v2/api.bob")
+}
+
+test "services/scheduler/api.bob is what models/scheduler.json generates" {
+	assert generate(readFile("models/scheduler.json")!, "models/scheduler.json", "services/scheduler/api.bob")
+		== readFile("services/scheduler/api.bob")
+}
+
+/// Whether what std/regex runs for the pattern p matches s; null if it runs nothing for it.
+function runs(p: string, s: string): bool | null {
+	const r = runnable(p)
+	if (r == null) {
+		return null
+	}
+	try {
+		return compile(r!).test(s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+test "a pattern of Java's spelling runs in RE2's" {
+	const latin = "^[\\u0009\\u000A\\u000D\\u0020-\\u00FF]+$"
+	assert runnable(latin) == "^[\\x{0009}\\x{000A}\\x{000D}\\x{0020}-\\x{00FF}]+$"
+	assert runs(latin, "a\té") == true && runs(latin, "€") == false && runs(latin, "") == false
+	assert runs("^\\p{ASCII}+$", "a~") == true && runs("^\\p{ASCII}+$", "é") == false
+	assert runnable("^[x\\p{ASCII}]$") == "^[x\\x00-\\x7F]$"
+	// four digits, as Java reads them: U+1000, then 0 to U+10FF, then F
+	assert runnable("^[\\u10000-\\u10FFFF]$") == "^[\\x{1000}0-\\x{10FF}FF]$"
+	assert runnable("^[a-z]+$") == "^[a-z]+$"
+	assert runnable("^[\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*$") == null
+}
+
+test "a pattern of lookarounds runs as one without, matching the same strings" {
+	const filled = "^(?!\\s*$).+$"
+	assert runs(filled, " a ") == true && runs(filled, "") == false && runs(filled, " \t ") == false
+	const alias = "^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$"
+	assert runs(alias, "live") == true && runs(alias, "1a") == true && runs(alias, "v-1_") == true
+	assert runs(alias, "123") == false && runs(alias, "") == false && runs(alias, "a b") == false
+	const qualifier = "^((?!^\\d+$)^[0-9a-zA-Z-_]+$)$"
+	assert runs(qualifier, "1a") == true && runs(qualifier, "12") == false
+	const name = "^(?=.*[a-zA-Z_\\-\\.])[a-zA-Z0-9_\\-\\.]+$"
+	assert runs(name, "a1") == true && runs(name, "1.") == true && runs(name, "12") == false
+		&& runs(name, "a b") == false
+	const undotted = "^[0-9A-Za-z\\.\\-_]*(?<!\\.)$"
+	assert runs(undotted, "") == true && runs(undotted, "a.b") == true
+	assert runs(undotted, "a.") == false && runs(undotted, ".") == false
+	const collection = "^(^(?!(system\\x2e)))(^[_a-zA-Z0-9])([^$]*)$"
+	for (const s of ["users", "s", "sys.a", "system", "systems.a", "_a.b"]) {
+		assert runs(collection, s) == true
+	}
+	for (const s of ["system.users", "system.", "a$b", "", "$", ".a"]) {
+		assert runs(collection, s) == false
+	}
+	const domain = "^(\\*\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$"
+	for (const s of ["example.com", "*.example.com", "a.b-c.io"]) {
+		assert runs(domain, s) == true
+	}
+	for (const s of ["-a.com", "a-.com", "example", "a.c", "a.-cc", "*.com"]) {
+		assert runs(domain, s) == false
+	}
+	const named = "^(arn:(aws[a-zA-Z-]*)?:lambda:)?((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?(\\d{12}:)?"
+		+ "(function:)?([a-zA-Z0-9-_]{1,64})(:((?!\\d+$)[0-9a-zA-Z-_]+))?$"
+	assert runs(named, "f") == true && runs(named, "f:live") == true && runs(named, "f:1a") == true
+	assert runs(named, "arn:aws:lambda:us-east-1:000000000000:function:f:live") == true
+	assert runs(named, "f:12") == false && runs(named, "f:") == false
+	const jdbc = "^jdbc:(redshift|postgresql)://((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+(redshift(-serverless)?)\\."
+		+ "([a-zA-Z0-9\\.\\-]+):\\d{1,5}/[a-zA-Z0-9_$-]+$"
+	assert runs(jdbc, "jdbc:redshift://c.a-b.redshift.amazonaws.com:5439/db") == true
+	assert runs(jdbc, "jdbc:redshift://-c.redshift.amazonaws.com:5439/db") == false
+	assert runs(jdbc, "jdbc:redshift://c-.redshift.amazonaws.com:5439/db") == false
+	const source = "^(?=[/\\.\\-_A-Za-z0-9]+)((?!aws\\.).*)|(\\$(\\.[\\w_-]+(\\[(\\d+|\\*)\\])*)*)$"
+	for (const s of ["my.app", "a", "aws", "awsx.a", "$.detail.items[0]"]) {
+		assert runs(source, s) == true
+	}
+	for (const s of ["aws.ec2", "", " a"]) {
+		assert runs(source, s) == false
+	}
 }

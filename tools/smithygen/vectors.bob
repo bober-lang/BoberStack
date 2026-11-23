@@ -12,9 +12,13 @@ export function caller(requestId: string): Caller {
 	return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", requestId)
 }
 
-/// Whether the XML document of res and want say the same, whitespace between elements aside. Where the root of want
-/// has no ResponseMetadata, that of res is left out: a vector shows it only where it tests it.
+/// Whether the XML document of res and want say the same, whitespace between elements aside; or, if want is no
+/// document, whether res's body is want. Where the root of want has no ResponseMetadata, that of res is left out: a
+/// vector shows it only where it tests it.
 export function same(res: Response, want: string): bool throws ParseError {
+	if (!startsWith(trim(want), "<")) {
+		return (res.body.whole ?? "") == want
+	}
 	const g = parse(res.body.whole ?? "").elements()[0]
 	const w = parse(want).elements()[0]
 	if (!w.children.some(c => c.name == "ResponseMetadata")) {
@@ -48,10 +52,12 @@ function attributes(el: Node): string {
 	return all.join(" ")
 }
 
-/// Whether the JSON of res and want say the same, whitespace and the order of members aside; none if want is "".
+/// Whether the JSON of res and want say the same, whitespace and the order of members aside; none if want is "", and
+/// byte for byte if want is no object or array, as a payload's text or blob.
 export function sameJson(res: Response, want: string): bool throws ParseError {
 	const got = res.body.whole ?? ""
-	return if (want == "") got == "" else canonical(got) == canonical(want)
+	const t = trim(want)
+	return if (startsWith(t, "{") || startsWith(t, "[")) canonical(got) == canonical(want) else got == want
 }
 
 /// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.

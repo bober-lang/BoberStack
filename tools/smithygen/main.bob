@@ -1,8 +1,9 @@
-//! Generates the API of an awsQuery or awsJson service from its Smithy model, in the JSON AST: a class for each
-//! structure its operations take or give, a type for each enum, for each union a class U$M of one field M for each
-//! member M and their union U, a function making each error's Fault, an interface of the operations' handlers, a class
-//! Unimplemented answering each NotImplemented, for a service to mix in, and a function handle serving the service's
-//! requests by a handler with the codec of ../../core/protocol/query or json. It fails on what that cannot express.
+//! Generates the API of an awsQuery, awsJson, restXml or restJson1 service from its Smithy model, in the JSON AST: a
+//! class for each structure its operations take or give, a type for each enum, for each union a class U$M of one field
+//! M for each member M and their union U, a function making each error's Fault, an interface of the operations'
+//! handlers, a class Unimplemented answering each NotImplemented, for a service to mix in, and a function handle
+//! serving the service's requests by a handler with its codec of ../../core/protocol. It fails on what that cannot
+//! express, but for a REST operation, which it leaves not implemented and lists.
 //! Given a list of the model's protocol test vectors to skip, it generates a test of each of the others beside the API,
 //! as OUT.test.bob: of a request by a class Got noting the input, of a response by a class, named by the vector's id,
 //! answering as the vector does.
@@ -11,8 +12,10 @@
 //! or `-- models/awsquery-tests.json protocoltests/query/api.bob protocoltests/query/skips.txt`.
 
 import { indexOf, lastIndexOf, sortBy, startsWith, unique } from "std/algo"
+import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { min, round } from "std/math"
+import { compile } from "std/regex"
 import { lower, ParseError, replace, split } from "std/string"
 
 class Model {
@@ -31,6 +34,14 @@ class Shape {
 	output: Ref | null
 	operations: Ref[] = []
 	resources: Ref[] = []
+	/// A resource's lifecycle operations, besides its operations.
+	create: Ref | null
+	put: Ref | null
+	read: Ref | null
+	update: Ref | null
+	delete: Ref | null
+	list: Ref | null
+	collectionOperations: Ref[] = []
 	errors: Ref[] = []
 	traits = new Traits()
 	rest: json.Unknown[] @json.Rest = []
@@ -51,8 +62,13 @@ class Traits {
 	timestampFormat: string | null @json.Name["smithy.api#timestampFormat"]
 	enumValue: string | i32 | null @json.Name["smithy.api#enumValue"]
 	enum: EnumValue[] | null @json.Name["smithy.api#enum"]
+	length: Bounds | null @json.Name["smithy.api#length"]
+	range: Bounds | null @json.Name["smithy.api#range"]
+	pattern: string | null @json.Name["smithy.api#pattern"]
+	sensitive: Mark | null @json.Name["smithy.api#sensitive"]
 	streaming: Mark | null @json.Name["smithy.api#streaming"]
 	sparse: Mark | null @json.Name["smithy.api#sparse"]
+	unwrapped: Mark | null @json.Name["aws.customizations#s3UnwrappedXmlOutput"]
 	error: string | null @json.Name["smithy.api#error"]
 	httpError: i32 | null @json.Name["smithy.api#httpError"]
 	queryError: QueryError | null @json.Name["aws.protocols#awsQueryError"]
@@ -60,6 +76,17 @@ class Traits {
 	awsJson10: Mark | null @json.Name["aws.protocols#awsJson1_0"]
 	awsJson11: Mark | null @json.Name["aws.protocols#awsJson1_1"]
 	queryCompatible: Mark | null @json.Name["aws.protocols#awsQueryCompatible"]
+	restXml: RestXml | null @json.Name["aws.protocols#restXml"]
+	restJson1: Mark | null @json.Name["aws.protocols#restJson1"]
+	jsonName: string | null @json.Name["smithy.api#jsonName"]
+	http: Http | null @json.Name["smithy.api#http"]
+	httpLabel: Mark | null @json.Name["smithy.api#httpLabel"]
+	httpQuery: string | null @json.Name["smithy.api#httpQuery"]
+	httpQueryParams: Mark | null @json.Name["smithy.api#httpQueryParams"]
+	httpHeader: string | null @json.Name["smithy.api#httpHeader"]
+	httpPrefixHeaders: string | null @json.Name["smithy.api#httpPrefixHeaders"]
+	httpPayload: Mark | null @json.Name["smithy.api#httpPayload"]
+	httpResponseCode: Mark | null @json.Name["smithy.api#httpResponseCode"]
 	sigv4: Sigv4 | null @json.Name["aws.auth#sigv4"]
 	service: Service | null @json.Name["aws.api#service"]
 	requestTests: Vector[] @json.Name["smithy.test#httpRequestTests"] = []
@@ -74,6 +101,7 @@ class Vector {
 	appliesTo = ""
 	method = ""
 	uri = ""
+	queryParams: string[] = []
 	headers: [string, string][] @json.Mapping = []
 	body: string | null
 	params = new json.Keys()
@@ -81,16 +109,36 @@ class Vector {
 	rest: json.Unknown[] @json.Rest = []
 }
 
-class Mark {}
+/// A trait's mark; what it holds besides, as awsJson's protocols, which HTTP versions serve it, is ignored.
+class Mark {
+	rest: json.Unknown[] @json.Rest = []
+}
 
 class Namespace {
 	uri = ""
+	prefix = ""
 	rest: json.Unknown[] @json.Rest = []
+}
+
+class RestXml {
+	noErrorWrapping = false
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Http {
+	method = ""
+	uri = ""
+	code: i32 = 200
 }
 
 class EnumValue {
 	value = ""
 	rest: json.Unknown[] @json.Rest = []
+}
+
+class Bounds {
+	min: f64 | null
+	max: f64 | null
 }
 
 class QueryError {
@@ -105,6 +153,24 @@ class Sigv4 {
 
 class Service {
 	sdkId = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+/// A service's authorization reference, of the operations' actions.
+class Reference {
+	Operations: Operation[] = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Operation {
+	Name = ""
+	AuthorizedActions: Action[] = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Action {
+	Name = ""
+	Service = ""
 	rest: json.Unknown[] @json.Rest = []
 }
 
@@ -128,17 +194,245 @@ class Decl {
 
 const width = 120
 
+/// How the services below answer a request breaking their models' constraints, as AWS did on 2026-11-23: by their
+/// shape ids, the code of the fault, whether its messages quote the values, and whether a pattern is checked as the
+/// others are; if not, a member of a pattern is left to the service's handlers, as are all of a service not listed.
+const validations: [string, string, bool, bool][] = [["com.amazonaws.iam#AWSIdentityManagementV20100508",
+	"ValidationError", false, false],
+	["com.amazonaws.sts#AWSSecurityTokenServiceV20110615", "ValidationError", true, true],
+	["com.amazonaws.eventbridge#AWSEvents", "ValidationException", true, true],
+	["com.amazonaws.cloudwatchlogs#Logs_20140328", "InvalidParameterException", false, true],
+	["com.amazonaws.kms#TrentService", "ValidationException", true, true],
+	["com.amazonaws.kinesis#Kinesis_20131202", "ValidationException", true, true],
+	["com.amazonaws.lambda#AWSGirApiService", "ValidationException", true, true],
+	["com.amazonaws.sfn#AWSStepFunctions", "ValidationException", true, true],
+	["com.amazonaws.route53#AWSDnsV20130401", "InvalidInput", true, true],
+	["com.amazonaws.firehose#Firehose_20150804", "ValidationException", false, true],
+	["com.amazonaws.acm#CertificateManager", "ValidationException", false, true],
+	["com.amazonaws.scheduler#AWSChronosService", "ValidationException", true, true]]
+
+/// What the services below call a value their messages on its constraints do not quote, where not "Value", as ACM
+/// did on 2026-11-23: by their shape ids.
+const unquoted: [string, string][] = [["com.amazonaws.acm#CertificateManager", "Value of the input"]]
+
+/// How the services below answer a request IAM denies, as AWS did on 2026-11-23: by their shape ids, the status and
+/// code of the fault, and its wording, of core/service's Wording; any other by AccessDenied, of 403, reasoned.
+const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentityManagementV20100508", 403,
+	"AccessDenied", "linked"], ["com.amazonaws.sts#AWSSecurityTokenServiceV20110615", 403, "AccessDenied", "plain"],
+	["com.amazonaws.sqs#AmazonSQS", 403, "AccessDenied", "linked"],
+	["com.amazonaws.dynamodb#DynamoDB_20120810", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.dynamodbstreams#DynamoDBStreams_20120810", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.sns#AmazonSimpleNotificationService", 403, "AuthorizationError", "reasoned"],
+	["com.amazonaws.eventbridge#AWSEvents", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.secretsmanager#secretsmanager", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.ssm#AmazonSSM", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.cloudwatchlogs#Logs_20140328", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.kms#TrentService", 400, "AccessDeniedException", "linked"],
+	["com.amazonaws.kinesis#Kinesis_20131202", 400, "AccessDeniedException", "linked"],
+	["com.amazonaws.lambda#AWSGirApiService", 403, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.sfn#AWSStepFunctions", 400, "AccessDeniedException", "linked"],
+	["com.amazonaws.firehose#Firehose_20150804", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.acm#CertificateManager", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.route53#AWSDnsV20130401", 403, "AccessDenied", "reasoned"],
+	["com.amazonaws.scheduler#AWSChronosService", 403, "AccessDeniedException", "reasoned"]]
+
+/// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
+/// with an error of the service's own, or, as ACM's key algorithms, answers names outside it.
+const strings: [string, string[]][] = [["com.amazonaws.sqs#AmazonSQS",
+	["com.amazonaws.sqs#ReceiveMessageRequest$AttributeNames"]],
+	["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
+	["com.amazonaws.cloudwatch#MetricDatum$Unit", "com.amazonaws.cloudwatch#GetMetricStatisticsInput$Statistics",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Unit",
+	"com.amazonaws.cloudwatch#ListMetricsInput$RecentlyActive"]],
+	["com.amazonaws.acm#CertificateManager",
+	["com.amazonaws.acm#CertificateDetail$KeyAlgorithm", "com.amazonaws.acm#CertificateSummary$KeyAlgorithm"]]]
+
+/// The required members of the services below that AWS answers the lack of with an error of its own, by their shape
+/// ids: they take null, and their handlers answer as AWS does.
+const optional: [string, string[]][] = [["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
+	["com.amazonaws.cloudwatch#PutMetricDataInput$Namespace", "com.amazonaws.cloudwatch#MetricDatum$MetricName",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Namespace",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$MetricName",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$StartTime",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$EndTime",
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Period"]]]
+
+/// The services whose enums are all strings: AWS takes a value outside an enum, or answers it with an error of its own.
+const opened = ["com.amazonaws.s3#AmazonS3"]
+
+/// The statuses that operations of the services below answer with where their models say otherwise, as AWS did on
+/// 2026-11-23: by their shape ids, each operation's name and status.
+const statuses: [string,
+	[string, i32][]][] = [["com.amazonaws.s3#AmazonS3", [["PutBucketPolicy", 204], ["PutBucketTagging", 204]]]]
+
+/// The restXml services that write a date-time to the millisecond, .000 too, as S3 and Route 53 do.
+const milliseconds = ["com.amazonaws.s3#AmazonS3", "com.amazonaws.route53#AWSDnsV20130401"]
+
+/// The flattened lists that the services below write as one, in the order that a field `order` of their structure
+/// gives: by their shape ids, each structure's and the names of the two lists' items.
+const interleaved: [string, [string, string, string][]][] = [["com.amazonaws.s3#AmazonS3",
+	[["com.amazonaws.s3#ListObjectVersionsOutput", "Version", "DeleteMarker"]]]]
+
+/// The XML names the services below give structures where AWS names them otherwise than their models, as on
+/// 2026-11-23: by their shape ids, each structure's and its name.
+const xmlNames: [string, [string, string][]][] = [["com.amazonaws.s3#AmazonS3",
+	[["com.amazonaws.s3#ListBucketAnalyticsConfigurationsOutput", "ListBucketAnalyticsConfigurationsResult"],
+	["com.amazonaws.s3#ListBucketIntelligentTieringConfigurationsOutput",
+	"ListIntelligentTieringConfigurationsResult"]]]]
+
+/// The codes the services below answer with besides the errors their models declare, as AWS did on 2026-11-23: by
+/// their shape ids, each code and its __type.
+const undeclared: [string, [string, string][]][] = [["com.amazonaws.sqs#AmazonSQS",
+	[["InvalidParameterValue", "com.amazon.coral.service#InvalidParameterValueException"]]],
+	["com.amazonaws.sfn#AWSStepFunctions",
+	[["AccessDeniedException", "com.amazon.coral.service#AccessDeniedException"]]]]
+
+/// The unions the services below word on their own where none of a union's members is set or more than one, as AWS
+/// did on 2026-11-23: by their shape ids, each union's and its two messages.
+const unions: [string, [string, string, string][]][] = [["com.amazonaws.dynamodb#DynamoDB_20120810",
+	[["com.amazonaws.dynamodb#AttributeValue",
+	"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+	"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"]]]]
+
+/// What the services below answer that their models lack, as AWS did on 2026-11-23: by their shape ids, shapes of
+/// Smithy's JSON AST, whose members are added to the model's shape of an id, replacing those of the same names, or which
+/// are added to it if it has none.
+const amendments: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328",
+	`{"shapes": {
+	"com.amazonaws.cloudwatchlogs#OutputLogEvent": {"type": "structure", "members": {
+		"eventId": {"target": "com.amazonaws.cloudwatchlogs#EventId"}}},
+	"com.amazonaws.cloudwatchlogs#FilterLogEventsResponse": {"type": "structure", "members": {
+		"searchStatistics": {"target": "com.amazonaws.cloudwatchlogs#SearchStatistics"}}},
+	"com.amazonaws.cloudwatchlogs#SearchStatistics": {"type": "structure", "members": {
+		"approximateTotalLogStreamCount": {"target": "smithy.api#Integer", "traits": {"smithy.api#required": {}}},
+		"completedLogStreamCount": {"target": "smithy.api#Integer", "traits": {"smithy.api#required": {}}}}}}}`],
+	["com.amazonaws.iam#AWSIdentityManagementV20100508",
+	`{"shapes": {
+	"com.amazonaws.iam#PermissionsBoundaryAttachmentType": {"type": "enum", "members": {
+		"Answered": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Policy"}}}},
+	"com.amazonaws.iam#PolicySourceType": {"type": "enum", "members": {
+		"IAMPolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "IAM Policy"}},
+		"ResourcePolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Resource Policy"}}}}}}`],
+	["com.amazonaws.route53#AWSDnsV20130401",
+	`{"shapes": {
+	"com.amazonaws.route53#GetHostedZoneResponse": {"type": "structure", "members": {
+		"HostedZoneDeletionProtectionEnabled": {"target": "smithy.api#Boolean"}}},
+	"com.amazonaws.route53#ListHostedZonesResponse": {"type": "structure", "members": {
+		"Marker": {"target": "com.amazonaws.route53#PageMarker"}}},
+	"com.amazonaws.route53#ListHealthChecksResponse": {"type": "structure", "members": {
+		"Marker": {"target": "com.amazonaws.route53#PageMarker"}}}}}`],
+	["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
+	`{"shapes": {
+	"com.amazonaws.cloudwatch#MetricAlarm": {"type": "structure", "members": {
+		"CreationId": {"target": "smithy.api#String"}}},
+	"com.amazonaws.cloudwatch#CompositeAlarm": {"type": "structure", "members": {
+		"CreationId": {"target": "smithy.api#String"}}}}}`]]
+
+/// The names that the validation of the services below gives members where AWS names them otherwise than their models,
+/// as on 2026-11-23: by their shape ids, each member's and its name.
+const named: [string, [string, string][]][] = [["com.amazonaws.route53#AWSDnsV20130401",
+	[["com.amazonaws.route53#GetHostedZoneRequest$Id", "resourceId"],
+	["com.amazonaws.route53#DeleteHostedZoneRequest$Id", "resourceId"],
+	["com.amazonaws.route53#UpdateHostedZoneCommentRequest$Id", "resourceId"],
+	["com.amazonaws.route53#ListResourceRecordSetsRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#ChangeResourceRecordSetsRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#AssociateVPCWithHostedZoneRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#DisassociateVPCFromHostedZoneRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#GetChangeRequest$Id", "resourceId"],
+	["com.amazonaws.route53#GetReusableDelegationSetRequest$Id", "resourceId"],
+	["com.amazonaws.route53#DeleteReusableDelegationSetRequest$Id", "resourceId"],
+	["com.amazonaws.route53#GetHostedZoneLimitRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#GetReusableDelegationSetLimitRequest$DelegationSetId", "resourceId"],
+	["com.amazonaws.route53#TestDNSAnswerRequest$HostedZoneId", "resourceId"],
+	["com.amazonaws.route53#ListCidrBlocksRequest$CollectionId", "id"]]]]
+
+/// What std/regex runs for the patterns below, each as its model writes it: one matching the same strings without the
+/// lookarounds, which RE2's syntax, std/regex's, does not have. As in every pattern run, . and \s are RE2's.
+const lookarounds: [string, string][] = [["^(?!\\s*$).+$", "^.*\\S.*$"],
+	["^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$", "^[a-zA-Z0-9_-]*[a-zA-Z_-][a-zA-Z0-9_-]*$"],
+	["^((?!^\\d+$)^[0-9a-zA-Z-_]+$)$", "^[a-zA-Z0-9_-]*[a-zA-Z_-][a-zA-Z0-9_-]*$"],
+	["^(?=.*[a-zA-Z_\\-\\.])[a-zA-Z0-9_\\-\\.]+$", "^[a-zA-Z0-9_.-]*[a-zA-Z_.-][a-zA-Z0-9_.-]*$"],
+	["^[0-9A-Za-z\\.\\-_]*(?<!\\.)$", "^([0-9A-Za-z._-]*[0-9A-Za-z_-])?$"],
+	["^(^(?!(system\\x2e)))(^[_a-zA-Z0-9])([^$]*)$",
+	"^([_a-rt-zA-Z0-9][^$]*|s|s[^y$][^$]*|sy|sy[^s$][^$]*|sys|sys[^t$][^$]*|syst|syst[^e$][^$]*|syste|syste[^m$"
+	+ "][^$]*|system|system[^.$][^$]*)$"],
+	["^(\\*\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$",
+	"^(\\*\\.)?((([A-Za-z0-9][A-Za-z0-9-]{0,61})?[A-Za-z0-9])\\.)+([A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9])$"],
+	["^(arn:(aws[a-zA-Z-]*)?:lambda:)?((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?(\\d{12}:)?(func"
+	+ "tion:)?([a-zA-Z0-9-_]{1,64})(:((?!\\d+$)[0-9a-zA-Z-_]+))?$",
+	"^(arn:(aws[a-zA-Z-]*)?:lambda:)?((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?(\\d{12}:)?(func"
+	+ "tion:)?([a-zA-Z0-9-_]{1,64})(:([a-zA-Z0-9_-]*[a-zA-Z_-][a-zA-Z0-9_-]*))?$"],
+	["^jdbc:(redshift|postgresql)://((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+(redshift(-serverless)?)\\.([a-zA-Z0-9\\."
+	+ "\\-]+):\\d{1,5}/[a-zA-Z0-9_$-]+$",
+	"^jdbc:(redshift|postgresql)://([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+(redshift(-serverless)?)\\."
+	+ "([a-zA-Z0-9\\.\\-]+):\\d{1,5}/[a-zA-Z0-9_$-]+$"],
+	["^(?=[/\\.\\-_A-Za-z0-9]+)((?!aws\\.).*)|(\\$(\\.[\\w_-]+(\\[(\\d+|\\*)\\])*)*)$",
+	"^([/.\\-_b-zA-Z0-9]|a$|a[^w]|aw$|aw[^s]|aws$|aws[^.])|(\\$(\\.[\\w_-]+(\\[(\\d+|\\*)\\])*)*)$"]]
+
+/// The members of the services below whose models' constraints AWS does not check, by their shape ids: their
+/// handlers answer as AWS does.
+const unconstrained: [string, string[]][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328",
+	["com.amazonaws.cloudwatchlogs#ListLogGroupsRequest$logGroupNamePattern",
+	"com.amazonaws.cloudwatchlogs#TagResourceRequest$resourceArn"]],
+	["com.amazonaws.iam#AWSIdentityManagementV20100508",
+	["com.amazonaws.iam#CreateOpenIDConnectProviderRequest$ThumbprintList",
+	"com.amazonaws.iam#UpdateOpenIDConnectProviderThumbprintRequest$ThumbprintList"]]]
+
+/// The member holding the message of an access denied of the services below, where AWS names it otherwise than their
+/// models, as on 2026-11-23: by their shape ids.
+const deniedMessages: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328", "Message"],
+	["com.amazonaws.lambda#AWSGirApiService", "Message"], ["com.amazonaws.sfn#AWSStepFunctions", "Message"]]
+
+/// The awsQuery services that serve awsJson 1.0 alike, as their models list both, by their shape ids: their classes
+/// are tagged for both codecs, and handleJson serves awsJson as handle serves awsQuery. An error's members besides its
+/// message are written as awsQuery writes them.
+const twofold = ["com.amazonaws.cloudwatch#GraniteServiceVersion20100801"]
+
 class Generator {
 	model: Model
 	/// The structures, unions and enums the operations reach.
 	structures: string[] = []
 	enums: string[] = []
+	/// The outputs of the operations whose output is unwrapped, as S3's GetBucketLocation's.
+	unwrapped: string[] = []
+	/// How the service answers a request breaking its model's constraints, null if they are not checked.
+	validation: [string, string, bool, bool] | null = null
+	/// The aliases of the constraints of shapes, by their ids; whether a tag of core/protocol/model is used; and the
+	/// patterns std/regex cannot run in any form, by their shapes' ids, which go unchecked.
+	aliases: [string, string][] = []
+	modeled = false
+	unchecked: string[] = []
+	/// The members whose constraints, and their items', go unchecked, and whether the member being typed is one.
+	unconstrained: string[] = []
+	/// The members that validation names otherwise, and their names.
+	named: [string, string][] = []
+	exempt = false
+	/// The members whose enums are strings, or whether all are, and whether the member being typed is one.
+	strings: string[] = []
+	/// The required members that take null.
+	optional: string[] = []
+	opened = false
+	open = false
+	/// The flattened lists written as one, by their structures' ids.
+	interleaved: [string, string, string][] = []
+	/// The XML names AWS gives structures, by their ids, where it differs from the model.
+	xmlNames: [string, string][] = []
+	/// Whether the service serves awsJson 1.0 besides awsQuery.
+	twofold = false
+	/// Whether the member being typed is a restXml payload, which may be a stream; and the operations the API cannot
+	/// express.
+	payload = false
+	unexpressible: string[] = []
+	/// Whether the member being typed is bound outside a restJson1 body, and so takes the tags of core/protocol/rest.
+	bound = false
 
 	/// The names declared, the imported ones too, to fail on a second of one.
-	taken = ["query", "json", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response", "signingName",
-		"version", "ns", "service", "Unimplemented", "handle"]
+	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
+		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes", "rest",
+		"restjson", "handleJson"]
 
-	/// The service's protocol, awsQuery, awsJson1_0 or awsJson1_1, once api has begun; and its shape id, operations and
+	/// The service's protocol, awsQuery, awsJson1_0, awsJson1_1, restXml or restJson1, once api has begun; and its
+	/// shape id, operations and
 	/// version, once api has run.
 	protocol = ""
 	id = ""
@@ -157,55 +451,173 @@ class Generator {
 		this.protocol = if (t.awsQuery != null) "awsQuery"
 			else if (t.awsJson10 != null) "awsJson1_0"
 			else if (t.awsJson11 != null) "awsJson1_1"
+			else if (t.restXml != null) "restXml"
+			else if (t.restJson1 != null) "restJson1"
 			else ""
 		const query = this.protocol == "awsQuery"
-		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null || s.resources.length > 0) {
-			const why = "not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
+		const rest = this.rest()
+		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null
+			|| !rest && s.resources.length > 0) {
+			const why = "not an awsQuery service of an XML namespace, an awsJson or REST one, of sigv4, or has resources"
 			throw new ModelError(`${services[0][0]}: ${why}`)
 		}
-		const ops = s.operations.map(r => r.target)
+		this.amend(services[0][0])
+		this.twofold = query && twofold.includes(services[0][0])
+		this.validation = validations.find(v => v[0] == services[0][0])
+		const exempt = unconstrained.find(u => u[0] == services[0][0])
+		this.unconstrained = if (exempt == null) [] else exempt[1]
+		const called = named.find(n => n[0] == services[0][0])
+		this.named = if (called == null) [] else called[1]
+		const open = strings.find(s => s[0] == services[0][0])
+		this.strings = if (open == null) [] else open[1]
+		const lax = optional.find(o => o[0] == services[0][0])
+		this.optional = if (lax == null) [] else lax[1]
+		this.opened = opened.includes(services[0][0])
+		const merged = interleaved.find(i => i[0] == services[0][0])
+		this.interleaved = if (merged == null) [] else merged[1]
+		const sent = xmlNames.find(x => x[0] == services[0][0])
+		this.xmlNames = if (sent == null) [] else sent[1]
+		const fixed = statuses.find(c => c[0] == services[0][0])
+		const answered = if (fixed == null) [] else fixed[1]
+		const ops = [...s.operations.map(r => r.target), ...this.operationsOf(s.resources)]
 		sortNames(ops)
 		const errors = s.errors.map(r => r.target)
 		const signatures: Decl[] = []
 		const unimplemented: Decl[] = []
 		const cases: string[] = []
+		const actions = this.actions(from, t.sigv4!.name)
 		let unit = false
+		const routes: [i32, string][] = [] // by how specific
+		const unserved: string[] = []
 		for (const id of ops) {
 			const op = this.shape(id)
+			if (rest) {
+				routes.push(this.route(id))
+				const why = this.unexpressed(id)
+				if (why != "") {
+					this.unexpressible.push(id)
+					unserved.push(`// ${name(id)}: ${why}`)
+					cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.fail(notImplemented(${json.quoted(name(id))}))`))
+					continue
+				}
+			}
 			errors.push(...op.errors.map(r => r.target))
 			const input = this.structure(op.input)
 			const output = this.structure(op.output)
+			if (op.traits.unwrapped != null && op.output != null) {
+				this.unwrapped.push(op.output!.target)
+			}
 			if (input == "Unit" || output == "Unit") {
 				unit = true
 			}
 			const head = `\t${lowerCamel(name(id))}(caller: Caller, input: ${input}): ${output} throws Fault`
 			signatures.push(new Decl("method", signature(head)))
 			unimplemented.push(new Decl("method", method(head, [`\t\tthrow notImplemented(${json.quoted(name(id))})`])))
-			cases.push(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))})`)
+			const authorized = actions.find(a => a[0] == name(id))
+			let by = if (authorized == null) "" else `, [${authorized[1].map(a => json.quoted(a)).join(", ")}]`
+			const given = answered.find(c => c[0] == name(id))
+			const code = if (given != null) given[1] else op.traits.http?.code ?? 200
+			if (rest && code != 200) {
+				by = `${if (by == "") ", []" else by}, ${code}`
+			}
+			cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))}${by})`))
 		}
 		sortNames(errors)
+		for (const id of unique(errors)) {
+			for (const m of this.shape(id).members.filter(m => lower(m[0]) != "message")) {
+				this.reach(m[1].target)
+			}
+		}
 		sortNames(this.structures)
 		sortNames(this.enums)
-		const decls = imports(out, query, unit)
-		decls.push(new Decl("const", [`export const signingName = ${json.quoted(t.sigv4!.name)}`]))
-		if (query) {
-			decls.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
-			decls.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
-		} else {
-			const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id)})`)
-			const version = json.quoted(if (this.protocol == "awsJson1_0") "1.0" else "1.1")
-			const head = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
-			decls.push(new Decl("const", wrap(`${head}, ${t.queryCompatible != null}, [${shapes.join(", ")}])`)))
-		}
+		const body: Decl[] = []
 		for (const id of this.enums) {
-			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, this.values(id))))
+			body.push(new Decl("type", fill(`export type ${this.declare(enumName(id))} = `, this.values(id))))
 		}
+		const classes: Decl[] = []
 		for (const id of this.structures) {
-			decls.push(...this.classOf(id))
+			classes.push(...this.classOf(id))
 		}
 		for (const id of unique(errors)) {
-			decls.push(new Decl("function", this.maker(id)))
+			classes.append(this.maker(id))
 		}
+		sortBy(this.aliases, (a, b) => a[0] < b[0])
+		body.append(this.aliases.map(a => new Decl("type", wrap(a[1]))))
+		body.append(classes)
+		const v = this.validation
+		const worded = unions.find(u => u[0] == services[0][0])
+		const validated = v != null || worded != null
+		const codec = this.codec()
+		const head: Decl[] = if (this.twofold) [new Decl("import",
+			[`import * as json from "${root(out)}core/protocol/json"`])]
+			else []
+		head.append(imports(out, codec, unit, this.modeled || validated))
+		const unchecked = if (this.unchecked.length == 0) []
+			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
+		if (unserved.length > 0) {
+			unchecked.append(["// Operations this cannot express, so not implemented:", ...unserved])
+		}
+		head.push(new Decl("const", [...unchecked, `export const signingName = ${json.quoted(t.sigv4!.name)}`]))
+		if (validated) {
+			const args = [json.quoted(if (v != null) v[1] else if (query) "ValidationError" else "ValidationException")]
+			const called = unquoted.find(u => u[0] == services[0][0])
+			if (v != null && !v[2] || worded != null || called != null) {
+				args.push(`${v == null || v[2]}`)
+			}
+			if (worded != null) {
+				const listed = worded[1].map(u => `[${[name(u[0]), u[1], u[2]].map(x => json.quoted(x)).join(", ")}]`)
+				args.push(`[${listed.join(", ")}]`)
+			} else if (called != null) {
+				args.push("[]")
+			}
+			if (called != null) {
+				args.push(json.quoted(called![1]))
+			}
+			head.push(new Decl("const", wrap(`export const validation = new model.Validation(${args.join(", ")})`)))
+		}
+		const denial = denials.find(d => d[0] == services[0][0])
+		if (query) {
+			head.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
+			head.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
+		} else if (this.protocol == "restXml") {
+			const ns = json.quoted(t.xmlNamespace?.uri ?? "")
+			const start = `export const service = new restxml.Service(${json.quoted(services[0][0])}, ${ns}`
+			const ms = milliseconds.includes(services[0][0])
+			const end = if (validated) `, ${ms}, validation` else if (ms) ", true" else ""
+			head.push(new Decl("const", wrap(`${start}, ${!t.restXml!.noErrorWrapping}${end})`)))
+		}
+		const renamed = deniedMessages.find(d => d[0] == services[0][0])
+		const denier = if (denial == null || renamed == null) "" else denial[2]
+		const held = if (renamed == null) "" else renamed[1]
+		const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id, denier, held)})`)
+		const besides = undeclared.find(u => u[0] == services[0][0])
+		for (const [code, typed] of if (besides == null) [] else besides[1]) {
+			const key = if (code == denier) held else "message"
+			shapes.push(`new json.ErrorShape(${json.quoted(typed)}, ${json.quoted(key)}, ${json.quoted(code)})`)
+		}
+		const listed = besides != null && besides[1].some(e => e[0] == denier)
+		if (denier != "" && !listed && !unique(errors).some(id => name(id) == denier)) {
+			// an access denied the model does not declare
+			const typed = `${split(services[0][0], "#")[0]}#${denier}`
+			shapes.push(`new json.ErrorShape(${json.quoted(typed)}, ${json.quoted(held)}, "")`)
+		}
+		if (this.protocol == "restJson1") {
+			const start = `export const service = new restjson.Service(${json.quoted(services[0][0])}`
+			const end = if (validated) ", validation" else ""
+			head.push(new Decl("const", wrap(`${start}, [${shapes.join(", ")}]${end})`)))
+		}
+		if (rest) {
+			sortBy(routes, (a, b) => a[0] > b[0] || a[0] == b[0] && a[1] < b[1])
+			const doc = "/// The operations' routes, the most specific first."
+			head.push(new Decl("const", [doc, ...wrap(`export const routes = [${routes.map(r => r[1]).join(", ")}]`)]))
+		}
+		if (!query && !rest || this.twofold) {
+			const version = json.quoted(if (this.protocol == "awsJson1_1") "1.1" else "1.0")
+			const start = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
+			const end = if (validated) ", validation" else ""
+			head.push(new Decl("const", wrap(`${start}, ${t.queryCompatible != null}, [${shapes.join(", ")}]${end})`)))
+		}
+		const decls = [...head, ...body]
 		const handlers = this.declare(replace(t.service?.sdkId ?? name(services[0][0]), " ", ""))
 		this.id = services[0][0]
 		this.version = s.version
@@ -213,8 +625,118 @@ class Generator {
 		decls.push(new Decl("interface", [`export interface ${handlers} {`, ...layout(signatures), "}"]))
 		const doc = "/// Every operation, not implemented: a service mixes it in and declares those it implements."
 		decls.push(new Decl("class", [doc, "export class Unimplemented {", ...layout(unimplemented), "}"]))
-		decls.push(new Decl("function", handle(handlers, cases, query)))
+		const denied = if (denial == null) `403, "AccessDenied", "reasoned"`
+			else `${denial[1]}, ${json.quoted(denial[2])}, ${json.quoted(denial[3])}`
+		decls.push(new Decl("function", handle(handlers, cases, codec, validated, denied)))
+		if (this.twofold) {
+			decls.push(new Decl("function", handle(handlers, cases, "json", validated, denied, "handleJson")))
+		}
 		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
+	}
+
+	/// The operations of the resources rs and of theirs, each of a REST service, which binds them to routes as it does
+	/// its own.
+	operationsOf(rs: Ref[]): string[] throws ModelError {
+		const out: string[] = []
+		for (const r of rs) {
+			const s = this.shape(r.target)
+			for (const o of [s.create, s.put, s.read, s.update, s.delete, s.list]) {
+				if (o != null) {
+					out.push(o.target)
+				}
+			}
+			out.append([...s.operations, ...s.collectionOperations].map(o => o.target))
+			out.append(this.operationsOf(s.resources))
+		}
+		return out
+	}
+
+	/// Adds to the model what the service id answers that it lacks, as amendments gives it.
+	amend(id: string): void throws ModelError {
+		const a = amendments.find(a => a[0] == id)
+		if (a == null) {
+			return
+		}
+		try {
+			for (const [sid, added] of json.decode[Model](a[1]).shapes) {
+				const s = this.model.shapes.find(s => s[0] == sid)
+				if (s == null) {
+					this.model.shapes.push([sid, added])
+				} else {
+					for (const m of added.members) {
+						const same = s[1].members.find(n => n[0] == m[0])
+						if (same == null) {
+							s[1].members.push(m)
+						} else {
+							same[1] = m[1]
+						}
+					}
+				}
+			}
+		} catch (e: ParseError) {
+			throw new ModelError(`${id}'s amendments: ${e}`)
+		}
+	}
+
+	/// The Route of the operation id, of a REST protocol, and how specific it is: by the literals and required members of the
+	/// query and headers it requires, then by its path's literal segments.
+	route(id: string): [i32, string] throws ModelError {
+		const op = this.shape(id)
+		const http = op.traits.http
+		if (http == null) {
+			throw new ModelError(`${id}: an operation without the http trait`)
+		}
+		const parts = split(http!.uri, "?")
+		const literals = if (parts.length < 2) [] else split(parts[1], "&").filter(l => l != "")
+		const queries: string[] = []
+		const headers: string[] = []
+		for (const m of this.required(id)) {
+			if (m.traits.httpQuery != null) {
+				queries.push(m.traits.httpQuery!)
+			} else if (m.traits.httpHeader != null) {
+				headers.push(lower(m.traits.httpHeader!))
+			}
+		}
+		const args = [json.quoted(name(id)), json.quoted(http!.method), json.quoted(parts[0])]
+		for (const xs of [literals, queries, headers]) {
+			args.push(`[${xs.map(x => json.quoted(x)).join(", ")}]`)
+		}
+		while (args[args.length - 1] == "[]") {
+			args.pop()
+		}
+		const required = literals.filter(l => !startsWith(l, "x-id=")).length + queries.length + headers.length
+		const fixed = split(parts[0], "/").filter(s => s != "" && !startsWith(s, "{")).length
+		return [100 * required + fixed, `new rest.Route(${args.join(", ")})`]
+	}
+
+	/// Why the API cannot express the REST operation id, "" if it can: of an event stream, or of the shapes its
+	/// input and output reach.
+	unexpressed(id: string): string throws ModelError {
+		const op = this.shape(id)
+		if (this.streams(op.input) || this.streams(op.output)) {
+			return "an event stream"
+		}
+		const g = new Generator(this.model)
+		g.protocol = this.protocol
+		try {
+			g.structure(op.input)
+			g.structure(op.output)
+			for (const s of g.structures) {
+				g.classOf(s)
+			}
+		} catch (e: ModelError) {
+			return e.what
+		}
+		return ""
+	}
+
+	/// Whether the operation's input or output r holds an event stream.
+	streams(r: Ref | null): bool throws ModelError {
+		if (r == null || r.target == "smithy.api#Unit") {
+			return false
+		}
+		return this.shape(r.target).members.some(m => this.shape(m[1].target).traits.streaming != null
+			&& this.shape(m[1].target).type == "union")
 	}
 
 	/// n, declared at the top level.
@@ -298,52 +820,239 @@ class Generator {
 			for (const m of s.members) {
 				const v = this.declare(`${name(id)}$${m[0]}`)
 				variants.push(v)
-				decls.push(new Decl("class", [`export class ${v} {`, this.field(id, m, true), "}"]))
+				decls.push(new Decl("class", [`export class ${v} {`, ...this.field(id, m, true).lines, "}"]))
 			}
 			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, variants)))
 			return decls
 		}
 		const n = this.declare(name(id))
+		let tags = ""
+		const sent = this.xmlNames.find(x => x[0] == id)
+		const xmlName = if (sent == null) s.traits.xmlName else sent![1]
+		if (this.protocol == "restXml" && xmlName != null) {
+			tags += ` @restxml.Name[${json.quoted(xmlName!)}]`
+		}
+		if (this.protocol == "restXml" && s.traits.xmlNamespace != null) {
+			tags += ` ${namespace(s.traits.xmlNamespace!)}`
+		}
+		if (this.unwrapped.includes(id)) {
+			tags += " @restxml.Unwrapped"
+		}
 		if (s.members.length == 0) {
-			return [new Decl("class", [`export class ${n} {}`])]
+			return [new Decl("class", [`export class ${n}${tags} {}`])]
 		}
-		const lines = [`export class ${n} {`]
+		const fields: Decl[] = []
 		for (const m of s.members) {
-			lines.push(this.field(id, m, m[1].traits.required != null))
+			fields.push(this.field(id, m, m[1].traits.required != null && !this.optional.includes(`${id}$${m[0]}`)))
 		}
-		lines.push("}")
+		const merged = this.interleaved.find(i => i[0] == id)
+		if (merged != null) {
+			const [_, a, b] = merged
+			fields.push(new Decl("field",
+				[`\t/// The order of the ${a} and ${b} items, written as one list: whether each is a ${b}.`,
+				`\torder: bool[] | null @restxml.Interleave[${json.quoted(a)}, ${json.quoted(b)}]`]))
+		}
+		const lines = [`export class ${n}${tags} {`, ...layout(fields), "}"]
 		return [new Decl("class", lines)]
 	}
 
-	/// The field of the member m of the shape id, null unless required.
-	field(id: string, m: [string, Ref], required: bool): string throws ModelError {
+	/// The module of the service's codec, of core/protocol.
+	codec(): string {
+		return switch (this.protocol) {
+			case "awsQuery": "query"
+			case "restXml": "restxml"
+			case "restJson1": "restjson"
+			default: "json"
+		}
+	}
+
+	/// Whether the service's protocol is restXml or restJson1, of core/protocol/rest's bindings.
+	rest(): bool { return this.protocol == "restXml" || this.protocol == "restJson1" }
+	/// Whether the service's bodies are JSON.
+	json(): bool { return this.codec() == "json" || this.codec() == "restjson" }
+	/// The tag n of the service's codec.
+	tag(n: string): string { return `@${this.codec()}.${n}` }
+
+	/// The tags of a REST protocol that bind the member r to where it is on the wire, and of restXml those that shape
+	/// its XML: of a payload, its element's name too.
+	bindings(r: Ref): string[] throws ModelError {
+		const t = r.traits
+		const tags: string[] = []
+		const xml = this.protocol == "restXml"
+		if (t.httpLabel != null) {
+			tags.push("@rest.Label")
+		}
+		if (t.httpQuery != null) {
+			tags.push(`@rest.Query[${json.quoted(t.httpQuery!)}]`)
+		}
+		if (t.httpQueryParams != null) {
+			tags.push("@rest.Params")
+		}
+		if (t.httpHeader != null) {
+			tags.push(`@rest.Header[${json.quoted(t.httpHeader!)}]`)
+		}
+		if (t.httpPrefixHeaders != null) {
+			tags.push(`@rest.Prefix[${json.quoted(t.httpPrefixHeaders!)}]`)
+		}
+		if (t.httpResponseCode != null) {
+			tags.push("@rest.Status")
+		}
+		if (t.httpPayload != null) {
+			tags.push("@rest.Payload")
+			if (xml && t.xmlName == null) {
+				const s = this.shape(r.target)
+				tags.push(`@restxml.Name[${json.quoted(s.traits.xmlName ?? name(r.target))}]`)
+			}
+		}
+		if (xml && t.xmlAttribute != null) {
+			tags.push("@restxml.Attr")
+		}
+		if (xml && t.xmlNamespace != null) {
+			tags.push(namespace(t.xmlNamespace!))
+		}
+		return tags
+	}
+
+	/// The field of the member m of the shape id, null unless required or of a default.
+	field(id: string, m: [string, Ref], required: bool): Decl throws ModelError {
 		const t = m[1].traits
 		const query = this.protocol == "awsQuery"
+		const xml = query || this.protocol == "restXml"
 		if (query && t.xmlAttribute != null) {
 			throw new ModelError(`${id}$${m[0]}: an XML attribute`)
 		}
-		const tags: string[] = []
-		if (query && t.xmlName != null) {
-			tags.push(`@query.Name[${json.quoted(t.xmlName!)}]`)
+		const tags = if (this.rest()) this.bindings(m[1]) else []
+		if (xml && t.xmlName != null) {
+			tags.push(this.tag(`Name[${json.quoted(t.xmlName!)}]`))
 		}
-		if (query && t.xmlFlattened != null) {
-			tags.push("@query.Flat")
+		if (xml && t.xmlFlattened != null) {
+			tags.push(this.tag("Flat"))
 		}
+		const bound = t.httpLabel != null || t.httpQuery != null || t.httpQueryParams != null || t.httpHeader != null
+			|| t.httpPrefixHeaders != null || t.httpPayload != null
+		if (this.protocol == "restJson1" && t.jsonName != null && !bound) {
+			tags.push(`@json.Name[${json.quoted(t.jsonName!)}]`)
+		}
+		const d = m[1].traits.rest.find(x => x[0] == "smithy.api#default")
+		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
+		if (initial != null) {
+			tags.push("@model.Default")
+			this.modeled = true
+		}
+		const called = this.named.find(n => n[0] == `${id}$${m[0]}`)
+		if (called != null) {
+			tags.push(`@model.Named[${json.quoted(called[1])}]`)
+			this.modeled = true
+		}
+		this.exempt = this.unconstrained.includes(`${id}$${m[0]}`)
+		const valid = if (this.exempt) "" else this.valid(m[1])
+		this.open = this.opened || this.strings.includes(`${id}$${m[0]}`)
+		this.payload = t.httpPayload != null
+		this.bound = bound && this.protocol == "restJson1"
 		const ty = this.typeOf(m[1], tags, false)
-		const tagged = tags.map(x => ` ${x}`).join("")
-		const field = if (required) `\t${m[0]}: ${ty}${tagged}${this.initial(m[1].target, ty)}`
-			else `\t${m[0]}: ${ty} | null${tagged}`
-		if (wide(field)) {
-			throw new ModelError(`${id}$${m[0]}: a field wider than a line`) // bober format would wrap it
+		this.exempt = false
+		this.open = false
+		this.payload = false
+		this.bound = false
+		if (valid != "") {
+			tags.push(valid)
 		}
-		return field
+		const tagged = tags.map(x => ` ${x}`).join("")
+		const field = if (initial != null) `\t${m[0]}: ${ty}${tagged} = ${initial}`
+			else if (required) `\t${m[0]}: ${ty}${tagged}${this.initial(m[1].target, ty)}`
+			else `\t${m[0]}: ${ty} | null${tagged}`
+		if (!wide(field) || initial != null || required) {
+			return new Decl("field", [field]) // which bober format leaves as it is
+		}
+		// as bober format breaks a type too wide before its last member, unless that does not make it fit
+		const last = `\t\t| null${tagged}`
+		return new Decl("field", if (wide(last)) [field] else [`\t${m[0]}: ${ty}`, last])
+	}
+
+	/// The value of the member r of the default d, as Smithy's JSON gives it.
+	defaultOf(r: Ref, d: string): string throws ModelError {
+		const s = this.shape(r.target)
+		try {
+			switch (s.type) {
+				case "blob": return json.quoted(base64.decode(json.decode[string](d)))
+				case "map": return "[]"
+				case "timestamp": return `${(round(json.decode[f64](d) * 1000.0) as i64) * 1000000}`
+				default: return this.literal(r, d)
+			}
+		} catch (e: ParseError) {
+			throw new ModelError(`${r.target}: a default of ${d}`)
+		}
+	}
+
+	/// The tag of the constraints of the member or item r, "" if it has none or the service's handlers check them; an
+	/// alias of its target's where the member adds none of its own; and Sensitive if it is and values are quoted.
+	valid(r: Ref): string throws ModelError {
+		const v = this.validation
+		const s = this.shape(r.target)
+		const own = r.traits.length != null || r.traits.range != null || r.traits.pattern != null
+		const length = r.traits.length ?? s.traits.length
+		const pattern = r.traits.pattern ?? s.traits.pattern
+		if (v == null || pattern != null && !v[3] || enumerates(s)) {
+			return ""
+		}
+		let tag = ""
+		if (s.type == "list" || s.type == "map") {
+			if (length == null) {
+				return ""
+			}
+			tag = `model.Size[${bound(length!.min)}, ${bound(length!.max)}]`
+		} else {
+			const b = length ?? r.traits.range ?? s.traits.range
+			let p = pattern ?? ""
+			const run = runnable(p)
+			if (run == null) {
+				const unrun = `${r.target}: ${p}`
+				if (!this.unchecked.includes(unrun)) {
+					this.unchecked.push(unrun)
+				}
+				p = ""
+			}
+			if (b == null && p == "") {
+				return ""
+			}
+			const bounds = `${bound(b?.min)}, ${bound(b?.max)}, ${json.quoted(p)}`
+			tag = if (run == null || run! == p) `model.Valid[${bounds}]`
+				else `model.Rewritten[${bounds}, ${json.quoted(run!)}]`
+		}
+		// of a string or number, as a blob's value is hidden anyway, and a list's or map's items take the tag
+		const sensitive = r.traits.sensitive != null || s.traits.sensitive != null
+		const hidden = if (v[2] && sensitive && !["blob", "list", "map"].includes(s.type)) " @model.Sensitive" else ""
+		if (own) {
+			return `@${tag}${hidden}`
+		}
+		const alias = this.aliases.find(a => a[0] == r.target)
+		if (alias == null) {
+			this.aliases.push([r.target, `type ${this.declare(name(r.target))} = ${tag}`])
+		}
+		return `@${name(r.target)}${hidden}`
+	}
+
+	/// The actions that authorize each operation, by its name, as the authorization reference of the service of the
+	/// signing name signing, beside the model from, gives them; none if there is no reference.
+	actions(from: string, signing: string): [string, string[]][] throws ModelError {
+		const at = lastIndexOf(from, "/")
+		const file = readFile(`${from.slice(0, at + 1)}${signing}-auth.json`)
+		if (file == null) {
+			return []
+		}
+		try {
+			return json.decode[Reference](file!).Operations.map(o => [o.Name,
+				o.AuthorizedActions.map(a => `${a.Service}:${a.Name}`)])
+		} catch (e: ParseError) {
+			throw new ModelError(`${signing}-auth.json: ${e}`)
+		}
 	}
 
 	/// The initializer of a required field of the shape id, of type ty: none where ty has a zero value.
 	initial(id: string, ty: string): string throws ModelError {
 		const s = this.shape(id)
 		if (enumerates(s)) {
-			return ` = ${this.values(id)[0]}`
+			return if (ty == "string") "" else ` = ${this.values(id)[0]}`
 		}
 		switch (s.type) {
 			case "list", "map": return " = []"
@@ -357,10 +1066,16 @@ class Generator {
 	typeOf(r: Ref, tags: string[], inner: bool): string throws ModelError {
 		const s = this.shape(r.target)
 		if (enumerates(s)) {
-			return name(r.target)
+			if (this.open) {
+				this.reach(r.target)
+				return "string"
+			}
+			return enumName(r.target)
 		}
-		const query = this.protocol == "awsQuery"
-		if (!query && ["timestamp", "document", "list", "map"].includes(s.type)) {
+		const xml = this.protocol == "awsQuery" || this.protocol == "restXml" || this.bound
+		// the module of the timestamp and blob tags
+		const of = if (this.protocol == "awsQuery") "query" else if (xml) "rest" else "json"
+		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
 			return this.jsonType(r, s, tags)
 		}
 		switch (s.type) {
@@ -373,40 +1088,59 @@ class Generator {
 			case "float": return "f32"
 			case "double": return "f64"
 			case "timestamp":
-				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? "date-time"
-				tags.push(if (format == "date-time") "@query.Timestamp" else `@query.Timestamp[${json.quoted(format)}]`)
+				// that of core/protocol/rest is of where the member is bound
+				const otherwise = if (of == "rest") "" else "date-time"
+				const format = r.traits.timestampFormat ?? s.traits.timestampFormat ?? otherwise
+				tags.push(if (format == otherwise) `@${of}.Timestamp` else `@${of}.Timestamp[${json.quoted(format)}]`)
+				if (this.twofold) {
+					this.jsonType(r, s, tags)
+				}
 				return "i64"
 			case "blob":
-				if (s.traits.streaming != null) {
+				if (s.traits.streaming != null && !this.payload) {
 					throw new ModelError(`${r.target}: a stream`)
 				}
-				tags.push(if (query) "@query.Blob" else "@json.Blob")
+				tags.push(`@${of}.Blob`)
+				if (this.twofold) {
+					tags.push("@json.Blob")
+				}
 				return "string"
 			case "list":
 				const m = s.member!
 				if (s.traits.sparse != null || inner && m.traits.xmlName != null) {
 					throw new ModelError(`${r.target}: a sparse list, or one within a list or map whose items are named`)
 				}
-				if (m.traits.xmlName != null) {
-					tags.push(`@query.Member[${json.quoted(m.traits.xmlName!)}]`)
+				if (m.traits.xmlName != null && this.protocol != "restJson1") {
+					tags.push(this.tag(`Member[${json.quoted(m.traits.xmlName!)}]`))
 				}
-				return `${this.typeOf(m, tags, true)}[]`
+				return `${this.item(m, tags)}[]`
 			case "map":
 				const k = s.key!
 				const v = s.value!
 				if (s.traits.sparse != null || inner && (k.traits.xmlName != null || v.traits.xmlName != null)) {
 					throw new ModelError(`${r.target}: a sparse map, or one within a list or map whose keys or values are named`)
 				}
-				if (k.traits.xmlName != null) {
-					tags.push(`@query.Key[${json.quoted(k.traits.xmlName!)}]`)
+				if (k.traits.xmlName != null && this.protocol != "restJson1") {
+					tags.push(this.tag(`Key[${json.quoted(k.traits.xmlName!)}]`))
 				}
-				if (v.traits.xmlName != null) {
-					tags.push(`@query.Value[${json.quoted(v.traits.xmlName!)}]`)
+				if (v.traits.xmlName != null && this.protocol != "restJson1") {
+					tags.push(this.tag(`Value[${json.quoted(v.traits.xmlName!)}]`))
 				}
-				return `[${this.typeOf(k, tags, true)}, ${this.typeOf(v, tags, true)}][]`
+				return `[${this.typeOf(k, tags, true)}, ${this.item(v, tags)}][]`
 			case "structure", "union": return name(r.target)
 			default: throw new ModelError(`${r.target}: a ${s.type}`)
 		}
+	}
+
+	/// The type of the item r of a list or map, with the tags into tags that it takes: its constraints, unless it is a
+	/// list or map itself, whose number of items they would bound.
+	item(r: Ref, tags: string[]): string throws ModelError {
+		const ty = this.typeOf(r, tags, true)
+		const valid = if (this.exempt || ["list", "map"].includes(this.shape(r.target).type)) "" else this.valid(r)
+		if (valid != "") {
+			tags.push(valid)
+		}
+		return ty
 	}
 
 	/// The type of a member, or item, r of an awsJson service, of the timestamp, document, list or map s, with the tags
@@ -422,27 +1156,30 @@ class Generator {
 				tags.push("@json.Document")
 				return "string"
 			case "list":
-				const item = this.typeOf(s.member!, tags, true)
+				const item = this.item(s.member!, tags)
 				return if (s.traits.sparse != null) `(${item} | null)[]` else `${item}[]`
 			default:
 				// a map
 				const k = this.typeOf(s.key!, tags, true)
-				const v = this.typeOf(s.value!, tags, true)
+				const v = this.item(s.value!, tags)
 				return `[${k}, ${v}${if (s.traits.sparse != null) " | null" else ""}][]`
 		}
 	}
 
 	/// The arguments making the ErrorShape of the error id: its id, the member that holds its message and its code
-	/// under awsQuery.
-	errorShape(id: string): string throws ModelError {
+	/// under awsQuery; held where it is the access denied of the code denier.
+	errorShape(id: string, denier: string, held: string): string throws ModelError {
 		const message = this.shape(id).members.find(m => lower(m[0]) == "message")
 		const code = this.shape(id).traits.queryError?.code ?? ""
-		return `${json.quoted(id)}, ${json.quoted(if (message == null) "" else message[0])}, ${json.quoted(code)}`
+		const m = if (name(id) == denier) held else if (message == null) "" else message[0]
+		return `${json.quoted(id)}, ${json.quoted(m)}, ${json.quoted(code)}`
 	}
 
-	/// The function making the Fault of the error id, as the protocol answers it, of a message if it has one.
-	maker(id: string): string[] throws ModelError {
-		const t = this.shape(id).traits
+	/// The function making the Fault of the error id, as the protocol answers it, of a message if it has one; and if
+	/// the error has other members, the class of them, which the function takes too.
+	maker(id: string): Decl[] throws ModelError {
+		const s = this.shape(id)
+		const t = s.traits
 		if (t.error == null) {
 			throw new ModelError(`${id}: an error without the error trait`)
 		}
@@ -450,13 +1187,26 @@ class Generator {
 		const query = this.protocol == "awsQuery"
 		const status = (if (query) t.queryError?.httpResponseCode else t.httpError) ?? (if (client) 400 else 500)
 		const code = (if (query) t.queryError?.code else null) ?? name(id)
-		const message = query || this.shape(id).members.some(m => lower(m[0]) == "message")
-		const param = if (message) "message: string" else ""
-		const sender = if (client == (status < 500)) "" else `, ${client}`
-		const head = `export function ${this.declare(lowerCamel(name(id)))}(${param}): Fault {`
-		const body = `return new Fault(${status}, ${json.quoted(code)}, ${if (message) "message" else "\"\""}${sender})`
+		const message = query || this.protocol == "restXml" || s.members.some(m => lower(m[0]) == "message")
+		const others = s.members.filter(m => lower(m[0]) != "message")
+		const decls: Decl[] = []
+		const params: string[] = if (message) ["message: string"] else []
+		let members = ""
+		if (others.length > 0) {
+			const c = this.declare(name(id))
+			const doc = `/// The members of ${name(id)} besides its message.`
+			const fields = layout(others.map(m => this.field(id, m, m[1].traits.required != null)))
+			decls.push(new Decl("class", [doc, `export class ${c} {`, ...fields, "}"]))
+			params.push(`members: ${c} = new ${c}()`)
+			members = `, ${client}, ${this.codec()}.members(members)`
+		}
+		const sender = if (members != "" || client == (status < 500)) "" else `, ${client}`
+		const head = `export function ${this.declare(lowerCamel(name(id)))}(${params.join(", ")}): Fault {`
+		const text = if (message) "message" else "\"\""
+		const body = `return new Fault(${status}, ${json.quoted(code)}, ${text}${sender}${members})`
 		const line = `${head} ${body} }` // as bober format puts a body of one statement where it fits
-		return if (wide(line)) [head, `\t${body}`, "}"] else [line]
+		decls.push(new Decl("function", if (wide(line)) [...signature(head), ...wrap(`\t${body}`), "}"] else [line]))
+		return decls
 	}
 
 	/// The tests of the vectors of the operations and their errors, of the API in the file out, after api has run;
@@ -498,6 +1248,10 @@ class Generator {
 				} else if (v.appliesTo == "client" || reason != null) {
 					const why = if (reason == null) "for clients only" else reason.slice(1, reason.length).join(": ")
 					skipped.push(`// ${test}: ${why}`)
+				} else if (this.unexpressible.includes(op)) {
+					skipped.push(`// ${test}: of an operation the API cannot express`)
+				} else if (error != null && this.rest() && this.unrequestable(op)) {
+					skipped.push(`// ${test}: of an input whose required members a request of its route lacks`)
 				} else if (error == null) {
 					if (!requested) {
 						const output = this.className(this.shape(op).output)
@@ -526,7 +1280,7 @@ class Generator {
 		const up = root(out)
 		const decls = [new Decl("import", [`import { Fault } from "${up}core/fault"`])]
 		decls.push(new Decl("import", [`import { Caller, Unit } from "${up}core/service"`]))
-		const same = if (this.protocol == "awsQuery") "same" else "sameJson"
+		const same = if (this.json()) "sameJson" else "same"
 		decls.push(new Decl("import", [`import { caller, ${same} } from "${up}tools/smithygen/vectors"`]))
 		decls.push(new Decl("import", [`import * as api from "./${replace(split(out, "/").pop()!, ".bob", "")}"`]))
 		decls.push(new Decl("import", [`import { Request } from "std/http"`]))
@@ -550,16 +1304,18 @@ class Generator {
 	request(op: string, v: Vector): string[] throws ModelError | ParseError {
 		const o = this.shape(op)
 		const input = this.className(o.input)
-		if (v.body == null) {
+		const rest = this.rest()
+		if (v.body == null && !rest) {
 			throw new ModelError(`${v.id}: a request without a body`)
 		}
 		const lines = ["\tconst h = new Got()"]
-		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(v.uri)}, ${json.quoted(v.body!)})`
+		const uri = if (v.queryParams.length == 0) v.uri else `${v.uri}?${v.queryParams.join("&")}`
+		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(uri)}, ${json.quoted(v.body ?? "")})`
 		lines.append(wrap(`\tconst req = ${req}`))
 		for (const h of v.headers) {
 			lines.push(`\treq.headers.set(${json.quoted(h[0])}, ${json.quoted(h[1])})`)
 		}
-		if (this.protocol != "awsQuery" && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
+		if (this.protocol != "awsQuery" && !rest && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
 			lines.push(this.target(op))
 		}
 		lines.append([`\tapi.handle(h, caller(""), req)`, `\tconst want = new ${input}()`])
@@ -577,10 +1333,21 @@ class Generator {
 		if (error != "") {
 			const message = this.shape(error).members.find(m => lower(m[0]) == "message")
 			const given = v.params.all.find(p => message != null && p[0] == message[0])
-			if (v.params.all.length > (if (given == null) 0 else 1) || this.protocol == "awsQuery" && given == null) {
-				throw new ModelError(`${v.id}: an error of members besides a Message`)
+			const query = this.protocol == "awsQuery"
+			if (query && given == null) {
+				throw new ModelError(`${v.id}: an error without a Message, which the awsQuery codec writes`)
 			}
-			const text = if (message == null) "" else if (given == null) "\"\"" else this.literal(message[1], given[1])
+			let text = if (message == null && !query && this.protocol != "restXml") ""
+				else if (given == null) "\"\""
+				else this.literal(message![1], given[1])
+			const others = v.params.all.filter(p => message == null || p[0] != message[0])
+			if (others.length > 0) {
+				body.push(`\t\tconst e = new api.${name(error)}()`)
+				for (const p of others) {
+					body.append(wrap(`\t\te.${p[0]} = ${this.literal(this.member(error, p[0]), p[1])}`))
+				}
+				text = if (text == "") "e" else `${text}, e`
+			}
 			body.append(wrap(`\t\tthrow api.${lowerCamel(name(error))}(${text})`))
 		} else if (v.params.all.length == 0) {
 			body.push(`\t\treturn new ${output}()`)
@@ -601,6 +1368,11 @@ class Generator {
 			const id = if (has(body, "<RequestId>")) split(split(body, "<RequestId>")[1], "</RequestId>")[0] else ""
 			const req = `new Request("POST", "/", ${json.quoted(`Action=${name(op)}&Version=${this.version}`)})`
 			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), ${req})`))
+		} else if (this.rest()) {
+			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
+			const id = if (header == null) "" else header[1]
+			lines.append(this.routed(op))
+			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), req)`))
 		} else {
 			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
 			const id = if (header == null) "" else header[1]
@@ -617,12 +1389,46 @@ class Generator {
 				throw new ModelError(`${v.id}: a body that a template literal cannot hold as it is`)
 			}
 			const want = (if (verbatim) `\`${body}\`` else json.quoted(body)) + ")"
-			const same = if (query) "same" else "sameJson"
+			const same = if (this.json()) "sameJson" else "same"
 			const line = `\tassert ${same}(res, ${want}`
 			// as bober format breaks it, a body of several lines measured as if of one
 			lines.append(if (wide(line)) [`\tassert ${same}(res,`, `\t\t${want}`] else [line])
 		}
 		return lines
+	}
+
+	/// The statements making req, a request of the REST operation op's route: each label and required query
+	/// parameter or header of it "a".
+	routed(op: string): string[] throws ModelError {
+		const http = this.shape(op).traits.http!
+		const parts = split(http.uri, "?")
+		const segments = split(parts[0], "/").map(s => if (startsWith(s, "{")) "a" else s)
+		const query = if (parts.length < 2) [] else split(parts[1], "&").filter(l => l != "")
+		const headers: string[] = []
+		for (const m of this.required(op)) {
+			if (m.traits.httpQuery != null) {
+				query.push(`${m.traits.httpQuery!}=a`)
+			} else if (m.traits.httpHeader != null) {
+				headers.push(`\treq.headers.set(${json.quoted(m.traits.httpHeader!)}, "a")`)
+			}
+		}
+		const uri = segments.join("/") + (if (query.length == 0) "" else `?${query.join("&")}`)
+		return [...wrap(`\tconst req = new Request(${json.quoted(http.method)}, ${json.quoted(uri)}, "")`), ...headers]
+	}
+
+	/// The required members of the input of operation op.
+	required(op: string): Ref[] throws ModelError {
+		const input = this.shape(op).input
+		if (input == null || input.target == "smithy.api#Unit") {
+			return []
+		}
+		return this.shape(input.target).members.filter(m => m[1].traits.required != null).map(m => m[1])
+	}
+
+	/// Whether a request of the REST operation op's route, as routed makes it, lacks a member its input requires.
+	unrequestable(op: string): bool throws ModelError {
+		return this.required(op).some(m => m.traits.httpLabel == null && m.traits.httpQuery == null
+			&& m.traits.httpHeader == null)
 	}
 
 	/// The statement setting the X-Amz-Target of req to name the operation op.
@@ -743,12 +1549,20 @@ function root(out: string): string {
 	return up
 }
 
-/// The imports of the file out, of the awsQuery codec if query, else of the awsJson one, and of Unit if unit.
-function imports(out: string, query: bool, unit: bool): Decl[] {
+/// The imports of the file out, of the codec, the bindings of a REST one and the JSON of restjson's, of Unit if unit,
+/// and of the codecs' model if modeled.
+function imports(out: string, codec: string, unit: bool, modeled: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
-	const codec = if (query) "query" else "json"
-	decls.push(new Decl("import", [`import * as ${codec} from "${up}core/protocol/${codec}"`]))
+	const of = if (codec == "restjson") [codec, "rest", "json"]
+		else if (codec == "restxml") [codec, "rest"]
+		else [codec]
+	for (const c of of) {
+		decls.push(new Decl("import", [`import * as ${c} from "${up}core/protocol/${c}"`]))
+	}
+	if (modeled) {
+		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))
+	}
 	decls.push(new Decl("import", [`import { Fault } from "${up}core/fault"`]))
 	const names = if (unit) "Caller, notImplemented, Unit" else "Caller, notImplemented"
 	decls.push(new Decl("import", [`import { ${names} } from "${up}core/service"`]))
@@ -756,17 +1570,23 @@ function imports(out: string, query: bool, unit: bool): Decl[] {
 	return decls
 }
 
-/// The function serving a request by a handler of the interface handlers, by the cases of its operations, of awsQuery
-/// if query, else of awsJson.
-function handle(handlers: string, cases: string[], query: bool): string[] {
-	const lines = ["/// The answer of h to req."]
-	const head = `export function handle(h: ${handlers}, caller: Caller, req: Request)`
+/// The function serving a request by a handler of the interface handlers, by the cases of its operations, of the codec
+/// query, json, restxml or restjson; of the service's validation if validated; IAM's denials answered as denied says, its
+/// status, code and wording as 403, "AccessDenied", "reasoned".
+function handle(handlers: string, cases: string[], codec: string, validated: bool, denied: string,
+	named = "handle"): string[] {
+	const lines = [if (named == "handle") "/// The answer of h to req." else "/// The answer of h to req of awsJson."]
+	const head = `export function ${named}(h: ${handlers}, caller: Caller, req: Request)`
 	lines.append(signature(`${head}: Response throws IoError {`))
-	if (query) {
-		lines.append(["\tconst c = query.call(caller, req, version, ns)", "\tswitch (c.action) {", ...cases])
+	lines.push(`\tcaller.denied = [${denied}]`)
+	if (codec == "query") {
+		const call = `\tconst c = query.call(caller, req, version, ns${if (validated) ", validation" else ""})`
+		lines.append([call, "\tswitch (c.action) {", ...cases])
 		lines.push("\t\tdefault: return c.invalidAction()")
 	} else {
-		lines.append(["\tconst c = json.call(caller, req, service)", "\tswitch (c.operation) {", ...cases])
+		const call = if (codec == "json") "json.call(caller, req, service)"
+			else `${codec}.call(caller, req, service, routes)`
+		lines.append([`\tconst c = ${call}`, "\tswitch (c.operation) {", ...cases])
 		lines.push("\t\tdefault: return c.unknownOperation()")
 	}
 	lines.append(["\t}", "}"])
@@ -804,14 +1624,18 @@ function signature(line: string): string[] {
 	return lines
 }
 
-/// The decls' lines, a blank line between two of different kinds or of more than a line, as bober format puts them.
+/// The number of lines of d but its comments.
+function code(d: Decl): i32 { return d.lines.filter(l => !startsWith(l, "//") && !startsWith(l, "\t//")).length }
+
+/// The decls' lines, a blank line between two of different kinds or of more than a line of code, as bober format puts
+/// them.
 function layout(decls: Decl[]): string[] {
 	const lines: string[] = []
 	for (let i = 0; i < decls.length; i++) {
 		const d = decls[i]
 		if (i > 0) {
 			const prev = decls[i - 1]
-			if (prev.kind != d.kind || prev.lines.length > 1 || d.lines.length > 1) {
+			if (prev.kind != d.kind || code(prev) > 1 || code(d) > 1) {
 				lines.push("")
 			}
 		}
@@ -891,6 +1715,67 @@ function pieces(s: string): string[] {
 	return out
 }
 
+/// What std/regex runs for the pattern p: p if it can run it, else its equal among lookarounds or in RE2's spelling;
+/// null if it can run neither.
+export function runnable(p: string): string | null {
+	const equal = lookarounds.find(l => l[0] == p)
+	for (const r of [p, if (equal == null) re2(p) else equal![1]]) {
+		try {
+			compile(r)
+			return r
+		} catch (e: ParseError) {
+			continue
+		}
+	}
+	return null
+}
+
+/// The pattern p of Java's spelling in RE2's: \uXXXX, of four hexadecimal digits as Java reads it, as \x{XXXX}, and
+/// \p{ASCII} as its range, in a class or as one.
+function re2(p: string): string {
+	const out: string[] = []
+	let i = 0
+	let inside = false
+	while (i < p.length) {
+		const c = p.slice(i, i + 1)
+		const rest = p.slice(i, p.length)
+		if (c != "\\") {
+			inside = c == "[" || inside && c != "]"
+			out.push(c)
+			i++
+		} else if (rest.length >= 6 && rest.slice(1, 2) == "u" && hexadecimal(rest.slice(2, 6))) {
+			out.push(`\\x{${rest.slice(2, 6)}}`)
+			i += 6
+		} else if (startsWith(rest, "\\p{ASCII}")) {
+			out.push(if (inside) "\\x00-\\x7F" else "[\\x00-\\x7F]")
+			i += 9
+		} else {
+			out.push(rest.slice(0, min(2, rest.length)))
+			i += 2
+		}
+	}
+	return out.join("")
+}
+
+/// Whether s is of hexadecimal digits only.
+function hexadecimal(s: string): bool {
+	for (const c of s) {
+		if (!(c >= 48 && c <= 57 || c >= 65 && c <= 70 || c >= 97 && c <= 102)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The text of a constraint's bound b, "" if none.
+function bound(b: f64 | null): string {
+	if (b == null) {
+		return "\"\""
+	}
+	const n = b!
+	return json.quoted(if (n == round(n)) `${n as i64}` else `${n}`)
+}
+
 /// Whether line is wider than bober format allows, a tab as 4 columns.
 function wide(line: string): bool { return line.length + 3 * tabs(line) > width }
 
@@ -903,6 +1788,12 @@ function tabs(line: string): i32 {
 	return n
 }
 
+/// The restXml tag of the XML namespace ns.
+function namespace(ns: Namespace): string {
+	const prefix = if (ns.prefix == "") "" else `, ${json.quoted(ns.prefix)}`
+	return `@restxml.Namespace[${json.quoted(ns.uri)}${prefix}]`
+}
+
 /// Whether s has sub in it.
 function has(s: string, sub: string): bool { return indexOf(s, sub) >= 0 }
 /// Whether s is an enum, or a string of Smithy 1's enum trait.
@@ -911,6 +1802,11 @@ function enumerates(s: Shape): bool { return s.type == "enum" || s.traits.enum !
 function sortNames(ids: string[]) { sortBy(ids, (a, b) => name(a) < name(b)) }
 /// The name of the shape id, without its namespace.
 function name(id: string): string { return split(id, "#")[1] }
+
+/// The name of the enum id, followed by a $ if the API imports one of that name, as SSM's Fault.
+function enumName(id: string): string {
+	return if (["Caller", "Fault", "Request", "Response"].includes(name(id))) `${name(id)}$` else name(id)
+}
 
 /// s with its leading capitals lowered, but for the last of several that starts a word: IDPError as idpError.
 function lowerCamel(s: string): string {
