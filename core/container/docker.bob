@@ -1,0 +1,362 @@
+//! Containers by Docker's daemon, over its Engine API on the unix socket DOCKER_HOST names, else /var/run/docker.sock.
+//! The API is pinned at 1.44, the oldest Docker 29 takes. std/http's Client dials TCP only, so std/http/h1 frames the
+//! messages here, each on a connection of its own.
+
+import { Arch, ContainerError, Containers, Spec } from "./container"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { EncodeError, Name, OmitEmpty, Rest, Unknown, decode, encode } from "std/encoding/json"
+import { Buffered, Framed, head, readHead } from "std/http/h1"
+import { readAll } from "std/io"
+import { Conn, dial } from "std/net"
+import { env } from "std/process"
+import { ParseError, lower, parseInt, split, trim } from "std/string"
+import { Decodable } from "std/types"
+import { Query, escape } from "std/url"
+
+const api = "/v1.44"
+/// The least the daemon lets a container have.
+const leastMb = 6
+
+export class DockerContainers implements Containers {
+	/// Where the daemon listens, as net.dial takes it.
+	daemon = located()
+
+	pull(image: string) throws ContainerError {
+		const [repo, tag] = reference(image)
+		const found = this.send("GET", `/images/${escape(named(repo, tag), "path")}/json`)
+		if (found.status == 404) {
+			found.close()
+			this.fetch(repo, tag, null)
+		} else {
+			found.ok()
+		}
+	}
+
+	start(spec: Spec): string throws ContainerError {
+		const [repo, tag] = reference(spec.image)
+		const platform = platformOf(spec.arch)
+		const body = json(create(spec, named(repo, tag)))
+		const target = `/containers/create?${query([["platform", platform]])}`
+		let made = this.send("POST", target, body)
+		// As for an image not here, or here for other platforms only.
+		if (made.status == 404) {
+			made.close()
+			this.fetch(repo, tag, platform)
+			made = this.send("POST", target, body)
+		}
+		const id = parse[Created](made.ok()).id
+		try {
+			this.send("POST", `/containers/${escape(id, "component")}/start`).ok()
+		} catch (e: ContainerError) {
+			try {
+				this.stop(id)
+			} catch (ignored: ContainerError) {}
+			throw e
+		}
+		return id
+	}
+
+	host(): string throws ContainerError {
+		const bridge = this.send("GET", "/networks/bridge")
+		if (bridge.status == 404) {
+			bridge.close()
+			throw new ContainerError("Unavailable", "the daemon has no bridge network")
+		}
+		for (const c of parse[Network](bridge.ok()).ipam.config ?? []) {
+			if (indexOf(c.gateway, ".") > 0) {
+				return c.gateway
+			}
+		}
+		throw new ContainerError("Unavailable", "the bridge network has no IPv4 gateway")
+	}
+
+	output(id: string): string throws ContainerError {
+		const q = query([["stdout", "1"], ["stderr", "1"]])
+		return demultiplexed(this.send("GET", `/containers/${escape(id, "component")}/logs?${q}`).ok())
+	}
+
+	wait(id: string): i32 throws ContainerError {
+		const r = this.send("POST", `/containers/${escape(id, "component")}/wait`, "", true)
+		return parse[Exited](r.ok()).statusCode as i32
+	}
+
+	stop(id: string) throws ContainerError {
+		const q = query([["force", "1"], ["v", "1"]])
+		const r = this.send("DELETE", `/containers/${escape(id, "component")}?${q}`)
+		if (r.status == 404) {
+			r.close()
+		} else {
+			r.ok()
+		}
+	}
+
+	/// The daemon's response to a request of target under api; with no timeout if long, as a wait's is.
+	private send(method: string, target: string, body: string = "", long: bool = false): Answer throws ContainerError {
+		const conn = connect(this.daemon)
+		if (long) {
+			conn.timeout = 0
+		}
+		try {
+			return exchange(conn, `${method} ${api}${target}`, body)
+		} catch (e: ContainerError) {
+			close(conn)
+			throw e
+		}
+	}
+
+	/// Pulls repo at tag for platform, or the daemon's own if null; a failure past the response's head is in its body.
+	private fetch(repo: string, tag: string, platform: string | null) throws ContainerError {
+		const q: [string, string][] = [["fromImage", repo], ["tag", tag]]
+		if (platform != null) {
+			q.push(["platform", platform!])
+		}
+		const progress = this.send("POST", `/images/create?${query(q)}`, "", true).ok()
+		for (const line of split(progress, "\n")) {
+			if (trim(line) != "") {
+				const p = parse[Progress](line)
+				if (p.error != "") {
+					throw new ContainerError("Failed", p.error)
+				}
+			}
+		}
+	}
+}
+
+function connect(daemon: string): Conn throws ContainerError {
+	// A DOCKER_HOST of tcp:// or ssh://, whose scheme dial would look up as a host.
+	if (indexOf(daemon, "://") >= 0) {
+		throw new ContainerError("Unavailable", `${daemon}: not a unix socket's address`)
+	}
+	try {
+		return dial(daemon)
+	} catch (e: IoError | ParseError) {
+		const why = if (e instanceof IoError) e.message() else "not an address"
+		throw new ContainerError("Unavailable", `${daemon}: ${why}`)
+	}
+}
+
+/// The response to request, a method and a target, on conn, which it then owns.
+function exchange(conn: Conn, request: string, body: string): Answer throws ContainerError {
+	try {
+		const headers: [string, string][] = [["Host", "docker"], ["Connection", "close"]]
+		if (body != "") {
+			headers.push(["Content-Type", "application/json"])
+		}
+		headers.push(["Content-Length", `${body.length}`])
+		conn.write(head(`${request} HTTP/1.1`, headers) + body)
+		const b = new Buffered(conn)
+		const h = readHead(b, 1 << 16)
+		if (h == null) {
+			throw new ContainerError("Failed", `the daemon closed the connection of ${request}`)
+		}
+		const [start, fields] = h!
+		let length: i64 | null = null
+		let chunked = false
+		for (const [k, v] of fields) {
+			if (lower(k) == "content-length") {
+				length = parseInt[i64](v)
+			} else if (lower(k) == "transfer-encoding") {
+				chunked = indexOf(lower(v), "chunked") >= 0
+			}
+		}
+		const status = parseInt(start[1])
+		if (status == 204 || status == 304) {
+			length = 0
+		}
+		return new Answer(status, conn, new Framed(b, length, chunked, (clean: bool) => {}))
+	} catch (e: IoError | ParseError) {
+		const why = if (e instanceof IoError) e.message() else "an answer that is not HTTP"
+		throw new ContainerError("Failed", `${request}: ${why}`)
+	}
+}
+
+/// A response of the daemon's, whose body is read once.
+class Answer {
+	status: i32
+	private conn: Conn
+	private body: Framed
+
+	constructor(status: i32, conn: Conn, body: Framed) {
+		this.status = status
+		this.conn = conn
+		this.body = body
+	}
+
+	/// The body of a success, else what the daemon failed with; the connection then closed.
+	ok(): string throws ContainerError {
+		let text = ""
+		try {
+			text = readAll(this.body)
+		} catch (e: IoError) {
+			throw new ContainerError("Failed", e.message())
+		} finally {
+			this.close()
+		}
+		if (this.status >= 300) {
+			throw failure(this.status, text)
+		}
+		return text
+	}
+
+	close() { close(this.conn) }
+}
+
+function close(conn: Conn) {
+	try {
+		conn.close()
+	} catch (ignored: IoError) {}
+}
+
+/// DOCKER_HOST's socket, as dial takes it, or DOCKER_HOST itself for one not unix's, which connect refuses.
+function located(): string {
+	const h = env("DOCKER_HOST") ?? ""
+	if (h == "") {
+		return "unix:/var/run/docker.sock"
+	}
+	return if (startsWith(h, "unix://")) "unix:" + h.slice(7, h.length) else h
+}
+
+class Message {
+	message = ""
+	rest: Unknown[] @Rest = []
+}
+
+function failure(status: i32, text: string): ContainerError {
+	let message = text
+	try {
+		message = decode[Message](text).message
+	} catch (e: ParseError) {}
+	return new ContainerError(if (status == 404) "NotFound" else "Failed", message)
+}
+
+function json[T](v: T): string throws ContainerError {
+	try {
+		return encode(v)
+	} catch (e: EncodeError) {
+		throw new ContainerError("Failed", `${e.value} has no JSON`)
+	}
+}
+
+function parse[T extends Decodable](text: string): T throws ContainerError {
+	try {
+		return decode[T](text)
+	} catch (e: ParseError) {
+		throw new ContainerError("Failed", `the daemon answered what this does not read: ${text}`)
+	}
+}
+
+function query(pairs: [string, string][]): string {
+	const q = new Query()
+	for (const [k, v] of pairs) {
+		q.append(k, v)
+	}
+	return q.toString()
+}
+
+/// ref's repository, and its tag or digest, latest if it has neither, as the daemon pulls every tag for none.
+function reference(ref: string): [string, string] {
+	const at = indexOf(ref, "@")
+	const name = if (at < 0) ref else ref.slice(0, at)
+	const colon = lastIndexOf(name, ":")
+	const repo = if (colon > lastIndexOf(name, "/")) name.slice(0, colon) else name
+	if (at >= 0) {
+		return [repo, ref.slice(at + 1, ref.length)]
+	}
+	return [repo, if (repo == name) "latest" else name.slice(colon + 1, name.length)]
+}
+
+function named(repo: string, tag: string): string { return repo + (if (indexOf(tag, ":") < 0) ":" else "@") + tag }
+function platformOf(a: Arch): string { return if (a == "x86_64") "linux/amd64" else "linux/arm64" }
+
+class Progress {
+	error = ""
+	rest: Unknown[] @Rest = []
+}
+
+/// A ContainerConfig, of the members a spec sets.
+class Create {
+	image: string @Name["Image"] = ""
+	entrypoint: string[] @Name["Entrypoint"] @OmitEmpty = []
+	cmd: string[] @Name["Cmd"] @OmitEmpty = []
+	env: string[] @Name["Env"] = []
+	hostConfig: HostConfig @Name["HostConfig"] = new HostConfig()
+}
+
+class HostConfig {
+	memory: i64 @Name["Memory"] = 0
+	/// Of memory and swap together: as much as memory, for no swap, as Lambda has none.
+	memorySwap: i64 @Name["MemorySwap"] = 0
+	mounts: Bind[] @Name["Mounts"] = []
+}
+
+/// A bind mount, which unlike one of Binds fails for a source that is not there rather than make it.
+class Bind {
+	kind: string @Name["Type"] = "bind"
+	source: string @Name["Source"] = ""
+	target: string @Name["Target"] = ""
+	readOnly: bool @Name["ReadOnly"] = true
+}
+
+function create(spec: Spec, image: string): Create {
+	const c = new Create()
+	c.image = image
+	// An entrypoint given drops the image's command as well.
+	if (spec.command.length > 0) {
+		c.entrypoint = [spec.command[0]]
+		c.cmd = spec.command.slice(1, spec.command.length)
+	}
+	for (const [k, v] of spec.env) {
+		c.env.push(`${k}=${v}`)
+	}
+	const mb = if (spec.memoryMb < leastMb) leastMb else spec.memoryMb
+	c.hostConfig.memory = (mb as i64) << 20
+	c.hostConfig.memorySwap = c.hostConfig.memory
+	for (const m of spec.mounts) {
+		const b = new Bind()
+		b.source = m.host
+		b.target = m.path
+		b.readOnly = m.readOnly
+		c.hostConfig.mounts.push(b)
+	}
+	return c
+}
+
+class Created {
+	id: string @Name["Id"] = ""
+	rest: Unknown[] @Rest = []
+}
+
+class Exited {
+	statusCode: i64 @Name["StatusCode"] = 0
+	rest: Unknown[] @Rest = []
+}
+
+class Network {
+	ipam: Ipam @Name["IPAM"] = new Ipam()
+	rest: Unknown[] @Rest = []
+}
+
+class Ipam {
+	config: Subnet[] | null @Name["Config"] = null
+	rest: Unknown[] @Rest = []
+}
+
+class Subnet {
+	gateway: string @Name["Gateway"] = ""
+	rest: Unknown[] @Rest = []
+}
+
+/// A log of a container without a terminal, its streams in frames of a byte naming the stream, three of zeros, and the
+/// payload's length, big-endian in four.
+function demultiplexed(log: string): string {
+	const out: string[] = []
+	let i = 0
+	while (i + 8 <= log.length) {
+		const n = ((log[i + 4] as i64) << 24) | ((log[i + 5] as i64) << 16) | ((log[i + 6] as i64) << 8)
+			| (log[i + 7] as i64)
+		const end = if (i + 8 + n > log.length) log.length else (i + 8 + n) as i32
+		out.push(log.slice(i + 8, end))
+		i = end
+	}
+	return out.join("")
+}

@@ -1,0 +1,235 @@
+import { DockerContainers, demultiplexed, reference } from "./docker"
+import { ContainerError, Mount, Spec } from "./container"
+import { indexOf } from "std/algo"
+import { Request, Response, Server } from "std/http"
+import { ParseError } from "std/string"
+
+test "reference names a repository and a tag or digest" {
+	assert reference("alpine") == ["alpine", "latest"]
+	assert reference("me/app:1") == ["me/app", "1"]
+	assert reference("localhost:5000/app") == ["localhost:5000/app", "latest"]
+	assert reference("localhost:5000/app:2") == ["localhost:5000/app", "2"]
+	assert reference("public.ecr.aws/lambda/nodejs@sha256:ab") == ["public.ecr.aws/lambda/nodejs", "sha256:ab"]
+	assert reference("app:1@sha256:ab") == ["app", "sha256:ab"]
+}
+
+test "demultiplexed joins the frames' payloads as they came" {
+	assert demultiplexed("") == ""
+	assert demultiplexed("\x02\0\0\0\0\0\0\x04err\n\x01\0\0\0\0\0\0\x04out\n") == "err\nout\n"
+	let long = ""
+	while (long.length < 256) {
+		long += "x"
+	}
+	assert demultiplexed("\x01\0\0\0\0\0\x01\x00" + long) == long
+	// One cut short, as a log read while written may end.
+	assert demultiplexed("\x01\0\0\0\0\0\0\x09partial") == "partial"
+}
+
+const image = "public.ecr.aws/docker/library/busybox"
+
+/// A Reader of a string in pieces, for a body the server sends in chunks.
+class Pieces {
+	private parts: string[]
+	private next = 0
+
+	constructor(parts: string[]) { this.parts = parts }
+
+	read(n: i32): string | null {
+		this.next++
+		return if (this.next > this.parts.length) null else this.parts[this.next - 1]
+	}
+}
+
+/// A daemon answering as Docker 29's does, holding busybox for arm64 at first; each request's line is kept, and the
+/// body of each create.
+class Fake {
+	server = new Server()
+	requests: string[] = []
+	created: string[] = []
+	images = [`${image}:latest linux/arm64`]
+	containers: string[] = []
+
+	constructor() {
+		this.server.addr = "127.0.0.1:0"
+		this.server.listen()
+	}
+
+	handle(req: Request): Response throws IoError | ParseError {
+		const target = req.url.path + (if (req.url.query.raw == null) "" else `?${req.url.query.raw!}`)
+		this.requests.push(`${req.method} ${target}`)
+		const path = req.url.path
+		const q = req.url.query
+		if (req.method == "GET" && path == "/v1.44/images/public.ecr.aws/docker/library/busybox%3Alatest/json") {
+			return new Response(200, "{}")
+		}
+		if (req.method == "GET" && indexOf(path, "/v1.44/images/") == 0) {
+			return gone("No such image: x")
+		}
+		if (path == "/v1.44/images/create") {
+			if (q.get("tag") == "none") {
+				return gone("manifest unknown")
+			}
+			if (q.get("tag") == "broken") {
+				return new Response(200,
+					new Pieces([`{"status":"Pulling fs layer","id":"a"}\n`,
+					`{"errorDetail":{"message":"unexpected EOF"},"error":"unexpected EOF"}\n`]))
+			}
+			this.images.push(`${q.get("fromImage")!}:${q.get("tag")!} ${q.get("platform") ?? "linux/arm64"}`)
+			return new Response(200,
+				new Pieces([`{"status":"Pulling from x","id":"latest"}\n`,
+				`{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"a"}\n`]))
+		}
+		if (path == "/v1.44/containers/create") {
+			const body = req.body.text()
+			this.created.push(body)
+			const named = body.slice(indexOf(body, ":") + 2, indexOf(body, ",") - 1)
+			if (!this.images.some((i: string) => i == `${named} ${q.get("platform")!}`)) {
+				return gone(`No such image: ${named}`)
+			}
+			const id = `c${this.created.length}`
+			this.containers.push(id)
+			return new Response(201, `{"Id":"${id}","Warnings":[]}`)
+		}
+		const id = path.slice("/v1.44/containers/".length, path.length)
+		const has = (c: string) => this.containers.some((k: string) => k == c)
+		if (req.method == "POST" && path == "/v1.44/containers/c2/start") {
+			return new Response(500, `{"message":"failed to create task for container"}`)
+		}
+		if (req.method == "POST" && id == "c1/start" && has("c1")) {
+			return new Response(204)
+		}
+		if (req.method == "GET" && id == "c1/logs" && has("c1")) {
+			return new Response(200,
+				new Pieces(["\x01\0\0\0\0\0\0\x03", "hi\n\x02\0\0\0", "\0\0\0\x04oops", "\x01\0\0\0\0\0\0\x03bye"]))
+		}
+		if (req.method == "POST" && id == "c1/wait" && has("c1")) {
+			return new Response(200, `{"Error":null,"StatusCode":7}`)
+		}
+		if (req.method == "DELETE" && has(id)) {
+			this.containers = this.containers.filter((k: string) => k != id)
+			return new Response(204)
+		}
+		if (path == "/v1.44/networks/bridge") {
+			return new Response(200,
+				`{"Name":"bridge","IPAM":{"Driver":"default","Options":null,"Config":[`
+				+ `{"Subnet":"fd00::/64","Gateway":"fd00::1"},{"Subnet":"172.17.0.0/16","Gateway":"172.17.0.1"}]}}`)
+		}
+		return gone(`No such container: ${id.slice(0, indexOf(id + "/", "/"))}`)
+	}
+}
+
+function gone(message: string): Response { return new Response(404, `{"message":"${message}"}`) }
+
+/// What f was asked while use ran against it.
+function against(f: Fake, use: (c: DockerContainers) => void throws ContainerError): string[] throws ContainerError {
+	const serving = async f.server.serve((req: Request) => f.handle(req))
+	try {
+		const c = new DockerContainers()
+		c.daemon = f.server.addr
+		use(c)
+	} finally {
+		f.server.close()
+		await serving
+	}
+	return f.requests
+}
+
+test "a container of an image here runs, and its output and status are read" {
+	const f = new Fake()
+	const m = new Mount()
+	m.host = "/tmp/code"
+	m.path = "/var/task"
+	let host = ""
+	let out = ""
+	let status = 0
+	const asked = against(f, (c: DockerContainers) => {
+		host = c.host()
+		c.pull(image)
+		const spec = new Spec()
+		spec.image = image
+		spec.arch = "arm64"
+		spec.command = ["/bin/sh", "-c", "echo hi"]
+		spec.env = [["A", "1"], ["B", "x=y"]]
+		spec.mounts = [m]
+		const id = c.start(spec)
+		out = c.output(id)
+		status = c.wait(id)
+		c.stop(id)
+		c.stop(id)
+	})
+	assert host == "172.17.0.1" && out == "hi\noopsbye" && status == 7
+	assert asked
+		== ["GET /v1.44/networks/bridge", "GET /v1.44/images/public.ecr.aws/docker/library/busybox%3Alatest/json",
+		"POST /v1.44/containers/create?platform=linux%2Farm64", "POST /v1.44/containers/c1/start",
+		"GET /v1.44/containers/c1/logs?stdout=1&stderr=1", "POST /v1.44/containers/c1/wait",
+		"DELETE /v1.44/containers/c1?force=1&v=1", "DELETE /v1.44/containers/c1?force=1&v=1"]
+	assert f.created
+		== [`{"Image":"${image}:latest","Entrypoint":["/bin/sh"],"Cmd":["-c","echo hi"],`
+		+ `"Env":["A=1","B=x=y"],"HostConfig":{"Memory":134217728,"MemorySwap":134217728,`
+		+ `"Mounts":[{"Type":"bind","Source":"/tmp/code","Target":"/var/task","ReadOnly":true}]}}`]
+}
+
+test "an image of another platform, or not here, is pulled for it, and a container that fails to start is removed" {
+	const f = new Fake()
+	const asked = against(f, (c: DockerContainers) => {
+		c.pull("me/app")
+		const spec = new Spec()
+		spec.image = image
+		spec.memoryMb = 1
+		try {
+			c.start(spec)
+			assert false
+		} catch (e: ContainerError) {
+			assert e.kind == "Failed" && e.message == "failed to create task for container"
+		}
+	})
+	assert asked
+		== ["GET /v1.44/images/me/app%3Alatest/json", "POST /v1.44/images/create?fromImage=me%2Fapp&tag=latest",
+		"POST /v1.44/containers/create?platform=linux%2Famd64",
+		"POST /v1.44/images/create?fromImage=public.ecr.aws%2Fdocker%2Flibrary%2Fbusybox&tag=latest&platform=linux%2Famd64",
+		"POST /v1.44/containers/create?platform=linux%2Famd64", "POST /v1.44/containers/c2/start",
+		"DELETE /v1.44/containers/c2?force=1&v=1"]
+	// The image's own program, and the least memory the daemon takes.
+	assert f.created[1]
+		== `{"Image":"${image}:latest","Env":[],"HostConfig":{"Memory":6291456,"MemorySwap":6291456,"Mounts":[]}}`
+	assert f.containers == []
+}
+
+/// What call failed with.
+function failure(call: () => void throws ContainerError): string {
+	try {
+		call()
+		return "nothing"
+	} catch (e: ContainerError) {
+		return `${e.kind}: ${e.message}`
+	}
+}
+
+test "what the daemon fails with maps to a kind" {
+	let failed: string[] = []
+	against(new Fake(), (c: DockerContainers) => {
+		failed = [failure(() => c.pull("me/app:none")), failure(() => c.pull("me/app:broken")),
+			failure(() => c.output("c9")), failure(() => c.wait("c9")), failure(() => c.stop("c9"))]
+	})
+	assert failed
+		== ["NotFound: manifest unknown", "Failed: unexpected EOF", "NotFound: No such container: c9",
+		"NotFound: No such container: c9", "nothing"]
+}
+
+test "no daemon is Unavailable" {
+	const c = new DockerContainers()
+	c.daemon = "127.0.0.1:1"
+	try {
+		c.host()
+		assert false
+	} catch (e: ContainerError) {
+		assert e.kind == "Unavailable"
+	}
+	c.daemon = "tcp://127.0.0.1:2375"
+	try {
+		c.stop("c1")
+		assert false
+	} catch (e: ContainerError) {
+		assert e.kind == "Unavailable" && e.message == "tcp://127.0.0.1:2375: not a unix socket's address"
+	}
+}
