@@ -44,8 +44,12 @@ export function found(caller: Caller, name: string, expected: string | null, res
 /// Throws S3's access denied unless the caller may perform its actions on resource, with the reason only to a caller
 /// of b's account.
 export function authorize(caller: Caller, b: Bucket, resource: string, context: Context = []) throws Fault {
+	// The owner's root may always read, replace and delete the bucket policy, whatever it denies, as on AWS.
+	const managing = caller.arn == `arn:aws:iam::${b.owner}:root`
+		&& caller.actions.every(a => a == "s3:GetBucketPolicy" || a == "s3:PutBucketPolicy"
+		|| a == "s3:DeleteBucketPolicy")
 	try {
-		caller.allow(resource, b.policy, context, `"${resource}"`, b.owner)
+		caller.allow(resource, if (managing) null else b.policy, context, `"${resource}"`, b.owner)
 	} catch (f: Fault) {
 		if (f.code == "AccessDenied" && caller.account != b.owner) {
 			throw new Fault(403, "AccessDenied", "Access Denied")

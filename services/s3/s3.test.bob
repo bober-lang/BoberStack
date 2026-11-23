@@ -8,6 +8,7 @@ import { indexOf } from "std/algo"
 import { md5 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
+import { crc32 } from "std/hash/crc32"
 import { Request, Response } from "std/http"
 import { replace } from "std/string"
 import { escape } from "std/url"
@@ -232,6 +233,38 @@ test "multipart: parts joined in order, the ETag of their MD5s, sizes checked, a
 	assert live() == before
 }
 
+test "multipart: a CRC32 upload's checksum is its parts' composite, or the whole object's if asked" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	let five = "0123456789abcdef"
+	while (five.length < 5 << 20) {
+		five += five
+	}
+	const raw = (c: u32) => fromBytes([(c >> 24) as u8, ((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8,
+		(c & 0xff) as u8])
+	for (const kind of ["COMPOSITE", "FULL_OBJECT"]) {
+		test `${kind}` {
+			const started = s3(g, "POST", "/bkt/m?uploads", "",
+				[["x-amz-checksum-algorithm", "CRC32"], ["x-amz-checksum-type", kind]])
+			assert started.headers.get("x-amz-checksum-type") == kind
+			const id = text(started, "UploadId")!
+			const e1 = s3(g, "PUT", `/bkt/m?partNumber=1&uploadId=${id}`, five).headers.get("etag")!
+			const e2 = s3(g, "PUT", `/bkt/m?partNumber=2&uploadId=${id}`, "tail").headers.get("etag")!
+			const done = s3(g, "POST", `/bkt/m?uploadId=${id}`,
+				`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part>`
+				+ `<Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part></CompleteMultipartUpload>`)
+			const sum = if (kind == "FULL_OBJECT") base64.encode(raw(crc32(five + "tail")))
+				else `${base64.encode(raw(crc32(raw(crc32(five)) + raw(crc32("tail")))))}-2`
+			assert text(done, "ChecksumCRC32") == sum && text(done, "ChecksumType") == kind
+			const head = s3(g, "HEAD", "/bkt/m", "", [["x-amz-checksum-mode", "ENABLED"]])
+			assert head.headers.get("x-amz-checksum-crc32") == sum && head.headers.get("x-amz-checksum-type") == kind
+		}
+	}
+	g.close()
+	assert live() == before
+}
+
 test "virtual-hosted requests name their bucket in the host" {
 	const before = live()
 	const g = stack(new Catalog(""))
@@ -269,6 +302,33 @@ test "access: bucket policies allow others and anyone; others are denied plainly
 	assert s3(g, "GET", "/bkt/k", "", [["x-amz-expected-bucket-owner", account]]).status == 200
 	assert s3(g, "DELETE", "/bkt?policy").status == 204
 	assert fails(s3(g, "GET", "/bkt/k", "", [], null), 403, "AccessDenied")
+	g.close()
+	assert live() == before
+}
+
+test "a bucket created with tags has them" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	const body = `<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Tags><Tag><Key>app</Key>`
+		+ `<Value>a</Value></Tag></Tags></CreateBucketConfiguration>`
+	assert s3(g, "PUT", "/tbk", body).status == 200
+	assert texts(s3(g, "GET", "/tbk?tagging"), "Value") == ["a"]
+	g.close()
+	assert live() == before
+}
+
+test "access: the owner's root manages a bucket policy that denies it all" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*",`
+		+ `"Resource":["arn:aws:s3:::bkt","arn:aws:s3:::bkt/*"]}]}`
+	assert s3(g, "PUT", "/bkt?policy", p).status == 204
+	assert fails(s3(g, "PUT", "/bkt/k", "v"), 403, "AccessDenied")
+	assert all(s3(g, "GET", "/bkt?policy")) == p
+	assert s3(g, "PUT", "/bkt?policy", p).status == 204
+	assert s3(g, "DELETE", "/bkt?policy").status == 204
+	assert s3(g, "PUT", "/bkt/k", "v").status == 200
 	g.close()
 	assert live() == before
 }

@@ -31,6 +31,8 @@ export class Settings {
 	encryption: api.ServerSideEncryptionRule[] | null = null
 	cors: api.CORSRule[] | null = null
 	lifecycle: api.LifecycleRule[] | null = null
+	/// The lifecycle's x-amz-transition-default-minimum-object-size, AWS's default since 2024 if not given.
+	transitionMinimum = "all_storage_classes_128K"
 	website: api.WebsiteConfiguration | null = null
 	logging: api.LoggingEnabled | null = null
 	payer = "BucketOwner"
@@ -294,6 +296,11 @@ export class Config {
 		caller.actions = ["s3:PutLifecycleConfiguration"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
 		const rules = input.LifecycleConfiguration?.Rules ?? []
+		const minimum = input.TransitionDefaultMinimumObjectSize ?? "all_storage_classes_128K"
+		if (!among[api.TransitionDefaultMinimumObjectSize](minimum)) {
+			throw argument("Invalid TransitionDefaultMinimumObjectSize", "x-amz-transition-default-minimum-object-size",
+				minimum)
+		}
 		for (const r of rules) {
 			const classes = (r.Transitions ?? []).map(t => t.StorageClass ?? "GLACIER")
 			classes.append((r.NoncurrentVersionTransitions ?? []).map(t => t.StorageClass ?? "GLACIER"))
@@ -316,19 +323,21 @@ export class Config {
 		}
 		const s = settings(f)
 		s.lifecycle = rules
+		s.transitionMinimum = minimum
 		save(f, s)
-		return new api.PutBucketLifecycleConfigurationOutput()
+		return { ...new api.PutBucketLifecycleConfigurationOutput(), TransitionDefaultMinimumObjectSize: minimum }
 	}
 
 	getBucketLifecycleConfiguration(caller: Caller,
 		input: api.GetBucketLifecycleConfigurationRequest): api.GetBucketLifecycleConfigurationOutput throws Fault {
 		caller.actions = ["s3:GetLifecycleConfiguration"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
-		const rules = settings(f).lifecycle
-		if (rules == null) {
+		const s = settings(f)
+		if (s.lifecycle == null) {
 			throw missing("NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", input.Bucket)
 		}
-		return { ...new api.GetBucketLifecycleConfigurationOutput(), Rules: rules }
+		return { ...new api.GetBucketLifecycleConfigurationOutput(), Rules: s.lifecycle,
+			TransitionDefaultMinimumObjectSize: s.transitionMinimum }
 	}
 
 	deleteBucketLifecycle(caller: Caller, input: api.DeleteBucketLifecycleRequest): Unit throws Fault {

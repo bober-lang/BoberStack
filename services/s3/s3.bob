@@ -16,7 +16,7 @@ import { parse } from "../../core/auth/policy"
 import { hosted } from "../../core/auth/sigv2"
 import * as model from "../../core/protocol/model"
 import * as restxml from "../../core/protocol/restxml"
-import { Caller, Context, Unit } from "../../core/service"
+import { Caller, Context, requestTags, Unit } from "../../core/service"
 import { crc32c } from "../../core/hash/crc32c"
 import { crc64nvme } from "../../core/hash/crc64nvme"
 import { Blob } from "../../core/state/store"
@@ -94,7 +94,12 @@ export class Handler {
 		if (locked) {
 			caller.actions.append(["s3:PutBucketObjectLockConfiguration", "s3:PutBucketVersioning"])
 		}
-		caller.allow(arn(name), null, [], `"${arn(name)}"`)
+		const initial = input.CreateBucketConfiguration?.Tags ?? []
+		const tagged = if (initial.length == 0) null else tags(initial)
+		if (tagged != null) {
+			caller.actions.push("s3:TagResource")
+		}
+		caller.allow(arn(name), null, requestTags(tagged ?? []), `"${arn(name)}"`)
 		const home = given ?? "us-east-1"
 		if (there != null) {
 			if (there.account != caller.account) {
@@ -113,7 +118,7 @@ export class Handler {
 			const t = now()
 			all.put(name, { ...new Place(), account: caller.account, region: home, created: t - t % second })
 			const b = { ...new Bucket(), name: name, owner: caller.account, region: home, created: t - t % second,
-				versioning: if (locked) "Enabled" else "", locked: locked }
+				versioning: if (locked) "Enabled" else "", locked: locked, tags: tagged }
 			(new Tables(caller.tree(`${caller.account}/${home}`)).buckets).put(name, b)
 		}
 		const r = new api.CreateBucketOutput()
@@ -264,7 +269,7 @@ export class Handler {
 		const [at, n] = range ?? [0 as i64, v.size]
 		if (range == null && input.ChecksumMode != null) {
 			set(r, v.algorithm, v.checksum)
-			r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
+			r.ChecksumType = checksumType(v)
 		}
 		r.ContentLength = n
 		r.CacheControl = input.ResponseCacheControl ?? r.CacheControl
@@ -297,7 +302,7 @@ export class Handler {
 		const [at, n] = range ?? [0 as i64, v.size]
 		if (range == null && input.ChecksumMode != null) {
 			set(r, v.algorithm, v.checksum)
-			r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
+			r.ChecksumType = checksumType(v)
 		}
 		r.ContentLength = n
 		return r
@@ -529,6 +534,9 @@ export class Handler {
 		v.metadata = input.Metadata ?? []
 		v.tags = tagging(input.Tagging)
 		v.algorithm = if (input.ChecksumAlgorithm == null) "" else `${input.ChecksumAlgorithm!}`
+		// CRC64NVME is only of the whole object, the SHAs only composite, the other CRCs composite unless asked
+		u.full = v.algorithm == "" || v.algorithm == "CRC64NVME"
+			|| input.ChecksumType == "FULL_OBJECT" && startsWith(v.algorithm, "CRC")
 		retain(f, v, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 		encrypt(caller, f, v, input)
 		f.db.uploads.put(`${path(input.Bucket, input.Key)}\x00${`${1000000000000 + u.order}`.slice(1, 13)}`, u)
@@ -541,7 +549,7 @@ export class Handler {
 		keyed(r, v)
 		r.SSEKMSEncryptionContext = v.context
 		r.ChecksumAlgorithm = input.ChecksumAlgorithm
-		r.ChecksumType = if (input.ChecksumAlgorithm == null) null else "COMPOSITE"
+		r.ChecksumType = if (input.ChecksumAlgorithm == null) null else if (u.full) "FULL_OBJECT" else "COMPOSITE"
 		return r
 	}
 
@@ -697,15 +705,32 @@ export class Handler {
 		v.etag = `"${hex.encode(hash(md5, digests))}-${parts.length}"`
 		v.parts = parts.length
 		v.sizes = parts.map(p => p.size)
-		// of no checksum asked for, the whole object's CRC64NVME, as S3's default
-		let crc: u64 = 0
-		if (v.algorithm == "") {
+		// of no checksum asked for, the whole object's CRC64NVME, as S3's default; a composite one is of the parts'
+		// checksums joined, and their count
+		v.algorithm = if (v.algorithm == "") "CRC64NVME" else v.algorithm
+		if (u.full) {
+			let [c, c64]: [u32, u64] = [0, 0]
 			for (const p of parts) {
-				crc = crc64nvme(read(f.db, "s3/parts", part(u.id, p.number)), crc)
+				const data = read(f.db, "s3/parts", part(u.id, p.number))
+				switch (v.algorithm) {
+					case "CRC32": c = crc32(data, c)
+					case "CRC32C": c = crc32c(data, c)
+					default: c64 = crc64nvme(data, c64)
+				}
 			}
+			v.checksum = if (v.algorithm == "CRC64NVME") base64.encode(bigEndian(c64, 8))
+				else base64.encode(bigEndian(c as u64, 4))
+		} else {
+			let joined = ""
+			try {
+				for (const p of parts) {
+					joined += base64.decode(p.checksum)
+				}
+			} catch (e: ParseError) {
+				throw new Fault(500, "InternalError", "A part's checksum is not base64")
+			}
+			v.checksum = `${computed(v.algorithm, joined)}-${parts.length}`
 		}
-		v.checksum = if (v.algorithm == "") base64.encode(bigEndian(crc, 8)) else ""
-		v.algorithm = if (v.algorithm == "") "CRC64NVME" else ""
 		const blobs: Blob[] = []
 		for (const p of parts) {
 			blobs.push(blob(f.db, "s3/parts", part(u.id, p.number)))
@@ -724,7 +749,7 @@ export class Handler {
 		encrypted(r, v)
 		r.VersionId = versionOf(f.bucket, v)
 		set(r, v.algorithm, v.checksum)
-		r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
+		r.ChecksumType = checksumType(v)
 		return r
 	}
 
@@ -947,7 +972,7 @@ export class Handler {
 			r.ObjectSize = v.size
 		}
 		if (asked.includes("Checksum") && v.algorithm != "") {
-			const c = { ...new api.Checksum(), ChecksumType: if (v.parts > 0) "COMPOSITE" else "FULL_OBJECT" }
+			const c = { ...new api.Checksum(), ChecksumType: checksumType(v) }
 			if (v.algorithm == "CRC32") {
 				c.ChecksumCRC32 = v.checksum
 			} else if (v.algorithm == "CRC32C") {
@@ -1153,7 +1178,7 @@ export class Handler {
 					Owner: owner(v.owner) }
 				if (v.algorithm != "") {
 					o.ChecksumAlgorithm = [v.algorithm]
-					o.ChecksumType = "FULL_OBJECT"
+					o.ChecksumType = checksumType(v)
 				}
 				versions.push(o)
 			}
@@ -1805,6 +1830,10 @@ function computed(algorithm: string, data: string): string throws Fault {
 	}
 }
 
+function checksumType(v: Version): api.ChecksumType | null {
+	return if (v.algorithm == "") null else if (indexOf(v.checksum, "-") < 0) "FULL_OBJECT" else "COMPOSITE"
+}
+
 function bigEndian(x: u64, n: i32): string {
 	const out: u8[] = []
 	for (let i = n - 1; i >= 0; i--) {
@@ -1962,7 +1991,7 @@ function contents(vs: Version[], of: string | null, url: bool): api.Object[] thr
 			StorageClass: "STANDARD" }
 		if (v.algorithm != "") {
 			o.ChecksumAlgorithm = [v.algorithm]
-			o.ChecksumType = "FULL_OBJECT"
+			o.ChecksumType = checksumType(v)
 		}
 		if (of != null) {
 			o.Owner = owner(of!)
