@@ -86,9 +86,16 @@ test "a value not of its type" {
 	assert decode[Scalars](`{"Name": "", "Count": "1"}`) throws count
 	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [safe, fast]")
 	assert decode[Scalars](`{"Name": "", "Mode": "slow"}`) throws new Fault(400, "ValidationException", mode)
+	const only = message("Value 'two' at 'only' failed to satisfy constraint: Member must satisfy enum value set: [one]")
+	assert decode[Single](`{"Only": "two"}`) throws new Fault(400, "ValidationException", only)
+	assert decode[Single](`{"Only": "one"}`).Only == "one"
 	assert decode[Collections](`{"Sparse": [1]}`) throws malformed("a string", "'Sparse.1'", "1")
 	assert decode[Collections](`{"Strings": ["a", null]}`) throws malformed("a string", "'Strings.2'", "null")
 	assert decode[Scalars]("{") throws malformed("an object", "the body", "{")
+}
+
+class Single {
+	Only: "one" = "one"
 }
 
 class Choosing$Name {

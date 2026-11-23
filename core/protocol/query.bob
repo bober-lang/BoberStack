@@ -254,6 +254,12 @@ function value[T extends Decodable](p: Query, k: string, at: string, tags: Type[
 /// The value of the enum T, a union of literals, that s names, at the member path at; or if none, the first, a
 /// violation noted into v.
 export function choice[T](s: string, at: string, v: Violations): T {
+	if (T.kind == "literal") {
+		if (s != T.value) {
+			v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
+		}
+		return T.value
+	}
 	for (const M of T.members) {
 		if (M.kind == "literal" && s == M.value) {
 			return M.value
