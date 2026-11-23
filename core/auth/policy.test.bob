@@ -258,6 +258,15 @@ test "NotPrincipal" {
 	assert is(evaluate(r, p), "allowed", "identity")
 }
 
+// As SimulateCustomPolicy answered this document on 2026-11-23.
+test "statement positions" {
+	const p = parse(`{\n  "Version": "2012-10-17",\n  "Statement": [\n    {\n      "Effect": "Allow",\n`
+		+ `      "Action": "s3:GetObject",\n      "Resource": "*"\n    },\n`
+		+ `    {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}\n  ]\n}`, "identity")
+	assert p.statements[0].start == [3, 17] && p.statements[0].end == [8, 6]
+	assert p.statements[1].start == [8, 6] && p.statements[1].end == [9, 59]
+}
+
 // An exclusive resource policy, as a KMS key policy, lets identity-based policies and the root allow only where it
 // allows the account (KMS Developer Guide, "Default key policy").
 test "an exclusive resource policy" {

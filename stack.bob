@@ -1,6 +1,7 @@
 //! BoberStack whole: every service behind one gateway, as main serves it and tests of several services build it.
 
 import { Gateway } from "./core/gateway"
+import * as query from "./core/protocol/query"
 import * as restjson from "./core/protocol/restjson"
 import * as restxml from "./core/protocol/restxml"
 import * as acmApi from "./services/acm/api"
@@ -80,7 +81,9 @@ export function stack(catalog: Catalog): Gateway {
 	e.firehose = h
 	n.firehose = h
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
+	g.faults.set(iamApi.signingName, (f, id) => query.error(f, id, iamApi.ns))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	g.faults.set(stsApi.signingName, (f, id) => query.error(f, id, stsApi.ns))
 	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
 	// DynamoDB Streams signs as DynamoDB does, its operations named apart by X-Amz-Target.
 	const t = new streams.Handler()

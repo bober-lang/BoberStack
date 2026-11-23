@@ -136,11 +136,11 @@ export class Handler {
 		const [found, more] = page[Group](groups(s), prefix, token, input.limit ?? 50,
 			g => (pattern == null || indexOf(g.name, pattern!) >= 0) && (named.length == 0 || named.includes(g.name))
 			&& (input.logGroupClass == null || g.class == input.logGroupClass))
+		// AWS searches by pattern or class apart, giving a token after the last page too, of which the next is empty
+		const searched = pattern != null || input.logGroupClass != null
 		const r = new api.DescribeLogGroupsResponse()
 		r.logGroups = found.map(g => wire(caller, g, metricFilters(s).scan(null, 1000, g.name + "\x00").length,
-			pattern == null))
-		// AWS gives a token after the last page of a search by pattern or class too, of which the next page is empty
-		const searched = pattern != null || input.logGroupClass != null
+			!searched))
 		r.nextToken = if (more || searched && found.length > 0) found[found.length - 1].name else null
 		return r
 	}
@@ -822,7 +822,7 @@ function nameOf(identifier: string): string {
 	return if (endsWith(name, ":*")) name.slice(0, name.length - 2) else name
 }
 
-/// The LogGroup of g, which has count metric filters; full as DescribeLogGroups answers but by pattern.
+/// The LogGroup of g, which has count metric filters; full as DescribeLogGroups answers but by pattern or class.
 function wire(caller: Caller, g: Group, count: i32, full: bool): api.LogGroup {
 	return { ...new api.LogGroup(), logGroupName: g.name, creationTime: g.created, retentionInDays: g.retention,
 		metricFilterCount: count, arn: arnOf(caller, g.name) + ":*", storedBytes: if (full) 0 as i64 else null,

@@ -72,7 +72,7 @@ function simulate(caller: Caller, identity: Source[], boundary: string[] | null,
 	const ps = new auth.Policies()
 	ps.identity = identity.map(s => s.policy)
 	ps.boundary = if (boundary == null || boundary!.length == 0) null else parsed(boundary![0], "identity")
-	const rp = if (resource == null) null else source("ResourcePolicy", null, resource!, "resource")
+	const rp = if (resource == null) null else source("ResourcePolicy", "Resource Policy", resource!, "resource")
 	ps.resource = rp?.policy
 	const r = new auth.Request()
 	r.principal.arn = by ?? ""
@@ -129,8 +129,8 @@ function simulate(caller: Caller, identity: Source[], boundary: string[] | null,
 	return out
 }
 
-/// The statements of sources that decide as effect does, each as MatchedStatements names it, without its position,
-/// which the parser does not keep: those that allow for allowed, deny for explicitDeny, none for implicitDeny.
+/// The statements of sources that decide as effect does, each as MatchedStatements names it: those that allow for
+/// allowed, deny for explicitDeny, none for implicitDeny.
 function matched(r: auth.Request, sources: Source[], effect: auth.Effect): api.Statement[] {
 	const out: api.Statement[] = []
 	if (effect == "implicitDeny") {
@@ -142,11 +142,21 @@ function matched(r: auth.Request, sources: Source[], effect: auth.Effect): api.S
 				const m = new api.Statement()
 				m.SourcePolicyId = s.id
 				m.SourcePolicyType = s.kind
+				m.StartPosition = position(s.policy.statements[i].start)
+				m.EndPosition = position(s.policy.statements[i].end)
 				out.push(m)
 			}
 		}
 	}
 	return out
+}
+
+/// The Position at, as [line, column].
+function position(at: [i32, i32]): api.Position {
+	const p = new api.Position()
+	p.Line = at[0]
+	p.Column = at[1]
+	return p
 }
 
 /// The keys, as the policies write them, of the conditions of those statements of sources that would apply to r but
@@ -211,6 +221,31 @@ function keysOf(sources: Source[]): string[] {
 			}
 		}
 	}
+	return hashed(out)
+}
+
+/// keys in the order AWS lists them, a Java HashSet's: by the bucket of each one's String.hashCode in a table of 16
+/// or the power of two above that holds them at a load of 3/4, then in the order given.
+function hashed(keys: string[]): string[] {
+	let size = 16
+	while (keys.length * 4 > size * 3) {
+		size *= 2
+	}
+	const buckets = keys.map(k => {
+		let h: i64 = 0
+		for (const c of k) {
+			h = (31 * h + (c as i64)) & 0xffffffff
+		}
+		return (h ^ (h >> 16)) & (size - 1)
+	})
+	const out: string[] = []
+	for (let b = 0; b < size; b++) {
+		for (let i = 0; i < keys.length; i++) {
+			if (buckets[i] == b) {
+				out.push(keys[i])
+			}
+		}
+	}
 	return out
 }
 
@@ -220,12 +255,11 @@ function written(d: string, k: string): string {
 	return if (at < 0) k else d.slice(at + 1, at + 1 + k.length)
 }
 
-/// The identity-based policies of PolicyInputList, of ids PolicyInputList.1 and on, of no type of the model's: AWS
-/// answers "IAM Policy", which the model does not have.
+/// The identity-based policies of PolicyInputList, of ids PolicyInputList.1 and on.
 function inputs(documents: string[]): Source[] {
 	const out: Source[] = []
 	for (let i = 0; i < documents.length; i++) {
-		out.push(source(`PolicyInputList.${i + 1}`, null, documents[i]))
+		out.push(source(`PolicyInputList.${i + 1}`, "IAM Policy", documents[i]))
 	}
 	return out
 }

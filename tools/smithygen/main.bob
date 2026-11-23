@@ -292,13 +292,19 @@ const amendments: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_2014
 	["com.amazonaws.iam#AWSIdentityManagementV20100508",
 	`{"shapes": {
 	"com.amazonaws.iam#PermissionsBoundaryAttachmentType": {"type": "enum", "members": {
-		"Answered": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Policy"}}}}}}`]]
+		"Answered": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Policy"}}}},
+	"com.amazonaws.iam#PolicySourceType": {"type": "enum", "members": {
+		"IAMPolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "IAM Policy"}},
+		"ResourcePolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Resource Policy"}}}}}}`]]
 
 /// The members of the services below whose models' constraints AWS does not check, by their shape ids: their
 /// handlers answer as AWS does.
 const unconstrained: [string, string[]][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328",
 	["com.amazonaws.cloudwatchlogs#ListLogGroupsRequest$logGroupNamePattern",
-	"com.amazonaws.cloudwatchlogs#TagResourceRequest$resourceArn"]]]
+	"com.amazonaws.cloudwatchlogs#TagResourceRequest$resourceArn"]],
+	["com.amazonaws.iam#AWSIdentityManagementV20100508",
+	["com.amazonaws.iam#CreateOpenIDConnectProviderRequest$ThumbprintList",
+	"com.amazonaws.iam#UpdateOpenIDConnectProviderThumbprintRequest$ThumbprintList"]]]
 
 /// The member holding the message of an access denied of the services below, where AWS names it otherwise than their
 /// models, as on 2026-11-23: by their shape ids.
@@ -324,8 +330,9 @@ class Generator {
 	aliases: [string, string][] = []
 	modeled = false
 	unchecked: string[] = []
-	/// The members whose constraints go unchecked.
+	/// The members whose constraints, and their items', go unchecked, and whether the member being typed is one.
 	unconstrained: string[] = []
+	exempt = false
 	/// The members whose enums are strings, or whether all are, and whether the member being typed is one.
 	strings: string[] = []
 	/// The required members that take null.
@@ -837,11 +844,13 @@ class Generator {
 			tags.push("@model.Default")
 			this.modeled = true
 		}
-		const valid = if (this.unconstrained.includes(`${id}$${m[0]}`)) "" else this.valid(m[1])
+		this.exempt = this.unconstrained.includes(`${id}$${m[0]}`)
+		const valid = if (this.exempt) "" else this.valid(m[1])
 		this.open = this.opened || this.strings.includes(`${id}$${m[0]}`)
 		this.payload = t.httpPayload != null
 		this.bound = bound && this.protocol == "restJson1"
 		const ty = this.typeOf(m[1], tags, false)
+		this.exempt = false
 		this.open = false
 		this.payload = false
 		this.bound = false
@@ -1026,7 +1035,7 @@ class Generator {
 	/// list or map itself, whose number of items they would bound.
 	item(r: Ref, tags: string[]): string throws ModelError {
 		const ty = this.typeOf(r, tags, true)
-		const valid = if (["list", "map"].includes(this.shape(r.target).type)) "" else this.valid(r)
+		const valid = if (this.exempt || ["list", "map"].includes(this.shape(r.target).type)) "" else this.valid(r)
 		if (valid != "") {
 			tags.push(valid)
 		}

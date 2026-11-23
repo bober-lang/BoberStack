@@ -6,8 +6,8 @@
 
 import { indexOf, startsWith } from "std/algo"
 
-import { apostrophe, backslash, dollar, isAlphanumeric, isDigit, isHexDigit, lbrace, lbracket, question, quote,
-	star } from "std/ascii"
+import { apostrophe, backslash, colon, dollar, isAlphanumeric, isDigit, isHexDigit, lbrace, lbracket, lf, question,
+	quote, rbrace, rbracket, star } from "std/ascii"
 
 import * as base64 from "std/encoding/base64"
 import * as std from "std/encoding/json"
@@ -45,6 +45,10 @@ class Statement {
 	resources: string[] | null = null
 	notResource = false
 	conditions: Condition[] = []
+	/// Where it starts in its document, at its opening brace, and ends, just past its closing one: [line, column],
+	/// each from 1, as IAM's simulator counts them.
+	start: [i32, i32] = [0, 0]
+	end: [i32, i32] = [0, 0]
 }
 
 export class Policy {
@@ -147,7 +151,75 @@ export function parse(document: string, k: Kind): Policy throws Fault {
 		}
 		p.statements.push(st)
 	}
+	const at = positions(document)
+	for (let i = 0; i < p.statements.length && i < at.length; i++) {
+		p.statements[i].start = [at[i][0], at[i][1]]
+		p.statements[i].end = [at[i][2], at[i][3]]
+	}
 	return p
+}
+
+/// The positions of the statements of the JSON policy document, as IAM's simulator gives them: [line, column] just
+/// past the token before each, the Statement member's colon or bracket or the statement before, and [line, column]
+/// just past its closing brace.
+function positions(document: string): i32[][] {
+	const out: i32[][] = []
+	let line = 1
+	let column = 0
+	let depth = 0
+	let quoted = false
+	let escaped = false
+	let text = "" // the string read last at depth 1
+	let member = "" // the member whose value is read at depth 1
+	let level = -1 // the depth that the statements open at, while the Statement member is read
+	let before = [0, 0] // just past the token before the next statement
+	let from = [0, 0] // where the statement being read starts
+	for (const c of document) {
+		column++
+		if (quoted) {
+			if (escaped) {
+				escaped = false
+			} else if (c == backslash) {
+				escaped = true
+			} else if (c == quote) {
+				quoted = false
+			}
+			if (quoted && depth == 1) {
+				text += chr(c)
+			}
+		} else if (c == quote) {
+			quoted = true
+			text = ""
+		} else if (c == colon && depth == 1) {
+			member = text
+			before = [line, column + 1]
+		} else if (c == lbrace || c == lbracket) {
+			if (depth == 1 && member == "Statement") {
+				level = if (c == lbrace) 1 else 2
+				if (c == lbracket) {
+					before = [line, column + 1]
+				}
+			}
+			if (c == lbrace && depth == level) {
+				from = before
+			}
+			depth++
+		} else if (c == rbrace || c == rbracket) {
+			depth--
+			if (c == rbrace && depth == level) {
+				out.push([from[0], from[1], line, column + 1])
+				before = [line, column + 1]
+			}
+			if (depth == 1) {
+				level = -1
+				member = ""
+			}
+		} else if (c == lf) {
+			line++
+			column = 0
+		}
+	}
+	return out
 }
 
 /// What the policies decide for r: allowed, implicitly or explicitly denied, and by which kind of policy.
