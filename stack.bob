@@ -10,6 +10,8 @@ import * as iamApi from "./services/iam/api"
 import { Catalog } from "./services/iam/catalog"
 import * as iam from "./services/iam/iam"
 import { identify } from "./services/iam/identities"
+import * as kinesisApi from "./services/kinesis/api"
+import * as kinesis from "./services/kinesis/kinesis"
 import * as kmsApi from "./services/kms/api"
 import * as kms from "./services/kms/kms"
 import * as logsApi from "./services/logs/api"
@@ -45,6 +47,7 @@ export function stack(catalog: Catalog): Gateway {
 	const o = new s3.Handler()
 	o.sqs = q
 	o.sns = n
+	const r = new kinesis.Handler()
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
 	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
@@ -55,6 +58,7 @@ export function stack(catalog: Catalog): Gateway {
 	g.services.set(ssmApi.signingName, (caller, req) => ssmApi.handle(p, caller, req))
 	g.services.set(logsApi.signingName, (caller, req) => logsApi.handle(l, caller, req))
 	g.services.set(kmsApi.signingName, (caller, req) => kmsApi.handle(k, caller, req))
+	g.services.set(kinesisApi.signingName, (caller, req) => kinesisApi.handle(r, caller, req))
 	g.services.set(s3Api.signingName, (caller, req) => s3.serve(o, caller, req))
 	g.faults.set(s3Api.signingName, (f, id) => restxml.error(s3Api.service, f, id))
 	g.anonymous = s3Api.signingName

@@ -1,0 +1,1115 @@
+//! Amazon Kinesis Data Streams: streams, provisioned or on demand, their shards and records, shard iterators,
+//! resharding, retention, tags, encryption settings, enhanced fan-out consumers and resource policies. Channels,
+//! queues, account settings, limits and SubscribeToShard, an event stream over HTTP/2, are not implemented. Where AWS
+//! differs:
+//!
+//! - Nothing runs between requests. A stream, a reshard and a consumer are ACTIVE at once, where AWS takes seconds in
+//!   CREATING or UPDATING; a stream's retention hides older records, and shards closed before it, at each request, and
+//!   nothing is deleted. A shard iterator expires 5 minutes after the request that gave it, as of the request using it.
+//! - Nothing is throttled: no ProvisionedThroughputExceededException, no failed record in PutRecords, no limit on
+//!   resharding per day or on the shards of an account.
+//! - UpdateShardCount closes every open shard and opens the target count, dividing the hash keys evenly; each new
+//!   shard's parents are the old ones holding its first and last hash keys, so a shard that spans more has no parent
+//!   naming them. AWS splits and merges.
+//! - There is no KMS: a stream's key is stored as given, and records are not encrypted.
+//! - Sequence numbers are 56 digits as AWS's are, but of the stream's own count and the shard's number, not a time.
+//! - An expired iterator's message gives its times in RFC 3339, not as Java's Date prints them.
+
+import { Fault } from "../../core/fault"
+import * as auth from "../../core/auth/policy"
+import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import * as hash from "./hash"
+import { Consumer, consumers, Record, records, save, Shard, Stream, streams } from "./records"
+import { lastIndexOf, startsWith } from "std/algo"
+import { isDigit } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { md5 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import { ParseError, parseInt, split } from "std/string"
+import { hour, millisecond, minute, rfc3339, second } from "std/time"
+
+/// The retention periods a stream may have, in hours, and the tags it and a consumer may have.
+const minRetention = 24
+const maxRetention = 8760
+const tagLimit = 50
+/// The consumers a stream may have.
+const consumerLimit = 20
+/// The shards of an on-demand stream when created.
+const onDemandShards = 4
+/// The most bytes PutRecords takes, and GetRecords gives.
+const batchBytes = 5242880
+const readBytes = 10485760
+
+/// The service, of the operations on streams, records, shards, consumers, tags and resource policies.
+export class Handler {
+	...api.Unimplemented
+
+	createStream(caller: Caller, input: api.CreateStreamInput): Unit throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a == "kinesis:CreateStream" || tags.length > 0)
+		const name = input.StreamName
+		caller.allow(arnOf(caller.region, caller.account, name), null, requestTags(tags))
+		const mode = input.StreamModeDetails?.StreamMode ?? "PROVISIONED"
+		if (mode == "PROVISIONED" && input.ShardCount == null) {
+			throw invalid("ShardCount is required for streams in PROVISIONED mode.")
+		}
+		if (tags.length > tagLimit) {
+			throw invalid(`Failed to create stream ${name} under account ${caller.account} because a given stream cannot `
+				+ `have more than ${tagLimit} tags.`)
+		}
+		const db = streams(caller.regional())
+		if (db.get(name) != null) {
+			throw api.resourceInUseException(`Stream ${name} under account ${caller.account} already exists.`)
+		}
+		const t = now()
+		const s = { ...new Stream(), name: name, created: t, mode: mode, tags: tags,
+			maxRecordKiB: input.MaxRecordSizeInKiB ?? 1024 }
+		for (const [start, end] of hash.ranges(input.ShardCount ?? onDemandShards)) {
+			open(s, start, end, null, null, t)
+		}
+		save(db, name, s)
+		return new Unit()
+	}
+
+	describeStream(caller: Caller, input: api.DescribeStreamInput): api.DescribeStreamOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const live = alive(s, now())
+		const after = input.ExclusiveStartShardId
+		const listed = live.filter(h => after == null || shardId(h.index) > after!)
+		const n = input.Limit ?? 100
+		const d = new api.StreamDescription()
+		d.StreamName = s.name
+		d.StreamARN = at.arn
+		d.StreamStatus = "ACTIVE"
+		d.StreamModeDetails = { ...new api.StreamModeDetails(), StreamMode: s.mode as api.StreamMode }
+		d.Shards = listed.slice(0, if (n < listed.length) n else listed.length).map(h => wire(h))
+		d.HasMoreShards = listed.length > n
+		d.RetentionPeriodHours = s.retention
+		d.StreamCreationTimestamp = s.created
+		d.EnhancedMonitoring = [{ ...new api.EnhancedMetrics(), ShardLevelMetrics: s.metrics }]
+		d.EncryptionType = s.encryption as api.EncryptionType
+		d.KeyId = s.keyId
+		const r = new api.DescribeStreamOutput()
+		r.StreamDescription = d
+		return r
+	}
+
+	describeStreamSummary(caller: Caller,
+		input: api.DescribeStreamSummaryInput): api.DescribeStreamSummaryOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const d = new api.StreamDescriptionSummary()
+		d.StreamName = s.name
+		d.StreamARN = at.arn
+		d.StreamStatus = "ACTIVE"
+		d.StreamModeDetails = { ...new api.StreamModeDetails(), StreamMode: s.mode as api.StreamMode }
+		d.RetentionPeriodHours = s.retention
+		d.StreamCreationTimestamp = s.created
+		d.EnhancedMonitoring = [{ ...new api.EnhancedMetrics(), ShardLevelMetrics: s.metrics }]
+		d.EncryptionType = s.encryption as api.EncryptionType
+		d.KeyId = s.keyId
+		d.OpenShardCount = s.shards.filter(h => h.closed == null).length
+		d.ConsumerCount = consumers(at.tree).scan(null, consumerLimit, s.name + "\x00").length
+		d.MaxRecordSizeInKiB = s.maxRecordKiB
+		const r = new api.DescribeStreamSummaryOutput()
+		r.StreamDescriptionSummary = d
+		return r
+	}
+
+	listStreams(caller: Caller, input: api.ListStreamsInput): api.ListStreamsOutput throws Fault {
+		caller.allow("*")
+		let after = input.ExclusiveStartStreamName
+		if (input.NextToken != null) {
+			after = unwrapped(input.NextToken!)
+		}
+		const n = if ((input.Limit ?? 100) < 100) input.Limit! else 100
+		const got = streams(caller.regional()).scan(after, n + 1).map(e => e[1])
+		const page = got.slice(0, if (n < got.length) n else got.length)
+		const r = new api.ListStreamsOutput()
+		r.StreamNames = page.map(s => s.name)
+		r.HasMoreStreams = got.length > n
+		r.NextToken = if (got.length > n) base64.encode(page[page.length - 1].name) else null
+		r.StreamSummaries = page.map(s => ({ ...new api.StreamSummary(), StreamName: s.name,
+			StreamARN: arnOf(caller.region, caller.account, s.name), StreamStatus: "ACTIVE",
+			StreamModeDetails: { ...new api.StreamModeDetails(), StreamMode: s.mode as api.StreamMode },
+			StreamCreationTimestamp: s.created }))
+		return r
+	}
+
+	listShards(caller: Caller, input: api.ListShardsInput): api.ListShardsOutput throws Fault {
+		const token = input.NextToken
+		let filter = input.ShardFilter
+		let after = input.ExclusiveStartShardId
+		let at: Target | null = null
+		if (token != null) {
+			const parts = split(unwrapped(token!), "\x00")
+			if (parts.length != 5) {
+				throw invalid("NextToken is invalid.")
+			}
+			at = target(caller, null, parts[0])
+			caller.allow(at!.arn, at!.stream?.policy, resourceTags(at!.stream?.tags ?? []))
+			if (input.StreamName != null || input.StreamARN != null) {
+				throw invalid("NextToken and StreamName cannot be provided together.")
+			}
+			if (input.ExclusiveStartShardId != null || input.ShardFilter != null) {
+				throw invalid("NextToken and ExclusiveStartShardId or ShardFilter cannot be provided together.")
+			}
+			const issued = number(parts[4]) ?? 0
+			if (now() - issued > 5 * minute) {
+				throw api.expiredNextTokenException("The timestamp of the nextToken has expired.")
+			}
+			after = parts[1]
+			filter = if (parts[2] == "") null
+				else ({ ...new api.ShardFilter(), Type: parts[2] as api.ShardFilterType, Timestamp: number(parts[3]),
+				ShardId: if (parts[2] == "AFTER_SHARD_ID") parts[3] else null })
+		} else {
+			if (input.StreamName == null && input.StreamARN == null) {
+				caller.allow(arnOf(caller.region, caller.account, "null"))
+			}
+			at = target(caller, input.StreamName, input.StreamARN)
+		}
+		const s = allowed(caller, at!)
+		const t = now()
+		let listed = alive(s, t)
+		if (filter != null) {
+			listed = listed.filter(h => kept(filter!, s, h, t))
+			if (filter!.Type == "AFTER_SHARD_ID") {
+				after = filter!.ShardId
+			}
+		}
+		listed = listed.filter(h => after == null || shardId(h.index) > after!)
+		const n = input.MaxResults ?? 1000
+		const r = new api.ListShardsOutput()
+		const page = listed.slice(0, if (n < listed.length) n else listed.length)
+		r.Shards = page.map(h => wire(h))
+		if (listed.length > n) {
+			const f = filter
+			const kind = if (f == null) "" else f!.Type
+			const by = if (f == null) "" else if (f!.Timestamp != null) `${f!.Timestamp!}` else f!.ShardId ?? ""
+			r.NextToken = base64.encode([at!.arn, shardId(page[page.length - 1].index), kind, by, `${t}`].join("\x00"))
+		}
+		return r
+	}
+
+	deleteStream(caller: Caller, input: api.DeleteStreamInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const cs = consumers(at.tree)
+		const registered = cs.scan(null, consumerLimit, s.name + "\x00")
+		if (registered.length > 0 && !(input.EnforceConsumerDeletion ?? false)) {
+			throw api.resourceInUseException(`Stream ${s.name} under account ${at.account} has registered consumers.`)
+		}
+		for (const [k, _] of registered) {
+			cs.delete(k)
+		}
+		streams(at.tree).delete(s.name)
+		clear(records(at.tree), s.name + "\x00")
+		return new Unit()
+	}
+
+	updateStreamMode(caller: Caller, input: api.UpdateStreamModeInput): Unit throws Fault {
+		const at = target(caller, null, input.StreamARN)
+		const s = allowed(caller, at)
+		s.mode = input.StreamModeDetails.StreamMode
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	increaseStreamRetentionPeriod(caller: Caller, input: api.IncreaseStreamRetentionPeriodInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const h = input.RetentionPeriodHours
+		bounded(h)
+		if (h < s.retention) {
+			throw invalid(`Requested retention period (${h} hours) for stream ${s.name} can not be shorter than existing `
+				+ `retention period (${s.retention} hours). Use DecreaseRetentionPeriod API.`)
+		}
+		s.retention = h
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	decreaseStreamRetentionPeriod(caller: Caller, input: api.DecreaseStreamRetentionPeriodInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const h = input.RetentionPeriodHours
+		bounded(h)
+		if (h > s.retention) {
+			throw invalid(`Requested retention period (${h} hours) for stream ${s.name} can not be longer than existing `
+				+ `retention period (${s.retention} hours). Use IncreaseRetentionPeriod API.`)
+		}
+		s.retention = h
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	addTagsToStream(caller: Caller, input: api.AddTagsToStreamInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		tagStream(caller, at, input.Tags)
+		return new Unit()
+	}
+
+	removeTagsFromStream(caller: Caller, input: api.RemoveTagsFromStreamInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		s.tags = s.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	listTagsForStream(caller: Caller, input: api.ListTagsForStreamInput): api.ListTagsForStreamOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const after = input.ExclusiveStartTagKey
+		const tags = s.tags.filter(t => after == null || t[0] > after!)
+		const n = input.Limit ?? 50
+		const r = new api.ListTagsForStreamOutput()
+		r.Tags = tags.slice(0, if (n < tags.length) n else tags.length).map(t => tag(t))
+		r.HasMoreTags = tags.length > n
+		return r
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceInput): Unit throws Fault {
+		const at = resource(caller, input.ResourceARN)
+		if (at.consumer == "") {
+			tagStream(caller, at, input.Tags)
+			return new Unit()
+		}
+		const [k, c] = consumerOf(caller, at)
+		const tags = merged(c.tags, input.Tags)
+		if (tags.length > tagLimit) {
+			throw invalid(`A given consumer cannot have more than ${tagLimit} tags.`)
+		}
+		c.tags = tags
+		save(consumers(at.tree), k, c)
+		return new Unit()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceInput): Unit throws Fault {
+		const at = resource(caller, input.ResourceARN)
+		if (at.consumer == "") {
+			const s = allowed(caller, at)
+			s.tags = s.tags.filter(t => !input.TagKeys.includes(t[0]))
+			save(streams(at.tree), s.name, s)
+			return new Unit()
+		}
+		const [k, c] = consumerOf(caller, at)
+		c.tags = c.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(consumers(at.tree), k, c)
+		return new Unit()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceInput): api.ListTagsForResourceOutput throws Fault {
+		const at = resource(caller, input.ResourceARN)
+		const tags = if (at.consumer == "") allowed(caller, at).tags else consumerOf(caller, at)[1].tags
+		const r = new api.ListTagsForResourceOutput()
+		r.Tags = tags.map(t => tag(t))
+		return r
+	}
+
+	startStreamEncryption(caller: Caller, input: api.StartStreamEncryptionInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		if (input.EncryptionType != "KMS") {
+			throw invalid("Invalid EncryptionType. Valid value is KMS.")
+		}
+		s.encryption = "KMS"
+		s.keyId = input.KeyId
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	stopStreamEncryption(caller: Caller, input: api.StopStreamEncryptionInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		s.encryption = "NONE"
+		s.keyId = null
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	enableEnhancedMonitoring(caller: Caller,
+		input: api.EnableEnhancedMonitoringInput): api.EnhancedMonitoringOutput throws Fault {
+		return monitor(caller, input.StreamName, input.StreamARN, input.ShardLevelMetrics, true)
+	}
+
+	disableEnhancedMonitoring(caller: Caller,
+		input: api.DisableEnhancedMonitoringInput): api.EnhancedMonitoringOutput throws Fault {
+		return monitor(caller, input.StreamName, input.StreamARN, input.ShardLevelMetrics, false)
+	}
+
+	putRecord(caller: Caller, input: api.PutRecordInput): api.PutRecordOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const key = partitionKey(input.PartitionKey)
+		sized(s, input.Data, key)
+		const h = shardFor(s, key, input.ExplicitHashKey)
+		if (input.DryRun ?? false) {
+			throw dryRun()
+		}
+		const seq = put(at.tree, s, h, input.Data, key, now())
+		save(streams(at.tree), s.name, s)
+		const r = new api.PutRecordOutput()
+		r.ShardId = shardId(h.index)
+		r.SequenceNumber = seq
+		r.EncryptionType = s.encryption as api.EncryptionType
+		return r
+	}
+
+	putRecords(caller: Caller, input: api.PutRecordsInput): api.PutRecordsOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		let bytes = 0
+		const to: Shard[] = []
+		for (const e of input.Records) {
+			const key = partitionKey(e.PartitionKey)
+			sized(s, e.Data, key)
+			bytes += e.Data.length + key.length
+			to.push(shardFor(s, key, e.ExplicitHashKey))
+		}
+		if (bytes > batchBytes) {
+			throw invalid("Records size exceeds 5 MB limit")
+		}
+		if (input.DryRun ?? false) {
+			throw dryRun()
+		}
+		const t = now()
+		const r = new api.PutRecordsOutput()
+		r.FailedRecordCount = 0
+		for (let i = 0; i < to.length; i++) {
+			const seq = put(at.tree, s, to[i], input.Records[i].Data, input.Records[i].PartitionKey!, t)
+			r.Records.push({ ...new api.PutRecordsResultEntry(), SequenceNumber: seq, ShardId: shardId(to[i].index) })
+		}
+		save(streams(at.tree), s.name, s)
+		r.EncryptionType = s.encryption as api.EncryptionType
+		return r
+	}
+
+	getShardIterator(caller: Caller, input: api.GetShardIteratorInput): api.GetShardIteratorOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const h = shardOf(s, at, input.ShardId)
+		const kind = input.ShardIteratorType
+		const prefix = `${s.name}\x00${shardId(h.index)}\x00`
+		const db = records(at.tree)
+		let after = ""
+		if (kind == "AT_SEQUENCE_NUMBER" || kind == "AFTER_SEQUENCE_NUMBER") {
+			const seq = input.StartingSequenceNumber
+			if (seq == null) {
+				throw invalid(`StartingSequenceNumber must be specified for shardIteratorType ${kind}.`)
+			}
+			const encoded = indexOfSequence(seq!)
+			if (encoded == null) {
+				throw invalid(`StartingSequenceNumber ${seq!} used in GetShardIterator on shard ${shardId(h.index)} in `
+					+ `stream ${s.name} under account ${at.account} is invalid.`)
+			}
+			if (encoded! != h.index) {
+				throw invalid(`Invalid StartingSequenceNumber. It encodes ${shardId(encoded!)}, while it was used in a call `
+					+ `to a shard with ${shardId(h.index)}`)
+			}
+			after = if (kind == "AFTER_SEQUENCE_NUMBER") seq! else before(seq!)
+		} else if (kind == "LATEST") {
+			after = latest(db, prefix)
+		} else if (kind == "AT_TIMESTAMP") {
+			if (input.Timestamp == null) {
+				throw invalid("Must specify timestampInMillis parameter for iterator of type AT_TIMESTAMP. Current request "
+					+ "has no timestamp parameter.")
+			}
+			after = latest(db, prefix)
+			let from: string | null = null
+			while (true) {
+				const chunk = db.scan(from, 100, prefix)
+				const first = chunk.find(e => e[1].arrived >= input.Timestamp!)
+				if (first != null) {
+					after = before(first[0].slice(prefix.length, first[0].length))
+					break
+				}
+				if (chunk.length < 100) {
+					break
+				}
+				from = chunk[chunk.length - 1][0]
+			}
+		}
+		const r = new api.GetShardIteratorOutput()
+		r.ShardIterator = iterator(at, s, h.index, after, now())
+		return r
+	}
+
+	getRecords(caller: Caller, input: api.GetRecordsInput): api.GetRecordsOutput throws Fault {
+		const it = Iterator.parse(input.ShardIterator)
+		if (it == null) {
+			throw invalid("Invalid ShardIterator.")
+		}
+		const i = it!
+		const tree = if (i.account == caller.account && i.region == caller.region) caller.regional()
+			else caller.existing(`${i.account}/${i.region}`)
+		const found = if (tree == null) null else streams(tree!).get(i.stream)
+		const arn = arnOf(i.region, i.account, i.stream)
+		caller.allow(arn, found?.policy, resourceTags(found?.tags ?? []))
+		const t = now()
+		if (t - i.issued > 5 * minute) {
+			throw api.expiredIteratorException(`Iterator expired. The iterator was created at time ${rfc3339(i.issued)} `
+				+ `while right now it is ${rfc3339(t)} which is further in the future than the tolerated delay of 300000 `
+				+ "milliseconds.")
+		}
+		if (found == null || found!.created != i.created) {
+			throw notFound(i.stream, i.account)
+		}
+		const s = found!
+		const h = s.shards.find(x => x.index == i.shard)
+		if (h == null) {
+			throw api.resourceNotFoundException(`Shard ${shardId(i.shard)} in stream ${s.name} under account ${i.account} `
+				+ "does not exist")
+		}
+		const prefix = `${s.name}\x00${shardId(i.shard)}\x00`
+		const db = records(tree!)
+		const oldest = t - (s.retention as i64) * hour
+		const n = input.Limit ?? 10000
+		const out: api.Record[] = []
+		let bytes = 0
+		let from = if (i.after == "") null else prefix + i.after
+		let last = i.after
+		let next: Record | null = null
+		while (next == null) {
+			const chunk = db.scan(from, 100, prefix)
+			for (const [k, rec] of chunk) {
+				if (rec.arrived < oldest) {
+					continue
+				}
+				const size = rec.data.length * 3 / 4 + rec.key.length
+				if (out.length == n || out.length > 0 && bytes + size > readBytes) {
+					next = rec
+					break
+				}
+				bytes += size
+				last = k.slice(prefix.length, k.length)
+				out.push({ ...new api.Record(), SequenceNumber: last, ApproximateArrivalTimestamp: rec.arrived,
+					Data: decoded(rec.data), PartitionKey: rec.key,
+					EncryptionType: if (rec.encrypted) "KMS" as api.EncryptionType else null })
+			}
+			if (chunk.length < 100) {
+				break
+			}
+			from = chunk[chunk.length - 1][0]
+		}
+		const r = new api.GetRecordsOutput()
+		r.Records = out
+		r.MillisBehindLatest = if (next == null) 0 as i64 else (t - next!.arrived) / millisecond
+		if (h!.closed != null && next == null) {
+			r.ChildShards = s.shards.filter(c => c.parent == shardId(i.shard) || c.adjacent == shardId(i.shard)).map(c => ({ ...new api.ChildShard(),
+				ShardId: shardId(c.index), ParentShards: parents(c), HashKeyRange: range(c) }))
+		} else {
+			r.NextShardIterator = iterator(new Target(tree!, i.account, s.name, arn, s), s, i.shard, last, t)
+		}
+		return r
+	}
+
+	splitShard(caller: Caller, input: api.SplitShardInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const h = openShard(s, at, input.ShardToSplit)
+		const k = input.NewStartingHashKey
+		if (hash.parse(k) == null || !hash.atMost(k, h.end) || hash.atMost(k, h.start)) {
+			throw invalid(`NewStartingHashKey ${k} used in SplitShard() on shard ${shardId(h.index)} in stream ${s.name} `
+				+ `under account ${at.account} is not both greater than one plus the shard's StartingHashKey ${h.start} `
+				+ `and less than the shard's EndingHashKey ${h.end}.`)
+		}
+		const t = now()
+		close(s, h, t)
+		open(s, h.start, hash.step(k, -1), shardId(h.index), null, t)
+		open(s, k, h.end, shardId(h.index), null, t)
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	mergeShards(caller: Caller, input: api.MergeShardsInput): Unit throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const a = openShard(s, at, input.ShardToMerge)
+		const b = openShard(s, at, input.AdjacentShardToMerge)
+		const [low, high] = if (hash.atMost(a.start, b.start)) [a, b] else [b, a]
+		if (a.index == b.index || hash.step(low.end, 1) != high.start) {
+			throw invalid(`Shards ${shardId(a.index)} and ${shardId(b.index)} in stream ${s.name} under account `
+				+ `${at.account} are not an adjacent pair of shards eligible for merging`)
+		}
+		const t = now()
+		close(s, a, t)
+		close(s, b, t)
+		open(s, low.start, high.end, shardId(a.index), shardId(b.index), t)
+		save(streams(at.tree), s.name, s)
+		return new Unit()
+	}
+
+	updateShardCount(caller: Caller, input: api.UpdateShardCountInput): api.UpdateShardCountOutput throws Fault {
+		const at = target(caller, input.StreamName, input.StreamARN)
+		const s = allowed(caller, at)
+		const opened = s.shards.filter(h => h.closed == null)
+		const current = opened.length
+		const n = input.TargetShardCount
+		if (n > 2 * current || 2 * n < current) {
+			throw invalid(`UpdateShardCount failed for stream ${s.name} under account ${at.account}: the target shard count `
+				+ `${n} must be between half and double the current open shard count ${current}.`)
+		}
+		if (n != current) {
+			const t = now()
+			for (const h of opened) {
+				close(s, h, t)
+			}
+			for (const [start, end] of hash.ranges(n)) {
+				const first = opened.find(h => hash.atMost(h.start, start) && hash.atMost(start, h.end))!
+				const second = opened.find(h => hash.atMost(h.start, end) && hash.atMost(end, h.end))!
+				open(s, start, end, shardId(first.index),
+					if (second.index == first.index) null else shardId(second.index), t)
+			}
+			save(streams(at.tree), s.name, s)
+		}
+		const r = new api.UpdateShardCountOutput()
+		r.StreamName = s.name
+		r.StreamARN = at.arn
+		r.CurrentShardCount = current
+		r.TargetShardCount = n
+		return r
+	}
+
+	registerStreamConsumer(caller: Caller,
+		input: api.RegisterStreamConsumerInput): api.RegisterStreamConsumerOutput throws Fault {
+		const tags = input.Tags ?? []
+		const at = target(caller, null, input.StreamARN)
+		const context = resourceTags(at.stream?.tags ?? [])
+		context.append(requestTags(tags))
+		caller.allow(at.arn, at.stream?.policy, context)
+		if (at.stream == null) {
+			throw notFound(at.name, at.account)
+		}
+		const db = consumers(at.tree)
+		const name = input.ConsumerName
+		if (db.get(`${at.name}\x00${name}`) != null) {
+			throw api.resourceInUseException(`Consumer ${name} under stream ${at.name} already exists for account `
+				+ `${at.account}.`)
+		}
+		if (db.scan(null, consumerLimit, at.name + "\x00").length >= consumerLimit) {
+			throw api.limitExceededException(`Consumer limit of ${consumerLimit} for stream ${at.name} under account `
+				+ `${at.account} has been reached.`)
+		}
+		const c = { ...new Consumer(), name: name, created: now(), tags: tags }
+		save(db, `${at.name}\x00${name}`, c)
+		const r = new api.RegisterStreamConsumerOutput()
+		r.Consumer = { ...new api.Consumer(), ConsumerName: name, ConsumerARN: consumerArn(at.arn, c),
+			ConsumerStatus: "ACTIVE", ConsumerCreationTimestamp: c.created }
+		return r
+	}
+
+	describeStreamConsumer(caller: Caller,
+		input: api.DescribeStreamConsumerInput): api.DescribeStreamConsumerOutput throws Fault {
+		const at = named(caller, input.ConsumerARN, input.StreamARN, input.ConsumerName)
+		const c = consumerOf(caller, at)[1]
+		const r = new api.DescribeStreamConsumerOutput()
+		r.ConsumerDescription = { ...new api.ConsumerDescription(), ConsumerName: c.name,
+			ConsumerARN: consumerArn(at.arn, c), ConsumerStatus: "ACTIVE", ConsumerCreationTimestamp: c.created,
+			StreamARN: at.arn }
+		return r
+	}
+
+	listStreamConsumers(caller: Caller,
+		input: api.ListStreamConsumersInput): api.ListStreamConsumersOutput throws Fault {
+		const at = target(caller, null, input.StreamARN)
+		allowed(caller, at)
+		const under = at.name + "\x00"
+		const after = if (input.NextToken == null) null else under + unwrapped(input.NextToken!)
+		const n = input.MaxResults ?? 100
+		const got = consumers(at.tree).scan(after, n + 1, under).map(e => e[1])
+		const page = got.slice(0, if (n < got.length) n else got.length)
+		const r = new api.ListStreamConsumersOutput()
+		r.Consumers = page.map(c => ({ ...new api.Consumer(), ConsumerName: c.name, ConsumerARN: consumerArn(at.arn, c),
+			ConsumerStatus: "ACTIVE", ConsumerCreationTimestamp: c.created }))
+		r.NextToken = if (got.length > n) base64.encode(page[page.length - 1].name) else null
+		return r
+	}
+
+	deregisterStreamConsumer(caller: Caller, input: api.DeregisterStreamConsumerInput): Unit throws Fault {
+		const at = named(caller, input.ConsumerARN, input.StreamARN, input.ConsumerName)
+		const [k, _] = consumerOf(caller, at)
+		consumers(at.tree).delete(k)
+		return new Unit()
+	}
+
+	putResourcePolicy(caller: Caller, input: api.PutResourcePolicyInput): Unit throws Fault {
+		const at = resource(caller, input.ResourceARN)
+		try {
+			auth.parse(input.Policy, "resource")
+		} catch (f: Fault) {
+			throw invalid(`Invalid policy: ${f.message}`)
+		}
+		policy(caller, at, input.Policy)
+		return new Unit()
+	}
+
+	getResourcePolicy(caller: Caller, input: api.GetResourcePolicyInput): api.GetResourcePolicyOutput throws Fault {
+		const at = resource(caller, input.ResourceARN)
+		const p = if (at.consumer == "") allowed(caller, at).policy else consumerOf(caller, at)[1].policy
+		const r = new api.GetResourcePolicyOutput()
+		r.Policy = p ?? "{}"
+		return r
+	}
+
+	deleteResourcePolicy(caller: Caller, input: api.DeleteResourcePolicyInput): Unit throws Fault {
+		policy(caller, resource(caller, input.ResourceARN), null)
+		return new Unit()
+	}
+}
+
+/// A stream a request names: the tree of its account and region, that account, its name and ARN, and the stream,
+/// null if there is none; and of a consumer, its name, else "", and of its ARN, the creation in seconds that names.
+class Target {
+	tree: Store
+	account: string
+	name: string
+	arn: string
+	stream: Stream | null
+	consumer = ""
+	stamp = ""
+
+	constructor(tree: Store, account: string, name: string, arn: string, stream: Stream | null) {
+		this.tree = tree
+		this.account = account
+		this.name = name
+		this.arn = arn
+		this.stream = stream
+	}
+}
+
+/// The stream a request names by name or ARN, the ARN if both.
+function target(caller: Caller, name: string | null, arn: string | null): Target throws Fault {
+	if (arn == null) {
+		if (name == null) {
+			throw invalid("Stream arn and stream name can't be empty at the same time")
+		}
+		const tree = caller.regional()
+		return new Target(tree, caller.account, name!, arnOf(caller.region, caller.account, name!),
+			streams(tree).get(name!))
+	}
+	const at = resource(caller, arn!)
+	if (at.consumer != "") {
+		throw badArn(arn!)
+	}
+	return at
+}
+
+/// The stream, or a consumer of it, of the ARN arn, in the caller's region.
+function resource(caller: Caller, arn: string): Target throws Fault {
+	const parts = split(arn, ":")
+	const head = `arn:aws:kinesis:${caller.region}:`
+	if (parts.length < 6 || !startsWith(arn, head) || !startsWith(parts[5], "stream/")) {
+		throw badArn(arn)
+	}
+	const account = parts[4]
+	const path = split(arn.slice(head.length + account.length + 8, arn.length), "/")
+	if (path[0] == ""
+		|| path.length != 1
+		&& (path.length != 3 || path[1] != "consumer" || parts.length != 7 || number(parts[6]) == null)) {
+		throw badArn(arn)
+	}
+	const tree = if (account == caller.account) caller.regional() else caller.existing(`${account}/${caller.region}`)
+	const t = new Target(tree ?? caller.regional(), account, path[0], arnOf(caller.region, account, path[0]),
+		if (tree == null) null else streams(tree!).get(path[0]))
+	if (path.length == 3) {
+		const colon = lastIndexOf(path[2], ":")
+		t.consumer = path[2].slice(0, colon)
+		t.stamp = path[2].slice(colon + 1, path[2].length)
+	}
+	return t
+}
+
+/// The consumer of the ARN arn, or of the stream's ARN and the consumer's name.
+function named(caller: Caller, arn: string | null, stream: string | null, name: string | null): Target throws Fault {
+	if (arn != null) {
+		return resource(caller, arn!)
+	}
+	if (stream == null || name == null) {
+		throw invalid("Both streamARN and consumer name must be provided if consumerARN is not provided.")
+	}
+	const at = target(caller, null, stream!)
+	at.consumer = name!
+	return at
+}
+
+/// The stream at names, once the caller is allowed it.
+function allowed(caller: Caller, at: Target): Stream throws Fault {
+	caller.allow(at.arn, at.stream?.policy, resourceTags(at.stream?.tags ?? []))
+	if (at.stream == null) {
+		throw notFound(at.name, at.account)
+	}
+	return at.stream!
+}
+
+/// The key and consumer at names, once the caller is allowed it.
+function consumerOf(caller: Caller, at: Target): [string, Consumer] throws Fault {
+	const k = `${at.name}\x00${at.consumer}`
+	const found = if (at.stream == null) null else consumers(at.tree).get(k)
+	const c = if (found == null || at.stamp != "" && at.stamp != `${found!.created / second}`) null else found
+	const shown = if (c == null) `${at.arn}/consumer/${at.consumer}` else consumerArn(at.arn, c!)
+	caller.allow(shown, c?.policy, resourceTags(c?.tags ?? []))
+	if (at.stream == null) {
+		throw notFound(at.name, at.account)
+	}
+	if (c == null) {
+		throw api.resourceNotFoundException(`Consumer ${at.consumer} under stream ${at.name} not found for account `
+			+ `${at.account}.`)
+	}
+	return [k, c!]
+}
+
+/// Sets the resource policy of what at names to p, none if null.
+function policy(caller: Caller, at: Target, p: string | null) throws Fault {
+	if (at.consumer == "") {
+		const s = allowed(caller, at)
+		s.policy = p
+		save(streams(at.tree), s.name, s)
+		return
+	}
+	const [k, c] = consumerOf(caller, at)
+	c.policy = p
+	save(consumers(at.tree), k, c)
+}
+
+function tagStream(caller: Caller, at: Target, tags: [string, string][]) throws Fault {
+	const context = resourceTags(at.stream?.tags ?? [])
+	context.append(requestTags(tags))
+	caller.allow(at.arn, at.stream?.policy, context)
+	if (at.stream == null) {
+		throw notFound(at.name, at.account)
+	}
+	const s = at.stream!
+	const all = merged(s.tags, tags)
+	if (all.length > tagLimit) {
+		throw invalid(`Failed to add tags to stream ${s.name} under account ${at.account} because a given stream cannot `
+			+ `have more than ${tagLimit} tags.`)
+	}
+	s.tags = all
+	save(streams(at.tree), s.name, s)
+}
+
+/// tags with those given set, each in place or at the end.
+function merged(tags: [string, string][], given: [string, string][]): [string, string][] {
+	const out = tags.slice(0, tags.length)
+	for (const [k, v] of given) {
+		const i = out.map(t => t[0]).indexOf(k)
+		if (i < 0) {
+			out.push([k, v])
+		} else {
+			out[i] = [k, v]
+		}
+	}
+	return out
+}
+
+function tag(t: [string, string]): api.Tag { return { ...new api.Tag(), Key: t[0], Value: t[1] } }
+
+/// Enables or disables the shard-level metrics given, ALL for every one, of the stream named.
+function monitor(caller: Caller, name: string | null, arn: string | null, metrics: api.MetricsName[],
+	enable: bool): api.EnhancedMonitoringOutput throws Fault {
+	const at = target(caller, name, arn)
+	const s = allowed(caller, at)
+	const every: api.MetricsName[] = ["IncomingBytes", "IncomingRecords", "OutgoingBytes", "OutgoingRecords",
+		"WriteProvisionedThroughputExceeded", "ReadProvisionedThroughputExceeded", "IteratorAgeMilliseconds"]
+	const given = if (metrics.includes("ALL")) every else metrics
+	const r = new api.EnhancedMonitoringOutput()
+	r.StreamName = s.name
+	r.StreamARN = at.arn
+	r.CurrentShardLevelMetrics = s.metrics
+	s.metrics = every.filter(m => if (enable) s.metrics.includes(m) || given.includes(m)
+		else s.metrics.includes(m) && !given.includes(m))
+	r.DesiredShardLevelMetrics = s.metrics
+	save(streams(at.tree), s.name, s)
+	return r
+}
+
+/// The shards of s not yet past its retention at t, closed ones too.
+function alive(s: Stream, t: i64): Shard[] {
+	const oldest = t - (s.retention as i64) * hour
+	return s.shards.filter(h => h.closed == null || h.closed! >= oldest)
+}
+
+/// Whether ListShards' filter f keeps the shard h of s at t.
+function kept(f: api.ShardFilter, s: Stream, h: Shard, t: i64): bool throws Fault {
+	switch (f.Type) {
+		case "AFTER_SHARD_ID":
+			if (f.ShardId == null) {
+				throw invalid("ShardId must be specified for ShardFilter type AFTER_SHARD_ID.")
+			}
+			return true
+		case "AT_LATEST": return h.closed == null
+		case "AT_TRIM_HORIZON": return openAt(h, maximum(t - (s.retention as i64) * hour, s.created))
+		case "FROM_TRIM_HORIZON": return true
+		default:
+			if (f.Timestamp == null) {
+				throw invalid(`Timestamp must be specified for ShardFilter type ${f.Type}.`)
+			}
+			const at = maximum(f.Timestamp!, s.created)
+			return if (f.Type == "AT_TIMESTAMP") openAt(h, at) else h.closed == null || h.closed! > at
+	}
+}
+
+/// Whether h was open at t.
+function openAt(h: Shard, t: i64): bool { return h.opened <= t && (h.closed == null || h.closed! > t) }
+function maximum(a: i64, b: i64): i64 { return if (a > b) a else b }
+
+/// Adds to s a shard of the hash keys from start to end, of the parents given, opened at t.
+function open(s: Stream, start: string, end: string, parent: string | null, adjacent: string | null, t: i64) {
+	const index = s.shards.length
+	s.counter++
+	s.shards.push({ ...new Shard(), index: index, parent: parent, adjacent: adjacent, start: start, end: end,
+		first: sequence(s.counter, index), opened: t })
+}
+
+function close(s: Stream, h: Shard, t: i64) {
+	s.counter++
+	h.last = sequence(s.counter, h.index)
+	h.closed = t
+}
+
+/// Puts a record of the data and partition key key in the shard h of s at t; its sequence number.
+function put(tree: Store, s: Stream, h: Shard, data: string, key: string, t: i64): string throws Fault {
+	s.counter++
+	const seq = sequence(s.counter, h.index)
+	save(records(tree), `${s.name}\x00${shardId(h.index)}\x00${seq}`,
+		{ ...new Record(), data: base64.encode(data), key: key, arrived: t, encrypted: s.encryption == "KMS" })
+	return seq
+}
+
+/// The open shard of s whose hash keys hold the partition key's MD5, or the explicit hash key if given.
+function shardFor(s: Stream, key: string, explicit: string | null): Shard throws Fault {
+	let k = ""
+	if (explicit != null) {
+		if (hash.parse(explicit!) == null) {
+			throw invalid(`Invalid ExplicitHashKey. ExplicitHashKey must be in the range: [0, 2^128-1]. Specified value `
+				+ `was ${explicit!}`)
+		}
+		k = explicit!
+	} else {
+		try {
+			k = hash.format(hash.ofDigest(md5(key)))
+		} catch (e: CryptoError) {
+			throw new Fault(500, "InternalFailure", `No MD5: ${e}`)
+		}
+	}
+	return s.shards.find(h => h.closed == null && hash.atMost(h.start, k) && hash.atMost(k, h.end))!
+}
+
+/// The partition key a record must give.
+function partitionKey(key: string | null): string throws Fault {
+	if (key == null) {
+		throw api.validationException("1 validation error detected: Value null at 'partitionKey' failed to satisfy "
+			+ "constraint: Member must not be null")
+	}
+	return key!
+}
+
+/// Throws unless a record of data and the partition key key fits s.
+function sized(s: Stream, data: string, key: string) throws Fault {
+	const most = s.maxRecordKiB * 1024
+	if (data.length + key.length > most) {
+		throw api.validationException(`1 validation error detected: Value at 'data' failed to satisfy constraint: Member `
+			+ `must have length less than or equal to ${most}`)
+	}
+}
+
+/// The shard of s of the id, which at names.
+function shardOf(s: Stream, at: Target, id: string): Shard throws Fault {
+	const h = s.shards.find(x => shardId(x.index) == id)
+	if (h == null) {
+		throw api.resourceNotFoundException(`Shard ${id} in stream ${s.name} under account ${at.account} does not exist`)
+	}
+	return h!
+}
+
+/// As shardOf, of a shard still open.
+function openShard(s: Stream, at: Target, id: string): Shard throws Fault {
+	const h = shardOf(s, at, id)
+	if (h.closed != null) {
+		throw api.resourceInUseException(`Shard ${id} in stream ${s.name} under account ${at.account} has already been `
+			+ "merged or split, and thus is not eligible for merging or splitting.")
+	}
+	return h
+}
+
+/// The sequence number counting n, of the shard of index: 49, n in 34 digits and index in 20.
+function sequence(n: i64, index: i32): string { return "49" + pad(n, 34) + pad(index as i64, 20) }
+
+/// The index of the shard whose sequence number s is, null if s is none.
+function indexOfSequence(s: string): i32 | null {
+	if (s.length != 56 || !startsWith(s, "49")) {
+		return null
+	}
+	const n = number(s.slice(36, 56))
+	return if (n == null || n! > 2147483647) null else n! as i32
+}
+
+/// The sequence number one below s, of the same width.
+function before(s: string): string {
+	const out: u8[] = []
+	let borrow = true
+	for (let i = s.length - 1; i >= 0; i--) {
+		if (borrow && s[i] == 48) {
+			out.push(57)
+		} else {
+			out.push(if (borrow) s[i] - 1 else s[i])
+			borrow = false
+		}
+	}
+	out.reverse()
+	return fromBytes(out)
+}
+
+/// The sequence number of the last record under prefix, "" if none.
+function latest(db: Table[Record], prefix: string): string {
+	const last = db.scan(null, 1, prefix, true)
+	return if (last.length == 0) "" else last[0][0].slice(prefix.length, prefix.length + 56)
+}
+
+/// A shard iterator: where a shard is read from, of a stream at an instant of its creation, and when it was given.
+class Iterator {
+	account = ""
+	region = ""
+	stream = ""
+	created: i64 = 0
+	shard = 0
+	/// The sequence number after which it reads, "" from the shard's start.
+	after = ""
+	issued: i64 = 0
+
+	/// The iterator s encodes, null if none.
+	static parse(s: string): Iterator | null {
+		let text = ""
+		try {
+			text = base64.decode(s)
+		} catch (e: ParseError) {
+			return null
+		}
+		const parts = split(text, "\x00")
+		if (parts.length != 7) {
+			return null
+		}
+		const created = number(parts[3])
+		const shard = number(parts[4])
+		const issued = number(parts[6])
+		if (created == null || shard == null || issued == null || shard! > 2147483647) {
+			return null
+		}
+		return { ...new Iterator(), account: parts[0], region: parts[1], stream: parts[2], created: created!,
+			shard: shard! as i32, after: parts[5], issued: issued! }
+	}
+}
+
+/// The iterator of the shard of index of s, which at names, reading after the sequence number after, given at t.
+function iterator(at: Target, s: Stream, index: i32, after: string, t: i64): string {
+	const region = split(at.arn, ":")[3]
+	return base64.encode([at.account, region, s.name, `${s.created}`, `${index}`, after, `${t}`].join("\x00"))
+}
+
+function wire(h: Shard): api.Shard {
+	return { ...new api.Shard(), ShardId: shardId(h.index), ParentShardId: h.parent, AdjacentParentShardId: h.adjacent,
+		HashKeyRange: range(h),
+		SequenceNumberRange: { ...new api.SequenceNumberRange(), StartingSequenceNumber: h.first,
+		EndingSequenceNumber: h.last } }
+}
+
+function range(h: Shard): api.HashKeyRange {
+	return { ...new api.HashKeyRange(), StartingHashKey: h.start, EndingHashKey: h.end }
+}
+
+function parents(h: Shard): string[] { return if (h.adjacent == null) [h.parent!] else [h.parent!, h.adjacent!] }
+
+/// Throws unless hours is a retention period a stream may have.
+function bounded(hours: i32) throws Fault {
+	if (hours < minRetention) {
+		throw invalid(`Minimum allowed retention period is ${minRetention} hours. Requested retention period (${hours} `
+			+ "hours) is too short.")
+	}
+	if (hours > maxRetention) {
+		throw invalid(`Maximum allowed retention period is ${maxRetention} hours. Requested retention period (${hours} `
+			+ "hours) is too long.")
+	}
+}
+
+/// Deletes the entries of t under prefix.
+function clear(t: Table[Record], prefix: string) throws Fault {
+	while (true) {
+		const chunk = t.scan(null, 1000, prefix)
+		if (chunk.length == 0) {
+			return
+		}
+		for (const [k, _] of chunk) {
+			t.delete(k)
+		}
+	}
+}
+
+/// The ARN of the stream name of the account in region.
+function arnOf(region: string, account: string, name: string): string {
+	return `arn:aws:kinesis:${region}:${account}:stream/${name}`
+}
+
+/// The ARN of the consumer c of the stream of ARN stream: of its name and creation, in seconds.
+function consumerArn(stream: string, c: Consumer): string {
+	return `${stream}/consumer/${c.name}:${c.created / second}`
+}
+
+function shardId(index: i32): string { return "shardId-" + pad(index as i64, 12) }
+
+/// n in decimal, padded with 0s to width digits, so that byte order is numeric order.
+function pad(n: i64, width: i32): string {
+	let s = `${n}`
+	while (s.length < width) {
+		s = "0" + s
+	}
+	return s
+}
+
+/// The number s is, null if it is not one.
+function number(s: string): i64 | null {
+	for (let i = 0; i < s.length; i++) {
+		if (!isDigit(s[i])) {
+			return null
+		}
+	}
+	try {
+		return parseInt[i64](s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The text a token of base64 holds.
+function unwrapped(token: string): string throws Fault {
+	try {
+		return base64.decode(token)
+	} catch (e: ParseError) {
+		throw invalid("NextToken is invalid.")
+	}
+}
+
+/// The bytes the base64 s holds, which a record stored.
+function decoded(s: string): string {
+	try {
+		return base64.decode(s)
+	} catch (e: ParseError) {
+		return ""
+	}
+}
+
+function notFound(name: string, account: string): Fault {
+	return api.resourceNotFoundException(`Stream ${name} under account ${account} not found.`)
+}
+
+function badArn(arn: string): Fault { return invalid(`The input ARN "${arn}" is invalid`) }
+
+function dryRun(): Fault {
+	return api.dryRunOperationException("Request would have succeeded, but DryRun flag is set.")
+}
+
+function invalid(why: string): Fault { return api.invalidArgumentException(why) }

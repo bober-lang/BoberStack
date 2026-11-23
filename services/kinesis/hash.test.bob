@@ -1,0 +1,26 @@
+import { atMost, format, largest, ofDigest, parse, ranges, step } from "./hash"
+
+test "a key in decimal" {
+	assert format(parse(largest)!) == largest
+	assert format(parse("0")!) == "0"
+	assert format(parse("4294967296")!) == "4294967296"
+	assert parse("340282366920938463463374607431768211456") == null
+	assert parse("12a") == null
+	assert format(ofDigest("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02")) == "4294967298"
+}
+
+test "stepping and comparing" {
+	assert step("4294967296", -1) == "4294967295"
+	assert step("4294967295", 1) == "4294967296"
+	assert atMost("4294967295", "4294967296") && !atMost("4294967296", "4294967295")
+}
+
+test "ranges as AWS divides them" {
+	assert ranges(1) == [["0", largest]]
+	assert ranges(2)
+		== [["0", "170141183460469231731687303715884105727"], ["170141183460469231731687303715884105728", largest]]
+	assert ranges(3)
+		== [["0", "113427455640312821154458202477256070484"],
+		["113427455640312821154458202477256070485", "226854911280625642308916404954512140969"],
+		["226854911280625642308916404954512140970", largest]]
+}

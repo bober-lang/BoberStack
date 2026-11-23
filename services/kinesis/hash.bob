@@ -1,0 +1,117 @@
+//! Hash keys: the unsigned 128-bit integers Kinesis maps partition keys to and divides among shards, as four 32-bit
+//! limbs, the most significant first, and in decimal as the API gives them.
+
+import { isDigit } from "std/ascii"
+
+const base: u64 = 4294967296
+/// The largest hash key, 2^128 - 1.
+export const largest = "340282366920938463463374607431768211455"
+
+/// The key of the decimal s, null if s is not one of 0 to 2^128 - 1.
+export function parse(s: string): u64[] | null {
+	if (s == "") {
+		return null
+	}
+	let k: u64[] = [0, 0, 0, 0]
+	for (let i = 0; i < s.length; i++) {
+		if (!isDigit(s[i])) {
+			return null
+		}
+		const [m, carry] = times(k, 10, (s[i] - 48) as u64)
+		if (carry != 0) {
+			return null
+		}
+		k = m
+	}
+	return k
+}
+
+/// k in decimal.
+export function format(k: u64[]): string {
+	let digits = ""
+	let n = k
+	while (true) {
+		const [q, r] = divide(n, 10)
+		digits = `${r}` + digits
+		if (q.every(x => x == 0)) {
+			return digits
+		}
+		n = q
+	}
+}
+
+/// The key of the 16 bytes digest, big-endian, as of a partition key's MD5.
+export function ofDigest(digest: string): u64[] {
+	const k: u64[] = []
+	for (let i = 0; i < 16; i += 4) {
+		k.push(((digest[i] as u64) << 24) | ((digest[i + 1] as u64) << 16) | ((digest[i + 2] as u64) << 8)
+			| (digest[i + 3] as u64))
+	}
+	return k
+}
+
+/// Whether a is less than b.
+export function less(a: u64[], b: u64[]): bool {
+	for (let i = 0; i < 4; i++) {
+		if (a[i] != b[i]) {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+/// Whether the decimal keys a and b are in order, a not greater; both parse.
+export function atMost(a: string, b: string): bool { return !less(parse(b)!, parse(a)!) }
+
+/// The decimal k plus d, 1 or -1, which stays within 0 to 2^128 - 1.
+export function step(k: string, d: i32): string {
+	const n = parse(k)!
+	for (let i = 3; i >= 0; i--) {
+		if (d > 0 && n[i] < base - 1 || d < 0 && n[i] > 0) {
+			n[i] = if (d > 0) n[i] + 1 else n[i] - 1
+			return format(n)
+		}
+		n[i] = if (d > 0) 0 else base - 1
+	}
+	return format(n)
+}
+
+/// The hash key ranges of n shards dividing 0 to 2^128 - 1 as AWS divides them: each of 2^128 / n keys, rounded down,
+/// the last to the end.
+export function ranges(n: i32): [string, string][] {
+	let [width, r] = divide(parse(largest)!, n as u64)
+	if (r == (n as u64) - 1) {
+		width = times(width, 1, 1)[0]
+	}
+	const out: [string, string][] = []
+	for (let i = 0; i < n; i++) {
+		const start = format(times(width, i as u64, 0)[0])
+		const end = if (i == n - 1) largest else step(format(times(width, (i + 1) as u64, 0)[0]), -1)
+		out.push([start, end])
+	}
+	return out
+}
+
+/// k times m plus a, both below 2^32, and what carries out of 128 bits.
+function times(k: u64[], m: u64, a: u64): [u64[], u64] {
+	const out: u64[] = [0, 0, 0, 0]
+	let carry = a
+	for (let i = 3; i >= 0; i--) {
+		const v = k[i] * m + carry
+		out[i] = v % base
+		carry = v / base
+	}
+	return [out, carry]
+}
+
+/// k divided by n, below 2^32, and the remainder.
+function divide(k: u64[], n: u64): [u64[], u64] {
+	const q: u64[] = []
+	let r: u64 = 0
+	for (const x of k) {
+		const v = r * base + x
+		q.push(v / n)
+		r = v % n
+	}
+	return [q, r]
+}
