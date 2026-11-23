@@ -1,7 +1,8 @@
 //! Route 53's state in an account's tree: its hosted zones by id, each with its record sets; the caller references
-//! that made them; and the changes submitted, by id.
+//! that made them; the changes submitted, by id; and the health checks by id, with the caller references that made them.
 
 import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
 
 export class Zone {
 	id = ""
@@ -42,11 +43,12 @@ export class Alias {
 	evaluate = false
 }
 
-/// A change submitted: when, and its comment.
+/// A change submitted: when, its comment, and whether a GetChange has read it.
 export class Change {
 	id = ""
 	submitted: i64 = 0
 	comment: string | null = null
+	read = false
 }
 
 /// The zone a caller reference made: its id.
@@ -54,15 +56,33 @@ export class Reference {
 	zone = ""
 }
 
+/// A health check: its config as the API gives it, AWS's defaults filled in, its version and tags.
+export class Check {
+	id = ""
+	reference = ""
+	config: api.HealthCheckConfig = new api.HealthCheckConfig()
+	version: i64 = 1
+	tags: [string, string][] = []
+}
+
+/// The health check a caller reference made: its id, kept after the check is deleted, as AWS keeps it.
+export class CheckReference {
+	check = ""
+}
+
 /// Route 53's tables in the account's tree s.
 export class Tables {
 	zones: Table[Zone]
 	references: Table[Reference]
 	changes: Table[Change]
+	checks: Table[Check]
+	checkReferences: Table[CheckReference]
 
 	constructor(s: Store) {
 		this.zones = new Table[Zone](s, "route53/zones")
 		this.references = new Table[Reference](s, "route53/references")
 		this.changes = new Table[Change](s, "route53/changes")
+		this.checks = new Table[Check](s, "route53/healthchecks")
+		this.checkReferences = new Table[CheckReference](s, "route53/healthcheckreferences")
 	}
 }

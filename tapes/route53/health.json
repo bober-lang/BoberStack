@@ -1,0 +1,506 @@
+{
+	"volatile": [
+		"RequestId",
+		"SubmittedAt",
+		"Id",
+		"CheckedTime"
+	],
+	"ignored": [
+		"NameServer"
+	],
+	"steps": [
+		{
+			"name": "create a calculated check",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><HealthThreshold>0</HealthThreshold></HealthCheckConfig></CreateHealthCheckRequest>",
+			"capture": {
+				"calc": "HealthCheck/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${calc}</Id><CallerReference>boberstack-ab-00000000-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><Inverted>false</Inverted><Disabled>false</Disabled><HealthThreshold>0</HealthThreshold><ChildHealthChecks/></HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck></CreateHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "create again of the same reference and config",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><HealthThreshold>0</HealthThreshold></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 201,
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${calc}</Id><CallerReference>boberstack-ab-00000000-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><Inverted>false</Inverted><Disabled>false</Disabled><HealthThreshold>0</HealthThreshold><ChildHealthChecks/></HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck></CreateHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "create again of the same reference and another config",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><HealthThreshold>1</HealthThreshold></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 409,
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HealthCheckAlreadyExists</Code><Message>A different health check has already been created with the specified caller reference. If that health check has been deleted, Route 53 will still maintain the caller reference for a number of days.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create a disabled HTTP check",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-2</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type><ResourcePath>/health</ResourcePath><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><RequestInterval>30</RequestInterval><FailureThreshold>3</FailureThreshold><Disabled>true</Disabled></HealthCheckConfig></CreateHealthCheckRequest>",
+			"capture": {
+				"http": "HealthCheck/Id"
+			},
+			"until": 201,
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${http}</Id><CallerReference>boberstack-ab-00000000-2</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type><ResourcePath>/health</ResourcePath><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><RequestInterval>30</RequestInterval><FailureThreshold>3</FailureThreshold><MeasureLatency>false</MeasureLatency><Inverted>false</Inverted><Disabled>true</Disabled><EnableSNI>false</EnableSNI></HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck></CreateHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "create an HTTP check of a documentation address",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-7</CallerReference><HealthCheckConfig><IPAddress>192.0.2.1</IPAddress><Port>80</Port><Type>HTTP</Type><Disabled>true</Disabled></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 400,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>IPv4 address 192.0.2.1 is forbidden</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create an HTTP check of no address or name",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-3</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 400,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid parameter : IP address and fully qualified domain name can not be both empty.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create a TCP check of no port",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-4</CallerReference><HealthCheckConfig><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><Type>TCP</Type><Disabled>true</Disabled></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 400,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>TCP health checks must specify a port</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "create an HTTP check of a request interval of 20",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-5</CallerReference><HealthCheckConfig><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><Port>80</Port><Type>HTTP</Type><RequestInterval>20</RequestInterval><Disabled>true</Disabled></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 400,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid XML ; javax.xml.stream.XMLStreamException: org.xml.sax.SAXParseException; lineNumber: 1; columnNumber: 274; cvc-enumeration-valid: Value '20' is not facet-valid with respect to enumeration '[10, 30]'. It must be a value from the enumeration.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			},
+			"differs": "AWS checks the XML against its schema, whose message names the column, which this does not"
+		},
+		{
+			"name": "create a calculated check of a child that is not",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck",
+			"body": "<CreateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><CallerReference>${prefix}-6</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><HealthThreshold>1</HealthThreshold><ChildHealthChecks><ChildHealthCheck>00000000-0000-0000-0000-000000000000</ChildHealthCheck></ChildHealthChecks></HealthCheckConfig></CreateHealthCheckRequest>",
+			"until": 400,
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid parameter : Child health check IDs do not exist or are deleted: 00000000-0000-0000-0000-000000000000</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "get the calculated check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${calc}</Id><CallerReference>boberstack-ab-00000000-1</CallerReference><HealthCheckConfig><Type>CALCULATED</Type><Inverted>false</Inverted><Disabled>false</Disabled><HealthThreshold>0</HealthThreshold><ChildHealthChecks/></HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck></GetHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "get the HTTP check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${http}</Id><CallerReference>boberstack-ab-00000000-2</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type><ResourcePath>/health</ResourcePath><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><RequestInterval>30</RequestInterval><FailureThreshold>3</FailureThreshold><MeasureLatency>false</MeasureLatency><Inverted>false</Inverted><Disabled>true</Disabled><EnableSNI>false</EnableSNI></HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck></GetHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "get a check that is not",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/00000000-0000-0000-0000-000000000000",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id 00000000-0000-0000-0000-000000000000 does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "count",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheckcount",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<GetHealthCheckCountResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheckCount>2</HealthCheckCount></GetHealthCheckCountResponse>"
+			}
+		},
+		{
+			"name": "update the HTTP check",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"body": "<UpdateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheckVersion>1</HealthCheckVersion><FailureThreshold>5</FailureThreshold></UpdateHealthCheckRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<UpdateHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${http}</Id><CallerReference>boberstack-ab-00000000-2</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type><ResourcePath>/health</ResourcePath><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><RequestInterval>30</RequestInterval><FailureThreshold>5</FailureThreshold><MeasureLatency>false</MeasureLatency><Inverted>false</Inverted><Disabled>true</Disabled><EnableSNI>false</EnableSNI></HealthCheckConfig><HealthCheckVersion>2</HealthCheckVersion></HealthCheck></UpdateHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "update it again of the old version",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"body": "<UpdateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheckVersion>1</HealthCheckVersion><FailureThreshold>4</FailureThreshold></UpdateHealthCheckRequest>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HealthCheckVersionMismatch</Code><Message>Health check with id ${http} has version 2, but expected to have version 1. Could not proceed with update.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "update it of no version",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"body": "<UpdateHealthCheckRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourcePath>/other</ResourcePath></UpdateHealthCheckRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<UpdateHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HealthCheck><Id>${http}</Id><CallerReference>boberstack-ab-00000000-2</CallerReference><HealthCheckConfig><Port>80</Port><Type>HTTP</Type><ResourcePath>/other</ResourcePath><FullyQualifiedDomainName>example.com</FullyQualifiedDomainName><RequestInterval>30</RequestInterval><FailureThreshold>5</FailureThreshold><MeasureLatency>false</MeasureLatency><Inverted>false</Inverted><Disabled>true</Disabled><EnableSNI>false</EnableSNI></HealthCheckConfig><HealthCheckVersion>3</HealthCheckVersion></HealthCheck></UpdateHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "status of the calculated check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${calc}/status",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid parameter : To get the status of a calculated health check, use either the Route 53 console or the CloudWatch console. The GetHealthCheckStatus action can't return the health of calculated health checks.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "status of the HTTP check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${http}/status",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid parameter : The specified health check has a special status of always healthy. GetHealthCheckStatus can't return the status of one of these special health checks.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "last failure reason of the HTTP check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${http}/lastfailurereason",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidInput</Code><Message>Invalid parameter : The specified health check has a special status of always healthy. GetHealthCheckStatus can't return the status of one of these special health checks.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "tag the calculated check",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/tags/healthcheck/${calc}",
+			"body": "<ChangeTagsForResourceRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><AddTags><Tag><Key>team</Key><Value>a</Value></Tag></AddTags></ChangeTagsForResourceRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeTagsForResourceResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></ChangeTagsForResourceResponse>"
+			}
+		},
+		{
+			"name": "its tags",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/tags/healthcheck/${calc}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ListTagsForResourceResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ResourceTagSet><ResourceType>healthcheck</ResourceType><ResourceId>${calc}</ResourceId><Tags><Tag><Key>team</Key><Value>a</Value></Tag></Tags></ResourceTagSet></ListTagsForResourceResponse>"
+			}
+		},
+		{
+			"name": "create a zone",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01/hostedzone",
+			"body": "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>${prefix}.example.test</Name><CallerReference>${prefix}-z</CallerReference></CreateHostedZoneRequest>",
+			"capture": {
+				"zone": "HostedZone/Id"
+			},
+			"response": {
+				"status": 201,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<CreateHostedZoneResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><HostedZone><Id>${zone}</Id><Name>boberstack-ab-00000000.example.test.</Name><CallerReference>boberstack-ab-00000000-z</CallerReference><Config><PrivateZone>false</PrivateZone><HostedZoneTier>STANDARD</HostedZoneTier></Config><ResourceRecordSetCount>2</ResourceRecordSetCount><Features><AcceleratedRecoveryStatus>DISABLED</AcceleratedRecoveryStatus><ChangeHistory><Status>DISABLED</Status></ChangeHistory><ChangeGuardrails><ChangeGuardrail><Name>NS_OCCLUSION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_DELEGATION_AUTHORITY_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>NS_FORMAT_CHECK</Name><Status>ENABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ALIAS_TARGET_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_RECORD_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail><ChangeGuardrail><Name>ACTIVE_DELEGATION_CHECK</Name><Status>DISABLED</Status></ChangeGuardrail></ChangeGuardrails></Features></HostedZone><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo><DelegationSet><NameServers><NameServer>ns-1065.awsdns-05.org</NameServer><NameServer>ns-984.awsdns-59.net</NameServer><NameServer>ns-109.awsdns-13.com</NameServer><NameServer>ns-1603.awsdns-08.co.uk</NameServer></NameServers></DelegationSet></CreateHostedZoneResponse>"
+			}
+		},
+		{
+			"name": "a record of a check that is not",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords><HealthCheckId>00000000-0000-0000-0000-000000000000</HealthCheckId></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ChangeResourceRecordSetsResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeInfo><Id>x</Id><Status>PENDING</Status><SubmittedAt>x-x-x:x:x.x</SubmittedAt></ChangeInfo></ChangeResourceRecordSetsResponse>"
+			}
+		},
+		{
+			"name": "a record of the calculated check",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords><HealthCheckId>${calc}</HealthCheckId></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to create resource record set [name='w.boberstack-ab-00000000.example.test.', type='A', set-identifier='one', health check='00000000-0000-0000-0000-000000000000'] but it already exists]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the check a record uses",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></DeleteHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "delete the record",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords><HealthCheckId>${calc}</HealthCheckId></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='w.boberstack-ab-00000000.example.test.', type='A', set-identifier='one', health check='${calc}'] but the values provided do not match the current values]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HostedZoneNotEmpty</Code><Message>The specified hosted zone contains resource record sets other than the default SOA and NS records and so cannot be deleted. Delete all non-default records and try again.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the calculated check",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id ${calc} does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete the HTTP check",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<DeleteHealthCheckResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"></DeleteHealthCheckResponse>"
+			}
+		},
+		{
+			"name": "get the deleted check",
+			"service": "route53",
+			"method": "GET",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id ${calc} does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "delete it again",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id ${calc} does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the record",
+			"service": "route53",
+			"method": "POST",
+			"path": "/2013-04-01${zone}/rrset",
+			"body": "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><ChangeBatch><Changes><Change><Action>DELETE</Action><ResourceRecordSet><Name>w.${prefix}.example.test</Name><Type>A</Type><SetIdentifier>one</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords><HealthCheckId>${calc}</HealthCheckId></ResourceRecordSet></Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>InvalidChangeBatch</Code><Message>[Tried to delete resource record set [name='w.boberstack-ab-00000000.example.test.', type='A', set-identifier='one', health check='${calc}'] but the values provided do not match the current values]</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the zone",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01${zone}",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>HostedZoneNotEmpty</Code><Message>The specified hosted zone contains resource record sets other than the default SOA and NS records and so cannot be deleted. Delete all non-default records and try again.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the calculated check",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${calc}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id ${calc} does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		},
+		{
+			"name": "clean up the HTTP check",
+			"service": "route53",
+			"method": "DELETE",
+			"path": "/2013-04-01/healthcheck/${http}",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "text/xml"
+				},
+				"body": "<?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>NoSuchHealthCheck</Code><Message>A health check with id ${http} does not exist.</Message></Error><RequestId>x-x-x-x-x</RequestId></ErrorResponse>"
+			}
+		}
+	]
+}

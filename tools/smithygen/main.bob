@@ -227,7 +227,8 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 	["com.amazonaws.lambda#AWSGirApiService", 403, "AccessDeniedException", "reasoned"],
 	["com.amazonaws.sfn#AWSStepFunctions", 400, "AccessDeniedException", "linked"],
 	["com.amazonaws.firehose#Firehose_20150804", 400, "AccessDeniedException", "reasoned"],
-	["com.amazonaws.acm#CertificateManager", 400, "AccessDeniedException", "reasoned"]]
+	["com.amazonaws.acm#CertificateManager", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.route53#AWSDnsV20130401", 403, "AccessDenied", "reasoned"]]
 
 /// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
 /// with an error of the service's own.
@@ -279,7 +280,8 @@ const unions: [string, [string, string, string][]][] = [["com.amazonaws.dynamodb
 	"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"]]]]
 
 /// What the services below answer that their models lack, as AWS did on 2026-11-23: by their shape ids, shapes of
-/// Smithy's JSON AST, whose members are added to the model's shape of an id, or which are added to it if it has none.
+/// Smithy's JSON AST, whose members are added to the model's shape of an id, replacing those of the same names, or which
+/// are added to it if it has none.
 const amendments: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_20140328",
 	`{"shapes": {
 	"com.amazonaws.cloudwatchlogs#OutputLogEvent": {"type": "structure", "members": {
@@ -295,7 +297,15 @@ const amendments: [string, string][] = [["com.amazonaws.cloudwatchlogs#Logs_2014
 		"Answered": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Policy"}}}},
 	"com.amazonaws.iam#PolicySourceType": {"type": "enum", "members": {
 		"IAMPolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "IAM Policy"}},
-		"ResourcePolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Resource Policy"}}}}}}`]]
+		"ResourcePolicy": {"target": "smithy.api#Unit", "traits": {"smithy.api#enumValue": "Resource Policy"}}}}}}`],
+	["com.amazonaws.route53#AWSDnsV20130401",
+	`{"shapes": {
+	"com.amazonaws.route53#GetHostedZoneResponse": {"type": "structure", "members": {
+		"HostedZoneDeletionProtectionEnabled": {"target": "smithy.api#Boolean"}}},
+	"com.amazonaws.route53#ListHostedZonesResponse": {"type": "structure", "members": {
+		"Marker": {"target": "com.amazonaws.route53#PageMarker"}}},
+	"com.amazonaws.route53#ListHealthChecksResponse": {"type": "structure", "members": {
+		"Marker": {"target": "com.amazonaws.route53#PageMarker"}}}}}`]]
 
 /// The members of the services below whose models' constraints AWS does not check, by their shape ids: their
 /// handlers answer as AWS does.
@@ -577,7 +587,14 @@ class Generator {
 				if (s == null) {
 					this.model.shapes.push([sid, added])
 				} else {
-					s[1].members.append(added.members)
+					for (const m of added.members) {
+						const same = s[1].members.find(n => n[0] == m[0])
+						if (same == null) {
+							s[1].members.push(m)
+						} else {
+							same[1] = m[1]
+						}
+					}
 				}
 			}
 		} catch (e: ParseError) {

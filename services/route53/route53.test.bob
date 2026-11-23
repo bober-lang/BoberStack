@@ -58,6 +58,7 @@ test "a zone, its records and its deletion" {
 		batch([["CREATE", a("WWW.example.test", "192.0.2.1")], ["CREATE", a("b.a.example.test", "192.0.2.2")],
 		["CREATE", a("*.example.test", "192.0.2.3")]]))
 	assert changed.status == 200
+	assert text(call(g, "GET", text(changed, "Id")!), "Status") == "PENDING"
 	assert text(call(g, "GET", text(changed, "Id")!), "Status") == "INSYNC"
 	const names = texts(call(g, "GET", `${id}/rrset`), "Name")
 	assert names == ["example.test.", "example.test.", "\\052.example.test.", "b.a.example.test.", "www.example.test."]
@@ -108,4 +109,20 @@ test "tags of a zone" {
 	assert call(g, "POST", `/tags/hostedzone/${bare}`, change).status == 200
 	const listed = call(g, "GET", `/tags/hostedzone/${bare}`)
 	assert texts(listed, "Key") == ["team"] && texts(listed, "Value") == ["dns"]
+}
+
+test "a health check's update resets only the elements named" {
+	const g = stack(new Catalog(0, 0))
+	const made = call(g, "POST", "/healthcheck",
+		`<CreateHealthCheckRequest xmlns="${ns}"><CallerReference>h1`
+		+ "</CallerReference><HealthCheckConfig><Type>HTTP</Type><ResourcePath>/up</ResourcePath>"
+		+ "<FullyQualifiedDomainName>example.com</FullyQualifiedDomainName></HealthCheckConfig></CreateHealthCheckRequest>")
+	assert made.status == 201 && text(made, "Port") == "80" && text(made, "EnableSNI") == "false"
+	const id = text(made, "Id")!
+	const updated = call(g, "POST", `/healthcheck/${id}`,
+		`<UpdateHealthCheckRequest xmlns="${ns}"><ResetElements>`
+		+ "<ResettableElementName>ResourcePath</ResettableElementName></ResetElements></UpdateHealthCheckRequest>")
+	assert updated.status == 200 && text(updated, "HealthCheckVersion") == "2"
+	assert text(updated, "ResourcePath") == null && text(updated, "FullyQualifiedDomainName") == "example.com"
+	assert texts(call(g, "GET", `/healthcheck/${id}/status`), "Status").length == 8
 }

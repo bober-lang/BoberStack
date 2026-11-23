@@ -2,22 +2,28 @@
 //!
 //! Route 53 is global: requests are signed for us-east-1 and its state is in the account's tree. A zone is made with
 //! its NS and SOA record sets and a delegation set of four name servers, one of each of AWS's top-level domains. A
-//! change is answered PENDING, as AWS answers it, and is INSYNC from then on: nothing runs between requests, so there
-//! is no propagation to wait for. There is no DNS server: record sets are stored and validated, never served, and
+//! change is answered PENDING, as AWS answers it, and so to its first GetChange, as AWS answers one right after it; it
+//! is INSYNC from then on, where AWS's takes some seconds: nothing runs between requests, and nothing propagates. There is no DNS server: record sets are stored and validated, never served, and
 //! routing policies, alias targets and health checks route nothing. Private zones take any VPC id, which AWS checks
 //! with EC2. A request's XML is decoded by the model, not by Route 53's schema: an element out of order is taken, and a
 //! missing one is answered by the model's validation, not by the schema's message; validation names the model's
-//! members, where AWS names some otherwise, as resourceId for an Id. Health checks, delegation sets, traffic policies,
-//! DNSSEC, query logging and the rest are not implemented.
+//! members, where AWS names some otherwise, as resourceId for an Id.
+//!
+//! Health checks are stored and validated as AWS validates them, never checked: every checker of an endpoint reports
+//! success, and none a last failure. A record set may name a health check that does not exist, and a health check
+//! may be deleted while a record set names it, as AWS allows. Health checks of a CloudWatch alarm or a recovery
+//! control, delegation sets, traffic policies, DNSSEC, query logging and the rest are not implemented.
 
 import { Fault } from "../../core/fault"
+import * as rest from "../../core/protocol/rest"
 import * as restxml from "../../core/protocol/restxml"
 import { Caller } from "../../core/service"
 import * as api from "./api"
-import { Alias, Change, Record, Reference, Tables, Zone } from "./records"
+import { Alias, Change, Check, CheckReference, Record, Reference, Tables, Zone } from "./records"
 import { endsWith, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
 import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
 import { encode, EncodeError } from "std/encoding/json"
 import { Body, Request, Response } from "std/http"
 import { min } from "std/math"
@@ -89,6 +95,7 @@ export class Handler {
 		if (z.isPrivate) {
 			out.VPCs = z.vpcs.map(v => vpc(v))
 		}
+		out.HostedZoneDeletionProtectionEnabled = false
 		return out
 	}
 
@@ -107,7 +114,7 @@ export class Handler {
 			|| z.id >= input.Marker!).filter(z => input.HostedZoneType == null || z.isPrivate)
 		const out = new api.ListHostedZonesResponse()
 		out.HostedZones = zs.slice(0, min(max, zs.length)).map(z => zoneOf(z))
-		out.Marker = input.Marker ?? ""
+		out.Marker = input.Marker
 		out.MaxItems = max
 		if (zs.length > max) {
 			out.IsTruncated = true
@@ -243,8 +250,7 @@ export class Handler {
 			}
 		}
 		if (errors.length > 0) {
-			// of no members: the generated fault would write an empty structure into the error
-			throw new Fault(400, "InvalidChangeBatch", `[${errors.join(", ")}]`)
+			throw api.invalidChangeBatch(`[${errors.join(", ")}]`)
 		}
 		put(t, z)
 		const out = new api.ChangeResourceRecordSetsResponse()
@@ -281,37 +287,56 @@ export class Handler {
 
 	getChange(caller: Caller, input: api.GetChangeRequest): api.GetChangeResponse throws Fault {
 		caller.allow(`arn:aws:route53:::change/${input.Id}`)
-		const c = new Tables(caller.store()).changes.get(input.Id)
+		const t = new Tables(caller.store())
+		const c = t.changes.get(input.Id)
 		if (c == null) {
 			throw api.noSuchChange(`Could not find resource with ID: ${input.Id}`)
 		}
 		const out = new api.GetChangeResponse()
 		out.ChangeInfo = info(c!)
-		out.ChangeInfo.Status = "INSYNC"
+		if (c!.read) {
+			out.ChangeInfo.Status = "INSYNC"
+		} else {
+			c!.read = true
+			try {
+				t.changes.put(c!.id, c!)
+			} catch (e: EncodeError) {
+				throw new Fault(500, "InternalFailure", `${e}`)
+			}
+		}
 		return out
 	}
 
 	changeTagsForResource(caller: Caller,
 		input: api.ChangeTagsForResourceRequest): api.ChangeTagsForResourceResponse throws Fault {
 		const t = new Tables(caller.store())
-		const z = tagged(caller, t, input.ResourceType, input.ResourceId)
 		const removed = input.RemoveTagKeys ?? []
-		let tags = z.tags.filter(g => !removed.includes(g[0]))
-		for (const g of input.AddTags ?? []) {
-			const k = g.Key ?? ""
-			tags = tags.filter(h => h[0] != k)
-			tags.push([k, g.Value ?? ""])
+		const retag = (old: [string, string][]): [string, string][] => {
+			let tags = old.filter(g => !removed.includes(g[0]))
+			for (const g of input.AddTags ?? []) {
+				const k = g.Key ?? ""
+				tags = tags.filter(h => h[0] != k)
+				tags.push([k, g.Value ?? ""])
+			}
+			return tags
 		}
-		z.tags = tags
-		put(t, z)
+		if (input.ResourceType == "healthcheck") {
+			caller.allow(checkArn(input.ResourceId))
+			const c = check(t, input.ResourceId)
+			c.tags = retag(c.tags)
+			keep(t, c)
+		} else {
+			const z = tagged(caller, t, input.ResourceType, input.ResourceId)
+			z.tags = retag(z.tags)
+			put(t, z)
+		}
 		return new api.ChangeTagsForResourceResponse()
 	}
 
 	listTagsForResource(caller: Caller,
 		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
-		const z = tagged(caller, new Tables(caller.store()), input.ResourceType, input.ResourceId)
 		const out = new api.ListTagsForResourceResponse()
-		out.ResourceTagSet = tagSet(input.ResourceType, z)
+		out.ResourceTagSet = tagSet(caller, new Tables(caller.store()), input.ResourceType, input.ResourceId)
 		return out
 	}
 
@@ -320,15 +345,153 @@ export class Handler {
 		const t = new Tables(caller.store())
 		const out = new api.ListTagsForResourcesResponse()
 		for (const r of input.ResourceIds) {
-			out.ResourceTagSets.push(tagSet(input.ResourceType, tagged(caller, t, input.ResourceType, r)))
+			out.ResourceTagSets.push(tagSet(caller, t, input.ResourceType, r))
 		}
 		return out
 	}
+
+	createHealthCheck(caller: Caller, input: api.CreateHealthCheckRequest): api.CreateHealthCheckResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const config = configured(t, input.HealthCheckConfig)
+		const made = t.checkReferences.get(input.CallerReference)
+		if (made != null) {
+			const c = t.checks.get(made!.check)
+			if (c == null || !alike(c!.config, config)) {
+				throw api.healthCheckAlreadyExists("A different health check has already been created with the specified "
+					+ "caller reference. If that health check has been deleted, Route 53 will still maintain the caller "
+					+ "reference for a number of days.")
+			}
+			return created(caller, c!)
+		}
+		const c = new Check()
+		c.id = uuid()
+		c.reference = input.CallerReference
+		c.config = config
+		keep(t, c)
+		const r = new CheckReference()
+		r.check = c.id
+		try {
+			t.checkReferences.put(input.CallerReference, r)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `${e}`)
+		}
+		return created(caller, c)
+	}
+
+	getHealthCheck(caller: Caller, input: api.GetHealthCheckRequest): api.GetHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const out = new api.GetHealthCheckResponse()
+		out.HealthCheck = checkOf(check(new Tables(caller.store()), input.HealthCheckId))
+		return out
+	}
+
+	getHealthCheckCount(caller: Caller,
+		input: api.GetHealthCheckCountRequest): api.GetHealthCheckCountResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetHealthCheckCountResponse()
+		out.HealthCheckCount = checks(new Tables(caller.store())).length
+		return out
+	}
+
+	listHealthChecks(caller: Caller, input: api.ListHealthChecksRequest): api.ListHealthChecksResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const cs = checks(new Tables(caller.store())).filter(c => input.Marker == null || c.id >= input.Marker!)
+		const out = new api.ListHealthChecksResponse()
+		out.HealthChecks = cs.slice(0, min(max, cs.length)).map(c => checkOf(c))
+		out.Marker = input.Marker
+		out.MaxItems = max
+		if (cs.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = cs[max].id
+		}
+		return out
+	}
+
+	updateHealthCheck(caller: Caller, input: api.UpdateHealthCheckRequest): api.UpdateHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const t = new Tables(caller.store())
+		const c = check(t, input.HealthCheckId)
+		if (input.HealthCheckVersion != null && input.HealthCheckVersion! != c.version) {
+			throw api.healthCheckVersionMismatch(`Health check with id ${c.id} has version ${c.version}, but expected to `
+				+ `have version ${input.HealthCheckVersion!}. Could not proceed with update.`)
+		}
+		const k = c.config
+		for (const e of input.ResetElements ?? []) {
+			switch (e) {
+				case "FullyQualifiedDomainName": k.FullyQualifiedDomainName = null
+				case "Regions": k.Regions = null
+				case "ResourcePath": k.ResourcePath = null
+				case "ChildHealthChecks": k.ChildHealthChecks = []
+			}
+		}
+		k.IPAddress = input.IPAddress ?? k.IPAddress
+		k.Port = input.Port ?? k.Port
+		k.ResourcePath = input.ResourcePath ?? k.ResourcePath
+		k.FullyQualifiedDomainName = input.FullyQualifiedDomainName ?? k.FullyQualifiedDomainName
+		k.SearchString = input.SearchString ?? k.SearchString
+		k.FailureThreshold = input.FailureThreshold ?? k.FailureThreshold
+		k.Inverted = input.Inverted ?? k.Inverted
+		k.Disabled = input.Disabled ?? k.Disabled
+		k.HealthThreshold = input.HealthThreshold ?? k.HealthThreshold
+		k.ChildHealthChecks = input.ChildHealthChecks ?? k.ChildHealthChecks
+		k.EnableSNI = input.EnableSNI ?? k.EnableSNI
+		k.Regions = input.Regions ?? k.Regions
+		k.AlarmIdentifier = input.AlarmIdentifier ?? k.AlarmIdentifier
+		k.InsufficientDataHealthStatus = input.InsufficientDataHealthStatus ?? k.InsufficientDataHealthStatus
+		c.config = configured(t, k)
+		c.version++
+		keep(t, c)
+		const out = new api.UpdateHealthCheckResponse()
+		out.HealthCheck = checkOf(c)
+		return out
+	}
+
+	deleteHealthCheck(caller: Caller, input: api.DeleteHealthCheckRequest): api.DeleteHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const t = new Tables(caller.store())
+		t.checks.delete(check(t, input.HealthCheckId).id)
+		return new api.DeleteHealthCheckResponse()
+	}
+
+	getHealthCheckStatus(caller: Caller,
+		input: api.GetHealthCheckStatusRequest): api.GetHealthCheckStatusResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const k = checked(check(new Tables(caller.store()), input.HealthCheckId))
+		const out = new api.GetHealthCheckStatusResponse()
+		const regions: api.HealthCheckRegion[] = ["us-east-1", "us-west-1", "us-west-2", "eu-west-1", "ap-southeast-1",
+			"ap-southeast-2", "ap-northeast-1", "sa-east-1"]
+		out.HealthCheckObservations = (k.Regions ?? regions).map(r => {
+			const o = new api.HealthCheckObservation()
+			o.Region = r
+			const s = new api.StatusReport()
+			s.Status = if (k.Type == "TCP") "Success: TCP connection established"
+				else "Success: HTTP Status Code 200, OK"
+			s.CheckedTime = now()
+			o.StatusReport = s
+			return o
+		})
+		return out
+	}
+
+	getHealthCheckLastFailureReason(caller: Caller,
+		input: api.GetHealthCheckLastFailureReasonRequest): api.GetHealthCheckLastFailureReasonResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		checked(check(new Tables(caller.store()), input.HealthCheckId))
+		return new api.GetHealthCheckLastFailureReasonResponse()
+	}
 }
 
-/// Serves req to h, answering in text/xml, as Route 53 does.
+/// Serves req to h, answering in text/xml, as Route 53 does, an output of no members as an empty element of its name.
 export function serve(h: Handler, caller: Caller, req: Request): Response throws IoError {
-	return typed(api.handle(h, caller, req))
+	const res = api.handle(h, caller, req)
+	if (res.status == 200 && !res.headers.has("content-type")) {
+		const op = rest.routed(req, api.routes)[0]
+		res.body = new Body(`<?xml version="1.0"?>\n<${op}Response xmlns="${api.service.ns}"></${op}Response>`)
+		res.headers.set("content-type", "text/xml")
+	}
+	return typed(res)
 }
 
 /// The answer of the fault f to the request requestId, as Route 53 words it.
@@ -379,12 +542,22 @@ function notImplementedTags(kind: string): Fault {
 	return new Fault(501, "NotImplemented", `Tags of a ${kind} are not implemented`)
 }
 
-/// The tags of z, of kind, as the API gives them.
-function tagSet(kind: api.TagResourceType, z: Zone): api.ResourceTagSet {
+/// The tags of the resource id, of kind, as the API gives them, after the caller may read them.
+function tagSet(caller: Caller, t: Tables, kind: api.TagResourceType, id: string): api.ResourceTagSet throws Fault {
 	const s = new api.ResourceTagSet()
 	s.ResourceType = kind
-	s.ResourceId = z.id
-	s.Tags = z.tags.map(g => {
+	let tags: [string, string][] = []
+	if (kind == "healthcheck") {
+		caller.allow(checkArn(id))
+		const c = check(t, id)
+		s.ResourceId = c.id
+		tags = c.tags
+	} else {
+		const z = tagged(caller, t, kind, id)
+		s.ResourceId = z.id
+		tags = z.tags
+	}
+	s.Tags = tags.map(g => {
 		const tag = new api.Tag()
 		tag.Key = g[0]
 		tag.Value = g[1]
@@ -681,9 +854,16 @@ function equal(a: Record, b: Record): bool {
 	}
 }
 
+/// The record set r as an InvalidChangeBatch names it: its name, type, set identifier and health check.
+function identified(r: Record): string {
+	return `[name='${r.name}', type='${r.type}'`
+		+ (if (r.setIdentifier == null) "" else `, set-identifier='${r.setIdentifier!}'`)
+		+ (if (r.healthCheck == null) "" else `, health check='${r.healthCheck!}'`) + "]"
+}
+
 /// Applies the action to r in z; or why it cannot, as AWS words it in an InvalidChangeBatch, z then as it was.
 function apply(z: Zone, action: api.ChangeAction, r: Record): string | null {
-	const named = `[name='${r.name}', type='${r.type}']`
+	const named = identified(r)
 	if (r.name != z.name && !endsWith(r.name, `.${z.name}`)) {
 		return `RRSet with DNS name ${r.name} is not permitted in zone ${z.name}`
 	}
@@ -712,7 +892,7 @@ function apply(z: Zone, action: api.ChangeAction, r: Record): string | null {
 		return null
 	}
 	if (action == "CREATE" && there != null) {
-		return `Tried to create resource record set ${named} but it already exists`
+		return `Tried to create resource record set ${identified(there!)} but it already exists`
 	}
 	if (r.type == "CNAME" && r.name == z.name) {
 		return `RRSet of type CNAME with DNS name ${r.name} is not permitted at apex in zone ${z.name}`
@@ -745,4 +925,134 @@ function parseIntOr(p: string): i32 {
 	} catch (e: ParseError) {
 		return -1
 	}
+}
+
+/// The ARN of the health check of id.
+function checkArn(id: string): string { return `arn:aws:route53:::healthcheck/${id}` }
+
+/// The health check of id, else NoSuchHealthCheck.
+function check(t: Tables, id: string): Check throws Fault {
+	const c = t.checks.get(id)
+	if (c == null) {
+		throw api.noSuchHealthCheck(`A health check with id ${id} does not exist.`)
+	}
+	return c!
+}
+
+/// Stores c.
+function keep(t: Tables, c: Check) throws Fault {
+	try {
+		t.checks.put(c.id, c)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `${e}`)
+	}
+}
+
+/// Every health check, by id.
+function checks(t: Tables): Check[] { return t.checks.scan(null, 1000000).map(e => e[1]) }
+
+/// The answer of a CreateHealthCheck that made c, or made it before.
+function created(caller: Caller, c: Check): api.CreateHealthCheckResponse {
+	const out = new api.CreateHealthCheckResponse()
+	out.HealthCheck = checkOf(c)
+	out.Location = `${caller.endpoint}/2013-04-01/healthcheck/${c.id}`
+	return out
+}
+
+/// The health check c as the API gives it.
+function checkOf(c: Check): api.HealthCheck {
+	const h = new api.HealthCheck()
+	h.Id = c.id
+	h.CallerReference = c.reference
+	h.HealthCheckConfig = c.config
+	h.HealthCheckVersion = c.version
+	return h
+}
+
+/// Whether a and b are the same config.
+function alike(a: api.HealthCheckConfig, b: api.HealthCheckConfig): bool {
+	try {
+		return encode(a) == encode(b)
+	} catch (e: EncodeError) {
+		return false
+	}
+}
+
+/// k validated as AWS validates a health check of its type, AWS's defaults filled in: an endpoint's of an address
+/// that is not forbidden or a name, and a port; a calculated one's of children that exist.
+function configured(t: Tables, k: api.HealthCheckConfig): api.HealthCheckConfig throws Fault {
+	k.Inverted = k.Inverted ?? false
+	k.Disabled = k.Disabled ?? false
+	if (k.Type == "CALCULATED") {
+		k.ChildHealthChecks = k.ChildHealthChecks ?? []
+		const missing = k.ChildHealthChecks!.filter(id => t.checks.get(id) == null)
+		if (missing.length > 0) {
+			throw api.invalidInput("Invalid parameter : Child health check IDs do not exist or are deleted: "
+				+ missing.join(", "))
+		}
+		return k
+	}
+	if (k.Type == "CLOUDWATCH_METRIC" || k.Type == "RECOVERY_CONTROL") {
+		throw new Fault(501, "NotImplemented", `Health checks of type ${k.Type} are not implemented`)
+	}
+	if (k.IPAddress == null && k.FullyQualifiedDomainName == null) {
+		throw api.invalidInput("Invalid parameter : IP address and fully qualified domain name can not be both empty.")
+	}
+	if (k.IPAddress != null && forbidden(k.IPAddress!)) {
+		throw api.invalidInput(`IPv4 address ${k.IPAddress!} is forbidden`)
+	}
+	const secure = k.Type == "HTTPS" || k.Type == "HTTPS_STR_MATCH"
+	if (k.Port == null) {
+		if (k.Type == "TCP") {
+			throw api.invalidInput("TCP health checks must specify a port")
+		}
+		k.Port = if (secure) 443 else 80
+	}
+	k.RequestInterval = k.RequestInterval ?? 30
+	if (k.RequestInterval! != 10 && k.RequestInterval! != 30) {
+		throw api.invalidInput(`Value '${k.RequestInterval!}' is not facet-valid with respect to enumeration '[10, 30]'. `
+			+ "It must be a value from the enumeration.")
+	}
+	k.FailureThreshold = k.FailureThreshold ?? 3
+	k.MeasureLatency = k.MeasureLatency ?? false
+	k.EnableSNI = k.EnableSNI ?? secure
+	return k
+}
+
+/// Whether v is an IPv4 address that Route 53 does not check: of a local, private, documentation, link-local or
+/// multicast range.
+function forbidden(v: string): bool {
+	if (!ipv4(v)) {
+		return false
+	}
+	const p = split(v, ".").map(s => parseIntOr(s))
+	const [a, b, c] = [p[0], p[1], p[2]]
+	return a == 0 || a == 10 || a == 127 || a >= 224 || a == 169 && b == 254 || a == 172 && b >= 16 && b < 32
+		|| a == 192 && b == 168 || a == 192 && b == 0 && c == 2 || a == 198 && b == 51 && c == 100
+		|| a == 203 && b == 0 && c == 113
+}
+
+/// The config of c, whose status a checker reports, else InvalidInput, as AWS answers of a calculated or disabled one.
+function checked(c: Check): api.HealthCheckConfig throws Fault {
+	if (c.config.Type == "CALCULATED") {
+		throw api.invalidInput("Invalid parameter : To get the status of a calculated health check, use either the "
+			+ "Route 53 console or the CloudWatch console. The GetHealthCheckStatus action can't return the health of "
+			+ "calculated health checks.")
+	}
+	if (c.config.Disabled ?? false) {
+		throw api.invalidInput("Invalid parameter : The specified health check has a special status of always healthy. "
+			+ "GetHealthCheckStatus can't return the status of one of these special health checks.")
+	}
+	return c.config
+}
+
+/// A random UUID, as a health check's id.
+function uuid(): string throws Fault {
+	let h = ""
+	try {
+		h = hex.encode(bytes(16))
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
 }
