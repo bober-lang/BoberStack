@@ -355,3 +355,102 @@ test "a configuration set keeps the options put to it" {
 		&& has(c, `"CustomRedirectDomain":"t.example.com"`)
 	assert callV2(g, "PUT", "/v2/email/configuration-sets/d/sending", `{"SendingEnabled": false}`).status == 404
 }
+
+test "contact lists, their contacts, and a send to a list's topic skips who opted out" {
+	const g = stack(new Catalog(0, 0))
+	assert callV2(g, "POST", "/v2/email/contact-lists",
+		`{"ContactListName": "l", "Topics": [{"TopicName": "news", "DisplayName": "News", `
+		+ `"DefaultSubscriptionStatus": "OPT_IN"}, {"TopicName": "ads", "DisplayName": "Ads", `
+		+ `"DefaultSubscriptionStatus": "OPT_OUT"}]}`).status == 200
+	assert callV2(g, "POST", "/v2/email/contact-lists", `{"ContactListName": "l"}`).status == 400
+	assert callV2(g, "POST", "/v2/email/contact-lists", `{"ContactListName": "m"}`).status == 400
+	assert has(callV2(g, "GET", "/v2/email/contact-lists/l"), `"TopicName":"ads"`)
+	assert has(callV2(g, "GET", "/v2/email/contact-lists"), `"ContactListName":"l"`)
+	assert callV2(g, "POST", "/v2/email/contact-lists/l/contacts",
+		`{"EmailAddress": "b@x.net", "TopicPreferences": [{"TopicName": "news", "SubscriptionStatus": "OPT_OUT"}]}`).status
+		== 200
+	callV2(g, "POST", "/v2/email/contact-lists/l/contacts", `{"EmailAddress": "a@x.net"}`)
+	callV2(g, "POST", "/v2/email/contact-lists/l/contacts", `{"EmailAddress": "c@x.net", "UnsubscribeAll": true}`)
+	const b = callV2(g, "GET", "/v2/email/contact-lists/l/contacts/b@x.net")
+	assert has(b, `"TopicPreferences":[{"TopicName":"news","SubscriptionStatus":"OPT_OUT"}]`)
+		&& has(b, `"TopicDefaultPreferences":[{"TopicName":"news","SubscriptionStatus":"OPT_IN"}`)
+	const out = callV2(g, "POST", "/v2/email/contact-lists/l/contacts/list",
+		`{"Filter": {"FilteredStatus": "OPT_OUT", "TopicFilter": {"TopicName": "news"}}}`)
+	assert has(out, "b@x.net") && !has(out, "a@x.net")
+	const page = callV2(g, "POST", "/v2/email/contact-lists/l/contacts/list", `{"PageSize": 2}`)
+	assert has(page, "a@x.net") && has(page, "b@x.net") && !has(page, "c@x.net") && has(page, `"NextToken"`)
+	call(g, "VerifyDomainIdentity", [["Domain", "example.com"]])
+	assert callV2(g, "POST", "/v2/email/outbound-emails",
+		`{"FromEmailAddress": "s@example.com", "Destination": {"ToAddresses": ["a@x.net", "b@x.net", "c@x.net"]}, `
+		+ `"Content": {"Simple": {"Subject": {"Data": "S"}, "Body": {"Text": {"Data": "B"}}}}, `
+		+ `"ListManagementOptions": {"ContactListName": "l", "TopicName": "news"}}`).status == 200
+	const stored = internal(g, "GET", "/_aws/ses")
+	assert has(stored, `"ToAddresses":["a@x.net"]`)
+	assert callV2(g, "PUT", "/v2/email/contact-lists/l/contacts/b@x.net", `{"UnsubscribeAll": true}`).status == 200
+	assert has(callV2(g, "GET", "/v2/email/contact-lists/l/contacts/b@x.net"), `"UnsubscribeAll":true`)
+	assert callV2(g, "DELETE", "/v2/email/contact-lists/l/contacts/b@x.net").status == 200
+	assert callV2(g, "GET", "/v2/email/contact-lists/l/contacts/b@x.net").status == 404
+	assert callV2(g, "DELETE", "/v2/email/contact-lists/l").status == 200
+	assert callV2(g, "GET", "/v2/email/contact-lists/l").status == 404
+}
+
+test "an identity made with a DKIM key of its own and a configuration set" {
+	const g = stack(new Catalog(0, 0))
+	const body = `{"EmailIdentity": "own.example", "ConfigurationSetName": "c", "DkimSigningAttributes": `
+		+ `{"DomainSigningSelector": "sel", "DomainSigningPrivateKey": "a2V5"}}`
+	assert callV2(g, "POST", "/v2/email/identities", body).status == 404
+	callV2(g, "POST", "/v2/email/configuration-sets", `{"ConfigurationSetName": "c"}`)
+	const made = callV2(g, "POST", "/v2/email/identities", body)
+	assert made.status == 200 && has(made, `"SigningAttributesOrigin":"EXTERNAL"`) && has(made, `"Tokens":["sel"]`)
+	assert has(callV2(g, "GET", "/v2/email/identities/own.example"), `"ConfigurationSetName":"c"`)
+}
+
+test "receipt rule sets, their rules in order, the active one, and receipt filters" {
+	const g = stack(new Catalog(0, 0))
+	assert call(g, "CreateReceiptRuleSet", [["RuleSetName", "s"]]).status == 200
+	assert text(call(g, "CreateReceiptRuleSet", [["RuleSetName", "s"]]), "Code") == "AlreadyExists"
+	call(g, "CreateReceiptRule",
+		[["RuleSetName", "s"], ["Rule.Name", "b"], ["Rule.Enabled", "true"],
+		["Rule.Actions.member.1.StopAction.Scope", "RuleSet"]])
+	call(g, "CreateReceiptRule", [["RuleSetName", "s"], ["Rule.Name", "a"]])
+	call(g, "CreateReceiptRule", [["RuleSetName", "s"], ["Rule.Name", "c"], ["After", "a"]])
+	const missing = call(g, "CreateReceiptRule", [["RuleSetName", "s"], ["Rule.Name", "d"], ["After", "x"]])
+	assert text(missing, "Code") == "RuleDoesNotExist" && text(missing, "Message") == "Rule does not exist: x"
+	const order = (): string => {
+		const d = call(g, "DescribeReceiptRuleSet", [["RuleSetName", "s"]]).body.whole ?? ""
+		return [indexOf(d, "<Name>a</Name>"), indexOf(d, "<Name>b</Name>"),
+			indexOf(d, "<Name>c</Name>")].map(i => `${i}`).join(",")
+	}
+	const before = call(g, "DescribeReceiptRuleSet", [["RuleSetName", "s"]]).body.whole ?? ""
+	assert indexOf(before, "<Name>a</Name>") < indexOf(before, "<Name>c</Name>")
+		&& indexOf(before, "<Name>c</Name>") < indexOf(before, "<Name>b</Name>")
+	assert has(call(g, "DescribeReceiptRule", [["RuleSetName", "s"], ["RuleName", "b"]]), "<Scope>RuleSet</Scope>")
+	call(g, "ReorderReceiptRuleSet",
+		[["RuleSetName", "s"], ["RuleNames.member.1", "b"], ["RuleNames.member.2", "c"], ["RuleNames.member.3", "a"]])
+	const reordered = order()
+	call(g, "SetReceiptRulePosition", [["RuleSetName", "s"], ["RuleName", "a"]])
+	assert order() != reordered
+	const moved = call(g, "DescribeReceiptRuleSet", [["RuleSetName", "s"]]).body.whole ?? ""
+	assert indexOf(moved, "<Name>a</Name>") < indexOf(moved, "<Name>b</Name>")
+		&& indexOf(moved, "<Name>b</Name>") < indexOf(moved, "<Name>c</Name>")
+	call(g, "UpdateReceiptRule", [["RuleSetName", "s"], ["Rule.Name", "b"], ["Rule.ScanEnabled", "true"]])
+	assert has(call(g, "DescribeReceiptRule", [["RuleSetName", "s"], ["RuleName", "b"]]),
+		"<ScanEnabled>true</ScanEnabled>")
+	call(g, "CloneReceiptRuleSet", [["RuleSetName", "t"], ["OriginalRuleSetName", "s"]])
+	assert has(call(g, "DescribeReceiptRuleSet", [["RuleSetName", "t"]]), "<Name>c</Name>")
+	assert has(call(g, "ListReceiptRuleSets"), "<Name>t</Name>")
+	call(g, "SetActiveReceiptRuleSet", [["RuleSetName", "s"]])
+	assert has(call(g, "DescribeActiveReceiptRuleSet"), "<Name>s</Name>")
+	assert text(call(g, "DeleteReceiptRuleSet", [["RuleSetName", "s"]]), "Code") == "CannotDelete"
+	call(g, "DeleteReceiptRule", [["RuleSetName", "s"], ["RuleName", "b"]])
+	assert text(call(g, "DescribeReceiptRule", [["RuleSetName", "s"], ["RuleName", "b"]]), "Code") == "RuleDoesNotExist"
+	call(g, "SetActiveReceiptRuleSet")
+	assert !has(call(g, "DescribeActiveReceiptRuleSet"), "<Metadata>")
+	assert call(g, "DeleteReceiptRuleSet", [["RuleSetName", "s"]]).status == 200
+	assert text(call(g, "DescribeReceiptRuleSet", [["RuleSetName", "s"]]), "Code") == "RuleSetDoesNotExist"
+	call(g, "CreateReceiptFilter",
+		[["Filter.Name", "f"], ["Filter.IpFilter.Policy", "Allow"], ["Filter.IpFilter.Cidr", "10.0.0.0/8"]])
+	assert has(call(g, "ListReceiptFilters"), "<Cidr>10.0.0.0/8</Cidr>")
+	call(g, "DeleteReceiptFilter", [["FilterName", "f"]])
+	assert !has(call(g, "ListReceiptFilters"), "<Name>f</Name>")
+}

@@ -1,23 +1,28 @@
 //! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state: identities, their
 //! attributes and sending authorization policies, templates, configuration sets with their options and event
-//! destinations, tags, the account's settings and suppression list, and the messages sent.
+//! destinations, tags, the account's settings and suppression list, v2's contact list and its contacts, the classic
+//! API's receipt rule sets, rules and filters, and the messages sent.
 //!
 //! An identity is verified at once, as nobody can follow a verification mail's link: its verification and DKIM status
-//! are Success from its creation on, as is its MAIL FROM domain's. Nothing is sent anywhere: each message is stored, in
-//! its account's regional state, as LocalStack's /_aws/ses lists it (core/internal), and delivered, or bounced or
-//! complained of as the mailbox simulator's addresses ask, bounced if suppressed for a reason the account or its
-//! configuration set suppresses, as the notifications published inside the request to the identity's SNS topics and
-//! its configuration set's SNS event destinations tell. An account whose sending is paused is refused each send. A
-//! template's message is rendered when sent: one that cannot be, of data that is not JSON or lacks an attribute the
-//! template names, is accepted with a message id and then not sent, as AWS reports it by a rendering failure event, so
-//! it is not stored. Nothing is received: there are no receipt rules, nor contact lists.
+//! are Success from its creation on, as is its MAIL FROM domain's, with Easy DKIM's tokens or a key of its own. Nothing
+//! is sent anywhere: each message is stored, in its account's regional state, as LocalStack's /_aws/ses lists it
+//! (core/internal), and delivered, or bounced or complained of as the mailbox simulator's addresses ask, bounced if
+//! suppressed for a reason the account or its configuration set suppresses, as the notifications published inside the
+//! request to the identity's SNS topics and its configuration set's SNS event destinations tell. An account whose
+//! sending is paused is refused each send. A send naming a contact list and topic is not sent to its contacts
+//! unsubscribed from all of the list or from the topic, by their own preference or else the topic's default; an
+//! address that is no contact is sent to. A template's message is rendered when sent: one that cannot be, of data
+//! that is not JSON or lacks an attribute the template names, is accepted with a message id and then not sent, as AWS
+//! reports it by a rendering failure event, so it is not stored.
 //!
 //! Where AWS differs: first, the account has production access, out of its sandbox, so only the source is checked,
-//! by its address or its domain, never the recipients as AWS checks them in the sandbox. A rendered template's MIME
-//! message has no Date or Message-ID header; event destinations other than SNS are stored but nothing is published to
-//! them, nor are open, click or rendering failure events; the send statistics are empty; a configuration set's
-//! sending, delivery, reputation and tracking options are kept, not followed; a request to v2 that fails before it is
-//! routed is answered as the classic API answers it, but for a bad signature.
+//! by its address or its domain, never the recipients as AWS checks them in the sandbox. Nothing is received: receipt
+//! rules and filters are kept, the active rule set too, and none is followed. A rendered template's MIME message has no
+//! Date or Message-ID header, nor a list's unsubscribe headers; event destinations other than SNS are stored but
+//! nothing is published to them, nor are open, click or rendering failure events; the send statistics are empty, as
+//! are message insights and metrics, not implemented; a configuration set's sending, delivery, reputation and tracking
+//! options are kept, not followed; a request to v2 that fails before it is routed is answered as the classic API
+//! answers it, but for a bad signature.
 
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
@@ -51,6 +56,8 @@ class Identity {
 	tags: [string, string][] = []
 	/// DKIM signing turned off, though its tokens were given.
 	unsigned = false
+	/// The selector of a DKIM key of the owner's own (Easy DKIM's otherwise), its tokens none.
+	selector: string | null = null
 	mailFrom: string | null = null
 	/// What to do on the MAIL FROM domain's MX failure, of v1's names.
 	mxFailure = "UseDefaultValue"
@@ -91,6 +98,15 @@ class Account {
 	sending = true
 	/// The reasons the account's suppression list suppresses an address for.
 	reasons: string[] = ["BOUNCE", "COMPLAINT"]
+	/// The name of the active receipt rule set, null if none.
+	active: string | null = null
+}
+
+/// A receipt rule set, its rules in order.
+class RuleSet {
+	name = ""
+	created: i64 = 0
+	rules: api.ReceiptRule[] = []
 }
 
 /// An event destination, its event types and dimension sources as v2 names them; a target null if not given.
@@ -154,9 +170,33 @@ class Suppressed {
 	updated: i64 = 0
 }
 
+/// A contact on a contact list.
+class Contact {
+	address = ""
+	topics: v2.TopicPreference[] = []
+	unsubscribed = false
+	attributes: string | null = null
+	created: i64 = 0
+	updated: i64 = 0
+}
+
+/// A v2 contact list, with its contacts.
+class ContactList {
+	name = ""
+	description: string | null = null
+	topics: v2.Topic[] = []
+	tags: [string, string][] = []
+	created: i64 = 0
+	updated: i64 = 0
+	contacts: Contact[] = []
+}
+
 /// SES's state in an account's regional tree.
 class Tables {
 	account: Table[Account]
+	lists: Table[ContactList]
+	ruleSets: Table[RuleSet]
+	filters: Table[api.ReceiptFilter]
 	identities: Table[Identity]
 	suppressed: Table[Suppressed]
 	templates: Table[Template]
@@ -165,6 +205,9 @@ class Tables {
 
 	constructor(s: Store) {
 		this.account = new Table[Account](s, "ses.account")
+		this.lists = new Table[ContactList](s, "ses.lists")
+		this.ruleSets = new Table[RuleSet](s, "ses.ruleSets")
+		this.filters = new Table[api.ReceiptFilter](s, "ses.filters")
 		this.identities = new Table[Identity](s, "ses.identities")
 		this.suppressed = new Table[Suppressed](s, "ses.suppressed")
 		this.templates = new Table[Template](s, "ses.templates")
@@ -464,6 +507,149 @@ export class Handler {
 		return new api.DeleteTemplateResponse()
 	}
 
+	createReceiptRuleSet(caller: Caller,
+		input: api.CreateReceiptRuleSetRequest): api.CreateReceiptRuleSetResponse throws Fault {
+		newRuleSet(caller, input.RuleSetName, [])
+		return new api.CreateReceiptRuleSetResponse()
+	}
+
+	cloneReceiptRuleSet(caller: Caller,
+		input: api.CloneReceiptRuleSetRequest): api.CloneReceiptRuleSetResponse throws Fault {
+		newRuleSet(caller, input.RuleSetName, ruleSet(caller, input.OriginalRuleSetName).rules)
+		return new api.CloneReceiptRuleSetResponse()
+	}
+
+	describeReceiptRuleSet(caller: Caller,
+		input: api.DescribeReceiptRuleSetRequest): api.DescribeReceiptRuleSetResponse throws Fault {
+		const r = ruleSet(caller, input.RuleSetName)
+		return { ...new api.DescribeReceiptRuleSetResponse(), Metadata: metadata(r), Rules: r.rules }
+	}
+
+	describeActiveReceiptRuleSet(caller: Caller,
+		input: api.DescribeActiveReceiptRuleSetRequest): api.DescribeActiveReceiptRuleSetResponse throws Fault {
+		caller.allow("*")
+		const name = account(caller).active
+		const r = if (name == null) null else new Tables(caller.regional()).ruleSets.get(name!)
+		const o = new api.DescribeActiveReceiptRuleSetResponse()
+		if (r != null) {
+			o.Metadata = metadata(r!)
+			o.Rules = r!.rules
+		}
+		return o
+	}
+
+	setActiveReceiptRuleSet(caller: Caller,
+		input: api.SetActiveReceiptRuleSetRequest): api.SetActiveReceiptRuleSetResponse throws Fault {
+		const name = input.RuleSetName
+		if (name != null) {
+			ruleSet(caller, name!)
+		}
+		changeAccount(caller, a => {
+			a.active = name
+		})
+		return new api.SetActiveReceiptRuleSetResponse()
+	}
+
+	listReceiptRuleSets(caller: Caller,
+		input: api.ListReceiptRuleSetsRequest): api.ListReceiptRuleSetsResponse throws Fault {
+		caller.allow("*")
+		const all = keyed(new Tables(caller.regional()).ruleSets.scan(null, 1000000).map(e => e[1]), r => r.name)
+		const [items, next] = paged(all, input.NextToken, 100, "NextToken", false)
+		return { ...new api.ListReceiptRuleSetsResponse(), RuleSets: items.map(metadata), NextToken: next }
+	}
+
+	deleteReceiptRuleSet(caller: Caller,
+		input: api.DeleteReceiptRuleSetRequest): api.DeleteReceiptRuleSetResponse throws Fault {
+		const name = input.RuleSetName
+		if (account(caller).active == name) {
+			throw api.cannotDeleteException(`Cannot delete active rule set: ${name}`)
+		}
+		new Tables(caller.regional()).ruleSets.delete(name)
+		return new api.DeleteReceiptRuleSetResponse()
+	}
+
+	createReceiptRule(caller: Caller, input: api.CreateReceiptRuleRequest): api.CreateReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const n = input.Rule.Name
+			if (r.rules.some(e => e.Name == n)) {
+				throw api.alreadyExistsException(`Rule already exists: ${n}`)
+			}
+			r.rules = placed(r.rules, input.Rule, input.After)
+		})
+		return new api.CreateReceiptRuleResponse()
+	}
+
+	describeReceiptRule(caller: Caller,
+		input: api.DescribeReceiptRuleRequest): api.DescribeReceiptRuleResponse throws Fault {
+		return { ...new api.DescribeReceiptRuleResponse(),
+			Rule: rule(ruleSet(caller, input.RuleSetName), input.RuleName) }
+	}
+
+	updateReceiptRule(caller: Caller, input: api.UpdateReceiptRuleRequest): api.UpdateReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			rule(r, input.Rule.Name)
+			r.rules = r.rules.map(e => if (e.Name == input.Rule.Name) input.Rule else e)
+		})
+		return new api.UpdateReceiptRuleResponse()
+	}
+
+	setReceiptRulePosition(caller: Caller,
+		input: api.SetReceiptRulePositionRequest): api.SetReceiptRulePositionResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const moved = rule(r, input.RuleName)
+			r.rules = placed(r.rules.filter(e => e.Name != moved.Name), moved, input.After)
+		})
+		return new api.SetReceiptRulePositionResponse()
+	}
+
+	reorderReceiptRuleSet(caller: Caller,
+		input: api.ReorderReceiptRuleSetRequest): api.ReorderReceiptRuleSetResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			const names = input.RuleNames
+			for (const n of names) {
+				rule(r, n)
+			}
+			if (names.length != r.rules.length) {
+				throw new Fault(400, "InvalidParameterValue", "Not all rules are in the rule set.")
+			}
+			r.rules = names.map(n => r.rules.find(e => e.Name == n)!)
+		})
+		return new api.ReorderReceiptRuleSetResponse()
+	}
+
+	deleteReceiptRule(caller: Caller, input: api.DeleteReceiptRuleRequest): api.DeleteReceiptRuleResponse throws Fault {
+		changeRules(caller, input.RuleSetName, r => {
+			r.rules = r.rules.filter(e => e.Name != input.RuleName)
+		})
+		return new api.DeleteReceiptRuleResponse()
+	}
+
+	createReceiptFilter(caller: Caller,
+		input: api.CreateReceiptFilterRequest): api.CreateReceiptFilterResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.regional()).filters
+		const n = input.Filter.Name
+		if (t.get(n) != null) {
+			throw api.alreadyExistsException(`Filter already exists: ${n}`)
+		}
+		save(t, n, input.Filter)
+		return new api.CreateReceiptFilterResponse()
+	}
+
+	listReceiptFilters(caller: Caller,
+		input: api.ListReceiptFiltersRequest): api.ListReceiptFiltersResponse throws Fault {
+		caller.allow("*")
+		return { ...new api.ListReceiptFiltersResponse(),
+			Filters: new Tables(caller.regional()).filters.scan(null, 1000000).map(e => e[1]) }
+	}
+
+	deleteReceiptFilter(caller: Caller,
+		input: api.DeleteReceiptFilterRequest): api.DeleteReceiptFilterResponse throws Fault {
+		caller.allow("*")
+		new Tables(caller.regional()).filters.delete(input.FilterName)
+		return new api.DeleteReceiptFilterResponse()
+	}
+
 	listTemplates(caller: Caller, input: api.ListTemplatesRequest): api.ListTemplatesResponse throws Fault {
 		caller.allow(templateArn(caller, "*"))
 		const all = keyed(new Tables(caller.regional()).templates.scan(null, 1000000).map(e => e[1]), t => t.name)
@@ -585,11 +771,18 @@ export class V2 {
 		if (t.get(n) != null) {
 			throw v2.alreadyExistsException(`Email identity ${n} already exist.`)
 		}
+		if (input.ConfigurationSetName != null) {
+			configurationSet(caller, input.ConfigurationSetName!, true)
+		}
 		const i = verify(caller, n, indexOf(n, "@") < 0)
-		if (i.domain) {
+		const own = input.DkimSigningAttributes?.DomainSigningSelector
+		if (i.domain && own != null) {
+			i.selector = own
+		} else if (i.domain) {
 			i.dkim = [token(16), token(16), token(16)]
 		}
 		i.tags = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		i.configurationSet = input.ConfigurationSetName
 		save(t, n, i)
 		const r = new v2.CreateEmailIdentityResponse()
 		r.IdentityType = if (i.domain) "DOMAIN" else "EMAIL_ADDRESS"
@@ -675,8 +868,15 @@ export class V2 {
 
 	putEmailIdentityDkimSigningAttributes(caller: Caller, input: v2.PutEmailIdentityDkimSigningAttributesRequest): v2.PutEmailIdentityDkimSigningAttributesResponse throws Fault {
 		const i = changeIdentity(caller, input.EmailIdentity, true, i => {
-			if (i.dkim.length == 0) {
-				i.dkim = [token(16), token(16), token(16)]
+			const own = input.SigningAttributes?.DomainSigningSelector
+			if (input.SigningAttributesOrigin == "EXTERNAL" && own != null) {
+				i.selector = own
+				i.dkim = []
+			} else if (input.SigningAttributesOrigin != "EXTERNAL") {
+				i.selector = null
+				if (i.dkim.length == 0) {
+					i.dkim = [token(16), token(16), token(16)]
+				}
 			}
 			i.unsigned = false
 		})
@@ -789,6 +989,15 @@ export class V2 {
 		}
 		const s = sent(caller, from!, if (input.Destination == null) null else v2Recipients(input.Destination!),
 			input.FromEmailAddressIdentityArn)
+		const m = input.ListManagementOptions
+		const d = s.Destination
+		if (m != null && d != null) {
+			const l = contactList(caller, m!.ContactListName)
+			const keep = (xs: string[]
+				| null): string[] | null => if (xs == null) null else xs!.filter(x => !unsubscribed(l, x, m!.TopicName))
+			s.Destination = { ...new Recipients(), ToAddresses: keep(d!.ToAddresses), CcAddresses: keep(d!.CcAddresses),
+				BccAddresses: keep(d!.BccAddresses) }
+		}
 		const simple = c.Simple
 		const t = c.Template
 		const r = new v2.SendEmailResponse()
@@ -958,6 +1167,140 @@ export class V2 {
 				SharedPoolDeliveryMode: input.SharedPoolDeliveryMode }
 		})
 		return new v2.PutConfigurationSetDeliveryOptionsResponse()
+	}
+
+	createContactList(caller: Caller, input: v2.CreateContactListRequest): v2.CreateContactListResponse throws Fault {
+		const n = input.ContactListName
+		caller.allow(listArn(caller, n))
+		const t = new Tables(caller.regional()).lists
+		if (t.get(n) != null) {
+			throw v2.alreadyExistsException(`List with name ${n} already exists.`)
+		}
+		if (t.scan(null, 1).length > 0) {
+			throw v2.limitExceededException("Maximum number of contact lists per account reached.")
+		}
+		const at = now()
+		save(t, n,
+			{ ...new ContactList(), name: n, description: input.Description, topics: input.Topics ?? [],
+			tags: (input.Tags ?? []).map(t => [t.Key, t.Value]), created: at, updated: at })
+		return new v2.CreateContactListResponse()
+	}
+
+	getContactList(caller: Caller, input: v2.GetContactListRequest): v2.GetContactListResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const r = new v2.GetContactListResponse()
+		r.ContactListName = l.name
+		r.Description = l.description
+		r.Topics = l.topics
+		r.CreatedTimestamp = l.created
+		r.LastUpdatedTimestamp = l.updated
+		r.Tags = l.tags.map(t => {
+			return { ...new v2.Tag(), Key: t[0], Value: t[1] }
+		})
+		return r
+	}
+
+	listContactLists(caller: Caller, input: v2.ListContactListsRequest): v2.ListContactListsResponse throws Fault {
+		caller.allow(listArn(caller, "*"))
+		const all = keyed(new Tables(caller.regional()).lists.scan(null, 1000000).map(e => e[1]), l => l.name)
+		const [items, next] = paged(all, input.NextToken, min(input.PageSize ?? 1000, 1000), "NextToken", true)
+		const r = new v2.ListContactListsResponse()
+		r.ContactLists = items.map(l => {
+			return { ...new v2.ContactList(), ContactListName: l.name, LastUpdatedTimestamp: l.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	updateContactList(caller: Caller, input: v2.UpdateContactListRequest): v2.UpdateContactListResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			l.topics = input.Topics ?? l.topics
+			l.description = input.Description ?? l.description
+		})
+		return new v2.UpdateContactListResponse()
+	}
+
+	deleteContactList(caller: Caller, input: v2.DeleteContactListRequest): v2.DeleteContactListResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		new Tables(caller.regional()).lists.delete(l.name)
+		return new v2.DeleteContactListResponse()
+	}
+
+	createContact(caller: Caller, input: v2.CreateContactRequest): v2.CreateContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			if (l.contacts.some(c => c.address == input.EmailAddress)) {
+				throw v2.alreadyExistsException(`Contact already exists in list ${l.name}`)
+			}
+			const at = now()
+			const c = { ...new Contact(), address: input.EmailAddress, topics: input.TopicPreferences ?? [],
+				unsubscribed: input.UnsubscribeAll, attributes: input.AttributesData, created: at, updated: at }
+			// Kept in order of address, as a page is.
+			l.contacts = [...l.contacts.filter(e => e.address < c.address), c,
+				...l.contacts.filter(e => e.address > c.address)]
+		})
+		return new v2.CreateContactResponse()
+	}
+
+	getContact(caller: Caller, input: v2.GetContactRequest): v2.GetContactResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const c = contact(l, input.EmailAddress)
+		const r = new v2.GetContactResponse()
+		r.ContactListName = l.name
+		r.EmailAddress = c.address
+		r.TopicPreferences = c.topics
+		r.TopicDefaultPreferences = defaults(l)
+		r.UnsubscribeAll = c.unsubscribed
+		r.AttributesData = c.attributes
+		r.CreatedTimestamp = c.created
+		r.LastUpdatedTimestamp = c.updated
+		return r
+	}
+
+	listContacts(caller: Caller, input: v2.ListContactsRequest): v2.ListContactsResponse throws Fault {
+		const l = contactList(caller, input.ContactListName)
+		const status = input.Filter?.FilteredStatus
+		const topic = input.Filter?.TopicFilter
+		const matching = l.contacts.filter(c => {
+			if (status == null) {
+				return true
+			}
+			if (topic == null || topic!.TopicName == null) {
+				return c.unsubscribed == (status == "OPT_OUT")
+			}
+			const own = c.topics.find(p => p.TopicName == topic!.TopicName)
+			if (own == null && !topic!.UseDefaultIfPreferenceUnavailable) {
+				return false
+			}
+			return (own?.SubscriptionStatus ?? defaultOf(l, topic!.TopicName!)) == status
+		})
+		const [items, next] = paged(keyed(matching, c => c.address), input.NextToken, min(input.PageSize ?? 1000, 1000),
+			"NextToken", true)
+		const r = new v2.ListContactsResponse()
+		r.Contacts = items.map(c => {
+			return { ...new v2.Contact(), EmailAddress: c.address, TopicPreferences: c.topics,
+				TopicDefaultPreferences: defaults(l), UnsubscribeAll: c.unsubscribed, LastUpdatedTimestamp: c.updated }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	updateContact(caller: Caller, input: v2.UpdateContactRequest): v2.UpdateContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			const c = contact(l, input.EmailAddress)
+			c.topics = input.TopicPreferences ?? c.topics
+			c.unsubscribed = input.UnsubscribeAll
+			c.attributes = input.AttributesData ?? c.attributes
+			c.updated = now()
+		})
+		return new v2.UpdateContactResponse()
+	}
+
+	deleteContact(caller: Caller, input: v2.DeleteContactRequest): v2.DeleteContactResponse throws Fault {
+		changeList(caller, input.ContactListName, l => {
+			const c = contact(l, input.EmailAddress)
+			l.contacts = l.contacts.filter(e => e.address != c.address)
+		})
+		return new v2.DeleteContactResponse()
 	}
 
 	listEmailTemplates(caller: Caller,
@@ -1228,10 +1571,11 @@ function topicOf(i: Identity, kind: string): string | null {
 
 function dkim(i: Identity): v2.DkimAttributes {
 	const d = new v2.DkimAttributes()
-	d.SigningEnabled = i.dkim.length > 0 && !i.unsigned
-	d.Status = if (i.dkim.length > 0) "SUCCESS" else "NOT_STARTED"
-	d.Tokens = if (i.dkim.length > 0) i.dkim else null
-	d.SigningAttributesOrigin = "AWS_SES"
+	const signing = i.dkim.length > 0 || i.selector != null
+	d.SigningEnabled = signing && !i.unsigned
+	d.Status = if (signing) "SUCCESS" else "NOT_STARTED"
+	d.Tokens = if (i.selector != null) [i.selector!] else if (i.dkim.length > 0) i.dkim else null
+	d.SigningAttributesOrigin = if (i.selector != null) "EXTERNAL" else "AWS_SES"
 	return d
 }
 
@@ -1242,6 +1586,123 @@ function template(caller: Caller, name: string): Template throws Fault {
 		throw api.templateDoesNotExistException(`Template ${name} does not exist.`)
 	}
 	return t!
+}
+
+/// The receipt rule set of name, as the classic API answers one that does not exist.
+function ruleSet(caller: Caller, name: string): RuleSet throws Fault {
+	caller.allow("*")
+	const r = new Tables(caller.regional()).ruleSets.get(name)
+	if (r == null) {
+		throw api.ruleSetDoesNotExistException(`Rule set does not exist: ${name}`,
+			{ ...new api.RuleSetDoesNotExistException(), Name: name })
+	}
+	return r!
+}
+
+/// Makes a receipt rule set of name and rules, as the classic API answers one that exists.
+function newRuleSet(caller: Caller, name: string, rules: api.ReceiptRule[]) throws Fault {
+	caller.allow("*")
+	const t = new Tables(caller.regional()).ruleSets
+	if (t.get(name) != null) {
+		throw api.alreadyExistsException(`Rule set already exists: ${name}`,
+			{ ...new api.AlreadyExistsException(), Name: name })
+	}
+	save(t, name, { ...new RuleSet(), name: name, created: now(), rules: rules })
+}
+
+/// Makes the rules of the receipt rule set of name over by f.
+function changeRules(caller: Caller, name: string, f: (r: RuleSet) => void throws Fault) throws Fault {
+	const r = ruleSet(caller, name)
+	f(r)
+	save(new Tables(caller.regional()).ruleSets, name, r)
+}
+
+/// The rule of name in r, as the classic API answers one that is not.
+function rule(r: RuleSet, name: string): api.ReceiptRule throws Fault {
+	const e = r.rules.find(e => e.Name == name)
+	if (e == null) {
+		throw api.ruleDoesNotExistException(`Rule does not exist: ${name}`,
+			{ ...new api.RuleDoesNotExistException(), Name: name })
+	}
+	return e!
+}
+
+/// rules with rule placed after the one named after, or first if after is null.
+function placed(rules: api.ReceiptRule[], rule: api.ReceiptRule, after: string | null): api.ReceiptRule[] throws Fault {
+	if (after == null) {
+		return [rule, ...rules]
+	}
+	let i = -1
+	for (let j = 0; j < rules.length; j++) {
+		if (rules[j].Name == after!) {
+			i = j
+		}
+	}
+	if (i < 0) {
+		throw api.ruleDoesNotExistException(`Rule does not exist: ${after!}`,
+			{ ...new api.RuleDoesNotExistException(), Name: after })
+	}
+	return [...rules.slice(0, i + 1), rule, ...rules.slice(i + 1, rules.length)]
+}
+
+function metadata(r: RuleSet): api.ReceiptRuleSetMetadata {
+	return { ...new api.ReceiptRuleSetMetadata(), Name: r.name, CreatedTimestamp: r.created }
+}
+
+function listArn(caller: Caller, name: string): string {
+	return `arn:aws:ses:${caller.region}:${caller.account}:contact-list/${name}`
+}
+
+/// The contact list of name, as v2 answers one that does not exist.
+function contactList(caller: Caller, name: string): ContactList throws Fault {
+	caller.allow(listArn(caller, name))
+	const l = new Tables(caller.regional()).lists.get(name)
+	if (l == null) {
+		throw v2.notFoundException(`List with name ${name} does not exist.`)
+	}
+	return l!
+}
+
+/// Makes the contact list of name over by f.
+function changeList(caller: Caller, name: string, f: (l: ContactList) => void throws Fault) throws Fault {
+	const l = contactList(caller, name)
+	f(l)
+	l.updated = now()
+	save(new Tables(caller.regional()).lists, name, l)
+}
+
+/// The contact of address on l, as v2 answers one that is not.
+function contact(l: ContactList, address: string): Contact throws Fault {
+	const c = l.contacts.find(c => c.address == address)
+	if (c == null) {
+		throw v2.notFoundException(`Contact ${address} does not exist in list ${l.name}`)
+	}
+	return c!
+}
+
+/// The default subscription status of each of l's topics.
+function defaults(l: ContactList): v2.TopicPreference[] {
+	return l.topics.map(t => {
+		return { ...new v2.TopicPreference(), TopicName: t.TopicName, SubscriptionStatus: t.DefaultSubscriptionStatus }
+	})
+}
+
+/// The default subscription status of l's topic of name, OPT_OUT if it has none of that name.
+function defaultOf(l: ContactList, name: string): v2.SubscriptionStatus {
+	return l.topics.find(t => t.TopicName == name)?.DefaultSubscriptionStatus ?? "OPT_OUT"
+}
+
+/// Whether address, if a contact on l, is unsubscribed from all of it or from its topic of name; one not a contact is
+/// sent to.
+function unsubscribed(l: ContactList, address: string, topic: string | null): bool {
+	const c = l.contacts.find(c => c.address == addressOf(address))
+	if (c == null) {
+		return false
+	}
+	if (c!.unsubscribed || topic == null) {
+		return c!.unsubscribed
+	}
+	return (c!.topics.find(p => p.TopicName == topic)?.SubscriptionStatus ?? defaultOf(l, topic!)) == "OPT_OUT"
 }
 
 function emailTemplate(caller: Caller, name: string): Template throws Fault {
