@@ -1,0 +1,172 @@
+import { evaluate, EvalError, ordered, read, resource, Scope, Template, TemplateError, text } from "./template"
+import { parse, write } from "../stepfunctions/value"
+import { startsWith } from "std/algo"
+
+function value(v: string, s: Scope): string { return text(evaluate(parse(v), s)) }
+
+test "intrinsic functions: Ref, Fn::Sub, Fn::Join, Fn::Select, Fn::Split, Fn::If, Fn::FindInMap, Fn::Base64" {
+	const s = new Scope()
+	s.refs = [["Env", "prod"], ["AWS::Region", "us-east-1"], ["Q", "url"]]
+	s.attributes = [["Q.Arn", "arn:q"]]
+	s.conditions = [["IsProd", true]]
+	s.mappings = parse(`{"M": {"prod": {"Size": "5"}}}`)
+	assert value(`{"Fn::Sub": "\${Env}-\${Q.Arn}-\${!Literal}"}`, s) == "prod-arn:q-\${Literal}"
+	assert value(`{"Fn::Sub": ["\${A}/\${AWS::Region}", {"A": {"Ref": "Env"}}]}`, s) == "prod/us-east-1"
+	assert value(`{"Fn::Join": ["-", ["a", {"Ref": "Env"}, {"Fn::GetAtt": ["Q", "Arn"]}]]}`, s) == "a-prod-arn:q"
+	assert value(`{"Fn::Select": ["1", {"Fn::Split": [",", "a,b,c"]}]}`, s) == "b"
+	assert value(`{"Fn::If": ["IsProd", "yes", "no"]}`, s) == "yes"
+	assert value(`{"Fn::FindInMap": ["M", {"Ref": "Env"}, "Size"]}`, s) == "5"
+	assert value(`{"Fn::Base64": "hi"}`, s) == "aGk="
+	assert value(`{"Fn::Equals": [{"Ref": "Env"}, "prod"]}`, s) == "true"
+	assert value(`{"Fn::And": [{"Condition": "IsProd"}, {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]}]}`, s) == "true"
+	assert value(`{"P": {"Ref": "AWS::NoValue"}, "Q": [1, {"Ref": "AWS::NoValue"}]}`, s) == `{"Q":[1]}`
+	try {
+		value(`{"Fn::ImportValue": "none"}`, s)
+		assert false
+	} catch (e: EvalError) {
+		assert e.message == "No export named none found."
+	}
+}
+
+test "a template's resources are ordered by references and DependsOn; a missing reference and no resources refused" {
+	const t = read(`{"Resources": {"A": {"Type": "T", "Properties": {"X": {"Fn::GetAtt": "B.Arn"}}},`
+		+ `"B": {"Type": "T", "DependsOn": ["C"]}, "C": {"Type": "T", "Properties": {"Y": {"Fn::Sub": "\${AWS::Region}"}}}}}`)
+	assert ordered(t).join(",") == "C,B,A"
+	try {
+		read(`{"Resources": {"A": {"Type": "T", "Properties": {"X": {"Ref": "Nope"}}}}}`)
+		assert false
+	} catch (e: TemplateError) {
+		assert e.message
+			== "Template format error: Unresolved resource dependencies [Nope] in the Resources block of the template"
+	}
+	try {
+		read(`{"Parameters": {}}`)
+		assert false
+	} catch (e: TemplateError) {
+		assert e.message == "Template format error: At least one Resources member must be defined."
+	}
+}
+
+const handle = "Resources:\n  H:\n    Type: AWS::CloudFormation::WaitConditionHandle\n"
+
+function refused(body: string): string {
+	try {
+		read(body)
+	} catch (e: TemplateError) {
+		return e.message
+	}
+	return ""
+}
+
+function metadata(t: Template): string { return write(resource(t, "H")!.get("Metadata")!) }
+
+test "a YAML template's short forms are the long forms; !GetAtt a.b stays one string" {
+	const t = read(`AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  P: {Type: String, Default: x}
+Resources:
+  H:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      a: !Ref P
+      b: !GetAtt G.Arn
+      c: !GetAtt [G, Arn]
+      d: !Sub ['\${x}', {x: !Ref P}]
+      e: !Join [',', !GetAZs '']
+      f: !If [C, !Ref 'AWS::NoValue', !Select [0, !Split [',', 'a,b']]]
+      g: !And [!Or [!Condition C, !Not [!Equals [a, b]]]]
+      h: !FindInMap [M, !Base64 x, !ImportValue y]
+      i: !Cidr [10.0.0.0/16, 6, 5]
+      j: !<!Ref> P
+  G:
+    Type: AWS::CloudFormation::WaitConditionHandle
+`)
+	assert t.description == null && t.parameters[0][1].str("Default") == "x"
+	assert metadata(t)
+		== `{"a":{"Ref":"P"},"b":{"Fn::GetAtt":"G.Arn"},"c":{"Fn::GetAtt":["G","Arn"]},`
+		+ `"d":{"Fn::Sub":["\${x}",{"x":{"Ref":"P"}}]},"e":{"Fn::Join":[",",{"Fn::GetAZs":""}]},`
+		+ `"f":{"Fn::If":["C",{"Ref":"AWS::NoValue"},{"Fn::Select":[0,{"Fn::Split":[",","a,b"]}]}]},`
+		+ `"g":{"Fn::And":[{"Fn::Or":[{"Condition":"C"},{"Fn::Not":[{"Fn::Equals":["a","b"]}]}]}]},`
+		+ `"h":{"Fn::FindInMap":["M",{"Fn::Base64":"x"},{"Fn::ImportValue":"y"}]},"i":{"Fn::Cidr":["10.0.0.0/16",6,5]},`
+		+ `"j":{"Ref":"P"}}`
+	assert ordered(t).join(",") == "G,H"
+}
+
+test "YAML scalars by the core schema; dates stay strings, as policy Versions must" {
+	const t = read(`Resources:
+  H:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      a: true
+      b: [42, +12, 1e3, 1.50, .inf]
+      g: 2012-10-17
+      h: "010"
+      i: !!str 5
+      j: !!float 1
+      k: !!timestamp 2001-01-01
+      l: 12345678901234567890
+      m: |
+        x
+        y
+`)
+	assert metadata(t)
+		== `{"a":true,"b":[42,12,1000.0,1.5,"Infinity"],"g":"2012-10-17","h":"010","i":"5",`
+		+ `"j":1.0,"k":"2001-01-01","l":12345678901234567890,"m":"x\\ny\\n"}`
+}
+
+test "YAML errors as AWS words them" {
+	// as CloudFormation answered on 2026-11-23
+	assert refused("Resources: [\n") == "Template format error: YAML not well-formed. (line 2, column 1)"
+	assert refused("Resources:\n\tH: x\n") == "Template format error: YAML not well-formed. (line 2, column 1)"
+	assert refused(`{"Resources": {`) == "Template format error: YAML not well-formed. (line 1, column 16)"
+	assert refused("Metadata:\n  a: &x 1\n  b: *x\n" + handle)
+		== "Template error: YAML aliases are not allowed in CloudFormation templates"
+	assert refused("Metadata:\n  v: !!binary aGk=\n" + handle)
+		== "Template error: use of tag:yaml.org,2002:binary is not allowed in CloudFormation templates"
+	assert refused("Metadata:\n  1: a\n" + handle)
+		== "Template format error: [/Metadata] map keys must be strings; received numeric [1] instead"
+	assert refused("Metadata:\n  1.5: a\n" + handle)
+		== "Template format error: [/Metadata] map keys must be strings; received numeric [1.5] instead"
+	assert refused(handle + "    Metadata:\n      a:\n        true: 1\n")
+		== "Template format error: [/Resources/H/Metadata/a] map keys must be strings; received boolean [true] instead"
+	assert refused("Metadata:\n  [a, b]: 1\n" + handle)
+		== "Template format error: [/Metadata] map keys must be strings; received a collection instead"
+	assert refused("Metadata:\n  !Ref a: 1\n" + handle)
+		== "Template format error: [/Metadata] map keys must be strings; received a map instead"
+	assert refused("Metadata:\n  ~: 1\n" + handle) == "Template format error: [/Metadata] encountered malformed key"
+	assert refused("- a\n- b\n") == "Template format error: unsupported structure."
+	assert refused("foo") == "Template format error: unsupported structure."
+	assert refused("# nothing\n") == "Template format error: At least one Resources member must be defined."
+	assert refused("Resources:\n  H:\n") == "Template format error: [/Resources/H] resource definition is malformed"
+	assert refused("Resources:\n") == "[/Resources] 'null' values are not allowed in templates"
+	assert refused("Metadata:\n  a: [1, ~]\n" + handle) == "[/Metadata/a/1] 'null' values are not allowed in templates"
+	assert refused(handle + "    Properties:\n      X: [a, {b: }]\n")
+		== "[/Resources/H/Type/X/1/b] 'null' values are not allowed in templates"
+	assert refused(`{"Resources": {"H": {"Type": "T", "Metadata": {"a": null}}}}`)
+		== "[/Resources/H/Metadata/a] 'null' values are not allowed in templates"
+	assert refused("Metadata:\n  a: ~\nResources:\n  H:\n    Properties: {}\n")
+		== "Template format error: [/Resources/H] Every Resources object must contain a Type member."
+	// AWS places these at the tag and the second document's ---; std gives the node's own place.
+	assert startsWith(refused("Metadata:\n  v: !Transform {Name: X}\n" + handle),
+		"Template format error: YAML not well-formed. (line 2, column ")
+	assert startsWith(refused("Metadata:\n  v: !Foo x\n" + handle),
+		"Template format error: YAML not well-formed. (line 2, column ")
+	assert startsWith(refused(handle + "---\n" + handle), "Template format error: YAML not well-formed. (line ")
+	assert read(`{Resources: {H: {Type: AWS::CloudFormation::WaitConditionHandle}}}`).resources.length == 1
+	assert read(`{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"},}}`).resources.length == 1
+}
+
+test "sections AWS does not know and transforms it cannot read are refused; the transforms named" {
+	// as CloudFormation answered on 2026-11-23
+	const h = `"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}`
+	assert refused(`{"Zeta": 1, "Bogus": null, ${h}}`) == "Invalid template property or properties [Zeta, Bogus]"
+	assert refused(`{"Bogus": 1}`) == "Template format error: At least one Resources member must be defined."
+	assert refused(`{"Transform": [], ${h}}`) == "Invalid template property or properties [Transform]"
+	assert refused(`{"Bogus": 1, "Transform": 5, ${h}}`)
+		== "Transforms must be declared as an object with the key Name, or as strings consisting solely of the Transform name."
+	assert refused(`{"Transform": {"Foo": "x"}, ${h}}`) == "Transforms defined as maps require Name key."
+	assert read(`{"Rules": {}, "Hooks": {}, "Metadata": {}, ${h}}`).transforms.length == 0
+	const t = read(`{"Transform": ["A", {"Name": "B", "Parameters": {"p": 1}}], "Resources": {"H": {`
+		+ `"Type": "AWS::CloudFormation::WaitConditionHandle", "Metadata": {"Fn::Transform": {"Name": "C"}}}}}`)
+	assert t.transforms == ["A", "B", "C"]
+}

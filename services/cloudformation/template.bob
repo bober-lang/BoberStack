@@ -1,0 +1,633 @@
+//! A CloudFormation template of JSON or YAML, and its intrinsic functions.
+
+import { arr, boolean, Json, JsonError, nul, obj, parse, str, write } from "../stepfunctions/value"
+import * as base64 from "std/encoding/base64"
+import * as yaml from "std/encoding/yaml"
+import { indexOf, sort, startsWith } from "std/algo"
+import { formatFloat } from "std/float"
+import { isFinite, isNaN } from "std/math"
+import { formatInt, ParseError, parseInt, split, trim } from "std/string"
+
+export class TemplateError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+export class Template {
+	description: string | null = null
+	parameters: [string, Json][] = []
+	mappings = new Json()
+	conditions: [string, Json][] = []
+	resources: [string, Json][] = []
+	outputs: [string, Json][] = []
+	/// The macros Transform and Fn::Transform name, as written, in the template's order.
+	transforms: string[] = []
+}
+
+const sections = ["AWSTemplateFormatVersion", "Description", "Metadata", "Parameters", "Rules", "Mappings",
+	"Conditions", "Transform", "Resources", "Outputs", "Hooks"]
+
+/// The template of body, with the checks ValidateTemplate makes.
+export function read(body: string): Template throws TemplateError {
+	const v = tree(body)
+	if (v.kind != "object") {
+		throw new TemplateError("Template format error: unsupported structure.")
+	}
+	const t = new Template()
+	t.description = v.str("Description")
+	t.parameters = v.get("Parameters")?.keys ?? []
+	t.mappings = v.get("Mappings") ?? new Json()
+	t.conditions = v.get("Conditions")?.keys ?? []
+	t.resources = v.get("Resources")?.keys ?? []
+	t.outputs = v.get("Outputs")?.keys ?? []
+	if (t.resources.length == 0 && v.get("Resources")?.kind != "null") {
+		throw new TemplateError("Template format error: At least one Resources member must be defined.")
+	}
+	for (const [r, d] of t.resources) {
+		if (d.kind != "object") {
+			throw new TemplateError(`Template format error: [/Resources/${r}] resource definition is malformed`)
+		}
+		if (d.str("Type") == null) {
+			throw new TemplateError(`Template format error: [/Resources/${r}] Every Resources object must contain a Type member.`)
+		}
+	}
+	const declared = v.get("Transform")
+	for (const x of if (declared == null) [] else if (declared.kind == "array") declared.items else [declared!]) {
+		t.transforms.push(transform(x))
+	}
+	// An empty list of transforms is refused as an unknown section is.
+	const unknown = v.keys.filter(e => !has(sections, e[0])
+		|| e[0] == "Transform" && e[1].kind == "array" && e[1].items.length == 0).map(e => e[0])
+	if (unknown.length > 0) {
+		throw new TemplateError(`Invalid template property or properties [${unknown.join(", ")}]`)
+	}
+	called(v, t.transforms)
+	for (const [k, x] of v.keys) {
+		if (k == "Resources" && x.kind == "object") {
+			for (const [r, d] of x.keys) {
+				for (const [a, y] of d.keys) {
+					// AWS names a null inside Properties as under Type.
+					nulls(y, `/Resources/${r}/${if (a == "Properties" && y.kind != "null") "Type" else a}`)
+				}
+			}
+		} else {
+			nulls(x, `/${k}`)
+		}
+	}
+	const names: string[] = []
+	for (const [p, _] of t.parameters) {
+		names.push(p)
+	}
+	for (const [r, _] of t.resources) {
+		names.push(r)
+	}
+	const unresolved: string[] = []
+	for (const [_, d] of t.resources) {
+		for (const n of references(d)) {
+			if (!has(names, n) && !startsWith(n, "AWS::") && !has(unresolved, n)) {
+				unresolved.push(n)
+			}
+		}
+	}
+	if (unresolved.length > 0) {
+		throw new TemplateError(`Template format error: Unresolved resource dependencies [${unresolved.join(", ")}] in the Resources block of the template`)
+	}
+	return t
+}
+
+function transform(x: Json): string throws TemplateError {
+	if (x.kind == "string") {
+		return x.text
+	}
+	if (x.kind != "object") {
+		throw new TemplateError("Transforms must be declared as an object with the key Name, or as strings consisting solely of the Transform name.")
+	}
+	const name = x.str("Name")
+	if (name == null) {
+		throw new TemplateError("Transforms defined as maps require Name key.")
+	}
+	return name!
+}
+
+/// Adds to names the macros that Fn::Transform calls under v.
+function called(v: Json, names: string[]): void throws TemplateError {
+	for (const x of v.items) {
+		called(x, names)
+	}
+	for (const [k, x] of v.keys) {
+		if (k == "Fn::Transform") {
+			names.push(transform(x))
+		} else {
+			called(x, names)
+		}
+	}
+}
+
+function nulls(v: Json, path: string): void throws TemplateError {
+	if (v.kind == "null") {
+		throw new TemplateError(`[${path}] 'null' values are not allowed in templates`)
+	}
+	for (let i = 0; i < v.items.length; i++) {
+		nulls(v.items[i], `${path}/${i}`)
+	}
+	for (const [k, x] of v.keys) {
+		nulls(x, `${path}/${k}`)
+	}
+}
+
+/// body as JSON, else as YAML, as AWS reads JSON it cannot parse: so its errors are YAML's.
+function tree(body: string): Json throws TemplateError {
+	if (startsWith(trim(body), "{")) {
+		try {
+			return parse(body)
+		} catch (e: JsonError) {}
+	}
+	let docs: yaml.Document[] = []
+	try {
+		docs = yaml.documents(body)
+	} catch (e: ParseError) {
+		throw malformed(body, e.at)
+	}
+	if (docs.length == 0) {
+		return obj([])
+	}
+	if (docs.length > 1) {
+		throw malformed(body, docs[1].root.at)
+	}
+	return node(body, docs[0].root, "")
+}
+
+/// AWS's error at an offset; std places it at a node's content, AWS at its tag.
+function malformed(body: string, at: i32): TemplateError {
+	let line = 1
+	let start = 0
+	let i = indexOf(body, "\n")
+	while (i >= 0 && i < at) {
+		line++
+		start = i + 1
+		i = indexOf(body, "\n", start)
+	}
+	return new TemplateError(`Template format error: YAML not well-formed. (line ${line}, column ${at - start + 1})`)
+}
+
+/// The long form of a short-form tag, of those AWS takes; it refuses the rest, !Transform among them.
+function longForm(tag: string): string | null {
+	switch (tag) {
+		case "!Ref", "!Condition": return tag.slice(1, tag.length)
+		case "!GetAtt", "!Sub", "!Join", "!If", "!Not", "!Equals", "!And", "!Or", "!Select", "!Split", "!FindInMap",
+			"!Base64", "!ImportValue", "!Cidr", "!GetAZs": return "Fn::" + tag.slice(1, tag.length)
+		default: return null
+	}
+}
+
+const core = "tag:yaml.org,2002:"
+
+function node(body: string, n: yaml.Node, path: string): Json throws TemplateError {
+	if (n instanceof yaml.Alias) {
+		throw new TemplateError("Template error: YAML aliases are not allowed in CloudFormation templates")
+	}
+	const tag = n.tag ?? "!"
+	if (tag != "!" && startsWith(tag, "!")) {
+		const f = longForm(tag)
+		if (f == null) {
+			throw malformed(body, n.at)
+		}
+		if (n instanceof yaml.Scalar) {
+			// A scalar under a short form is read untagged, but empty is "" rather than null.
+			const v = scalar(new yaml.Scalar(n.value, n.style, null, n.at))
+			return obj([[f!, if (v.kind == "null") str(n.value) else v]])
+		}
+		return obj([[f!, collection(body, n, path)]])
+	}
+	if (startsWith(tag, core)) {
+		const name = tag.slice(core.length, tag.length)
+		if (name == "binary" || name == "set" || name == "omap") {
+			throw new TemplateError(`Template error: use of ${tag} is not allowed in CloudFormation templates`)
+		}
+		if (name != "str" && name != "int" && name != "float" && name != "bool" && name != "null" && name != "map"
+			&& name != "seq" && name != "timestamp") {
+			// AWS follows this with the line and a caret at the tag.
+			throw new TemplateError(`Template format error: Global tag is not allowed: ${tag}`)
+		}
+	} else if (tag != "!") {
+		throw malformed(body, n.at)
+	}
+	if (n instanceof yaml.Scalar) {
+		return scalar(n)
+	}
+	return collection(body, n, path)
+}
+
+function collection(body: string, n: yaml.Seq | yaml.Map, path: string): Json throws TemplateError {
+	if (n instanceof yaml.Seq) {
+		const items: Json[] = []
+		for (let i = 0; i < n.items.length; i++) {
+			items.push(node(body, n.items[i], `${path}/${i}`))
+		}
+		return arr(items)
+	}
+	const keys: [string, Json][] = []
+	for (let i = 0; i < n.keys.length; i++) {
+		const k = key(body, n.keys[i], path)
+		keys.push([k, node(body, n.values[i], `${path}/${k}`)])
+	}
+	return obj(keys)
+}
+
+function key(body: string, k: yaml.Node, path: string): string throws TemplateError {
+	const v = node(body, k, path)
+	const refused = `Template format error: [${path}] map keys must be strings; received `
+	switch (v.kind) {
+		case "string": return v.text
+		case "number": throw new TemplateError(`${refused}numeric [${v.text}] instead`)
+		case "bool": throw new TemplateError(`${refused}boolean [${v.text}] instead`)
+		case "array": throw new TemplateError(`${refused}a collection instead`)
+		case "object": throw new TemplateError(`${refused}a map instead`)
+		default: throw new TemplateError(`Template format error: [${path}] encountered malformed key`)
+	}
+}
+
+/// A scalar by the core schema, numbers written as AWS writes them back: 1e3 as 1000.0, .inf as Infinity.
+function scalar(n: yaml.Scalar): Json {
+	try {
+		switch (yaml.kindOf(n)) {
+			case "null": return nul()
+			case "bool": return boolean(yaml.boolOf(n))
+			case "int": return { ...new Json(), kind: "number", text: formatInt(yaml.intOf(n)) }
+			case "float": {
+				const x = yaml.floatOf(n)
+				if (!isFinite(x)) {
+					// Not a JSON number; AWS's text of it.
+					return str(if (isNaN(x)) "NaN" else if (x > 0.0) "Infinity" else "-Infinity")
+				}
+				const f = formatFloat(x)
+				return { ...new Json(), kind: "number",
+					text: if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0) f + ".0" else f }
+			}
+			default: return str(n.value)
+		}
+	} catch (e: ParseError) {
+		// An int beyond i64, which AWS keeps whole.
+		return { ...new Json(), kind: "number", text: n.value }
+	}
+}
+
+/// The resources and parameters d refers to by Ref, Fn::GetAtt, Fn::Sub and DependsOn.
+export function references(d: Json): string[] {
+	const out: string[] = []
+	collect(d, out)
+	const on = d.get("DependsOn")
+	if (on != null) {
+		if (on.kind == "string") {
+			out.push(on.text)
+		}
+		for (const x of on.items) {
+			out.push(x.text)
+		}
+	}
+	return out
+}
+
+function collect(v: Json, out: string[]): void {
+	if (v.kind == "array") {
+		for (const x of v.items) {
+			collect(x, out)
+		}
+		return
+	}
+	if (v.kind != "object") {
+		return
+	}
+	if (v.keys.length == 1) {
+		const [k, a] = v.keys[0]
+		if (k == "Ref" && a.kind == "string") {
+			out.push(a.text)
+			return
+		}
+		if (k == "Fn::GetAtt") {
+			const target = if (a.kind == "string") split(a.text, ".")[0]
+				else if (a.items.length > 0) a.items[0].text
+				else ""
+			out.push(target)
+			return
+		}
+		if (k == "Fn::Sub") {
+			const s = if (a.kind == "string") a.text else if (a.items.length > 0) a.items[0].text else ""
+			const own: string[] = []
+			if (a.kind == "array" && a.items.length > 1) {
+				for (const [n, x] of a.items[1].keys) {
+					own.push(n)
+					collect(x, out)
+				}
+			}
+			for (const n of placeholders(s)) {
+				const name = split(n, ".")[0]
+				if (!has(own, name)) {
+					out.push(name)
+				}
+			}
+			return
+		}
+	}
+	for (const [_, x] of v.keys) {
+		collect(x, out)
+	}
+}
+
+/// The names in ${…} of a Fn::Sub string, but ${!…}.
+function placeholders(s: string): string[] {
+	const out: string[] = []
+	let i = 0
+	while (i < s.length - 1) {
+		if (at(s, i) == "$" && at(s, i + 1) == "{") {
+			const end = indexOf(s, "}", i)
+			if (end < 0) {
+				break
+			}
+			if (at(s, i + 2) != "!") {
+				out.push(s.slice(i + 2, end))
+			}
+			i = end + 1
+		} else {
+			i++
+		}
+	}
+	return out
+}
+
+/// The resources each after those it refers to; refuses a cycle as AWS words it.
+export function ordered(t: Template): string[] throws TemplateError {
+	const done: string[] = []
+	let left: string[] = []
+	for (const [r, _] of t.resources) {
+		left.push(r)
+	}
+	while (left.length > 0) {
+		const next: string[] = []
+		for (const r of left) {
+			let ready = true
+			for (const n of references(resource(t, r)!)) {
+				if (n != r && resource(t, n) != null && !has(done, n)) {
+					ready = false
+				}
+			}
+			if (ready) {
+				done.push(r)
+			} else {
+				next.push(r)
+			}
+		}
+		if (next.length == left.length) {
+			sort(next)
+			throw new TemplateError(`Circular dependency between resources: [${next.join(", ")}]`)
+		}
+		left = next
+	}
+	return done
+}
+
+export function resource(t: Template, r: string): Json | null {
+	for (const [n, d] of t.resources) {
+		if (n == r) {
+			return d
+		}
+	}
+	return null
+}
+
+export class EvalError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+export class Scope {
+	refs: [string, string][] = []
+	attributes: [string, string][] = []
+	conditions: [string, bool][] = []
+	mappings = new Json()
+	/// An export's value, null if there is none.
+	exports: (name: string) => string | null = name => null
+	region = ""
+	/// The exports Fn::ImportValue has read.
+	imported: string[] = []
+	lists: [string, string[]][] = []
+}
+
+function lookup(xs: [string, string][], k: string): string | null {
+	for (const [n, v] of xs) {
+		if (n == k) {
+			return v
+		}
+	}
+	return null
+}
+
+/// Whether v is {"Ref": "AWS::NoValue"}, which drops the property it is the value of.
+export function noValue(v: Json): bool {
+	return v.kind == "object" && v.keys.length == 1 && v.keys[0][0] == "Ref" && v.keys[0][1].text == "AWS::NoValue"
+}
+
+export function evaluate(v: Json, s: Scope): Json throws EvalError {
+	if (v.kind == "array") {
+		const items: Json[] = []
+		for (const x of v.items) {
+			if (!noValue(x)) {
+				items.push(evaluate(x, s))
+			}
+		}
+		return arr(items)
+	}
+	if (v.kind != "object") {
+		return v
+	}
+	if (v.keys.length == 1
+		&& (v.keys[0][0] == "Ref" || startsWith(v.keys[0][0], "Fn::") || v.keys[0][0] == "Condition")) {
+		return intrinsic(v.keys[0][0], v.keys[0][1], s)
+	}
+	const out = new Json()
+	out.kind = "object"
+	for (const [k, x] of v.keys) {
+		if (!noValue(x)) {
+			out.keys.push([k, evaluate(x, s)])
+		}
+	}
+	return out
+}
+
+export function text(v: Json): string { return if (v.kind == "object" || v.kind == "array") write(v) else v.text }
+
+function intrinsic(f: string, a: Json, s: Scope): Json throws EvalError {
+	if (f == "Ref") {
+		for (const [n, l] of s.lists) {
+			if (n == a.text) {
+				const items: Json[] = []
+				for (const x of l) {
+					items.push(str(x))
+				}
+				return arr(items)
+			}
+		}
+		const r = lookup(s.refs, a.text)
+		if (r == null) {
+			throw new EvalError(`Unresolved resource dependencies [${a.text}] in the Resources block of the template`)
+		}
+		return str(r!)
+	}
+	if (f == "Condition") {
+		return boolean(condition(a.text, s))
+	}
+	if (f == "Fn::GetAtt") {
+		const parts = if (a.kind == "string") split(a.text, ".") else [text(a.items[0]), text(evaluate(a.items[1], s))]
+		const name = `${parts[0]}.${parts.slice(1, parts.length).join(".")}`
+		const r = lookup(s.attributes, name)
+		if (r == null) {
+			throw new EvalError(`Template error: resource ${parts[0]} does not support attribute type ${parts[1]} in Fn::GetAtt`)
+		}
+		return str(r!)
+	}
+	if (f == "Fn::Join") {
+		const parts: string[] = []
+		for (const x of evaluate(a.items[1], s).items) {
+			parts.push(text(x))
+		}
+		return str(parts.join(text(a.items[0])))
+	}
+	if (f == "Fn::Sub") {
+		return str(sub(a, s))
+	}
+	if (f == "Fn::Select") {
+		const list = evaluate(a.items[1], s)
+		let i = 0
+		try {
+			i = parseInt(text(evaluate(a.items[0], s))) as i32
+		} catch (e: ParseError) {
+			throw new EvalError("Template error: Fn::Select requires a list argument with two elements: an integer index and a list")
+		}
+		if (i < 0 || i >= list.items.length) {
+			throw new EvalError("Template error: Fn::Select cannot select nonexistent value at index " + `${i}`)
+		}
+		return list.items[i]
+	}
+	if (f == "Fn::Split") {
+		const items: Json[] = []
+		for (const x of split(text(evaluate(a.items[1], s)), text(a.items[0]))) {
+			items.push(str(x))
+		}
+		return arr(items)
+	}
+	if (f == "Fn::If") {
+		return evaluate(if (condition(a.items[0].text, s)) a.items[1] else a.items[2], s)
+	}
+	if (f == "Fn::Equals") {
+		return boolean(text(evaluate(a.items[0], s)) == text(evaluate(a.items[1], s)))
+	}
+	if (f == "Fn::Not") {
+		return boolean(evaluate(a.items[0], s).text != "true")
+	}
+	if (f == "Fn::And" || f == "Fn::Or") {
+		let and = true
+		let or = false
+		for (const x of a.items) {
+			const b = evaluate(x, s).text == "true"
+			and = and && b
+			or = or || b
+		}
+		return boolean(if (f == "Fn::And") and else or)
+	}
+	if (f == "Fn::FindInMap") {
+		const m = s.mappings.get(text(evaluate(a.items[0], s)))
+		const top = m?.get(text(evaluate(a.items[1], s)))
+		const v = top?.get(text(evaluate(a.items[2], s)))
+		if (v == null) {
+			throw new EvalError(`Template error: Unable to get mapping for ${text(a.items[0])}::${text(evaluate(a.items[1], s))}::${text(evaluate(a.items[2], s))}`)
+		}
+		return v!
+	}
+	if (f == "Fn::ImportValue") {
+		const name = text(evaluate(a, s))
+		const v = s.exports(name)
+		if (v == null) {
+			throw new EvalError(`No export named ${name} found.`)
+		}
+		if (!has(s.imported, name)) {
+			s.imported.push(name)
+		}
+		return str(v!)
+	}
+	if (f == "Fn::Base64") {
+		return str(base64.encode(text(evaluate(a, s))))
+	}
+	if (f == "Fn::GetAZs") {
+		return arr([str(`${s.region}a`), str(`${s.region}b`), str(`${s.region}c`)])
+	}
+	throw new EvalError(`Template format error: Unrecognized intrinsic function: ${f}`)
+}
+
+export function condition(c: string, s: Scope): bool throws EvalError {
+	for (const [n, b] of s.conditions) {
+		if (n == c) {
+			return b
+		}
+	}
+	throw new EvalError(`Template format error: Unresolved dependencies [${c}]. Cannot reference resources in the Conditions block of the template`)
+}
+
+function sub(a: Json, s: Scope): string throws EvalError {
+	const body = if (a.kind == "string") a.text else a.items[0].text
+	const own: [string, string][] = []
+	if (a.kind == "array" && a.items.length > 1) {
+		for (const [n, x] of a.items[1].keys) {
+			own.push([n, text(evaluate(x, s))])
+		}
+	}
+	let out = ""
+	let i = 0
+	while (i < body.length) {
+		if (at(body, i) == "$" && at(body, i + 1) == "{") {
+			const end = indexOf(body, "}", i)
+			if (end < 0) {
+				out = out + body.slice(i, body.length)
+				break
+			}
+			const name = body.slice(i + 2, end)
+			if (startsWith(name, "!")) {
+				out = out + "${" + name.slice(1, name.length) + "}"
+			} else {
+				const mine = lookup(own, name)
+				if (mine != null) {
+					out = out + mine!
+				} else if (indexOf(name, ".") >= 0) {
+					const r = lookup(s.attributes, name)
+					if (r == null) {
+						throw new EvalError(`Template error: unresolved attribute ${name} in Fn::Sub`)
+					}
+					out = out + r!
+				} else {
+					const r = lookup(s.refs, name)
+					if (r == null) {
+						throw new EvalError(`Unresolved resource dependencies [${name}] in the Resources block of the template`)
+					}
+					out = out + r!
+				}
+			}
+			i = end + 1
+		} else {
+			out = out + at(body, i)
+			i++
+		}
+	}
+	return out
+}
+
+export function has(xs: string[], x: string): bool {
+	for (const y of xs) {
+		if (y == x) {
+			return true
+		}
+	}
+	return false
+}
+
+function at(s: string, i: i32): string { return if (i < s.length) s.slice(i, i + 1) else "" }
