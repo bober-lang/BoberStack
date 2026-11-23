@@ -202,7 +202,12 @@ test "subscription filters: stored, two a group, and resource policies" {
 		`{"logGroupName":"/g"}`)).subscriptionFilters!
 	assert described.map(f => f.filterName!) == ["a", "b"] && described[0].distribution == "ByLogStream"
 	assert call(g, "DeleteSubscriptionFilter", `{"logGroupName":"/g","filterName":"a"}`).status == 200
-	const policy = (name: string) => call(g, "PutResourcePolicy", `{"policyName":"${name}","policyDocument":"{}"}`)
+	const document = `{\\"Statement\\":[{\\"Effect\\":\\"Allow\\",\\"Principal\\":{\\"Service\\":\\"events.amazonaws.com\\"},`
+		+ `\\"Action\\":\\"logs:PutLogEvents\\",\\"Resource\\":\\"*\\"}]}`
+	const policy = (name: string) => call(g, "PutResourcePolicy",
+		`{"policyName":"${name}","policyDocument":"${document}"}`)
+	assert fails(call(g, "PutResourcePolicy", `{"policyName":"p","policyDocument":"{}"}`), "InvalidParameterException",
+		"Error occurred while parsing accessPolicy.")
 	for (let i = 0; i < 10; i++) {
 		assert policy(`p${i}`).status == 200
 	}

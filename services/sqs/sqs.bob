@@ -13,6 +13,7 @@
 //! the key is used on every send and on every receive that takes a message, not once per data key reuse period, and
 //! a receive decrypts the queue's latest data key, not the one each message was sent under.
 
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
@@ -414,7 +415,7 @@ function set(caller: Caller, db: Tables, q: Queue, k: api.QueueAttributeName, v:
 		case "ReceiveMessageWaitTimeSeconds": q.wait = ranged(k, v, 0, 20)
 		case "VisibilityTimeout": q.visibility = ranged(k, v, 0, 43200)
 		case "KmsDataKeyReusePeriodSeconds": q.kmsReuse = ranged(k, v, 60, 86400)
-		case "Policy": q.policy = if (v == "") null else document(k, v)
+		case "Policy": q.policy = if (v == "") null else policy(v)
 		case "RedrivePolicy": redrive(caller, db, q, v)
 		case "RedriveAllowPolicy": q.redriveAllow = if (v == "") null else allowing(v)
 		case "KmsMasterKeyId": q.kmsKey = if (v == "") null else v
@@ -1463,12 +1464,12 @@ function flag(k: api.QueueAttributeName, v: string): bool throws Fault {
 	return v == "true"
 }
 
-/// v, of the attribute k, if it is a JSON object.
-function document(k: api.QueueAttributeName, v: string): string throws Fault {
+/// v if it is a resource policy, as the Policy attribute must be.
+function policy(v: string): string throws Fault {
 	try {
-		json.decode[json.Keys](v)
-	} catch (e: ParseError) {
-		throw invalidValue(k)
+		auth.parse(v, "resource")
+	} catch (f: Fault) {
+		throw invalidValue("Policy")
 	}
 	return v
 }

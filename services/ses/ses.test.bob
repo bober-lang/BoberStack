@@ -206,6 +206,13 @@ test "an identity's attributes, and its policies let another account send from i
 	assert call(g, "SendRawEmail", raw, "111111111111").status == 403
 	assert call(g, "DeleteIdentityPolicy", [["Identity", "example.com"], ["PolicyName", "p"]]).status == 200
 	assert call(g, "SendEmail", send, "111111111111").status == 403
+	// A policy without a Principal is refused by either API, and nothing is kept.
+	const bad = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "ses:SendEmail", "Resource": "*"}]}`
+	assert callV2(g, "POST", "/v2/email/identities/example.com/policies/q", `{"Policy": ${quoted(bad)}}`).status == 400
+	assert text(call(g, "PutIdentityPolicy", [["Identity", "example.com"], ["PolicyName", "q"], ["Policy", bad]]),
+		"Code") == "InvalidPolicy"
+	const listed = call(g, "ListIdentityPolicies", [["Identity", "example.com"]])
+	assert listed.status == 200 && text(listed, "member") == null
 }
 
 test "a badly signed request is answered in the protocol of the API it is to" {

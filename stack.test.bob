@@ -442,6 +442,33 @@ test "an identity-based policy for one queue, table, topic and bus allows there 
 	g.close()
 }
 
+test "a resource policy without a Principal is refused when set, as each service refuses it, and leaves what was there" {
+	const g = gateway()
+	const bad = policy([statement("Allow", `"*"`, "*")])
+	const quoted = json.quoted(bad)
+	queue(g, "q")
+	assert fails(call(g, "sqs", "CreateQueue", `{"QueueName":"p","Attributes":{"Policy":${quoted}}}`), 400,
+		"InvalidAttributeValue", "Invalid value for the parameter Policy.")
+	assert fails(call(g, "sqs", "SetQueueAttributes",
+		`{"QueueUrl":"${queueUrl("q")}","Attributes":{"Policy":${quoted}}}`), 400, "InvalidAttributeValue",
+		"Invalid value for the parameter Policy.")
+	const got = call(g, "sqs", "GetQueueAttributes", `{"QueueUrl":"${queueUrl("q")}","AttributeNames":["All"]}`)
+	assert got.status == 200 && indexOf(got.body.whole ?? "", "Principal") < 0
+	topic(g, "t")
+	assert fails(query(g, "sns",
+		[["Action", "SetTopicAttributes"], ["TopicArn", topicArn("t")], ["AttributeName", "Policy"],
+		["AttributeValue", bad]]), 400, "InvalidParameter", "Invalid parameter: Policy")
+	assert query(g, "sns", [["Action", "GetTopicAttributes"], ["TopicArn", topicArn("t")]]).status == 200
+	assert fails(call(g, "events", "PutPermission", `{"Policy":${quoted}}`), 400, "ValidationException",
+		"Parameter Policy is not valid.")
+	assert call(g, "events", "DescribeEventBus", "{}").status == 200
+	assert fails(json11Of(g, "logs", "PutResourcePolicy", `{"policyName":"p","policyDocument":${quoted}}`), 400,
+		"InvalidParameterException", "Error occurred while parsing accessPolicy.")
+	const res = json11Of(g, "logs", "DescribeResourcePolicies", "{}")
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"policyName":"p"`) < 0
+	g.close()
+}
+
 test "a queue's or topic's policy alone allows a user or role session of its account; another account's only with its own" {
 	const g = gateway()
 	const t = topicArn("t")

@@ -19,6 +19,7 @@
 //! sending, delivery, reputation and tracking options are kept, not followed; a request to v2 that fails before it is
 //! routed is answered as the classic API answers it, but for a bad signature.
 
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
 import { Store, Table } from "../../core/state/store"
@@ -1176,6 +1177,12 @@ function checkPolicy(policy: string, ofV2: bool) throws Fault {
 	if (dataOf(policy) == null) {
 		throw if (ofV2) v2.badRequestException("Policy is not valid JSON.")
 			else api.invalidPolicyException("Policy is not valid JSON.")
+	}
+	try {
+		auth.parse(policy, "resource")
+	} catch (f: Fault) {
+		throw if (ofV2) v2.badRequestException(`Policy is not valid: ${f.message}`)
+			else api.invalidPolicyException(`Policy is not valid: ${f.message}`)
 	}
 }
 

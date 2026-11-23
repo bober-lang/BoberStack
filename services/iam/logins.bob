@@ -72,12 +72,16 @@ export class Logins {
 		return new Unit()
 	}
 
-	/// Of the calling user only, the old password given, the new one kept to the account's password policy.
+	/// Of the calling user only, the old password given, the new one kept to the account's password policy; without
+	/// iam:ChangePassword if that policy allows users to change their passwords.
 	changePassword(caller: Caller, input: api.ChangePasswordRequest): Unit throws Fault {
 		if (indexOf(caller.arn, ":user/") < 0) {
 			throw api.invalidUserTypeException("Only IAM Users can change their own password.")
 		}
 		const db = new Tables(caller.store())
+		if (!(db.account.get("")?.passwords?.change ?? false)) {
+			onUser(caller, null)
+		}
 		const u = owner(caller, db, null)
 		const l = login(db, u)
 		if (digest(input.OldPassword) != l.password) {

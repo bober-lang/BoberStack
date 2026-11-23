@@ -303,14 +303,15 @@ test "login profiles: kept to the password policy; a user that has one is not de
 	assert text(res, "PasswordResetRequired") == "false" && text(res, "MaxSigninSessionDuration") == "7200"
 	assert fails(call(g, "ChangePassword", [["OldPassword", "long-enough1"], ["NewPassword", "other-pass2"]]), 400,
 		"InvalidUserType")
-	call(g, "PutUserPolicy",
-		[["UserName", "bob"], ["PolicyName", "p"],
-		["PolicyDocument",
-		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ChangePassword","Resource":"*"}]}`]])
 	res = call(g, "CreateAccessKey", [["UserName", "bob"]])
 	const [id, secret] = [text(res, "AccessKeyId")!, text(res, "SecretAccessKey")!]
 	const change = (old: string,
 		now: string) => call(g, "ChangePassword", [["OldPassword", old], ["NewPassword", now]], id, secret)
+	// Without a policy, a user changes their own password only as the account's password policy allows users to.
+	assert fails(change("long-enough1", "other-pass2"), 403, "AccessDenied")
+	call(g, "UpdateAccountPasswordPolicy",
+		[["MinimumPasswordLength", "10"], ["RequireNumbers", "true"], ["RequireSymbols", "true"],
+		["AllowUsersToChangePassword", "true"]])
 	assert fails(change("wrong", "other-pass2"), 400, "InvalidUserType")
 	assert fails(change("long-enough1", "short"), 400, "PasswordPolicyViolation",
 		"Password should have a minimum length of 10")
@@ -321,7 +322,6 @@ test "login profiles: kept to the password policy; a user that has one is not de
 	assert fails(change("third-pass3", "fourth-pass4"), 404, "NoSuchEntity")
 	assert fails(call(g, "DeleteLoginProfile", [["UserName", "bob"]]), 404, "NoSuchEntity")
 	call(g, "DeleteAccessKey", [["UserName", "bob"], ["AccessKeyId", id]])
-	call(g, "DeleteUserPolicy", [["UserName", "bob"], ["PolicyName", "p"]])
 	assert call(g, "DeleteUser", [["UserName", "bob"]]).status == 200
 	g.close()
 }

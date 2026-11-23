@@ -13,6 +13,7 @@
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
 
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
@@ -627,8 +628,8 @@ export class Handler {
 		const name = required(input.policyName, "policyName")
 		const document = required(input.policyDocument, "policyDocument")
 		try {
-			json.decode[json.Keys](document)
-		} catch (e: ParseError) {
+			auth.parse(document, "resource")
+		} catch (f: Fault) {
 			throw invalid("Error occurred while parsing accessPolicy. Please check if the accessPolicy has been "
 				+ "constructed correctly using IAM grammar.")
 		}

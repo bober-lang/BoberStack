@@ -28,6 +28,7 @@ import { Archive, busArn, Bus, Connection, Destination, Replay, ruleArn, Rule, s
 
 import * as api from "./api"
 import { list, matches, member, members, str, validate } from "./pattern"
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { result } from "../../core/protocol/json"
 import * as json from "../../core/protocol/json"
@@ -156,7 +157,9 @@ export class Handler {
 		const b = bus(db, input.EventBusName ?? "default")
 		const arn = busArn(caller.region, caller.account, b.name)
 		if (input.Policy != null) {
-			if (members(input.Policy!).length == 0) {
+			try {
+				auth.parse(input.Policy!, "resource")
+			} catch (f: Fault) {
 				throw validation("Parameter Policy is not valid.")
 			}
 			b.policy = input.Policy

@@ -20,6 +20,7 @@
 //!   not implemented.
 
 import { secret } from "../../core/auth/credentials"
+import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
@@ -800,7 +801,12 @@ function topicAttribute(name: string, v: string, fifo: bool, create: bool) throw
 		case "DisplayName": if (v.length > 100) {
 			throw invalid("DisplayName")
 		}
-		case "Policy", "DeliveryPolicy": if (!object(v)) {
+		case "Policy": try {
+			auth.parse(v, "resource")
+		} catch (f: Fault) {
+			throw invalid(name)
+		}
+		case "DeliveryPolicy": if (!object(v)) {
 			throw invalid(name)
 		}
 		case "SignatureVersion": if (v != "1" && v != "2") {
