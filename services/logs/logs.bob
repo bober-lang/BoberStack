@@ -4,8 +4,10 @@
 //!
 //! - Nothing runs between requests: retention hides events older than it at each request, and a subscription filter
 //!   is sent the events of each PutLogEvents it matches within that request, by calling the Kinesis or Firehose handler
-//!   as a session of the filter's role; one refused is dropped, never retried. A Kinesis record's partition key is the
-//!   request's id, and its events carry no extractedFields. A filter to Lambda or a destination is refused.
+//!   as a session of the filter's role, or by invoking a function asynchronously as the service; one refused is
+//!   dropped, never retried. A Kinesis record's partition key is the request's id, and its events carry no
+//!   extractedFields. A filter to Lambda is checked with a dry run, not a test invocation. One to a destination is
+//!   refused.
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
 
@@ -19,6 +21,7 @@ import { match, parse } from "./pattern"
 import { list, member } from "../events/pattern"
 import * as firehoseApi from "../firehose/api"
 import * as kinesisApi from "../kinesis/api"
+import * as lambdaApi from "../lambda/api"
 import { actAs, passRole } from "../sts/sts"
 import * as cloudwatchApi from "../cloudwatch/api"
 import { publish } from "./metrics"
@@ -53,6 +56,7 @@ export class Handler {
 	/// What subscription filters deliver to, which the stack sets.
 	kinesis: kinesisApi.Kinesis | null = null
 	firehose: firehoseApi.Firehose | null = null
+	lambda: lambdaApi.Lambda | null = null
 	/// What metric filters publish to, which the stack sets.
 	cloudwatch: cloudwatchApi.CloudWatch | null = null
 
@@ -81,6 +85,28 @@ export class Handler {
 		r.PartitionKey = caller.requestId
 		try {
 			this.kinesis!.putRecord(assumed(caller, role, source, ["kinesis:PutRecord"]), r)
+		} catch (f: Fault) {
+			return false
+		}
+		return true
+	}
+
+	/// Whether the function took data, invoked as CloudWatch Logs on behalf of the log group source; a dry run if null.
+	/// The source ARN ends in :*, as AWS gives it.
+	private invoke(caller: Caller, fn: string, source: string, data: string | null): bool {
+		if (this.lambda == null) {
+			return false
+		}
+		const r = new lambdaApi.InvocationRequest()
+		r.FunctionName = fn
+		r.InvocationType = if (data == null) "DryRun" else "Event"
+		r.Payload = if (data == null) null else `{"awslogs":{"data":${json.quoted(base64.encode(gzip(data!)))}}}`
+		const as = caller.internal("logs.amazonaws.com", `${source}:*`, ["lambda:InvokeFunction"])
+		const parts = split(fn, ":")
+		as.account = parts[4]
+		as.region = parts[3]
+		try {
+			this.lambda!.invoke(as, r)
 		} catch (f: Fault) {
 			return false
 		}
@@ -347,15 +373,20 @@ export class Handler {
 		for (const [_, f] of subscriptions(s).scan(null, 1000, g + "\x00")) {
 			const p = parse(f.pattern)
 			const matched = put.filter(e => match(p, e[1].message) != null)
-			if (matched.length == 0 || f.role == null) {
+			const lambda = startsWith(f.destination, "arn:aws:lambda:")
+			if (matched.length == 0 || (f.role == null && !lambda)) {
 				continue
 			}
 			const logged = matched.map(e => `{"id":${json.quoted(e[0])},"timestamp":${e[1].timestamp},`
 				+ `"message":${json.quoted(e[1].message)}}`)
-			this.send(caller, f.destination, f.role!, arnOf(caller, g),
-				`{"messageType":"DATA_MESSAGE",`
+			const data = `{"messageType":"DATA_MESSAGE",`
 				+ `"owner":${json.quoted(caller.account)},"logGroup":${json.quoted(g)},"logStream":${json.quoted(name)},`
-				+ `"subscriptionFilters":[${json.quoted(f.name)}],"logEvents":[${logged.join(",")}]}`)
+				+ `"subscriptionFilters":[${json.quoted(f.name)}],"logEvents":[${logged.join(",")}]}`
+			if (lambda) {
+				this.invoke(caller, f.destination, arnOf(caller, g), data)
+			} else {
+				this.send(caller, f.destination, f.role!, arnOf(caller, g), data)
+			}
 		}
 		if (this.cloudwatch != null) {
 			publish(this.cloudwatch!, caller, arnOf(caller, g),
@@ -557,25 +588,25 @@ export class Handler {
 			throw invalid(`1 validation error detected: Unable to parse destinationArn ${input.destinationArn}`)
 		}
 		const vendor = parts[2]
-		if (vendor == "lambda") {
-			// There is no Lambda to execute.
-			throw invalid("Could not execute the lambda function. Make sure you have given CloudWatch Logs permission "
-				+ "to execute your function.")
-		}
 		if (vendor == "logs") {
 			throw api.resourceNotFoundException("The specified destination does not exist.")
 		}
-		if (vendor != "kinesis" && vendor != "firehose") {
+		if (vendor == "lambda") {
+			if (!this.invoke(caller, input.destinationArn, arnOf(caller, g), null)) {
+				throw invalid("Could not execute the lambda function. Make sure you have given CloudWatch Logs "
+					+ "permission to execute your function.")
+			}
+		} else if (vendor != "kinesis" && vendor != "firehose") {
 			throw invalid(`PutSubscriptionFilter operation cannot work with destinationArn for vendor ${vendor}`)
 		}
-		if (role == null) {
+		if (vendor != "lambda" && role == null) {
 			throw invalid(`destinationArn for vendor ${vendor} cannot be used without roleArn`)
 		}
 		const control = `{"messageType":"CONTROL_MESSAGE","owner":"CloudwatchLogs","logGroup":"","logStream":"",`
 			+ `"subscriptionFilters":[],"logEvents":[{"id":"","timestamp":${ms()},`
 			+ `"message":"CWL CONTROL MESSAGE: Checking health of destination `
 			+ (if (vendor == "kinesis") "Kinesis stream" else "Firehose") + `."}]}`
-		if (!this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
+		if (vendor != "lambda" && !this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
 			const named = if (vendor == "kinesis") "Kinesis" else "Firehose"
 			throw invalid(`Could not deliver test message to specified ${named} stream. Check if the given ${named} `
 				+ "stream is in ACTIVE state.")

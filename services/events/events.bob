@@ -3,7 +3,7 @@
 //! as their policies allow EventBridge; a delivery the target refuses goes to its dead-letter queue, or is dropped.
 //! The events of AWS's own services, as S3's, are put on the default bus by emit, unauthorized. Where AWS differs:
 //!
-//! - Targets other than SQS, SNS, Kinesis, Firehose, Step Functions, Logs and buses are stored but sent nothing.
+//! - Targets other than SQS, SNS, Lambda, Kinesis, Firehose, Step Functions, Logs and buses are stored but sent nothing.
 //!   Connections and API destinations are state only, always AUTHORIZED and ACTIVE; no HTTP is sent, no secret kept.
 //! - A log event is stamped with the time of delivery, not the event's time.
 //! - A rule's schedule (./schedule) fires at the gateway's tick, up to a second late; a tick that comes late fires each
@@ -24,6 +24,7 @@ import * as json from "../../core/protocol/json"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as firehoseApi from "../firehose/api"
+import * as lambdaApi from "../lambda/api"
 import * as kinesisApi from "../kinesis/api"
 import * as logsApi from "../logs/api"
 import * as snsApi from "../sns/api"
@@ -49,6 +50,7 @@ export class Handler {
 	firehose: firehoseApi.Firehose | null = null
 	logs: logsApi.CloudWatchLogs | null = null
 	states: sfnApi.SFN | null = null
+	lambda: lambdaApi.Lambda | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS) {
 		this.sqs = sqs
@@ -1024,6 +1026,16 @@ export class Handler {
 				m.stateMachineArn = t.Arn
 				m.input = body
 				this.states!.startExecution(assumed(caller, t.RoleArn ?? "", source, ["states:StartExecution"]), m)
+			} else if (service == "lambda" && this.lambda != null) {
+				// Invoked asynchronously, as the function's policy allows EventBridge.
+				const m = new lambdaApi.InvocationRequest()
+				m.FunctionName = t.Arn
+				m.InvocationType = "Event"
+				m.Payload = body
+				const c = caller.internal(principal, source, ["lambda:InvokeFunction"])
+				c.account = account
+				c.region = region
+				this.lambda!.invoke(c, m)
 			} else if (service == "kinesis" && this.kinesis != null) {
 				const m = new kinesisApi.PutRecordInput()
 				m.StreamARN = t.Arn

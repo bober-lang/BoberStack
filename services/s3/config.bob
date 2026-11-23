@@ -1,6 +1,6 @@
 //! S3's bucket configuration: the operations of the Handler of ./s3 that it mixes in. Lifecycle rules are kept, never
-//! run; notifications deliver to SQS queues and SNS topics, and with EventBridge on to the bucket owner's default event
-//! bus, within the request that makes the event.
+//! run; notifications deliver to SQS queues, SNS topics and Lambda functions, asynchronously invoked, and with
+//! EventBridge on to the bucket owner's default event bus, within the request that makes the event.
 //! Where AWS differs: an EventBridge event's key is as given, not URL-encoded, and of a removal of an object never
 //! versioned it has no etag; the events of tags, ACLs, restores and lifecycle are never made.
 
@@ -9,6 +9,7 @@ import { Policy } from "../../core/auth/policy"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as events from "../events/events"
+import * as lambdaApi from "../lambda/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
@@ -106,6 +107,7 @@ export class Config {
 	sqs: sqsApi.SQS | null = null
 	sns: snsApi.SNS | null = null
 	events: events.Handler | null = null
+	lambda: lambdaApi.Lambda | null = null
 
 	putPublicAccessBlock(caller: Caller, input: api.PutPublicAccessBlockRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketPublicAccessBlock"]
@@ -685,6 +687,9 @@ export class Config {
 		for (const t of c.TopicConfigurations ?? []) {
 			events.append(t.Events.map(e => `${e}`))
 		}
+		for (const l of c.LambdaFunctionConfigurations ?? []) {
+			events.append(l.Events.map(e => `${e}`))
+		}
 		for (const e of events) {
 			if (!among[api.Event](e)) {
 				throw argument("The event is not supported for notifications", "Event", e)
@@ -705,6 +710,11 @@ export class Config {
 				if (!this.toTopic(caller, f, t.TopicArn, test)) {
 					failed.push([t.TopicArn,
 						"Permissions on the destination topic do not allow S3 to publish notifications from this bucket"])
+				}
+			}
+			for (const l of c.LambdaFunctionConfigurations ?? []) {
+				if (!this.toFunction(caller, f, l.LambdaFunctionArn, null)) {
+					failed.push([l.LambdaFunctionArn, "Not authorized to invoke function"])
 				}
 			}
 			if (failed.length > 0) {
@@ -743,6 +753,11 @@ export class Config {
 		for (const t of topics) {
 			this.toTopic(caller, f, t.TopicArn, record(caller, f, event, v, t.Id ?? ""))
 		}
+		for (const l of c.LambdaFunctionConfigurations ?? []) {
+			if (takes(l.Events.map(e => `${e}`), l.Filter, event, v.key)) {
+				this.toFunction(caller, f, l.LambdaFunctionArn, record(caller, f, event, v, l.Id ?? ""))
+			}
+		}
 		if (c.EventBridgeConfiguration != null && this.events != null) {
 			// S3 puts it on the bucket owner's default bus of the bucket's region.
 			const s = caller.internal("s3.amazonaws.com", arn(f.bucket.name), [])
@@ -771,6 +786,27 @@ export class Config {
 				else "Permissions on the destination queue do not allow S3 to publish notifications from this bucket"
 		}
 		return null
+	}
+
+	/// Invokes the function of the ARN a with body, asynchronously, as S3; with none, only checks that S3 may.
+	private toFunction(caller: Caller, f: Found, a: string, body: string | null): bool {
+		if (this.lambda == null) {
+			return false
+		}
+		const m = new lambdaApi.InvocationRequest()
+		m.FunctionName = a
+		m.InvocationType = if (body == null) "DryRun" else "Event"
+		m.Payload = body
+		const s = caller.internal("s3.amazonaws.com", arn(f.bucket.name), ["lambda:InvokeFunction"])
+		const parts = split(a, ":")
+		s.account = if (parts.length >= 7) parts[4] else f.bucket.owner
+		s.region = f.bucket.region
+		try {
+			this.lambda!.invoke(s, m)
+		} catch (e: Fault) {
+			return false
+		}
+		return true
 	}
 
 	private toTopic(caller: Caller, f: Found, a: string, body: string): bool {
@@ -963,7 +999,7 @@ function sequencer(v: Version): string {
 
 function time(): string {
 	const t = now()
-	const s = rfc3339(t - t % 1000000)
+	const s = rfc3339(t - t % 1000000000)
 	return if (endsWith(s, "Z")) `${s.slice(0, s.length - 1)}.${`${1000 + t / 1000000 % 1000}`.slice(1, 4)}Z` else s
 }
 

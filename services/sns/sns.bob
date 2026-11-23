@@ -2,9 +2,9 @@
 //! publishing to them, which delivers within the publishing request as SNS's principal on behalf of the topic. Known
 //! differences from AWS:
 //!
-//! - Only sqs and firehose subscriptions are delivered to. Those of http, https, email and email-json are kept pending
-//!   confirmation, but no confirmation request is sent; those of sms, lambda and application are confirmed at once
-//!   and never delivered to.
+//! - Only sqs, firehose and lambda subscriptions are delivered to, a function asynchronously. Those of http, https,
+//!   email and email-json are kept pending confirmation, but no confirmation request is sent; those of sms and
+//!   application are confirmed at once and never delivered to.
 //! - A message is delivered once, within the publish: no retries, delays or delivery policies. One that a queue
 //!   refuses goes to the subscription's dead-letter queue if it has one, else is dropped.
 //! - Notifications are not signed: their Signature is random and their SigningCertURL names no certificate.
@@ -20,6 +20,7 @@ import { random, uuid } from "../../core/random"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as firehoseApi from "../firehose/api"
+import * as lambdaApi from "../lambda/api"
 import { actAs, passRole } from "../sts/sts"
 import { decryptAs, encryptAs } from "../kms/kms"
 import * as sqsApi from "../sqs/api"
@@ -44,6 +45,7 @@ export class Handler {
 	sqs: sqsApi.SQS
 	/// Set by the stack.
 	firehose: firehoseApi.Firehose | null = null
+	lambda: lambdaApi.Lambda | null = null
 
 	constructor(sqs: sqsApi.SQS) { this.sqs = sqs }
 
@@ -474,7 +476,7 @@ export class Handler {
 			p.db.published.put(key, { ...new Published(), id: id, sequence: seq!, at: now() })
 		}
 		for (const [_, s] of subscriptions(p.db, t.name)) {
-			if (s.confirmed && (s.protocol == "sqs" || s.protocol == "firehose")) {
+			if (s.confirmed && (s.protocol == "sqs" || s.protocol == "firehose" || s.protocol == "lambda")) {
 				this.deliver(caller, p, t, s, m, id, seq)
 			}
 		}
@@ -506,6 +508,22 @@ export class Handler {
 			return
 		}
 		const raw = attribute(s.attributes, "RawMessageDelivery") == "true"
+		if (s.protocol == "lambda") {
+			if (this.lambda != null) {
+				const r = new lambdaApi.InvocationRequest()
+				r.FunctionName = s.endpoint
+				r.InvocationType = "Event"
+				r.Payload = event(caller, p, t, s, m, payload, id)
+				const as = caller.internal("sns.amazonaws.com", p.arn, ["lambda:InvokeFunction"])
+				const parts = split(s.endpoint, ":")
+				as.account = parts[4]
+				as.region = parts[3]
+				try {
+					this.lambda!.invoke(as, r)
+				} catch (f: Fault) {} // dropped
+			}
+			return
+		}
 		if (s.protocol == "firehose") {
 			if (this.firehose != null) {
 				const r = new firehoseApi.PutRecordInput()
@@ -1040,6 +1058,24 @@ function envelope(caller: Caller, p: Place, t: Topic, s: Subscription, m: Messag
 		out += `,"MessageAttributes":{${attrs.join(",")}}`
 	}
 	return out + "}"
+}
+
+/// The notification as Lambda's event: one record, its members named as Lambda names them.
+function event(caller: Caller, p: Place, t: Topic, s: Subscription, m: Message, payload: string, id: string): string {
+	const q = json.quoted
+	const subject = if (m.subject == null) "null" else q(m.subject!)
+	const attrs = m.attributes.map(a => {
+		const v = if (startsWith(a[1].DataType, "Binary")) base64.encode(a[1].BinaryValue ?? "")
+			else a[1].StringValue ?? ""
+		return `${q(a[0])}:{"Type":${q(a[1].DataType)},"Value":${q(v)}}`
+	})
+	const unsubscribe = `${caller.endpoint}/?Action=Unsubscribe&SubscriptionArn=${p.arn}:${s.id}`
+	return `{"Records":[{"EventSource":"aws:sns","EventVersion":"1.0","EventSubscriptionArn":${q(`${p.arn}:${s.id}`)},`
+		+ `"Sns":{"Type":"Notification","MessageId":${q(id)},"TopicArn":${q(p.arn)},"Subject":${subject},`
+		+ `"Message":${q(payload)},"Timestamp":${q(timestamp(now()))},`
+		+ `"SignatureVersion":${q(attribute(t.attributes, "SignatureVersion") ?? "1")},"Signature":${q(`${secret(342)}==`)},`
+		+ `"SigningCertUrl":${q(certificate(caller))},"UnsubscribeUrl":${q(unsubscribe)},`
+		+ `"MessageAttributes":{${attrs.join(",")}}}}]}`
 }
 
 function certificate(caller: Caller): string {
