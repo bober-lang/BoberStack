@@ -8,7 +8,8 @@
 //! requires of it, an object of widgets each of a type, and kept as given. A composite alarm is evaluated with its
 //! children, and again whenever one of them changes state; it can be ALARM or OK only. An anomaly detector of a single
 //! metric is stored as put, and never trained: it stays PENDING_TRAINING, and no alarm uses its band. Detectors of
-//! metric math, insight rules, metric streams and the rest are not implemented. Where AWS differs:
+//! metric math are not implemented. Metric streams and Contributor Insights rules are kept as put, started or stopped,
+//! enabled or disabled, but nothing is streamed to their Firehose and no rule reads a log. Where AWS differs:
 //!
 //! - Retention is of the request's time: data older than 15 months is not read, nor that of a period under 5 minutes
 //!   older than 15 days or under an hour older than 63 days; a metric without data put in two weeks is not listed.
@@ -18,13 +19,14 @@
 //!   some operations, as GetMetricData and PutDashboard, does not quote the value.
 //! - Metric math knows + - * / ^, comparisons, METRICS(), SUM, AVG, MIN, MAX, FILL with a number, RATE, IF and
 //!   ABS; any other function is not found, as AWS answers one it does not know. An expression's series are of the
-//!   period of the request's first metric. GetMetricData answers in one page, MaxDatapoints aside.
-//! - Only alarms of a single metric are evaluated; one of metric math stays as it is but by SetAlarmState. Only actions
-//!   of SNS are delivered; an alarm message's Region is the region's code, its reason in short words, and the alarm's
-//!   StateReasonData is not given.
-//! - A composite alarm's rule knows TRUE, FALSE, NOT, AND, OR and the three states; AT_LEAST is a syntax error. The
-//!   reason of a change a child makes is worded more briefly than AWS words it.
-//! - DescribeAlarmHistory answers in one page, MaxRecords aside.
+//!   period of the request's first metric. GetMetricData's pages are of MaxDatapoints of all its results in order,
+//!   and its NextToken counts those before.
+//! - An alarm on metric math is evaluated on its query that returns data, of the period of that query or else of its
+//!   first metric, its reason worded as one of a single metric's. Only actions of SNS are delivered; an alarm message's
+//!   Region is the region's code, its reason in short words, and the alarm's StateReasonData is not given.
+//! - A composite alarm's rule knows TRUE, FALSE, NOT, AND, OR, the three states and AT_LEAST; a syntax error lists
+//!   fewer of the tokens AWS would take. The reason of a change a child makes is worded more briefly than AWS words it.
+//!   A DeleteAlarms of children still in a rule lists them in the order asked.
 //! - A dashboard's body is checked for its widgets' types only, and its Size is the body's length, where AWS counts
 //!   more.
 
@@ -35,15 +37,16 @@ import * as snsApi from "../sns/api"
 import * as api from "./api"
 import { holds, names, parse, Rule, SyntaxError } from "./rule"
 
-import { Alarm, alarms, Dashboard, dashboards, Detector, detectors, History, history, key, padded, Sample, samples,
-	save, Series, series } from "./records"
+import { Alarm, alarms, Dashboard, dashboards, Detector, detectors, History, history, InsightRule, insightRules, key,
+	MetricStream, metricStreams, padded, Sample, samples, save, Series, series } from "./records"
 
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
+import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { formatFloat, parseFloat } from "std/float"
 import { abs, floor, isFinite, isNaN, max, min, nan } from "std/math"
-import { ParseError, split } from "std/string"
+import { ParseError, parseInt, split } from "std/string"
 import { day, hour, minute, rfc3339, second } from "std/time"
 
 /// The data a PutMetricData may hold: datums, values of one, dimensions of one.
@@ -109,7 +112,7 @@ export class Handler {
 			}
 		}
 		for (const [_, a] of alarms(db).scan()) {
-			if (a.metric != null && keys.includes(key(a.namespace ?? "", a.metric!, a.dimensions))) {
+			if (watched(a).some(k => keys.includes(k))) {
 				this.evaluate(caller, a, t)
 			}
 		}
@@ -267,6 +270,18 @@ export class Handler {
 		out.MetricDataResults = []
 		out.Messages = []
 		const descending = (input.ScanBy ?? "TimestampDescending") == "TimestampDescending"
+		// A page holds MaxDatapoints of the datapoints of all results in order; a NextToken counts those given before.
+		let start = 0
+		if (input.NextToken != null) {
+			try {
+				start = parseInt(token(input.NextToken!)) as i32
+			} catch (e: ParseError) {
+				throw api.invalidNextToken("The service cannot complete the request.")
+			}
+		}
+		let skip = start
+		let left = input.MaxDatapoints ?? 100800
+		let partial = false
 		for (const q of qs) {
 			if (!(q.ReturnData ?? true)) {
 				continue
@@ -287,14 +302,22 @@ export class Handler {
 						r.Values!.push(v!)
 					}
 				}
-				const most = input.MaxDatapoints
-				if (most != null && r.Values!.length > most!) {
-					r.Timestamps = r.Timestamps!.slice(0, most!)
-					r.Values = r.Values!.slice(0, most!)
+				const from = min(skip, r.Values!.length)
+				const to = from + min(left, r.Values!.length - from)
+				if (to < r.Values!.length) {
 					r.StatusCode = "PartialData"
+					partial = true
 				}
+				r.Timestamps = r.Timestamps!.slice(from, to)
+				r.Values = r.Values!.slice(from, to)
+				skip -= from
+				left -= to - from
+				start += to - from
 				out.MetricDataResults!.push(r)
 			}
+		}
+		if (partial) {
+			out.NextToken = base64.encode(`${start}`)
 		}
 		return out
 	}
@@ -495,6 +518,134 @@ export class Handler {
 		return new api.DeleteAnomalyDetectorOutput()
 	}
 
+	putMetricStream(caller: Caller, input: api.PutMetricStreamInput): api.PutMetricStreamOutput throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a != "cloudwatch:TagResource" || tags.length > 0)
+		const arn = `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`
+		caller.allow(arn, null, requestTags(tags.map(t => [t.Key, t.Value])))
+		if ((input.IncludeFilters ?? []).length > 0 && (input.ExcludeFilters ?? []).length > 0) {
+			throw api.invalidParameterCombinationException("You cannot include both IncludeFilters and ExcludeFilters.")
+		}
+		const db = metricStreams(caller.regional())
+		const t = now()
+		const s = db.get(input.Name) ?? { ...new MetricStream(), created: t }
+		s.put = input
+		s.updated = t
+		save(db, input.Name, s)
+		const out = new api.PutMetricStreamOutput()
+		out.Arn = arn
+		return out
+	}
+
+	getMetricStream(caller: Caller, input: api.GetMetricStreamInput): api.GetMetricStreamOutput throws Fault {
+		caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`)
+		const s = metricStreams(caller.regional()).get(input.Name)
+		if (s == null) {
+			throw api.resourceNotFoundException("")
+		}
+		const p = s!.put
+		const out = new api.GetMetricStreamOutput()
+		out.Arn = `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${p.Name}`
+		out.Name = p.Name
+		out.IncludeFilters = p.IncludeFilters ?? []
+		out.ExcludeFilters = p.ExcludeFilters ?? []
+		out.FirehoseArn = p.FirehoseArn
+		out.RoleArn = p.RoleArn
+		out.State = s!.state
+		out.CreationDate = s!.created
+		out.LastUpdateDate = s!.updated
+		out.OutputFormat = p.OutputFormat
+		out.StatisticsConfigurations = p.StatisticsConfigurations ?? []
+		out.IncludeLinkedAccountsMetrics = p.IncludeLinkedAccountsMetrics ?? false
+		return out
+	}
+
+	listMetricStreams(caller: Caller, input: api.ListMetricStreamsInput): api.ListMetricStreamsOutput throws Fault {
+		caller.allow("*")
+		const most = input.MaxResults ?? 100
+		const out = new api.ListMetricStreamsOutput()
+		out.Entries = []
+		for (const [name, s] of metricStreams(caller.regional()).scan(if (input.NextToken == null) null
+			else token(input.NextToken!), most + 1)) {
+			if (out.Entries!.length == most) {
+				out.NextToken = base64.encode(out.Entries![most - 1].Name ?? "")
+				break
+			}
+			out.Entries!.push({ ...new api.MetricStreamEntry(), Name: name, FirehoseArn: s.put.FirehoseArn,
+				Arn: `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${name}`, State: s.state,
+				CreationDate: s.created, LastUpdateDate: s.updated, OutputFormat: s.put.OutputFormat })
+		}
+		return out
+	}
+
+	deleteMetricStream(caller: Caller, input: api.DeleteMetricStreamInput): api.DeleteMetricStreamOutput throws Fault {
+		caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`)
+		metricStreams(caller.regional()).delete(input.Name)
+		return new api.DeleteMetricStreamOutput()
+	}
+
+	startMetricStreams(caller: Caller, input: api.StartMetricStreamsInput): api.StartMetricStreamsOutput throws Fault {
+		this.streaming(caller, input.Names, "running")
+		return new api.StartMetricStreamsOutput()
+	}
+
+	stopMetricStreams(caller: Caller, input: api.StopMetricStreamsInput): api.StopMetricStreamsOutput throws Fault {
+		this.streaming(caller, input.Names, "stopped")
+		return new api.StopMetricStreamsOutput()
+	}
+
+	putInsightRule(caller: Caller, input: api.PutInsightRuleInput): api.PutInsightRuleOutput throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a != "cloudwatch:TagResource" || tags.length > 0)
+		caller.allow(insightArn(caller, input.RuleName), null, requestTags(tags.map(t => [t.Key, t.Value])))
+		const state = input.RuleState ?? "ENABLED"
+		if (state != "ENABLED" && state != "DISABLED") {
+			throw api.invalidParameterValueException("RuleState must be ENABLED or DISABLED")
+		}
+		save(insightRules(caller.regional()), input.RuleName,
+			{ ...new InsightRule(), definition: input.RuleDefinition, state: state,
+			transformed: input.ApplyOnTransformedLogs ?? false })
+		return new api.PutInsightRuleOutput()
+	}
+
+	describeInsightRules(caller: Caller,
+		input: api.DescribeInsightRulesInput): api.DescribeInsightRulesOutput throws Fault {
+		caller.allow("*")
+		const most = input.MaxResults ?? 500
+		const out = new api.DescribeInsightRulesOutput()
+		out.InsightRules = []
+		for (const [name, r] of insightRules(caller.regional()).scan(if (input.NextToken == null) null
+			else token(input.NextToken!), most + 1)) {
+			if (out.InsightRules!.length == most) {
+				out.NextToken = base64.encode(out.InsightRules![most - 1].Name)
+				break
+			}
+			out.InsightRules!.push({ ...new api.InsightRule(), Name: name, State: r.state, Definition: r.definition,
+				Schema: `{"Name": "CloudWatchLogRule", "Version": 1}`, ManagedRule: false,
+				ApplyOnTransformedLogs: r.transformed })
+		}
+		return out
+	}
+
+	deleteInsightRules(caller: Caller, input: api.DeleteInsightRulesInput): api.DeleteInsightRulesOutput throws Fault {
+		const out = new api.DeleteInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "")
+		return out
+	}
+
+	enableInsightRules(caller: Caller, input: api.EnableInsightRulesInput): api.EnableInsightRulesOutput throws Fault {
+		const out = new api.EnableInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "ENABLED")
+		return out
+	}
+
+	disableInsightRules(caller: Caller,
+		input: api.DisableInsightRulesInput): api.DisableInsightRulesOutput throws Fault {
+		const out = new api.DisableInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "DISABLED")
+		return out
+	}
+
 	putCompositeAlarm(caller: Caller, input: api.PutCompositeAlarmInput): Unit throws Fault {
 		const tags: [string, string][] = (input.Tags ?? []).map(t => [t.Key, t.Value])
 		caller.actions = caller.actions.filter(a => a == "cloudwatch:PutCompositeAlarm" || tags.length > 0)
@@ -593,9 +744,9 @@ export class Handler {
 						AlarmArn: alarmArn(caller, a.name), StateValue: a.state as api.StateValue,
 						StateUpdatedTimestamp: a.stateUpdated, StateTransitionedTimestamp: a.transitioned })
 				} else {
+					// A composite one by its name and ARN alone, as AWS lists it.
 					out.CompositeAlarms!.push({ ...new api.CompositeAlarm(), AlarmName: a.name,
-						AlarmArn: alarmArn(caller, a.name), StateValue: a.state as api.StateValue,
-						StateUpdatedTimestamp: a.stateUpdated, StateTransitionedTimestamp: a.transitioned })
+						AlarmArn: alarmArn(caller, a.name) })
 				}
 			}
 			return out
@@ -662,12 +813,22 @@ export class Handler {
 		for (const name of input.AlarmNames) {
 			caller.allow(alarmArn(caller, name))
 		}
+		const composites = input.AlarmNames.filter(n => alarms(db).get(n)?.rule != null)
+		if (composites.length > 1) {
+			throw api.validationException(`Cannot delete [${composites.length}] Composite Alarms as only one composite alarm `
+				+ "delete is allowed in single request")
+		}
+		const held: string[] = []
 		for (const [_, p] of alarms(db).scan()) {
 			for (const c of p.children) {
-				if (input.AlarmNames.includes(c) && !input.AlarmNames.includes(p.name)) {
-					throw api.validationException(`Cannot delete ${c} as there are composite alarm(s) depending on it.`)
+				if (input.AlarmNames.includes(c) && !input.AlarmNames.includes(p.name) && !held.includes(c)) {
+					held.push(c)
 				}
 			}
+		}
+		if (held.length > 0) {
+			throw api.validationException(`Cannot delete ${held.join(",")} as there are composite alarm(s) depending on `
+				+ (if (held.length == 1) "it." else "them."))
 		}
 		for (const name of input.AlarmNames) {
 			if (alarms(db).delete(name)) {
@@ -723,14 +884,18 @@ export class Handler {
 		/// By time, then as noted.
 		const items: [string, api.AlarmHistoryItem][] = []
 		const prefix = if (input.AlarmName == null) "" else `${input.AlarmName!}\x00`
+		const kinds = input.AlarmTypes ?? ["MetricAlarm"]
 		for (const [k, h] of history(db).scan(null, 1000000, prefix)) {
-			const typed = input.HistoryItemType == null || h.type == input.HistoryItemType
+			const name = split(k, "\x00")[0]
+			const of = alarms(db).get(name)
+			const kind: api.AlarmType = if (of != null && of!.rule != null) "CompositeAlarm" else "MetricAlarm"
+			const typed = (input.HistoryItemType == null || h.type == input.HistoryItemType) && kinds.includes(kind)
 			const after = input.StartDate == null || h.at >= input.StartDate!
 			const before = input.EndDate == null || h.at < input.EndDate!
 			if (typed && after && before) {
 				const i = new api.AlarmHistoryItem()
-				i.AlarmName = split(k, "\x00")[0]
-				i.AlarmType = "MetricAlarm"
+				i.AlarmName = name
+				i.AlarmType = kind
 				i.Timestamp = h.at
 				i.HistoryItemType = h.type as api.HistoryItemType
 				i.HistorySummary = h.summary
@@ -740,8 +905,19 @@ export class Handler {
 		}
 		const ascending = input.ScanBy == "TimestampAscending"
 		sortBy(items, (a, b) => if (ascending) a[0] < b[0] else a[0] > b[0])
+		let from = 0
+		if (input.NextToken != null) {
+			const after = token(input.NextToken!)
+			while (from < items.length && (if (ascending) items[from][0] <= after else items[from][0] >= after)) {
+				from++
+			}
+		}
+		const most = input.MaxRecords ?? 100
 		const out = new api.DescribeAlarmHistoryOutput()
-		out.AlarmHistoryItems = items.slice(0, min(items.length, input.MaxRecords ?? 100)).map(i => i[1])
+		out.AlarmHistoryItems = items.slice(from, min(items.length, from + most)).map(i => i[1])
+		if (from + most < items.length) {
+			out.NextToken = base64.encode(items[from + most - 1][0])
+		}
 		return out
 	}
 
@@ -812,18 +988,36 @@ export class Handler {
 			return this.change(caller, now, state, `${alarmArn(caller, a.name)} alarm rule evaluates to ${state}`, t,
 				false)
 		}
-		if (a.metric == null || a.period <= 0 || t < a.held) {
+		const seconds = if (a.metric != null) a.period else mathPeriod(a.metrics)
+		if ((a.metric == null && a.metrics.length == 0) || seconds <= 0 || t < a.held) {
 			return a
 		}
-		const period = (a.period as i64) * second
+		const period = (seconds as i64) * second
 		const end = t - t % period + period
 		const g = new Grid(end - (a.evaluationPeriods as i64) * period, period, a.evaluationPeriods)
-		const buckets = bucketed(caller, key(a.namespace ?? "", a.metric!, a.dimensions), g, a.unit)
+		const values: (f64 | null)[] = []
+		if (a.metric != null) {
+			for (const b of bucketed(caller, key(a.namespace ?? "", a.metric!, a.dimensions), g, a.unit)) {
+				values.push(if (b.length == 0) null else statOf(combined(b), a.statistic ?? a.extended!))
+			}
+		} else {
+			// The series of the query whose ReturnData is true; an expression that does not evaluate leaves the alarm.
+			const q = a.metrics.find(m => m.ReturnData ?? true) ?? a.metrics[a.metrics.length - 1]
+			try {
+				const lines = new Maths(caller, g, a.metrics).lines(q)
+				if (lines.length != 1) {
+					return a
+				}
+				for (const v of lines[0].values) {
+					values.push(if (v == null || isNaN(v!)) null else v)
+				}
+			} catch (f: Fault) {
+				return a
+			}
+		}
 		const points: [i64, f64 | null][] = []
-		for (let i = 0; i < buckets.length; i++) {
-			const at = g.start + (i as i64) * period
-			points.push([at,
-				if (buckets[i].length == 0) null else statOf(combined(buckets[i]), a.statistic ?? a.extended!)])
+		for (let i = 0; i < values.length; i++) {
+			points.push([g.start + (i as i64) * period, values[i]])
 		}
 		const present = points.filter(p => p[1] != null)
 		const breaching = present.filter(p => crosses(a, p[1]!))
@@ -856,6 +1050,44 @@ export class Handler {
 		const why = `Threshold Crossed: ${datapoints} [${shown}] ${if (n == 1) "was" else "were"} not ${word} the threshold `
 			+ `(${number(a.threshold)}).`
 		return this.change(caller, a, "OK", why, t, false)
+	}
+
+	/// Sets the state of the metric streams names, those that exist.
+	private streaming(caller: Caller, names: string[], state: string) throws Fault {
+		const db = metricStreams(caller.regional())
+		for (const n of names) {
+			caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${n}`)
+		}
+		for (const n of names) {
+			const s = db.get(n)
+			if (s != null) {
+				s!.state = state
+				save(db, n, s!)
+			}
+		}
+	}
+
+	/// Sets the state of the insight rules names, or deletes them for state "": the failures, of those not found.
+	private insights(caller: Caller, names: string[], state: string): api.PartialFailure[] throws Fault {
+		const db = insightRules(caller.regional())
+		for (const n of names) {
+			caller.allow(insightArn(caller, n))
+		}
+		const failures: api.PartialFailure[] = []
+		for (const n of names) {
+			const r = db.get(n)
+			if (r == null) {
+				failures.push({ ...new api.PartialFailure(), FailureResource: n,
+					ExceptionType: "ResourceNotFoundException", FailureCode: "404",
+					FailureDescription: "Rule not found" })
+			} else if (state == "") {
+				db.delete(n)
+			} else {
+				r!.state = state
+				save(db, n, r!)
+			}
+		}
+		return failures
 	}
 
 	/// The state the rule of the composite alarm a gives at t, its children evaluated first.
@@ -1697,6 +1929,46 @@ function clock(t: i64): string {
 function stamped(t: i64): string {
 	const ms = `${(t % second) / 1000000}`
 	return `${rfc3339(t - t % second).slice(0, 19)}.${"000".slice(0, 3 - ms.length)}${ms}+0000`
+}
+
+/// The key a NextToken of DescribeAlarmHistory gives, or the fault AWS answers one it did not give with.
+function token(t: string): string throws Fault {
+	try {
+		return base64.decode(t)
+	} catch (e: ParseError) {
+		throw api.invalidNextToken("The service cannot complete the request.")
+	}
+}
+
+/// The keys of the metrics the alarm a is of.
+function watched(a: Alarm): string[] throws Fault {
+	if (a.metric != null) {
+		return [key(a.namespace ?? "", a.metric!, a.dimensions)]
+	}
+	const out: string[] = []
+	for (const q of a.metrics) {
+		if (q.MetricStat != null) {
+			const m = q.MetricStat!.Metric
+			out.push(key(m.Namespace ?? "", m.MetricName ?? "", dimensionsOf(m.Dimensions ?? [], "Dimensions")))
+		}
+	}
+	return out
+}
+
+/// The period, in seconds, of an alarm of the metric math qs: that of its query that returns data, else its first
+/// metric's.
+function mathPeriod(qs: api.MetricDataQuery[]): i32 {
+	const q = qs.find(m => m.ReturnData ?? true)
+	if (q != null && (q!.MetricStat?.Period ?? q!.Period) != null) {
+		return q!.MetricStat?.Period ?? q!.Period!
+	}
+	const m = qs.find(m => m.MetricStat != null)
+	return if (m == null) 60 else m!.MetricStat!.Period
+}
+
+/// The ARN of the insight rule name.
+function insightArn(caller: Caller, name: string): string {
+	return `arn:aws:cloudwatch:${caller.region}:${caller.account}:insight-rule/${name}`
 }
 
 /// The rule s spells, answered as AWS answers one that does not parse.

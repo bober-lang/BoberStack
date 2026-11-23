@@ -123,6 +123,26 @@ export function match(p: Pattern, message: string): [string, string][] | null {
 	}
 }
 
+/// The value a metric transformation names, `$name` or `$1` of the values a match extracted, or `$.selector` of the JSON
+/// message, its first scalar; null if there is none.
+export function valueOf(extracted: [string, string][], message: string, name: string): string | null {
+	if (!startsWith(name, "$.")) {
+		const f = extracted.find(e => e[0] == name)
+		return if (f == null) null else f[1]
+	}
+	const v = document(message)
+	if (v == null) {
+		return null
+	}
+	try {
+		const s = new Scanner(name.slice(1, name.length))
+		const found = select(v!, s.selector()).filter(x => x.kind != "object" && x.kind != "array")
+		return if (found.length == 0) null else found[0].text
+	} catch (f: Fault) {
+		return null
+	}
+}
+
 /// The terms of the text t.
 function terms(t: string): Term[] throws Fault {
 	const out: Term[] = []

@@ -1,18 +1,22 @@
 //! A composite alarm's rule: ALARM(name), OK(name) and INSUFFICIENT_DATA(name), each of an alarm's name or ARN, bare or
-//! quoted; TRUE and FALSE; NOT, AND and OR, binding in that order; and parentheses. Its syntax errors are worded as
-//! AWS words them, AT_LEAST, which AWS knows, being one.
+//! quoted; AT_LEAST(n, state, (names)), n a count or a percentage, the state possibly NOT one; TRUE and FALSE; NOT, AND
+//! and OR, binding in that order; and parentheses. Its syntax errors are worded as AWS words them.
 
-import { indexOf, lastIndexOf } from "std/algo"
-import { isSpace } from "std/ascii"
-import { trim } from "std/string"
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import { parseFloat } from "std/float"
+import { ParseError, trim } from "std/string"
 
 /// A rule, or a part of one: of kind "state", true of the alarm named name in the state value; "TRUE" or "FALSE";
-/// or "NOT", "AND" or "OR" of its operands.
+/// "NOT", "AND" or "OR" of its operands; or "AT_LEAST", true if at least name, a count or "n%", of its operands, each
+/// of kind "state", are in the state value, "NOT ALARM" for one not in ALARM.
 export class Rule {
 	kind = ""
 	value = ""
 	name = ""
 	operands: Rule[] = []
+	/// Of AT_LEAST, its n.
+	least = 0.0
 }
 
 /// Why a rule does not parse, in AWS's words.
@@ -58,6 +62,13 @@ export function holds(r: Rule, state: (name: string) => string): bool {
 		case "TRUE": return true
 		case "FALSE": return false
 		case "NOT": return !holds(r.operands[0], state)
+		case "AT_LEAST":
+			const negated = startsWith(r.value, "NOT ")
+			const n = r.operands.filter(o => (state(o.name) == o.value) != negated).length
+			if (endsWith(r.name, "%")) {
+				return (n as f64) * 100.0 >= r.least * (r.operands.length as f64)
+			}
+			return (n as f64) >= r.least
 		case "AND": return r.operands.every(o => holds(o, state))
 		default: return r.operands.some(o => holds(o, state))
 	}
@@ -117,9 +128,88 @@ class Parser {
 				const r = { ...new Rule(), kind: "state", value: w, name: this.name() }
 				this.close()
 				return r
+			case "AT_LEAST": return this.atLeast()
 		}
 		this.at = start
 		throw this.unsupported(expected)
+	}
+
+	/// The rest of AT_LEAST(n, state, (names)), after its name.
+	atLeast(): Rule throws SyntaxError {
+		this.expect(40)
+		this.skip()
+		const start = this.at
+		while (this.at < this.s.length
+			&& (isDigit(this.s[this.at]) || this.s[this.at] == 46 || this.s[this.at] == 37)) {
+			this.at++
+		}
+		const count = this.s.slice(start, this.at)
+		if (count == "" || count == "%" || count == "."
+			|| (endsWith(count, "%") && indexOf(count, "%") < count.length - 1)) {
+			this.at = start
+			throw this.unsupported(", must be: NUMBER, PERCENTAGE NUMBER")
+		}
+		this.expect(44)
+		let value = if (this.keyword("NOT")) "NOT " else ""
+		this.skip()
+		const from = this.at
+		while (this.at < this.s.length && (isAlphanumeric(this.s[this.at]) || this.s[this.at] == 95)) {
+			this.at++
+		}
+		const named = this.s.slice(from, this.at)
+		if (!["ALARM", "OK", "INSUFFICIENT_DATA"].includes(named)) {
+			this.at = from
+			throw this.unsupported(", must be: 'NOT', ALARM, OK, or INSUFFICIENT_DATA")
+		}
+		value += named
+		this.expect(44)
+		this.expect(40)
+		const r = { ...new Rule(), kind: "AT_LEAST", value: value, name: count }
+		try {
+			r.least = parseFloat(if (endsWith(count, "%")) count.slice(0, count.length - 1) else count)
+		} catch (e: ParseError) {
+			this.at = start
+			throw this.unsupported(", must be: NUMBER, PERCENTAGE NUMBER")
+		}
+		while (true) {
+			this.skip()
+			const from = this.at
+			while (this.at < this.s.length && this.s[this.at] != 44 && this.s[this.at] != 41) {
+				this.at++
+			}
+			let n = trim(this.s.slice(from, this.at))
+			if (startsWith(n, "\"") && endsWith(n, "\"") && n.length >= 2) {
+				n = n.slice(1, n.length - 1)
+			}
+			if (n == "") {
+				this.at = from
+				throw this.unsupported("")
+			}
+			const colon = lastIndexOf(n, ":alarm:")
+			n = if (colon >= 0) n.slice(colon + 7, n.length) else n
+			r.operands.push({ ...new Rule(), kind: "state", value: named, name: n })
+			if (this.at < this.s.length && this.s[this.at] == 44) {
+				this.at++
+				continue
+			}
+			break
+		}
+		this.close()
+		this.close()
+		const n = r.operands.length
+		if (!endsWith(count, "%") && (r.least < 1.0 || r.least > (n as f64))) {
+			throw new SyntaxError(`Error in AlarmRule [AT_LEAST absolute threshold must be between 1 and number of alarms (${n})]`)
+		}
+		return r
+	}
+
+	/// Takes the character c, after any space.
+	expect(c: u8) throws SyntaxError {
+		this.skip()
+		if (this.at >= this.s.length || this.s[this.at] != c) {
+			throw this.unsupported("")
+		}
+		this.at++
 	}
 
 	/// The name of an alarm within parentheses, quoted or bare, of an ARN its last part.
@@ -169,7 +259,8 @@ class Parser {
 	/// The run of characters up to a space or parenthesis.
 	word(): string {
 		const start = this.at
-		while (this.at < this.s.length && !isSpace(this.s[this.at]) && this.s[this.at] != 40 && this.s[this.at] != 41) {
+		while (this.at < this.s.length && !isSpace(this.s[this.at]) && this.s[this.at] != 40 && this.s[this.at] != 41
+			&& this.s[this.at] != 44) {
 			this.at++
 		}
 		if (this.at == start && this.at < this.s.length) {

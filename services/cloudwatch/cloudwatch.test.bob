@@ -233,3 +233,95 @@ test "anomaly detectors are stored, of either form of request, and deleted" {
 	assert fails(call(g, "DeleteAnomalyDetector", single), 404, "ResourceNotFoundException")
 	assert texts(call(g, "DescribeAnomalyDetectors"), "Stat") == ["Average", "Average"]
 }
+
+test "metric streams and insight rules are kept as put, started and stopped, enabled and disabled" {
+	const g = gateway(new Topics())
+	assert call(g, "PutMetricStream",
+		[["Name", "s"], ["FirehoseArn", "arn:aws:firehose:us-east-1:000000000000:x"],
+		["RoleArn", "arn:aws:iam::000000000000:role/r"], ["OutputFormat", "json"]]).status == 200
+	assert text(call(g, "GetMetricStream", [["Name", "s"]]), "State") == "running"
+	assert call(g, "StopMetricStreams", [["Names.member.1", "s"]]).status == 200
+	assert text(call(g, "ListMetricStreams", []), "State") == "stopped"
+	assert call(g, "DeleteMetricStream", [["Name", "s"]]).status == 200
+	assert fails(call(g, "GetMetricStream", [["Name", "s"]]), 404, "ResourceNotFoundException")
+	assert call(g, "PutInsightRule", [["RuleName", "r"], ["RuleDefinition", "{}"]]).status == 200
+	assert texts(call(g, "DisableInsightRules", [["RuleNames.member.1", "r"], ["RuleNames.member.2", "q"]]),
+		"FailureResource").join(",") == "q"
+	assert text(call(g, "DescribeInsightRules", []), "State") == "DISABLED"
+	assert call(g, "DeleteInsightRules", [["RuleNames.member.1", "r"]]).status == 200
+	assert texts(call(g, "DescribeInsightRules", []), "Name").length == 0
+}
+
+test "a composite alarm's AT_LEAST counts its alarms in a state, or not in it, by number or percentage" {
+	const g = gateway(new Topics())
+	for (const name of ["a", "b", "c"]) {
+		const threshold = if (name == "c") "50" else "5"
+		assert call(g, "PutMetricAlarm",
+			[["AlarmName", name], ...metric, ["Statistic", "Maximum"], ["Period", "60"], ["EvaluationPeriods", "1"],
+			["Threshold", threshold], ["ComparisonOperator", "GreaterThanThreshold"]]).status == 200
+	}
+	assert put(g, [[["Value", "9"]]]).status == 200
+	const state = (rule: string) => {
+		assert call(g, "PutCompositeAlarm", [["AlarmName", "p"], ["AlarmRule", rule]]).status == 200
+		return text(call(g, "DescribeAlarms",
+			[["AlarmNames.member.1", "p"], ["AlarmTypes.member.1", "CompositeAlarm"]]), "StateValue")
+	}
+	assert state("AT_LEAST(2, ALARM, (a, b, c))") == "ALARM"
+	assert state("AT_LEAST(3, ALARM, (a, b, c))") == "OK"
+	assert state("AT_LEAST(60%, ALARM, (\"a\", b, c))") == "ALARM"
+	assert state("AT_LEAST(1, NOT ALARM, (a, b)) OR AT_LEAST(1, OK, (c))") == "ALARM"
+	assert state("AT_LEAST(100%, NOT OK, (a, b))") == "ALARM"
+	assert fails(call(g, "PutCompositeAlarm", [["AlarmName", "p"], ["AlarmRule", "AT_LEAST(x, ALARM, (a))"]]), 400,
+		"ValidationError")
+	const first = call(g, "DescribeAlarmHistory", [["MaxRecords", "2"], ["AlarmTypes.member.1", "MetricAlarm"]])
+	assert texts(first, "AlarmName").length == 2
+	const next = text(first, "NextToken") ?? ""
+	assert next != ""
+	const rest = call(g, "DescribeAlarmHistory",
+		[["MaxRecords", "100"], ["NextToken", next], ["AlarmTypes.member.1", "MetricAlarm"]])
+	assert texts(rest, "AlarmName").length == 4 && text(rest, "NextToken") == null
+	assert texts(call(g, "DescribeAlarmHistory", [["AlarmTypes.member.1", "CompositeAlarm"]]),
+		"AlarmType").every(t => t == "CompositeAlarm")
+}
+
+test "GetMetricData pages by MaxDatapoints of all its results, in either order" {
+	const g = gateway(new Topics())
+	assert put(g,
+		[[["Value", "2"], ["Timestamp", "2015-06-26T13:50:00Z"]],
+		[["Value", "4"], ["Timestamp", "2015-06-26T13:55:00Z"]]]).status == 200
+	const m = `{"Namespace":"n","MetricName":"m","Dimensions":[{"Name":"D","Value":"v"}]}`
+	const page = (token: string) => {
+		const t = if (token == "") "" else `"NextToken":"${token}",`
+		const res = callJson(g, "GetMetricData",
+			`{"StartTime":1435326600,"EndTime":1435327200,"MaxDatapoints":3,${t}`
+			+ `"MetricDataQueries":[{"Id":"m1","MetricStat":{"Metric":${m},"Period":300,"Stat":"Sum"}},`
+			+ `{"Id":"e1","Expression":"m1 * 10"}]}`)
+		assert res.status == 200
+		return res.body.whole ?? ""
+	}
+	const first = page("")
+	assert indexOf(first, `"Values":[4,2],"StatusCode":"Complete"`) >= 0
+	assert indexOf(first, `"Values":[40],"StatusCode":"PartialData"`) >= 0
+	const at = indexOf(first, `"NextToken":"`) + 13
+	const second = page(first.slice(at, indexOf(first, "\"", at)))
+	assert indexOf(second, `"Values":[20]`) >= 0 && indexOf(second, "NextToken") < 0
+}
+
+test "an alarm on metric math is evaluated on the query that returns data, as data is put to its metrics" {
+	const g = gateway(new Topics())
+	const m1 = "Metrics.member.1"
+	assert call(g, "PutMetricAlarm",
+		[["AlarmName", "x"], ["EvaluationPeriods", "1"], ["Threshold", "10"],
+		["ComparisonOperator", "GreaterThanThreshold"], [`${m1}.Id`, "m1"], [`${m1}.ReturnData`, "false"],
+		[`${m1}.MetricStat.Metric.Namespace`, "n"], [`${m1}.MetricStat.Metric.MetricName`, "m"],
+		[`${m1}.MetricStat.Metric.Dimensions.member.1.Name`, "D"],
+		[`${m1}.MetricStat.Metric.Dimensions.member.1.Value`, "v"], [`${m1}.MetricStat.Period`, "60"],
+		[`${m1}.MetricStat.Stat`, "Sum"], ["Metrics.member.2.Id", "e1"], ["Metrics.member.2.Expression", "m1 * 2"],
+		["Metrics.member.2.ReturnData", "true"]]).status == 200
+	const state = () => text(call(g, "DescribeAlarms", [["AlarmNames.member.1", "x"]]), "StateValue")
+	assert state() == "INSUFFICIENT_DATA"
+	assert put(g, [[["Value", "4"]]]).status == 200
+	assert state() == "OK"
+	assert put(g, [[["Value", "2"]]]).status == 200
+	assert state() == "ALARM"
+}

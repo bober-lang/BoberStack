@@ -74,6 +74,7 @@ function query(g: Gateway, service: string, params: [string, string][], k: Key =
 		case "iam": "2010-05-08"
 		case "sts": "2011-06-15"
 		case "cloudformation": "2010-05-15"
+		case "monitoring": "2010-08-01"
 		default: "2010-03-31"
 	}
 	const body = `Version=${version}`
@@ -1337,4 +1338,45 @@ test "CloudFormation rolls a stack back from a type it does not know, and refuse
 		+ `"B": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "A"}}}`
 	res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateBody", cycle]])
 	assert fails(res, 400, "ValidationError", "Circular dependency between resources: [A, B]")
+}
+
+test "a metric filter puts its matches' values to CloudWatch within PutLogEvents, and an alarm on them moves" {
+	const g = gateway()
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	assert json11Of(g, "logs", "PutMetricFilter",
+		`{"logGroupName":"/g","filterName":"f","filterPattern":"{ $.ms > 0 }",`
+		+ `"metricTransformations":[{"metricName":"ms","metricNamespace":"app","metricValue":"$.ms",`
+		+ `"dimensions":{"svc":"$.svc"},"unit":"Milliseconds"}]}`).status == 200
+	assert json11Of(g, "logs", "PutMetricFilter",
+		`{"logGroupName":"/g","filterName":"e","filterPattern":"ERROR",`
+		+ `"metricTransformations":[{"metricName":"errors","metricNamespace":"app","metricValue":"1",`
+		+ `"defaultValue":0}]}`).status == 200
+	assert query(g, "monitoring",
+		[["Action", "PutMetricAlarm"], ["AlarmName", "slow"], ["Namespace", "app"], ["MetricName", "ms"],
+		["Dimensions.member.1.Name", "svc"], ["Dimensions.member.1.Value", "web"], ["Statistic", "Maximum"],
+		["Period", "60"], ["EvaluationPeriods", "1"], ["Threshold", "500"],
+		["ComparisonOperator", "GreaterThanThreshold"]]).status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":[`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":900,\\"svc\\":\\"web\\"}"},`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":\\"slow\\",\\"svc\\":\\"web\\"}"},`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":5}"}]}`).status == 200
+	const alarm = query(g, "monitoring", [["Action", "DescribeAlarms"], ["AlarmNames.member.1", "slow"]])
+	assert text(alarm, "StateValue") == "ALARM"
+	const stats = (name: string, dims: [string, string][]) => {
+		const params: [string, string][] = [["Action", "GetMetricStatistics"], ["Namespace", "app"],
+			["MetricName", name], ["StartTime", "2015-06-26T13:00:00Z"], ["EndTime", "2015-06-26T15:00:00Z"],
+			["Period", "3600"], ["Statistics.member.1", "SampleCount"], ["Statistics.member.2", "Sum"]]
+		for (let i = 0; i < dims.length; i++) {
+			params.push([`Dimensions.member.${i + 1}.Name`, dims[i][0]])
+			params.push([`Dimensions.member.${i + 1}.Value`, dims[i][1]])
+		}
+		const r = query(g, "monitoring", params)
+		return `${text(r, "SampleCount")}/${text(r, "Sum")}/${text(r, "Unit")}`
+	}
+	assert stats("ms", [["svc", "web"]]) == "1.0/900.0/Milliseconds"
+	assert stats("errors", []) == "1.0/0.0/None"
+	g.close()
 }

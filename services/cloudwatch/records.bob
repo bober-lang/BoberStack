@@ -2,7 +2,7 @@
 //! dimension's name and value after a NUL, sorted by name; each metric's samples by its key, 0x01, the sample's
 //! timestamp in 20 digits and its request's id and place, so that a time range is a range of keys; its alarms by name,
 //! and their history by the alarm's name, a NUL, the time in 20 digits and a sequence; its dashboards by name;
-//! its anomaly detectors by their metric's key, 0x01 and the statistic.
+//! its anomaly detectors by their metric's key, 0x01 and the statistic; its metric streams and insight rules by name.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -91,12 +91,29 @@ export class Detector {
 	configuration: api.AnomalyDetectorConfiguration | null = null
 }
 
+/// A metric stream as put, which streams nothing: its state "running" or "stopped".
+export class MetricStream {
+	put: api.PutMetricStreamInput = new api.PutMetricStreamInput()
+	state = "running"
+	created: i64 = 0
+	updated: i64 = 0
+}
+
+/// A Contributor Insights rule as put, which reads no log: its state "ENABLED" or "DISABLED".
+export class InsightRule {
+	definition = ""
+	state = "ENABLED"
+	transformed = false
+}
+
 export function series(s: Store): Table[Series] { return new Table[Series](s, "cloudwatch/series") }
 export function samples(s: Store): Table[Sample] { return new Table[Sample](s, "cloudwatch/samples") }
 export function alarms(s: Store): Table[Alarm] { return new Table[Alarm](s, "cloudwatch/alarms") }
 export function history(s: Store): Table[History] { return new Table[History](s, "cloudwatch/history") }
 export function dashboards(s: Store): Table[Dashboard] { return new Table[Dashboard](s, "cloudwatch/dashboards") }
 export function detectors(s: Store): Table[Detector] { return new Table[Detector](s, "cloudwatch/detectors") }
+export function metricStreams(s: Store): Table[MetricStream] { return new Table[MetricStream](s, "cloudwatch/streams") }
+export function insightRules(s: Store): Table[InsightRule] { return new Table[InsightRule](s, "cloudwatch/insights") }
 
 /// The key of the metric of namespace, name and dimensions, which it sorts.
 export function key(namespace: string, name: string, dimensions: [string, string][]): string {

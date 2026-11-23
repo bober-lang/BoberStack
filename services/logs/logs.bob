@@ -23,6 +23,8 @@ import { list, member } from "../events/pattern"
 import * as firehoseApi from "../firehose/api"
 import * as kinesisApi from "../kinesis/api"
 import { actAs, passRole } from "../sts/sts"
+import * as cloudwatchApi from "../cloudwatch/api"
+import { publish } from "./metrics"
 
 import { events, Event, Group, groups, MetricFilter, metricFilters, policies, Policy, save, Sequence, sequence, Stream,
 	streams, Subscription, subscriptions } from "./records"
@@ -56,6 +58,8 @@ export class Handler {
 	/// What subscription filters deliver to, which the stack sets.
 	kinesis: kinesisApi.Kinesis | null = null
 	firehose: firehoseApi.Firehose | null = null
+	/// What metric filters publish to, which the stack sets.
+	cloudwatch: cloudwatchApi.CloudWatch | null = null
 
 	/// Puts data gzipped on the Kinesis stream or Firehose delivery stream of the ARN stream, as CloudWatch Logs under
 	/// the role of the ARN role on behalf of the log group of the ARN source: whether the stream took it.
@@ -360,6 +364,10 @@ export class Handler {
 				`{"messageType":"DATA_MESSAGE",`
 				+ `"owner":${json.quoted(caller.account)},"logGroup":${json.quoted(g)},"logStream":${json.quoted(name)},`
 				+ `"subscriptionFilters":[${json.quoted(f.name)}],"logEvents":[${logged.join(",")}]}`)
+		}
+		if (this.cloudwatch != null) {
+			publish(this.cloudwatch!, caller, arnOf(caller, g),
+				metricFilters(s).scan(null, 1000, g + "\x00").map(e => e[1]), put.map(e => e[1]))
 		}
 		const r = new api.PutLogEventsResponse()
 		r.nextSequenceToken = if (st.token == "") pad(0, 56) else st.token
