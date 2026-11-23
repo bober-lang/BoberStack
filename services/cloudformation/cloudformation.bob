@@ -11,9 +11,14 @@
 //! - Templates are JSON only: YAML, TemplateURL, transforms and change sets of type IMPORT are refused.
 //! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SQS::QueuePolicy,
 //!   AWS::SNS::Topic, AWS::SNS::Subscription, AWS::S3::Bucket, AWS::Logs::LogGroup, AWS::DynamoDB::Table,
-//!   AWS::IAM::Role (with Policies and ManagedPolicyArns) and AWS::SSM::Parameter; any other, AWS::Lambda::Function
-//!   among them, fails its resource, CREATE_FAILED, and the stack rolls back. Their properties are those of each
-//!   service's create call; tags are not propagated.
+//!   AWS::IAM::Role (with Policies and ManagedPolicyArns), AWS::IAM::Policy and AWS::IAM::ManagedPolicy (of Roles),
+//!   AWS::IAM::User, AWS::KMS::Key, AWS::KMS::Alias, AWS::SNS::TopicPolicy, AWS::S3::BucketPolicy, AWS::Events::Rule,
+//!   AWS::StepFunctions::StateMachine, AWS::Kinesis::Stream, AWS::Logs::LogStream, AWS::SecretsManager::Secret (with
+//!   GenerateSecretString), AWS::SSM::Parameter and AWS::Lambda's Function, Version, Alias, Permission, Url,
+//!   EventSourceMapping and LayerVersion (of S3 content); any other fails its resource, CREATE_FAILED, and the stack
+//!   rolls back. Their properties are those of each service's create call; tags are not propagated, but to a function.
+//! - A function's inline ZipFile is zipped as index.py for a Python runtime, else index.js, stored rather than
+//!   deflated, so its CodeSha256 and CodeSize are not AWS's.
 //! - A change set's Modify is of a resource whose definition changes or refers to a parameter whose value changes,
 //!   always with Replacement True and no Details; the stack's REVIEW_IN_PROGRESS event, which the model's
 //!   ResourceStatus lacks, is not recorded.
@@ -32,23 +37,31 @@ import { condition, evaluate, EvalError, has, ordered, read, references, resourc
 	text } from "./template"
 
 import * as dynamodbApi from "../dynamodb/api"
+import * as eventsApi from "../events/api"
 import * as iamApi from "../iam/api"
+import * as kinesisApi from "../kinesis/api"
+import * as kmsApi from "../kms/api"
+import * as lambdaApi from "../lambda/api"
 import * as logsApi from "../logs/api"
 import * as s3Api from "../s3/api"
+import * as secretsmanagerApi from "../secretsmanager/api"
 import * as snsApi from "../sns/api"
 import * as ssmApi from "../ssm/api"
 import * as sqsApi from "../sqs/api"
+import * as sfnApi from "../stepfunctions/api"
 import { actAs, passRole } from "../sts/sts"
-import { boolean, Json, str, write } from "../stepfunctions/value"
+import { boolean, Json, JsonError, nul, parse, str, write } from "../stepfunctions/value"
 import * as json from "../../core/protocol/json"
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
-import { startsWith } from "std/algo"
+import { indexOf, startsWith } from "std/algo"
 import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import { EncodeError } from "std/encoding/json"
-import { lower, split } from "std/string"
+import { crc32 } from "std/hash/crc32"
+import { lower, ParseError, parseInt, replace, split } from "std/string"
 import { rfc3339 } from "std/time"
 
 /// Who CloudFormation is to the roles it assumes.
@@ -156,9 +169,23 @@ export class Handler {
 	iam: iamApi.IAM
 	dynamodb: dynamodbApi.DynamoDB
 	ssm: ssmApi.SSM
+	lambda: lambdaApi.Lambda
+	kms: kmsApi.KMS
+	kinesis: kinesisApi.Kinesis
+	secretsmanager: secretsmanagerApi.SecretsManager
+	events: eventsApi.EventBridge
+	stepfunctions: sfnApi.SFN
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Api.S3, logs: logsApi.CloudWatchLogs, iam: iamApi.IAM,
-		dynamodb: dynamodbApi.DynamoDB, ssm: ssmApi.SSM) {
+		dynamodb: dynamodbApi.DynamoDB, ssm: ssmApi.SSM, lambda: lambdaApi.Lambda, kms: kmsApi.KMS,
+		kinesis: kinesisApi.Kinesis, secretsmanager: secretsmanagerApi.SecretsManager, events: eventsApi.EventBridge,
+		stepfunctions: sfnApi.SFN) {
+		this.events = events
+		this.stepfunctions = stepfunctions
+		this.lambda = lambda
+		this.kms = kms
+		this.kinesis = kinesis
+		this.secretsmanager = secretsmanager
 		this.sqs = sqs
 		this.sns = sns
 		this.s3 = s3
@@ -1025,7 +1052,467 @@ export class Handler {
 			r.ref = r.physical
 			return
 		}
+		if (startsWith(r.kind, "AWS::Lambda::")) {
+			this.lambdaResource(c, s, r, p)
+			return
+		}
+		this.other(c, s, r, p)
+	}
+
+	/// Makes r, of a type not made above.
+	private other(c: Caller, s: Stack, r: Made, p: Json) throws Fault {
+		if (r.kind == "AWS::Logs::LogStream") {
+			const q = new logsApi.CreateLogStreamRequest()
+			q.logGroupName = p.str("LogGroupName") ?? ""
+			q.logStreamName = p.str("LogStreamName") ?? physical(s, r, 512, false)
+			c.actions = ["logs:CreateLogStream"]
+			this.logs.createLogStream(c, q)
+			r.physical = q.logStreamName
+			r.ref = r.physical
+			r.parts = [[q.logGroupName, ""]]
+			return
+		}
+		if (r.kind == "AWS::IAM::ManagedPolicy" || r.kind == "AWS::IAM::Policy") {
+			const managed = r.kind == "AWS::IAM::ManagedPolicy"
+			const name = p.str(if (managed) "ManagedPolicyName" else "PolicyName") ?? physical(s, r, 128, false)
+			const doc = document(p.get("PolicyDocument"))
+			let arn = ""
+			if (managed) {
+				const q = new iamApi.CreatePolicyRequest()
+				q.PolicyName = name
+				q.Path = p.str("Path")
+				q.Description = p.str("Description")
+				q.PolicyDocument = doc
+				c.actions = ["iam:CreatePolicy"]
+				const made = this.iam.createPolicy(c, q).Policy
+				arn = made?.Arn ?? ""
+				r.attributes = [["PolicyArn", arn], ["PolicyId", made?.PolicyId ?? ""]]
+			}
+			for (const x of p.get("Roles")?.items ?? []) {
+				if (managed) {
+					const a = new iamApi.AttachRolePolicyRequest()
+					a.RoleName = x.text
+					a.PolicyArn = arn
+					c.actions = ["iam:AttachRolePolicy"]
+					this.iam.attachRolePolicy(c, a)
+				} else {
+					const i = new iamApi.PutRolePolicyRequest()
+					i.RoleName = x.text
+					i.PolicyName = name
+					i.PolicyDocument = doc
+					c.actions = ["iam:PutRolePolicy"]
+					this.iam.putRolePolicy(c, i)
+				}
+				r.parts.push([x.text, name])
+			}
+			r.physical = if (managed) arn else physical(s, r, 128, false)
+			r.ref = r.physical
+			return
+		}
+		if (r.kind == "AWS::Events::Rule") {
+			const q = new eventsApi.PutRuleRequest()
+			q.Name = p.str("Name") ?? physical(s, r, 64, false)
+			q.EventBusName = p.str("EventBusName")
+			q.ScheduleExpression = p.str("ScheduleExpression")
+			q.EventPattern = if (p.get("EventPattern") != null) document(p.get("EventPattern")) else null
+			q.State = if (p.str("State") == "DISABLED") "DISABLED" else "ENABLED"
+			q.Description = p.str("Description")
+			q.RoleArn = p.str("RoleArn")
+			c.actions = ["events:PutRule"]
+			const arn = this.events.putRule(c, q).RuleArn ?? ""
+			const targets = p.get("Targets")?.items ?? []
+			if (targets.length > 0) {
+				const t = new eventsApi.PutTargetsRequest()
+				t.Rule = q.Name
+				t.EventBusName = q.EventBusName
+				t.Targets = targets.map(x => json.decode[eventsApi.Target](write(x)))
+				c.actions = ["events:PutTargets"]
+				this.events.putTargets(c, t)
+			}
+			r.physical = if (q.EventBusName == null || q.EventBusName == "default") q.Name
+				else `${q.EventBusName}|${q.Name}`
+			r.ref = r.physical
+			r.attributes = [["Arn", arn]]
+			r.parts = [[q.Name, q.EventBusName ?? ""]]
+			for (const x of targets) {
+				r.parts.push(["target", x.str("Id") ?? ""])
+			}
+			return
+		}
+		if (r.kind == "AWS::StepFunctions::StateMachine") {
+			const q = new sfnApi.CreateStateMachineInput()
+			q.name = p.str("StateMachineName") ?? physical(s, r, 80, false)
+			let definition = p.str("DefinitionString")
+				?? (if (p.get("Definition") != null) write(p.get("Definition")!) else "")
+			for (const [k, v] of p.get("DefinitionSubstitutions")?.keys ?? []) {
+				definition = replace(definition, `\${${k}}`, text(v))
+			}
+			q.definition = definition
+			q.roleArn = p.str("RoleArn") ?? ""
+			q.type = if (p.str("StateMachineType") == "EXPRESS") "EXPRESS" else "STANDARD"
+			c.actions = ["states:CreateStateMachine"]
+			const arn = this.stepfunctions.createStateMachine(c, q).stateMachineArn
+			r.physical = arn
+			r.ref = arn
+			r.attributes = [["Arn", arn], ["Name", q.name]]
+			return
+		}
+		if (r.kind == "AWS::IAM::User") {
+			const q = new iamApi.CreateUserRequest()
+			q.UserName = p.str("UserName") ?? physical(s, r, 64, false)
+			q.Path = p.str("Path")
+			c.actions = ["iam:CreateUser"]
+			const u = this.iam.createUser(c, q).User
+			r.physical = q.UserName
+			r.ref = r.physical
+			r.attributes = [["Arn", u?.Arn ?? ""]]
+			return
+		}
+		if (r.kind == "AWS::KMS::Key") {
+			const q = new kmsApi.CreateKeyRequest()
+			q.Description = p.str("Description")
+			if (p.get("KeyPolicy") != null) {
+				q.Policy = document(p.get("KeyPolicy"))
+			}
+			c.actions = ["kms:CreateKey"]
+			const k = this.kms.createKey(c, q).KeyMetadata
+			r.physical = k?.KeyId ?? ""
+			r.ref = r.physical
+			r.attributes = [["Arn", k?.Arn ?? ""], ["KeyId", r.physical]]
+			return
+		}
+		if (r.kind == "AWS::KMS::Alias") {
+			const q = new kmsApi.CreateAliasRequest()
+			q.AliasName = p.str("AliasName") ?? ""
+			q.TargetKeyId = p.str("TargetKeyId") ?? ""
+			c.actions = ["kms:CreateAlias"]
+			this.kms.createAlias(c, q)
+			r.physical = q.AliasName
+			r.ref = r.physical
+			return
+		}
+		if (r.kind == "AWS::SNS::TopicPolicy") {
+			for (const t of p.get("Topics")?.items ?? []) {
+				const q = new snsApi.SetTopicAttributesInput()
+				q.TopicArn = t.text
+				q.AttributeName = "Policy"
+				q.AttributeValue = document(p.get("PolicyDocument"))
+				c.actions = ["sns:SetTopicAttributes"]
+				this.sns.setTopicAttributes(c, q)
+				r.parts.push([t.text, ""])
+			}
+			r.physical = physical(s, r, 256, false)
+			r.ref = r.physical
+			return
+		}
+		if (r.kind == "AWS::S3::BucketPolicy") {
+			const q = new s3Api.PutBucketPolicyRequest()
+			q.Bucket = p.str("Bucket") ?? ""
+			q.Policy = document(p.get("PolicyDocument"))
+			c.actions = ["s3:PutBucketPolicy"]
+			this.s3.putBucketPolicy(c, q)
+			r.physical = q.Bucket
+			r.ref = r.physical
+			return
+		}
+		if (r.kind == "AWS::Kinesis::Stream") {
+			const q = new kinesisApi.CreateStreamInput()
+			q.StreamName = p.str("Name") ?? physical(s, r, 128, false)
+			const mode = p.get("StreamModeDetails")?.str("StreamMode")
+			if (mode == "ON_DEMAND") {
+				const m = new kinesisApi.StreamModeDetails()
+				m.StreamMode = "ON_DEMAND"
+				q.StreamModeDetails = m
+			} else {
+				q.ShardCount = (p.get("ShardCount")?.number() ?? 1.0) as i32
+			}
+			c.actions = ["kinesis:CreateStream"]
+			this.kinesis.createStream(c, q)
+			r.physical = q.StreamName
+			r.ref = r.physical
+			r.attributes = [["Arn", `arn:aws:kinesis:${c.region}:${c.account}:stream/${q.StreamName}`]]
+			return
+		}
+		if (r.kind == "AWS::SecretsManager::Secret") {
+			const q = new secretsmanagerApi.CreateSecretRequest()
+			q.Name = p.str("Name") ?? `${r.logical}-${suffix(false)}`
+			q.Description = p.str("Description")
+			q.KmsKeyId = p.str("KmsKeyId")
+			q.SecretString = p.str("SecretString")
+			const generate = p.get("GenerateSecretString")
+			if (generate != null) {
+				const password = generated(generate!)
+				const template = generate!.str("SecretStringTemplate")
+				const key = generate!.str("GenerateStringKey")
+				if (template != null && key != null) {
+					try {
+						const v = parse(template!)
+						v.set(key!, str(password))
+						q.SecretString = write(v)
+					} catch (e: JsonError) {
+						throw new Fault(400, "ValidationException", "SecretStringTemplate is not valid JSON")
+					}
+				} else {
+					q.SecretString = password
+				}
+			}
+			c.actions = ["secretsmanager:CreateSecret"]
+			const made = this.secretsmanager.createSecret(c, q)
+			r.physical = made.ARN ?? ""
+			r.ref = r.physical
+			r.attributes = [["Id", r.physical]]
+			return
+		}
 		throw new Fault(400, "ValidationError", `Unrecognized resource types: [${r.kind}]`)
+	}
+
+	/// Deletes r, of a type not deleted in remove.
+	private unother(c: Caller, r: Made) throws Fault {
+		if (r.kind == "AWS::Logs::LogStream") {
+			const q = new logsApi.DeleteLogStreamRequest()
+			q.logGroupName = r.parts[0][0]
+			q.logStreamName = r.physical
+			c.actions = ["logs:DeleteLogStream"]
+			this.logs.deleteLogStream(c, q)
+		} else if (r.kind == "AWS::IAM::ManagedPolicy" || r.kind == "AWS::IAM::Policy") {
+			for (const [role, name] of r.parts) {
+				if (r.kind == "AWS::IAM::ManagedPolicy") {
+					const q = new iamApi.DetachRolePolicyRequest()
+					q.RoleName = role
+					q.PolicyArn = r.physical
+					c.actions = ["iam:DetachRolePolicy"]
+					this.iam.detachRolePolicy(c, q)
+				} else {
+					const q = new iamApi.DeleteRolePolicyRequest()
+					q.RoleName = role
+					q.PolicyName = name
+					c.actions = ["iam:DeleteRolePolicy"]
+					this.iam.deleteRolePolicy(c, q)
+				}
+			}
+			if (r.kind == "AWS::IAM::ManagedPolicy") {
+				const q = new iamApi.DeletePolicyRequest()
+				q.PolicyArn = r.physical
+				c.actions = ["iam:DeletePolicy"]
+				this.iam.deletePolicy(c, q)
+			}
+		} else if (r.kind == "AWS::Events::Rule") {
+			const [name, bus] = r.parts[0]
+			const ids = r.parts.slice(1, r.parts.length).map(x => x[1])
+			if (ids.length > 0) {
+				const t = new eventsApi.RemoveTargetsRequest()
+				t.Rule = name
+				t.EventBusName = if (bus == "") null else bus
+				t.Ids = ids
+				c.actions = ["events:RemoveTargets"]
+				this.events.removeTargets(c, t)
+			}
+			const q = new eventsApi.DeleteRuleRequest()
+			q.Name = name
+			q.EventBusName = if (bus == "") null else bus
+			c.actions = ["events:DeleteRule"]
+			this.events.deleteRule(c, q)
+		} else if (r.kind == "AWS::StepFunctions::StateMachine") {
+			const q = new sfnApi.DeleteStateMachineInput()
+			q.stateMachineArn = r.physical
+			c.actions = ["states:DeleteStateMachine"]
+			this.stepfunctions.deleteStateMachine(c, q)
+		} else if (r.kind == "AWS::IAM::User") {
+			const q = new iamApi.DeleteUserRequest()
+			q.UserName = r.physical
+			c.actions = ["iam:DeleteUser"]
+			this.iam.deleteUser(c, q)
+		} else if (r.kind == "AWS::KMS::Key") {
+			const q = new kmsApi.ScheduleKeyDeletionRequest()
+			q.KeyId = r.physical
+			c.actions = ["kms:ScheduleKeyDeletion"]
+			this.kms.scheduleKeyDeletion(c, q)
+		} else if (r.kind == "AWS::KMS::Alias") {
+			const q = new kmsApi.DeleteAliasRequest()
+			q.AliasName = r.physical
+			c.actions = ["kms:DeleteAlias"]
+			this.kms.deleteAlias(c, q)
+		} else if (r.kind == "AWS::SNS::TopicPolicy") {
+			for (const [topic, _] of r.parts) {
+				const q = new snsApi.SetTopicAttributesInput()
+				q.TopicArn = topic
+				q.AttributeName = "Policy"
+				q.AttributeValue = ""
+				c.actions = ["sns:SetTopicAttributes"]
+				this.sns.setTopicAttributes(c, q)
+			}
+		} else if (r.kind == "AWS::S3::BucketPolicy") {
+			const q = new s3Api.DeleteBucketPolicyRequest()
+			q.Bucket = r.physical
+			c.actions = ["s3:DeleteBucketPolicy"]
+			this.s3.deleteBucketPolicy(c, q)
+		} else if (r.kind == "AWS::Kinesis::Stream") {
+			const q = new kinesisApi.DeleteStreamInput()
+			q.StreamName = r.physical
+			c.actions = ["kinesis:DeleteStream"]
+			this.kinesis.deleteStream(c, q)
+		} else if (r.kind == "AWS::SecretsManager::Secret") {
+			const q = new secretsmanagerApi.DeleteSecretRequest()
+			q.SecretId = r.physical
+			q.ForceDeleteWithoutRecovery = true
+			c.actions = ["secretsmanager:DeleteSecret"]
+			this.secretsmanager.deleteSecret(c, q)
+		}
+	}
+
+	/// Makes r, a resource of Lambda's.
+	private lambdaResource(c: Caller, s: Stack, r: Made, p: Json) throws Fault {
+		if (r.kind == "AWS::Lambda::Function") {
+			const name = p.str("FunctionName") ?? physical(s, r, 64, false)
+			p.set("FunctionName", str(name))
+			const code = p.get("Code")
+			const inline = code?.str("ZipFile")
+			if (inline != null) {
+				const ext = if (startsWith(p.str("Runtime") ?? "", "python")) "py" else "js"
+				code!.set("ZipFile", str(base64.encode(zipped(`index.${ext}`, inline!))))
+			}
+			const tags = p.get("Tags")
+			p.set("Tags", nul())
+			const q = json.decode[lambdaApi.CreateFunctionRequest](write(p))
+			q.Tags = (tags?.items ?? []).map(t => [t.str("Key") ?? "", t.str("Value") ?? ""] as [string, string])
+			c.actions = ["lambda:CreateFunction"]
+			const f = this.lambda.createFunction(c, q)
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", f.FunctionArn ?? ""]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::Version") {
+			const q = new lambdaApi.PublishVersionRequest()
+			q.FunctionName = p.str("FunctionName") ?? ""
+			q.Description = p.str("Description")
+			q.CodeSha256 = p.str("CodeSha256")
+			c.actions = ["lambda:PublishVersion"]
+			const v = this.lambda.publishVersion(c, q)
+			r.physical = v.FunctionArn ?? ""
+			r.ref = r.physical
+			r.attributes = [["Version", v.Version ?? ""], ["FunctionArn", r.physical]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::Alias") {
+			const q = new lambdaApi.CreateAliasRequest()
+			q.FunctionName = p.str("FunctionName") ?? ""
+			q.Name = p.str("Name") ?? ""
+			q.FunctionVersion = p.str("FunctionVersion") ?? ""
+			q.Description = p.str("Description")
+			c.actions = ["lambda:CreateAlias"]
+			const a = this.lambda.createAlias(c, q)
+			r.physical = a.AliasArn ?? ""
+			r.ref = r.physical
+			r.attributes = [["AliasArn", r.physical]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::Permission") {
+			const q = new lambdaApi.AddPermissionRequest()
+			q.FunctionName = p.str("FunctionName") ?? ""
+			q.StatementId = physical(s, r, 100, false)
+			q.Action = p.str("Action") ?? ""
+			q.Principal = p.str("Principal") ?? ""
+			q.SourceArn = p.str("SourceArn")
+			q.SourceAccount = p.str("SourceAccount")
+			q.EventSourceToken = p.str("EventSourceToken")
+			q.PrincipalOrgID = p.str("PrincipalOrgID")
+			c.actions = ["lambda:AddPermission"]
+			this.lambda.addPermission(c, q)
+			r.physical = q.StatementId
+			r.ref = r.physical
+			r.parts = [[q.FunctionName, ""]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::Url") {
+			const q = new lambdaApi.CreateFunctionUrlConfigRequest()
+			q.FunctionName = p.str("TargetFunctionArn") ?? ""
+			q.Qualifier = p.str("Qualifier")
+			q.AuthType = if (p.str("AuthType") == "AWS_IAM") "AWS_IAM" else "NONE"
+			c.actions = ["lambda:CreateFunctionUrlConfig"]
+			const u = this.lambda.createFunctionUrlConfig(c, q)
+			r.physical = u.FunctionArn
+			r.ref = r.physical
+			r.attributes = [["FunctionArn", u.FunctionArn], ["FunctionUrl", u.FunctionUrl]]
+			r.parts = [[q.FunctionName, q.Qualifier ?? ""]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::EventSourceMapping") {
+			c.actions = ["lambda:CreateEventSourceMapping"]
+			const m = this.lambda.createEventSourceMapping(c,
+				json.decode[lambdaApi.CreateEventSourceMappingRequest](write(p)))
+			r.physical = m.UUID ?? ""
+			r.ref = r.physical
+			r.attributes = [["Id", r.physical], ["EventSourceMappingArn", m.EventSourceMappingArn ?? ""]]
+			return
+		}
+		if (r.kind == "AWS::Lambda::LayerVersion") {
+			const q = new lambdaApi.PublishLayerVersionRequest()
+			q.LayerName = p.str("LayerName") ?? physical(s, r, 140, false)
+			q.Description = p.str("Description")
+			q.LicenseInfo = p.str("LicenseInfo")
+			q.Content.S3Bucket = p.get("Content")?.str("S3Bucket")
+			q.Content.S3Key = p.get("Content")?.str("S3Key")
+			q.Content.S3ObjectVersion = p.get("Content")?.str("S3ObjectVersion")
+			c.actions = ["lambda:PublishLayerVersion"]
+			const l = this.lambda.publishLayerVersion(c, q)
+			r.physical = l.LayerVersionArn ?? ""
+			r.ref = r.physical
+			r.attributes = [["LayerVersionArn", r.physical]]
+			return
+		}
+		throw new Fault(400, "ValidationError", `Unrecognized resource types: [${r.kind}]`)
+	}
+
+	/// Deletes r, a resource of Lambda's.
+	private unfunction(c: Caller, r: Made) throws Fault {
+		// An ARN of a version, alias or layer version ends in its function's or layer's name and its qualifier.
+		const arn = split(r.physical, ":")
+		const named = if (arn.length > 6) arn[6] else r.physical
+		const qualifier = if (arn.length > 7) arn[7] else null
+		if (r.kind == "AWS::Lambda::Function" || r.kind == "AWS::Lambda::Version") {
+			const q = new lambdaApi.DeleteFunctionRequest()
+			q.FunctionName = named
+			q.Qualifier = qualifier
+			c.actions = ["lambda:DeleteFunction"]
+			this.lambda.deleteFunction(c, q)
+		} else if (r.kind == "AWS::Lambda::Alias") {
+			const q = new lambdaApi.DeleteAliasRequest()
+			q.FunctionName = named
+			q.Name = qualifier ?? ""
+			c.actions = ["lambda:DeleteAlias"]
+			this.lambda.deleteAlias(c, q)
+		} else if (r.kind == "AWS::Lambda::Permission" || r.kind == "AWS::Lambda::Url") {
+			const [target, qualified] = r.parts[0]
+			if (r.kind == "AWS::Lambda::Url") {
+				const q = new lambdaApi.DeleteFunctionUrlConfigRequest()
+				q.FunctionName = target
+				q.Qualifier = if (qualified == "") null else qualified
+				c.actions = ["lambda:DeleteFunctionUrlConfig"]
+				this.lambda.deleteFunctionUrlConfig(c, q)
+				return
+			}
+			const q = new lambdaApi.RemovePermissionRequest()
+			q.FunctionName = target
+			q.StatementId = r.physical
+			c.actions = ["lambda:RemovePermission"]
+			this.lambda.removePermission(c, q)
+		} else if (r.kind == "AWS::Lambda::EventSourceMapping") {
+			const q = new lambdaApi.DeleteEventSourceMappingRequest()
+			q.UUID = r.physical
+			c.actions = ["lambda:DeleteEventSourceMapping"]
+			this.lambda.deleteEventSourceMapping(c, q)
+		} else if (r.kind == "AWS::Lambda::LayerVersion") {
+			const q = new lambdaApi.DeleteLayerVersionRequest()
+			q.LayerName = named
+			try {
+				q.VersionNumber = parseInt(qualifier ?? "") as i64
+			} catch (e: ParseError) {
+				return
+			}
+			c.actions = ["lambda:DeleteLayerVersion"]
+			this.lambda.deleteLayerVersion(c, q)
+		}
 	}
 
 	/// Deletes r as the stack's session, but one retained or deleted; one that failed to be made has nothing to delete.
@@ -1102,6 +1589,10 @@ export class Handler {
 				q.SubscriptionArn = r.physical
 				c.actions = ["sns:Unsubscribe"]
 				this.sns.unsubscribe(c, q)
+			} else if (startsWith(r.kind, "AWS::Lambda::")) {
+				this.unfunction(c, r)
+			} else if (r.kind != "AWS::SQS::QueuePolicy") {
+				this.unother(c, r)
 			} else if (r.kind == "AWS::SQS::QueuePolicy") {
 				for (const [_, url] of r.parts) {
 					const q = new sqsApi.SetQueueAttributesRequest()
@@ -1582,6 +2073,58 @@ function encode(s: string): string {
 	for (let i = 0; i < s.length; i++) {
 		const ch = s.slice(i, i + 1)
 		out = out + (if (ch == ":") "%3A" else if (ch == "/") "%2F" else if (ch == "|") "%7C" else ch)
+	}
+	return out
+}
+
+/// A zip of one file, name, holding text stored as it is, as CloudFormation packages a function's inline code.
+function zipped(name: string, text: string): string {
+	const sum = crc32(text) as u64
+	const size = text.length as u64
+	const n = name.length as u64
+	const head = `${le(0x14, 2)}${le(0, 2)}${le(0, 2)}${le(0, 2)}${le(0x21, 2)}${le(sum, 4)}${le(size, 4)}${le(size, 4)}`
+		+ `${le(n, 2)}${le(0, 2)}`
+	const local = `PK\x03\x04${head}${name}${text}`
+	const central = `PK\x01\x02${le(0x031e, 2)}${head}${le(0, 2)}${le(0, 2)}${le(0, 2)}${le(0x81a40000, 4)}${le(0, 4)}${name}`
+	return `${local}${central}PK\x05\x06${le(0, 4)}${le(1, 2)}${le(1, 2)}${le(central.length as u64, 4)}`
+		+ `${le(local.length as u64, 4)}${le(0, 2)}`
+}
+
+/// x in n bytes, least significant first.
+function le(x: u64, n: i32): string {
+	const out: u8[] = []
+	for (let i = 0; i < n; i++) {
+		out.push(((x >> ((8 * i) as u64)) & 0xff) as u8)
+	}
+	return fromBytes(out)
+}
+
+/// A password as a secret's GenerateSecretString describes it: PasswordLength characters, 32 by default, of letters,
+/// digits and punctuation but those excluded.
+function generated(g: Json): string throws Fault {
+	let chars = ""
+	const excluded = g.str("ExcludeCharacters") ?? ""
+	const kinds: [string, string][] = [["ExcludeLowercase", "abcdefghijklmnopqrstuvwxyz"],
+		["ExcludeUppercase", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"], ["ExcludeNumbers", "0123456789"],
+		["ExcludePunctuation", "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"]]
+	for (const [flag, set] of kinds) {
+		if (g.get(flag)?.text != "true") {
+			for (let i = 0; i < set.length; i++) {
+				if (indexOf(excluded, set.slice(i, i + 1)) < 0) {
+					chars = `${chars}${set.slice(i, i + 1)}`
+				}
+			}
+		}
+	}
+	if (g.get("IncludeSpace")?.text == "true") {
+		chars = `${chars} `
+	}
+	const n = (g.get("PasswordLength")?.number() ?? 32.0) as i32
+	const noise = random(n)
+	let out = ""
+	for (let i = 0; i < n && chars.length > 0; i++) {
+		const at = (noise[i] as i32) % chars.length
+		out = `${out}${chars.slice(at, at + 1)}`
 	}
 	return out
 }

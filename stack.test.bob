@@ -1617,3 +1617,86 @@ test "CloudFormation change sets: CREATE under review, executed; an empty one FA
 	assert call(g, "dynamodb", "DescribeTable", `{"TableName": "tab"}`).status == 400
 	assert json11(g, "ssm", "GetParameter", `{"Name": "/p"}`).status == 400
 }
+
+test "CloudFormation makes a function of inline code zipped as index.py, its version, alias, permission and URL" {
+	const g = gateway()
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {`
+		+ `"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"F": {"Type": "AWS::Lambda::Function", "Properties": {"Runtime": "python3.12", "Handler": "index.handler",`
+		+ `"Role": {"Fn::GetAtt": ["R", "Arn"]}, "Code": {"ZipFile": "def handler(e, c):\\n  return 1\\n"},`
+		+ `"Tags": [{"Key": "team", "Value": "a"}]}},`
+		+ `"V": {"Type": "AWS::Lambda::Version", "Properties": {"FunctionName": {"Ref": "F"}}},`
+		+ `"A": {"Type": "AWS::Lambda::Alias", "Properties": {"FunctionName": {"Ref": "F"}, "Name": "live",`
+		+ `"FunctionVersion": {"Fn::GetAtt": ["V", "Version"]}}},`
+		+ `"P": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": {"Ref": "A"},`
+		+ `"Action": "lambda:InvokeFunction", "Principal": "sns.amazonaws.com"}},`
+		+ `"U": {"Type": "AWS::Lambda::Url", "Properties": {"TargetFunctionArn": {"Fn::GetAtt": ["F", "Arn"]},`
+		+ `"AuthType": "NONE"}}},`
+		+ `"Outputs": {"Url": {"Value": {"Fn::GetAtt": ["U", "FunctionUrl"]}}, "Alias": {"Value": {"Ref": "A"}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "fn"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "fn"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", ":live</OutputValue>") >= 0
+	res = query(g, "cloudformation",
+		[["Action", "DescribeStackResource"], ["StackName", "fn"], ["LogicalResourceId", "F"]])
+	const w = res.body.whole ?? ""
+	const name = w.slice(indexOf(w, "<PhysicalResourceId>") + 20, indexOf(w, "</PhysicalResourceId>"))
+	assert startsWith(name, "fn-F-")
+	res = g.handle(new Request("GET", member(lambdaGet(g, `/2015-03-31/functions/${name}?Qualifier=1`), "Location"),
+		""))
+	const zip = res.body.whole ?? ""
+	assert startsWith(zip, "PK\x03\x04") && indexOf(zip, "index.pydef handler(e, c):\n  return 1\n") >= 0
+	assert indexOf(lambdaGet(g, `/2015-03-31/functions/${name}/policy?Qualifier=live`).body.whole ?? "",
+		"sns.amazonaws.com") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "fn"]]).status == 200
+	assert lambdaGet(g, `/2015-03-31/functions/${name}`).status == 404
+}
+
+test "CloudFormation makes policies, a user, a key, alias, stream, log stream, secret, rule and state machine" {
+	const g = gateway()
+	const allow = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}`
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {`
+		+ `"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "sqs.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"M": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}, "Roles": [{"Ref": "R"}]}},`
+		+ `"I": {"Type": "AWS::IAM::Policy", "Properties": {"PolicyName": "inline", "PolicyDocument": ${allow},`
+		+ `"Roles": [{"Ref": "R"}]}}, "U": {"Type": "AWS::IAM::User"}, "K": {"Type": "AWS::KMS::Key"},`
+		+ `"SR": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "states.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {"StateMachineName": "sm",`
+		+ `"RoleArn": {"Fn::GetAtt": ["SR", "Arn"]}, "DefinitionString": "{\\"StartAt\\": \\"P\\", \\"States\\": {`
+		+ `\\"P\\": {\\"Type\\": \\"Pass\\", \\"Result\\": \\"\${greeting}\\", \\"End\\": true}}}",`
+		+ `"DefinitionSubstitutions": {"greeting": "hi"}}},`
+		+ `"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "rq"}},`
+		+ `"E": {"Type": "AWS::Events::Rule", "Properties": {"Name": "e", "EventPattern": {"source": ["cf"]},`
+		+ `"Targets": [{"Id": "q", "Arn": {"Fn::GetAtt": ["Q", "Arn"]}}]}},`
+		+ `"A": {"Type": "AWS::KMS::Alias", "Properties": {"AliasName": "alias/cf", "TargetKeyId": {"Ref": "K"}}},`
+		+ `"S": {"Type": "AWS::Kinesis::Stream", "Properties": {"ShardCount": 1}},`
+		+ `"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": "g"}},`
+		+ `"L": {"Type": "AWS::Logs::LogStream", "Properties": {"LogGroupName": {"Ref": "G"}, "LogStreamName": "l"}},`
+		+ `"X": {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": "x", "GenerateSecretString": {`
+		+ `"SecretStringTemplate": "{\\"user\\": \\"a\\"}", "GenerateStringKey": "password", "PasswordLength": 12,`
+		+ `"ExcludePunctuation": true}}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "more"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_NAMED_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "more"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = json11(g, "secretsmanager", "GetSecretValue", `{"SecretId": "x"}`)
+	assert indexOf(res.body.whole ?? "", `\\"user\\":\\"a\\",\\"password\\":\\"`) >= 0
+	assert json11(g, "kms", "DescribeKey", `{"KeyId": "alias/cf"}`).status == 200
+	res = call(g, "events", "ListTargetsByRule", `{"Rule": "e"}`)
+	assert indexOf(res.body.whole ?? "", queueArn("rq")) >= 0
+	res = call(g, "states", "DescribeStateMachine",
+		`{"stateMachineArn": "arn:aws:states:us-east-1:${account}:stateMachine:sm"}`)
+	assert indexOf(res.body.whole ?? "", `\\"Result\\": \\"hi\\"`) >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "more"]]).status == 200
+	assert call(g, "events", "DescribeRule", `{"Name": "e"}`).status == 400
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "more"]])
+	assert fails(res, 400, "ValidationError", "Stack with id more does not exist")
+	assert json11(g, "kms", "DescribeKey", `{"KeyId": "alias/cf"}`).status == 404
+}
