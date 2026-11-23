@@ -1,0 +1,650 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the source bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-src.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "create the target bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-dst.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put the source",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src/a key",
+			"contentType": "text/plain",
+			"headers": {
+				"x-amz-meta-color": "blue",
+				"cache-control": "max-age=60",
+				"x-amz-tagging": "t=1"
+			},
+			"body": "0123456789",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-checksum-crc64nvme": "Ffmx7kz9nB0=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "copy within the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src/copy",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "head the copy",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-src/copy",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-tagging-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "blue",
+					"cache-control": "max-age=60",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "copy across buckets, the source not led by a slash",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/copy",
+			"headers": {
+				"x-amz-copy-source": "${prefix}-src/a%20key"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "head the copy across",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-dst/copy",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-tagging-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "blue",
+					"cache-control": "max-age=60",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "get the copy across",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-dst/copy",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-meta-color": "blue",
+					"cache-control": "max-age=60",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-tagging-count": "1"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "copy replacing metadata",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/replaced",
+			"contentType": "application/json",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-metadata-directive": "REPLACE",
+				"x-amz-meta-shape": "round"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "head the replaced",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-dst/replaced",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-tagging-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-shape": "round",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "application/json"
+				}
+			}
+		},
+		{
+			"name": "copy with new metadata but no directive",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/kept",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-meta-shape": "round"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "head the kept",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-dst/kept",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-tagging-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "blue",
+					"cache-control": "max-age=60",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "copy with a bad directive",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/bad",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-metadata-directive": "MERGE"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>Unknown metadata directive.</Message><ArgumentName>x-amz-metadata-directive</ArgumentName><ArgumentValue>MERGE</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy replacing tags",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/tags",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-tagging-directive": "REPLACE",
+				"x-amz-tagging": "u=2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "get the replaced tags",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-dst/tags",
+			"params": {
+				"tagging": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>u</Key><Value>2</Value></Tag></TagSet></Tagging>"
+			}
+		},
+		{
+			"name": "get the copied tags",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-dst/copy",
+			"params": {
+				"tagging": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>t</Key><Value>1</Value></Tag></TagSet></Tagging>"
+			}
+		},
+		{
+			"name": "copy if the source matches",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/cond",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-copy-source-if-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "copy if the source matches another",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/cond",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-copy-source-if-match": "\"00000000000000000000000000000000\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if the source matches none of it",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/cond",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-copy-source-if-none-match": "\"781e5e245d69b566979b86e28d23f2c7\""
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-None-Match</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if the source is unmodified since the past",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/cond",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-copy-source-if-unmodified-since": "Sat, 01 Jan 2000 00:00:00 GMT"
+			},
+			"response": {
+				"status": 412,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message><Condition>x-amz-copy-source-If-Unmodified-Since</Condition><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy if the source is modified since the future",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/cond",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-copy-source-if-modified-since": "Fri, 01 Jan 2100 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "copy onto itself unchanged",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src/a key",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidRequest</Code><Message>This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy onto itself, copying metadata",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src/a key",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-metadata-directive": "COPY"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidRequest</Code><Message>This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy onto itself replacing metadata",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-src/a key",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key",
+				"x-amz-metadata-directive": "REPLACE",
+				"x-amz-meta-color": "red"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>\"781e5e245d69b566979b86e28d23f2c7\"</ETag><ChecksumCRC64NVME>Ffmx7kz9nB0=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>"
+			}
+		},
+		{
+			"name": "head it after",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-src/a key",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-tagging-count": "1",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "red",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "copy a missing key",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/x",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/none"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>none</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy from a missing bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/x",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-none/k"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy to a missing bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-none/x",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy from a source of no key",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/x",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>Invalid copy source object key</Message><ArgumentName>x-amz-copy-source</ArgumentName><ArgumentValue>x-amz-copy-source</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy with a body",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-dst/x",
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-src/a%20key"
+			},
+			"body": "body",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidRequest</Code><Message>The request included a body. Requests of this type must not include a non-empty body.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the source",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-src/a key",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the copy",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-src/copy",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the copy across",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/copy",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete replaced",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/replaced",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete kept",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/kept",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete bad",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/bad",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete tags",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/tags",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete cond",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/cond",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete x",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst/x",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the source bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-src",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the target bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-dst",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

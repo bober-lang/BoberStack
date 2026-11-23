@@ -1,0 +1,1052 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified",
+		"Initiated",
+		"DisplayName"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-m.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "list uploads of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m",
+			"params": {
+				"uploads": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"
+			}
+		},
+		{
+			"name": "create an upload",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"contentType": "text/plain",
+			"params": {
+				"uploads": ""
+			},
+			"headers": {
+				"x-amz-meta-color": "blue"
+			},
+			"capture": {
+				"upload": "UploadId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><UploadId>${upload}</UploadId></InitiateMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "upload part 1",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "${upload}"
+			},
+			"repeat": "part one ",
+			"size": 5242880,
+			"capture": {
+				"e1": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${e1}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "upload part 2",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "2",
+				"uploadId": "${upload}"
+			},
+			"repeat": "part two ",
+			"size": 5242880,
+			"capture": {
+				"e2": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${e2}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "upload part 3, small",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "3",
+				"uploadId": "${upload}"
+			},
+			"body": "end",
+			"capture": {
+				"e3": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${e3}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "upload part 0",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "0",
+				"uploadId": "${upload}"
+			},
+			"body": "zero",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Part number must be an integer between 1 and 10000, inclusive</Message><ArgumentName>partNumber</ArgumentName><ArgumentValue>0</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "upload part 10001",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "10001",
+				"uploadId": "${upload}"
+			},
+			"body": "past",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Part number must be an integer between 1 and 10000, inclusive</Message><ArgumentName>partNumber</ArgumentName><ArgumentValue>10001</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "upload a part to an unknown upload",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "unknown"
+			},
+			"body": "x",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message><UploadId>unknown</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "list the parts",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><UploadId>${upload}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><PartNumberMarker>0</PartNumberMarker><NextPartNumberMarker>3</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;61d55ca3e86fc7722280af8774beda7a&quot;</ETag><Size>5242880</Size></Part><Part><PartNumber>2</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;530a7dab9242f6e5ba29fea0fe8e9b17&quot;</ETag><Size>5242880</Size></Part><Part><PartNumber>3</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;7f021a1415b86f2d013b2618fb31ae53&quot;</ETag><Size>3</Size></Part></ListPartsResult>"
+			}
+		},
+		{
+			"name": "list the parts, one at most",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}",
+				"max-parts": "1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><UploadId>${upload}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><PartNumberMarker>0</PartNumberMarker><NextPartNumberMarker>1</NextPartNumberMarker><MaxParts>1</MaxParts><IsTruncated>true</IsTruncated><Part><PartNumber>1</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;61d55ca3e86fc7722280af8774beda7a&quot;</ETag><Size>5242880</Size></Part></ListPartsResult>"
+			}
+		},
+		{
+			"name": "list the parts after the first",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}",
+				"part-number-marker": "1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><UploadId>${upload}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><PartNumberMarker>1</PartNumberMarker><NextPartNumberMarker>3</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated><Part><PartNumber>2</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;530a7dab9242f6e5ba29fea0fe8e9b17&quot;</ETag><Size>5242880</Size></Part><Part><PartNumber>3</PartNumber><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;7f021a1415b86f2d013b2618fb31ae53&quot;</ETag><Size>3</Size></Part></ListPartsResult>"
+			}
+		},
+		{
+			"name": "list the parts of an unknown upload",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "unknown"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message><UploadId>unknown</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "list the uploads",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m",
+			"params": {
+				"uploads": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker>big</NextKeyMarker><NextUploadIdMarker>${upload}</NextUploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated><Upload><Key>big</Key><UploadId>${upload}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><Initiated>x-x-x:x:x.x</Initiated></Upload></ListMultipartUploadsResult>"
+			}
+		},
+		{
+			"name": "complete with the parts out of order",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part><Part><PartNumber>3</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidPartOrder</Code><Message>The list of parts was not in ascending order. Parts must be ordered by part number.</Message><UploadId>${upload}</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete with a wrong ETag",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"00000000000000000000000000000000\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>3</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidPart</Code><Message>One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.</Message><UploadId>${upload}</UploadId><PartNumber>1</PartNumber><ETag>00000000000000000000000000000000</ETag><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete with a part not uploaded",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part><Part><PartNumber>4</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidPart</Code><Message>One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.</Message><UploadId>${upload}</UploadId><PartNumber>4</PartNumber><ETag>7f021a1415b86f2d013b2618fb31ae53</ETag><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete with no parts",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload></CompleteMultipartUpload>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete an unknown upload",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "unknown"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message><UploadId>unknown</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>3</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>https://s3.eu-north-1.amazonaws.com/boberstack-ab-00000000-m/big</Location><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><ETag>\"759dd0116bcb8cdf168352f485b277fb-3\"</ETag><ChecksumCRC64NVME>NLIssy6C/dk=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CompleteMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "complete again",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part><Part><PartNumber>3</PartNumber><ETag>${e3}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>https://s3.eu-north-1.amazonaws.com/boberstack-ab-00000000-m/big</Location><Bucket>boberstack-ab-00000000-m</Bucket><Key>big</Key><ETag>\"759dd0116bcb8cdf168352f485b277fb-3\"</ETag></CompleteMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "list the parts of the completed upload",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message><UploadId>${upload}</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head the object",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-m/big",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"759dd0116bcb8cdf168352f485b277fb-3\"",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "blue",
+					"accept-ranges": "bytes",
+					"content-length": "10485763",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "head part 1",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "1"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"759dd0116bcb8cdf168352f485b277fb-3\"",
+					"x-amz-mp-parts-count": "3",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-meta-color": "blue",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 0-5242879/10485763",
+					"content-length": "5242880",
+					"content-type": "text/plain"
+				}
+			}
+		},
+		{
+			"name": "get part 3",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "3"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 10485760-10485762/10485763",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"759dd0116bcb8cdf168352f485b277fb-3\"",
+					"x-amz-meta-color": "blue",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-mp-parts-count": "3"
+				},
+				"size": 3,
+				"sha256": "361e48d0308f20e32dba5fb56328baf18d72ef0ccb43b84f5c262d2a6a1fc6c8"
+			}
+		},
+		{
+			"name": "get part 4",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"partNumber": "4"
+			},
+			"response": {
+				"status": 416,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidPartNumber</Code><Message>The requested partnumber is not satisfiable</Message><PartNumberRequested>4</PartNumberRequested><ActualPartCount>3</ActualPartCount><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get across the parts' boundary",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"headers": {
+				"range": "bytes=5242875-5242885"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "11",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 5242875-5242885/10485763",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"759dd0116bcb8cdf168352f485b277fb-3\"",
+					"x-amz-meta-color": "blue",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 11,
+				"sha256": "07f9c6c1a3bb5c9628536145f695a90f1749bea7eaf1e4fca61d5e7251270c45"
+			}
+		},
+		{
+			"name": "get the end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/big",
+			"headers": {
+				"range": "bytes=-5"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 10485758-10485762/10485763",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"759dd0116bcb8cdf168352f485b277fb-3\"",
+					"x-amz-meta-color": "blue",
+					"content-type": "text/plain",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "c1fdff65b749ed9dbb85b89c66a1fc0e4b0af27c136691557609ab29891ea63e"
+			}
+		},
+		{
+			"name": "create a second upload",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploads": ""
+			},
+			"capture": {
+				"upload2": "UploadId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>small</Key><UploadId>${upload2}</UploadId></InitiateMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "upload its small part 1",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "${upload2}"
+			},
+			"body": "a",
+			"capture": {
+				"s1": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${s1}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "upload its small part 2",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"partNumber": "2",
+				"uploadId": "${upload2}"
+			},
+			"body": "b",
+			"capture": {
+				"s2": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${s2}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "upload its part 2 again",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"partNumber": "2",
+				"uploadId": "${upload2}"
+			},
+			"body": "bb",
+			"capture": {
+				"s2": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${s2}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "complete with a part too small",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload2}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${s1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${s2}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>EntityTooSmall</Code><Message>Your proposed upload is smaller than the minimum allowed size</Message><ProposedSize>1</ProposedSize><MinSizeAllowed>5242880</MinSizeAllowed><PartNumber>1</PartNumber><ETag>0cc175b9c0f1b6a831c399e269772661</ETag><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create a third upload",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploads": ""
+			},
+			"capture": {
+				"upload3": "UploadId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>small</Key><UploadId>${upload3}</UploadId></InitiateMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "list the uploads of two",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m",
+			"params": {
+				"uploads": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker>small</NextKeyMarker><NextUploadIdMarker>${upload3}</NextUploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated><Upload><Key>small</Key><UploadId>${upload2}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><Initiated>x-x-x:x:x.x</Initiated></Upload><Upload><Key>small</Key><UploadId>${upload3}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><Initiated>x-x-x:x:x.x</Initiated></Upload></ListMultipartUploadsResult>"
+			}
+		},
+		{
+			"name": "list the uploads, one at most",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m",
+			"params": {
+				"uploads": "",
+				"max-uploads": "1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker>small</NextKeyMarker><NextUploadIdMarker>${upload2}</NextUploadIdMarker><MaxUploads>1</MaxUploads><IsTruncated>true</IsTruncated><Upload><Key>small</Key><UploadId>${upload2}</UploadId><Initiator><ID>arn:aws:iam::000000000000:root</ID><DisplayName>x-x-x-x-x</DisplayName></Initiator><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass><Initiated>x-x-x:x:x.x</Initiated></Upload></ListMultipartUploadsResult>"
+			}
+		},
+		{
+			"name": "abort the second",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "abort it again",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "abort an unknown upload",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "unknown"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message><UploadId>unknown</UploadId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete a single small part",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "${upload3}"
+			},
+			"body": "only",
+			"capture": {
+				"o1": "header:etag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"etag": "${o1}",
+					"x-amz-server-side-encryption": "AES256",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "complete the third",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload3}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${o1}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>https://s3.eu-north-1.amazonaws.com/boberstack-ab-00000000-m/small</Location><Bucket>boberstack-ab-00000000-m</Bucket><Key>small</Key><ETag>\"ea62d57755f34c46eea7035b29d5fc46-1\"</ETag><ChecksumCRC64NVME>rzsmsrcRLcM=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CompleteMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "create an upload by copy",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"uploads": ""
+			},
+			"capture": {
+				"upload4": "UploadId"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><Key>copied</Key><UploadId>${upload4}</UploadId></InitiateMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "copy a range as part 1",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"partNumber": "1",
+				"uploadId": "${upload4}"
+			},
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-m/big",
+				"x-amz-copy-source-range": "bytes=0-5242879"
+			},
+			"capture": {
+				"c1": "CopyPartResult/ETag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>${e1}</ETag></CopyPartResult>"
+			}
+		},
+		{
+			"name": "copy a range as part 2",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"partNumber": "2",
+				"uploadId": "${upload4}"
+			},
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-m/big",
+				"x-amz-copy-source-range": "bytes=10485755-10485762"
+			},
+			"capture": {
+				"c2": "CopyPartResult/ETag"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>x-x-x:x:x.x</LastModified><ETag>${c2}</ETag></CopyPartResult>"
+			}
+		},
+		{
+			"name": "copy a range past the end",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"partNumber": "3",
+				"uploadId": "${upload4}"
+			},
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-m/big",
+				"x-amz-copy-source-range": "bytes=10485755-10485800"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>Range specified is not valid for source object of size: 10485763</Message><ArgumentName>x-amz-copy-source-range</ArgumentName><ArgumentValue>bytes=10485755-10485800</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "copy a range malformed",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"partNumber": "3",
+				"uploadId": "${upload4}"
+			},
+			"headers": {
+				"x-amz-copy-source": "/${prefix}-m/big",
+				"x-amz-copy-source-range": "bytes=5-"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<Error><Code>InvalidArgument</Code><Message>The x-amz-copy-source-range value must be of the form bytes=first-last where first and last are the zero-based offsets of the first and last bytes to copy</Message><ArgumentName>x-amz-copy-source-range</ArgumentName><ArgumentValue>bytes=5-</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "complete the copy",
+			"service": "s3",
+			"method": "POST",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"uploadId": "${upload4}"
+			},
+			"body": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${c1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${c2}</ETag></Part></CompleteMultipartUpload>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>https://s3.eu-north-1.amazonaws.com/boberstack-ab-00000000-m/copied</Location><Bucket>boberstack-ab-00000000-m</Bucket><Key>copied</Key><ETag>\"f8169cfb95c0cd979ce84677cbd35b2b-2\"</ETag><ChecksumCRC64NVME>Au3M+Rb7Llc=</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></CompleteMultipartUploadResult>"
+			}
+		},
+		{
+			"name": "head the copy",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-m/copied",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"f8169cfb95c0cd979ce84677cbd35b2b-2\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-length": "5242888",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "get the copy's end",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m/copied",
+			"headers": {
+				"range": "bytes=-10"
+			},
+			"response": {
+				"status": 206,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"content-range": "bytes 5242878-5242887/5242888",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"f8169cfb95c0cd979ce84677cbd35b2b-2\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "da58948765c33fae0bb4e487baa8af388b232a74728776e415ba0581b3411780"
+			}
+		},
+		{
+			"name": "list the uploads after",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-m",
+			"params": {
+				"uploads": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>boberstack-ab-00000000-m</Bucket><KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker><NextKeyMarker></NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker><MaxUploads>1000</MaxUploads><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "abort the first",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/big",
+			"params": {
+				"uploadId": "${upload}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "abort the second if left",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "abort the third",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"params": {
+				"uploadId": "${upload3}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "abort the copy",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/copied",
+			"params": {
+				"uploadId": "${upload4}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete big",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/big",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete small",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/small",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete copied",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m/copied",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-m",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

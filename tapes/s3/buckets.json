@@ -1,0 +1,552 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"CreationDate",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create with the region's location constraint",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-a.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "create it again",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 409,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BucketAlreadyOwnedByYou</Code><Message>Your previous request to create the named bucket succeeded and you already own it.</Message><BucketName>boberstack-ab-00000000-a</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create it again without a location constraint",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 400,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create without a location constraint, at a regional endpoint",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with another region's location constraint",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The eu-west-1 location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with us-east-1 as the location constraint",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>us-east-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The us-east-1 location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with a location constraint not a region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>moon-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The moon-1 location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with a malformed configuration",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-b",
+			"body": "<CreateBucketConfiguration><LocationConstraint>eu-north-1</LocationConstraint>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create in upper case",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-UPPER",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create of two characters",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/ab",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>ab</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with an underscore",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}_b",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with two dots",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}..b",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create shaped as an IP address",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/192.168.5.4",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create of 64 characters",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-01234567890123456789012345678901234567890",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>IllegalLocationConstraintException</Code><Message>The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create in upper case, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-UPPER",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>boberstack-ab-00000000-UPPER</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with an underscore, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}_b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>boberstack-ab-00000000_b</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create with two dots, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}..b",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>boberstack-ab-00000000..b</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create shaped as an IP address, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/192.168.5.4",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>192.168.5.4</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create of 64 characters, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-01234567890123456789012345678901234567890",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>boberstack-ab-00000000-01234567890123456789012345678901234567890</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create ending in -s3alias, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-s3alias",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 403,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>The requested bucket name ends with a reserved suffix</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "create starting with a dash, in the region",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/-${prefix}",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidBucketName</Code><Message>The specified bucket is not valid.</Message><BucketName>-boberstack-ab-00000000</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "head virtual-hosted",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-a",
+			"virtual": true,
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "head missing",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-none",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "location",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-a",
+			"params": {
+				"location": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">eu-north-1</LocationConstraint>"
+			}
+		},
+		{
+			"name": "location of a missing bucket",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-none",
+			"params": {
+				"location": ""
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "list buckets of the prefix",
+			"service": "s3",
+			"method": "GET",
+			"path": "/",
+			"params": {
+				"prefix": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><Buckets><Bucket><Name>boberstack-ab-00000000-a</Name><CreationDate>x-x-x:x:x.x</CreationDate><BucketRegion>eu-north-1</BucketRegion><BucketArn>arn:aws:s3:::boberstack-ab-00000000-a</BucketArn></Bucket></Buckets><Prefix>boberstack-ab-00000000</Prefix></ListAllMyBucketsResult>"
+			}
+		},
+		{
+			"name": "list buckets of the prefix, one at most",
+			"service": "s3",
+			"method": "GET",
+			"path": "/",
+			"params": {
+				"prefix": "${prefix}",
+				"max-buckets": "1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><Buckets><Bucket><Name>boberstack-ab-00000000-a</Name><CreationDate>x-x-x:x:x.x</CreationDate><BucketRegion>eu-north-1</BucketRegion><BucketArn>arn:aws:s3:::boberstack-ab-00000000-a</BucketArn></Bucket></Buckets><Prefix>boberstack-ab-00000000</Prefix></ListAllMyBucketsResult>"
+			}
+		},
+		{
+			"name": "list buckets of a prefix of none",
+			"service": "s3",
+			"method": "GET",
+			"path": "/",
+			"params": {
+				"prefix": "${prefix}-none"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><Buckets/><Prefix>boberstack-ab-00000000-none</Prefix></ListAllMyBucketsResult>"
+			}
+		},
+		{
+			"name": "list buckets of the region",
+			"service": "s3",
+			"method": "GET",
+			"path": "/",
+			"params": {
+				"prefix": "${prefix}",
+				"bucket-region": "eu-north-1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>${owner}</ID></Owner><Buckets><Bucket><Name>boberstack-ab-00000000-a</Name><CreationDate>x-x-x:x:x.x</CreationDate><BucketRegion>eu-north-1</BucketRegion><BucketArn>arn:aws:s3:::boberstack-ab-00000000-a</BucketArn></Bucket></Buckets><Prefix>boberstack-ab-00000000</Prefix></ListAllMyBucketsResult>"
+			}
+		},
+		{
+			"name": "put an object",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-a/k",
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc64nvme": "M3eFcAZSQlc=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "delete the bucket, not empty",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BucketNotEmpty</Code><Message>The bucket you tried to delete is not empty</Message><BucketName>boberstack-ab-00000000-a</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete a missing bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-none",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete the object",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "head the deleted bucket",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "delete it again",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-a</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the object if left",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-a</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete the bucket if left",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-a",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-a</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	]
+}

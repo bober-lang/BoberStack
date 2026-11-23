@@ -1,0 +1,841 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-v.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "versioning never set",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+			}
+		},
+		{
+			"name": "put an object while unversioned",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v/old",
+			"body": "old",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"149603e6c03516362a8da23f624db945\"",
+					"x-amz-checksum-crc64nvme": "9BMaayUSn3M=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "enable versioning",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"headers": {
+				"content-md5": "QQFYoy/mRYV9PGZUfFi0Bw=="
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "set versioning to a status not one",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"headers": {
+				"content-md5": "u1vVTp/Eb3dzpjL9Nh4zbQ=="
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>On</Status></VersioningConfiguration>",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedXML</Code><Message>The XML you provided was not well-formed or did not validate against our published schema</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "versioning enabled",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>"
+			}
+		},
+		{
+			"name": "put one",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v/k",
+			"body": "one",
+			"capture": {
+				"v1": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${v1}",
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"f97c5d29941bfb1b2fdab0874906ab82\"",
+					"x-amz-checksum-crc64nvme": "sUmeCqrLO7M=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put two",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v/k",
+			"body": "two",
+			"capture": {
+				"v2": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-version-id": "${v2}",
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"b8a9f715dbb64fd5c56e7783c6820a61\"",
+					"x-amz-checksum-crc64nvme": "ybgaXgkx3JA=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get the latest",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"b8a9f715dbb64fd5c56e7783c6820a61\"",
+					"x-amz-version-id": "${v2}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3"
+			}
+		},
+		{
+			"name": "get the first by version",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"f97c5d29941bfb1b2fdab0874906ab82\"",
+					"x-amz-version-id": "${v1}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed"
+			}
+		},
+		{
+			"name": "head the first by version",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"f97c5d29941bfb1b2fdab0874906ab82\"",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-version-id": "${v1}",
+					"accept-ranges": "bytes",
+					"content-length": "3",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "get the object from before versioning, version null",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/old",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"149603e6c03516362a8da23f624db945\"",
+					"x-amz-version-id": "null",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4"
+			}
+		},
+		{
+			"name": "get a version malformed",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Invalid version id specified</Message><ArgumentName>versionId</ArgumentName><ArgumentValue>nope</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "get a version of a missing key",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/none",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message><Key>none</Key><VersionId>${v1}</VersionId><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "list the versions",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Version><Key>k</Key><VersionId>${v2}</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;b8a9f715dbb64fd5c56e7783c6820a61&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>k</Key><VersionId>${v1}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;f97c5d29941bfb1b2fdab0874906ab82&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>old</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;149603e6c03516362a8da23f624db945&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "delete, making a marker",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"capture": {
+				"dm": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm}",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "get behind the marker",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml",
+					"x-amz-delete-marker": "true",
+					"x-amz-version-id": "${dm}"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>k</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head behind the marker",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-v/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"x-amz-delete-marker": "true",
+					"x-amz-version-id": "${dm}",
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "get the marker by version",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm}"
+			},
+			"response": {
+				"status": 405,
+				"headers": {
+					"content-type": "application/xml",
+					"x-amz-version-id": "${dm}",
+					"x-amz-delete-marker": "true",
+					"last-modified": "x, x x x x:x:x x"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message><Method>GET</Method><ResourceType>DeleteMarker</ResourceType><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head the marker by version",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm}"
+			},
+			"response": {
+				"status": 405,
+				"headers": {
+					"x-amz-delete-marker": "true",
+					"last-modified": "x, x x x x:x:x x",
+					"x-amz-version-id": "${dm}",
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "get the second by version behind the marker",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v2}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"b8a9f715dbb64fd5c56e7783c6820a61\"",
+					"x-amz-version-id": "${v2}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3"
+			}
+		},
+		{
+			"name": "list objects behind the marker",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"list-type": "2"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-bucket-region": "eu-north-1",
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>old</Key><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;149603e6c03516362a8da23f624db945&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
+			}
+		},
+		{
+			"name": "list the versions with the marker",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><DeleteMarker><Key>k</Key><VersionId>${dm}</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><Owner><ID>${owner}</ID></Owner></DeleteMarker><Version><Key>k</Key><VersionId>${v2}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;b8a9f715dbb64fd5c56e7783c6820a61&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>k</Key><VersionId>${v1}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;f97c5d29941bfb1b2fdab0874906ab82&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>old</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;149603e6c03516362a8da23f624db945&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "list the versions, one at most",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": "",
+				"max-keys": "1"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><NextKeyMarker>k</NextKeyMarker><NextVersionIdMarker>${dm}</NextVersionIdMarker><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated><DeleteMarker><Key>k</Key><VersionId>${dm}</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><Owner><ID>${owner}</ID></Owner></DeleteMarker></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "list the versions from a key marker",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": "",
+				"key-marker": "k",
+				"version-id-marker": "${dm}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker>k</KeyMarker><VersionIdMarker>${dm}</VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Version><Key>k</Key><VersionId>${v2}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;b8a9f715dbb64fd5c56e7783c6820a61&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>k</Key><VersionId>${v1}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;f97c5d29941bfb1b2fdab0874906ab82&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>old</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;149603e6c03516362a8da23f624db945&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "delete the marker again, making another",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"capture": {
+				"dm2": "header:x-amz-version-id"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm2}",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "delete the second marker by version",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm2}",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "delete the first marker by version",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm}",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "get after removing the markers",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "3",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"b8a9f715dbb64fd5c56e7783c6820a61\"",
+					"x-amz-version-id": "${v2}",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 3,
+				"sha256": "3fc4ccfe745870e2c0d99f71f30ff0656c8dedd41cc1d7d3d376b0dbe685e2f3"
+			}
+		},
+		{
+			"name": "delete the first by version",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v1}"
+				}
+			}
+		},
+		{
+			"name": "delete it by version again",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v1}"
+				}
+			}
+		},
+		{
+			"name": "delete a version malformed",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code><Message>Invalid version id specified</Message><ArgumentName>versionId</ArgumentName><ArgumentValue>nope</ArgumentValue><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "suspend versioning",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"headers": {
+				"content-md5": "orZUUp7E9srl53Od8p1glA=="
+			},
+			"body": "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "versioning suspended",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versioning": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>"
+			}
+		},
+		{
+			"name": "put three while suspended",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v/k",
+			"body": "three",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"35d6d33467aae9a2e3dccb4b6b027878\"",
+					"x-amz-checksum-crc64nvme": "rjRGkQfpw8Y=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put four while suspended",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-v/k",
+			"body": "four",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"8cbad96aced40b3838dd9f07f6ef5772\"",
+					"x-amz-checksum-crc64nvme": "vNpDUOWM0Tc=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get the null version",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "4",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"8cbad96aced40b3838dd9f07f6ef5772\"",
+					"x-amz-version-id": "null",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 4,
+				"sha256": "04efaf080f5a3e74e1c29d1ca6a48569382cbbcd324e8d59d2b83ef21c039f00"
+			}
+		},
+		{
+			"name": "list the versions while suspended",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Version><Key>k</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;8cbad96aced40b3838dd9f07f6ef5772&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>4</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>k</Key><VersionId>${v2}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;b8a9f715dbb64fd5c56e7783c6820a61&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version><Version><Key>old</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;149603e6c03516362a8da23f624db945&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "delete while suspended",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "null",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "list the versions after",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": "",
+				"prefix": "k"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix>k</Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><DeleteMarker><Key>k</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>x-x-x:x:x.x</LastModified><Owner><ID>${owner}</ID></Owner></DeleteMarker><Version><Key>k</Key><VersionId>${v2}</VersionId><IsLatest>false</IsLatest><LastModified>x-x-x:x:x.x</LastModified><ETag>&quot;b8a9f715dbb64fd5c56e7783c6820a61&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>3</Size><Owner><ID>${owner}</ID></Owner><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "delete the bucket with versions",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v",
+			"response": {
+				"status": 409,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BucketNotEmpty</Code><Message>The bucket you tried to delete is not empty. You must delete all versions in the bucket.</Message><BucketName>boberstack-ab-00000000-v</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete the second",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v2}"
+				}
+			}
+		},
+		{
+			"name": "delete the first",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${v1}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${v1}"
+				}
+			}
+		},
+		{
+			"name": "delete the null version",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "null",
+					"x-amz-delete-marker": "true"
+				}
+			}
+		},
+		{
+			"name": "delete the marker",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm}"
+				}
+			}
+		},
+		{
+			"name": "delete the other marker",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/k",
+			"params": {
+				"versionId": "${dm2}"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "${dm2}"
+				}
+			}
+		},
+		{
+			"name": "delete old",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v/old",
+			"params": {
+				"versionId": "null"
+			},
+			"response": {
+				"status": 204,
+				"headers": {
+					"x-amz-version-id": "null"
+				}
+			}
+		},
+		{
+			"name": "list the versions left",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-v",
+			"params": {
+				"versions": ""
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>boberstack-ab-00000000-v</Name><Prefix></Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListVersionsResult>"
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-v",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}

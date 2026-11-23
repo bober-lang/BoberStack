@@ -30,42 +30,76 @@
 //! sent as the scenario's caller unless `as` names others, whose access key, secret and session token, if any, earlier
 //! steps capture as `<as>.key`, `<as>.secret` and `<as>.token`; a tape holds them as captures, `${<as>.secret}`.
 //!
+//! S3's requests are REST: `path` is a bucket and key, `/${prefix}-b/a key`, which the tool encodes once, as S3
+//! signs it, and sends to the bucket's host, `<bucket>.s3.<region>.amazonaws.com`, if `virtual`; `params` is the URL's
+//! query, `headers` the request's, `region` the one it is signed for if not the tape's `region`, by default
+//! us-east-1, and the body is `body`'s text, `base64`'s bytes, or `size` bytes of `repeat` over and over, as a
+//! multipart upload's parts are described rather than written out. A request to S3 is signed over all its headers
+//! and X-Amz-Content-Sha256, the body's hash unless the step sets it; not at all if `anonymous`; or in a presigned
+//! URL valid for `presign` seconds, signed `age` seconds before it is sent, whose query parameters `tamper` then
+//! changes. A path `header:<name>` captures a header of the answer.
+//!
 //! A tape holds nothing of the account: recording makes its id 000000000000, the caller's identity the account's
-//! root, which a replay sends as, the prefix `boberstack-ab-00000000`, a value captured `${name}` wherever it is, and
-//! that of a member named `volatile`, of the tape or the step, its form; and it refuses to write a tape that still
-//! names the account or the caller, or holds a unique id, which encodes the account: capture those, or make them
-//! volatile.
+//! root, which a replay sends as, the prefix `boberstack-ab-00000000`, a value captured `${name}` wherever it is, S3's
+//! canonical user id of the account `${owner}`, and that of a member or header named `volatile`, of the tape or the
+//! step, or `ignored`, its form; and it refuses to write a tape that still names the account, its canonical user or the
+//! caller, or holds a unique id, which encodes the account: capture those, or make them volatile.
 //!
 //! A replay compares the status, the headers in `headers`, and the body as a tree: of XML elements, or JSON members
 //! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
 //! does not. A captured value is expected where AWS's was, as is a volatile member, of the same form: its runs of
-//! letters, digits and +/= the same in number, between the same other characters; and the random id of an
-//! authorization that IAM's denials link to is not compared. A step with `differs`, the reason BoberStack answers
+//! letters, digits and +/= the same in number, between the same other characters; an ignored member need only be
+//! there; a `${name}` not yet bound, as `${owner}`, binds it to what is there; and the random id of an authorization
+//! that IAM's denials link to is not compared. Of S3 it compares the headers in `s3Headers`, Content-Length only of an
+//! object's bytes or no body, and an object's bytes by their length and hash, which the tape holds instead. It sends
+//! S3's requests to s3.localhost.localstack.cloud:4566, a virtual-hosted one to the bucket's subdomain of it, signed
+//! when a test's clock reads, and an anonymous one unsigned. A step with `differs`, the reason BoberStack answers
 //! otherwise, is expected to differ, until it no longer does.
 
 import * as client from "../../core/client"
+import * as sigv4 from "../../core/auth/sigv4"
 import { Gateway } from "../../core/gateway"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
 import { Keys, Mapping, OmitEmpty } from "std/encoding/json"
 import * as xml from "std/encoding/xml"
 import { readFile } from "std/fs"
 import { Request, Response } from "std/http"
+import { isAlphanumeric } from "std/ascii"
 import { CryptoError } from "std/crypto/error"
-import { indexOf } from "std/algo"
+import { sha256 } from "std/crypto/hash"
+import { indexOf, sort, startsWith, unique } from "std/algo"
 import { ParseError, replace, split, trim } from "std/string"
+import { iso8601Basic, second } from "std/time"
 import { escape } from "std/url"
 
 /// The headers of an answer that a tape holds.
 export const headers = ["content-type", "x-amzn-errortype", "x-amzn-query-error"]
+
+/// The headers of S3's answers that a tape holds, and the prefixes of the others it holds.
+export const s3Headers = ["accept-ranges", "cache-control", "content-disposition", "content-encoding",
+	"content-language", "content-length", "content-range", "content-type", "etag", "expires", "last-modified",
+	"location", "x-amz-bucket-region", "x-amz-copy-source-version-id", "x-amz-delete-marker", "x-amz-missing-meta",
+	"x-amz-mp-parts-count", "x-amz-storage-class", "x-amz-tagging-count", "x-amz-version-id",
+	"x-amz-website-redirect-location"]
+
+export const s3Prefixes = ["x-amz-checksum-", "x-amz-meta-", "x-amz-server-side-encryption"]
 /// The prefix of the names in a tape, as long as a recording's.
 export const prefix = "boberstack-ab-00000000"
+/// The instant a replay signs its requests at, which is now() in a test: 20150626T140000Z.
+export const replayed: i64 = 1435327200 * second
 
-/// An answer as a tape holds it: a JSON body as an object, any other as text.
+/// An answer as a tape holds it: a JSON body as an object, an object's bytes by their length and hash, any other as
+/// text.
 export class Answer {
 	status: i32 = 0
 	headers: [string, string][] @Mapping = []
 	body: string @OmitEmpty = ""
 	json: Keys | null @OmitEmpty = null
+	size: i32 @OmitEmpty = 0
+	/// In hex.
+	sha256: string @OmitEmpty = ""
 }
 
 /// A request, what to bind from its answer, and once recorded what AWS answered.
@@ -81,9 +115,29 @@ export class Step {
 	/// awsQuery's parameters, or awsJson's object.
 	query: [string, string][] @Mapping @OmitEmpty = []
 	json: Keys | null @OmitEmpty = null
+	/// The URL's query, a parameter of "" its name alone.
+	params: [string, string][] @Mapping @OmitEmpty = []
+	headers: [string, string][] @Mapping @OmitEmpty = []
+	/// The body: a text, bytes in base64, or size bytes of repeat over and over.
+	body: string @OmitEmpty = ""
+	base64: string @OmitEmpty = ""
+	repeat: string @OmitEmpty = ""
+	size: i32 @OmitEmpty = 0
+	/// Signed for, if not the tape's.
+	region: string @OmitEmpty = ""
+	/// Sent to the host of the bucket the path starts with.
+	virtual: bool @OmitEmpty = false
+	/// Unsigned.
+	anonymous: bool @OmitEmpty = false
+	/// A presigned URL's seconds, 0 to sign in the Authorization header; how long before it is sent it is signed; and
+	/// the query parameters set once it is.
+	presign: i64 @OmitEmpty = 0
+	age: i64 @OmitEmpty = 0
+	tamper: [string, string][] @Mapping @OmitEmpty = []
 	/// By name, the path of the text to bind it to.
 	capture: [string, string][] @Mapping @OmitEmpty = []
 	volatile: string[] @OmitEmpty = []
+	ignored: string[] @OmitEmpty = []
 	/// Whom it is sent as: by the values bound to <as>.key, <as>.secret and, of a session, <as>.token; the root if "".
 	as: string @OmitEmpty = ""
 	/// The status to retry for while recording, 0 for none.
@@ -96,8 +150,12 @@ export class Step {
 
 /// A scenario, or once recorded a tape.
 export class Tape {
-	/// The members of every answer whose values differ from one run to the next.
+	/// What ${region} is bound to, and steps are signed for unless they name another; us-east-1 if "".
+	region: string @OmitEmpty = ""
+	/// The members and headers of every answer whose values differ from one run to the next.
 	volatile: string[] @OmitEmpty = []
+	/// Those not compared at all.
+	ignored: string[] @OmitEmpty = []
 	steps: Step[] = []
 	/// Run after the steps, even if one failed while recording.
 	cleanup: Step[] @OmitEmpty = []
@@ -126,29 +184,146 @@ export function request(s: Step, values: [string, string][], endpoint: string): 
 	} else if (s.query.length > 0) {
 		body = s.query.map(p => `${escape(p[0], "component")}=${escape(fill(p[1], values, false), "component")}`).join("&")
 		kind = if (kind == "") "application/x-www-form-urlencoded; charset=utf-8" else kind
+	} else {
+		body = content(s, values)
 	}
-	const path = fill(if (s.path == "") "/" else s.path, values, false)
-	const req = new Request(if (s.method == "") "POST" else s.method, endpoint + path, body)
+	let path = fill(if (s.path == "") "/" else s.path, values, false)
+	let base = endpoint
+	if (s.service == "s3") {
+		path = split(path, "/").map(p => escape(p, "component")).join("/")
+	}
+	if (s.virtual) {
+		const end = indexOf(path, "/", 1)
+		const at = indexOf(base, "://") + 3
+		base = base.slice(0, at) + path.slice(1, if (end < 0) path.length else end) + "." + base.slice(at, base.length)
+		path = if (end < 0) "/" else path.slice(end, path.length)
+	}
+	const q = s.params.map(p => escape(p[0], "component")
+		+ (if (p[1] == "") "" else `=${escape(fill(p[1], values, false), "component")}`)).join("&")
+	const req = new Request(if (s.method == "") "POST" else s.method, base + path + (if (q == "") "" else `?${q}`),
+		body)
+	req.headers.set("host", `${req.url.host}${if (req.url.port == null) "" else `:${req.url.port}`}`)
 	if (kind != "") {
 		req.headers.set("content-type", kind)
 	}
 	if (s.target != "") {
 		req.headers.set("x-amz-target", s.target)
 	}
+	for (const [name, v] of s.headers) {
+		req.headers.set(name, fill(v, values, false))
+	}
 	return req
 }
 
-/// The answer that res is, its body body.
-export function answer(res: Response, body: string): Answer {
+/// The body s describes: base64's bytes, size bytes of repeat, or body with each ${name} replaced by its value in
+/// values.
+export function content(s: Step, values: [string, string][]): string throws ParseError {
+	if (s.base64 != "") {
+		return base64.decode(s.base64)
+	}
+	if (s.repeat != "") {
+		let out = s.repeat
+		while (out.length < s.size) {
+			out = out + out
+		}
+		return out.slice(0, s.size)
+	}
+	return fill(s.body, values, false)
+}
+
+/// Signs req, the request of s, by the access key, secret and session token of by at the instant t: not if s is
+/// anonymous; of S3 as an SDK signs it, or in a presigned URL; of any other service as ./../../core/client signs a
+/// query.
+export function authorize(req: Request, s: Step, values: [string, string][], by: [string, string, string],
+	t: i64) throws CryptoError {
+	if (s.anonymous) {
+		return
+	}
+	const [key, secret, token] = by
+	const region = regionOf(s, values)
+	const body = req.body.whole ?? ""
+	if (s.service != "s3") {
+		client.sign(req, body, s.service, region, key, secret, token, iso8601Basic(t - t % second))
+		return
+	}
+	const a = new sigv4.Authorization()
+	a.accessKey = key
+	a.region = region
+	a.service = "s3"
+	if (s.presign != 0) {
+		const stamp = iso8601Basic(t - t % second - s.age * second)
+		a.date = stamp.slice(0, 8)
+		a.expires = s.presign
+		a.signedHeaders = ["host"]
+		const q = req.url.query
+		q.set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+		q.set("X-Amz-Credential", `${key}/${sigv4.scope(a)}`)
+		q.set("X-Amz-Date", stamp)
+		q.set("X-Amz-Expires", `${s.presign}`)
+		if (token != "") {
+			q.set("X-Amz-Security-Token", token)
+		}
+		q.set("X-Amz-SignedHeaders", "host")
+		q.set("X-Amz-Signature", sigv4.signature(req, body, a, secret))
+		for (const [name, v] of s.tamper) {
+			q.set(name, fill(v, values, false))
+		}
+		return
+	}
+	const stamp = iso8601Basic(t - t % second)
+	a.date = stamp.slice(0, 8)
+	req.headers.set("x-amz-date", stamp)
+	if (token != "") {
+		req.headers.set("x-amz-security-token", token)
+	}
+	if (!req.headers.has("x-amz-content-sha256")) {
+		req.headers.set("x-amz-content-sha256", hex.encode(sha256(body)))
+	}
+	const names = unique(req.headers.entries.map(e => e[0]))
+	sort(names)
+	a.signedHeaders = names
+	const signature = sigv4.signature(req, body, a, secret, req.headers.get("x-amz-content-sha256"))
+	req.headers.set("authorization",
+		`AWS4-HMAC-SHA256 Credential=${key}/${sigv4.scope(a)}, SignedHeaders=${names.join(";")}, Signature=${signature}`)
+}
+
+/// The region s is signed for: its own, else the one values binds.
+export function regionOf(s: Step, values: [string, string][]): string {
+	return if (s.region == "") lookup(values, "region") ?? "us-east-1" else s.region
+}
+
+/// Whether a tape holds body, an answer of service, as an object's bytes: of S3, neither empty, XML nor JSON.
+export function opaque(service: string, body: string): bool {
+	const first = initial(body)
+	return service == "s3" && body != "" && first != "<" && first != "{"
+}
+
+/// Whether a tape holds the header name of an answer of service, whose body is an object's bytes or not, or none.
+export function kept(service: string, name: string, body: string): bool {
+	if (service != "s3") {
+		return headers.includes(name)
+	}
+	if (name == "content-length") {
+		return body == "" || opaque(service, body)
+	}
+	return s3Headers.includes(name) || s3Prefixes.some(p => startsWith(name, p))
+}
+
+/// The answer that res, of service, is, its body body.
+export function answer(res: Response, body: string, service: string): Answer throws CryptoError {
 	const a = new Answer()
 	a.status = res.status
-	for (const h of headers) {
-		const v = res.headers.get(h)
-		if (v != null) {
+	for (const [h, v] of res.headers.entries) {
+		if (kept(service, h, body) && lookup(a.headers, h) == null) {
 			a.headers.push([h, v])
 		}
 	}
-	if (trim(body).slice(0, 1) == "{") {
+	if (opaque(service, body)) {
+		a.size = body.length
+		a.sha256 = hex.encode(sha256(body))
+		return a
+	}
+	if (initial(body) == "{") {
 		try {
 			a.json = json.decode[Keys](body)
 			return a
@@ -173,6 +348,13 @@ export function find(body: string, path: string): string | null throws ParseErro
 	return if (t!.leaf) t!.text else null
 }
 
+/// What path captures of res, whose body is body: the header it names after header:, else the text at it in the
+/// body; null if there is none.
+export function captured(res: Response, body: string, path: string): string | null throws ParseError {
+	const header = "header:"
+	return if (startsWith(path, header)) res.headers.get(path.slice(header.length, path.length)) else find(body, path)
+}
+
 /// The texts of the members named one of names in body, those of 8 characters or more.
 export function volatiles(body: string, names: string[]): string[] throws ParseError {
 	const out: string[] = []
@@ -190,7 +372,13 @@ export function replay(path: string, g: Gateway): string[] {
 	} catch (e: IoError | ParseError) {
 		return [`${path}: ${e}`]
 	}
-	const values: [string, string][] = [["prefix", prefix], ["account", "000000000000"], ["region", "us-east-1"]]
+	return play(t, g)
+}
+
+/// What differs between the answers of g to t and those it holds, as replay says.
+export function play(t: Tape, g: Gateway): string[] {
+	const values: [string, string][] = [["prefix", prefix], ["account", "000000000000"],
+		["region", if (t.region == "") "us-east-1" else t.region]]
 	const out: string[] = []
 	const steps = t.steps.slice(0, t.steps.length)
 	steps.append(t.cleanup)
@@ -201,7 +389,7 @@ export function replay(path: string, g: Gateway): string[] {
 		let lines = [`no credentials captured as ${s.as}`]
 		try {
 			if (by != null) {
-				lines = check(s, send(s, values, by!, g), t.volatile, values)
+				lines = check(s, send(s, values, by!, g), t, values)
 			}
 		} catch (e: IoError | ParseError | CryptoError) {
 			lines = [`${e}`]
@@ -218,9 +406,9 @@ export function replay(path: string, g: Gateway): string[] {
 /// The answer of g to s, its ${name}s replaced by values, signed by the access key, secret and token of by.
 function send(s: Step, values: [string, string][], by: [string, string, string],
 	g: Gateway): Response throws IoError | ParseError | CryptoError {
-	const req = request(s, values, "http://localhost:4566")
-	const [key, secret, token] = by
-	client.sign(req, req.body.whole ?? "", s.service, "us-east-1", key, secret, token, "20150626T140000Z")
+	const req = request(s, values,
+		if (s.service == "s3") "http://s3.localhost.localstack.cloud:4566" else "http://localhost:4566")
+	authorize(req, s, values, by, replayed)
 	return g.handle(req)
 }
 
@@ -248,33 +436,85 @@ export function unlinked(s: string): string {
 	return out
 }
 
-/// How res differs from the answer s holds, whose captures it binds in values.
-function check(s: Step, res: Response, volatile: string[],
-	values: [string, string][]): string[] throws IoError | ParseError {
+/// The start of the ARN of what an organization holds.
+export const organizations = "arn:aws:organizations::"
+
+/// s with the ARNs of an organization's policies, as an SCP that denies names it, of 0s: the management account's
+/// id, and the ids of the organization, a root and a policy, after o-, r- and p-.
+export function unorganized(s: string): string {
+	let out = s
+	for (let i = indexOf(out, organizations); i >= 0; i = indexOf(out, organizations, i + 1)) {
+		let end = i
+		while (end < out.length && (isAlphanumeric(out[end]) || indexOf(":/-_", [out[end]]) >= 0)) {
+			end++
+		}
+		const parts = split(out.slice(i + organizations.length, end), ":")
+		const ids = (p: string) => if (p.length > 2
+			&& ["o-", "p-", "r-"].includes(p.slice(0, 2))) p.slice(0, 2) + zeros(p.length - 2)
+			else p
+		const resource = if (parts.length < 2) "" else split(parts[1], "/").map(ids).join("/")
+		out = out.slice(0, i) + `${organizations}${zeros(parts[0].length)}:${resource}` + out.slice(end, out.length)
+	}
+	return out
+}
+
+/// n 0s.
+function zeros(n: i32): string {
+	let out = ""
+	while (out.length < n) {
+		out += "0"
+	}
+	return out
+}
+
+/// How res differs from the answer s, of t, holds, whose captures it binds in values.
+function check(s: Step, res: Response, t: Tape, values: [string, string][]): string[] throws IoError | ParseError {
 	const want = s.response ?? new Answer()
-	const body = res.body.text()
+	const body = res.body.text(64 << 20)
 	const out: string[] = []
 	if (res.status != want.status) {
 		out.push(`status: expected ${want.status}, got ${res.status}`)
 	}
-	for (const h of headers) {
-		const w = lookup(want.headers, h)
-		const v = res.headers.get(h)
-		if (w != v) {
-			out.push(`header ${h}: expected ${show(w)}, got ${show(v)}`)
-		}
-	}
 	for (const [name, path] of s.capture) {
-		const v = find(body, path)
+		const v = captured(res, body, path)
 		if (v == null) {
 			out.push(`${path}: nothing to capture as ${name}`)
 		} else {
 			bind(values, name, v!)
 		}
 	}
-	const names = volatile.slice(0, volatile.length)
-	names.append(s.volatile)
-	compare(tree(bodyOf(want)), tree(body), "", names, values, out)
+	const volatile = t.volatile.slice(0, t.volatile.length)
+	volatile.append(s.volatile)
+	const ignored = t.ignored.slice(0, t.ignored.length)
+	ignored.append(s.ignored)
+	const names = if (s.service == "s3") want.headers.map(h => h[0]) else headers.slice(0, headers.length)
+	for (const [h, v] of res.headers.entries) {
+		if (s.service == "s3" && kept(s.service, h, body) && !names.includes(h)) {
+			names.push(h)
+		}
+	}
+	for (const h of names) {
+		const w = lookup(want.headers, h)
+		const e = if (w == null) null else fill(w!, values, false)
+		const v = res.headers.get(h)
+		const same = if (e == null || v == null) e == v
+			else ignored.includes(h) || e == v || volatile.includes(h) && form(e!) == form(v!)
+		if (!same) {
+			out.push(`header ${h}: expected ${show(e)}, got ${show(v)}`)
+		}
+	}
+	if (want.sha256 != "") {
+		try {
+			const hash = hex.encode(sha256(body))
+			if (body.length != want.size || hash != want.sha256) {
+				out.push(`body: expected ${want.size} bytes of SHA-256 ${want.sha256}, got ${body.length} of ${hash}`)
+			}
+		} catch (e: CryptoError) {
+			out.push(`body: ${e}`)
+		}
+		return out
+	}
+	compare(tree(bodyOf(want)), tree(body), "", volatile, ignored, values, out)
 	return out
 }
 
@@ -333,7 +573,7 @@ type Item = i64 | f64 | string | bool | Keys | null | (i64 | f64 | string | bool
 
 /// The tree of body: XML, JSON, or else a leaf of its text.
 function tree(body: string): Tree throws ParseError {
-	const first = trim(body).slice(0, 1)
+	const first = initial(body)
 	if (first == "<") {
 		return element(xml.parse(body), "")
 	}
@@ -375,7 +615,7 @@ function element(n: xml.Node, name: string): Tree {
 /// any other scalar's its JSON.
 function value(s: string, name: string): Tree throws ParseError {
 	const t = new Tree(name)
-	const first = trim(s).slice(0, 1)
+	const first = initial(s)
 	if (first == "{") {
 		t.leaf = false
 		for (const [k, v] of json.decode[Keys](s).all) {
@@ -423,11 +663,20 @@ function collect(t: Tree, names: string[], out: string[]): void {
 	}
 }
 
-/// Adds to out how a, at path, differs from e, AWS's, whose ${name}s are as values has them, and whose members named
-/// one of volatile need only be of the same form.
-function compare(e: Tree, a: Tree, path: string, volatile: string[], values: [string, string][], out: string[]): void {
+/// Adds to out how a, at path, differs from e, AWS's, whose ${name}s are as values has them, or bind them if it is one
+/// not bound, whose members named one of volatile need only be of the same form, and those named one of ignored only
+/// be there.
+function compare(e: Tree, a: Tree, path: string, volatile: string[], ignored: string[], values: [string, string][],
+	out: string[]): void {
 	const at = if (path == "") "body" else path
 	const want = fill(e.text, values, false)
+	const unbound = startsWith(want, "${") && indexOf(want, "}") == want.length - 1
+	if (e.leaf && a.leaf && (ignored.includes(e.name) || unbound)) {
+		if (unbound) {
+			bind(values, want.slice(2, want.length - 1), a.text)
+		}
+		return
+	}
 	if (volatile.includes(e.name) && e.leaf && a.leaf) {
 		if (form(want) != form(a.text)) {
 			out.push(`${at}: expected the form of ${show(want)}, got ${show(a.text)}`)
@@ -450,7 +699,7 @@ function compare(e: Tree, a: Tree, path: string, volatile: string[], values: [st
 		if (n >= ds.length) {
 			out.push(`${p}: expected ${if (c.leaf) show(c.text) else outline(c)}, got nothing`)
 		} else {
-			compare(c, ds[n], p, volatile, values, out)
+			compare(c, ds[n], p, volatile, ignored, values, out)
 		}
 	}
 	const extra: [string, i32][] = []
@@ -511,6 +760,12 @@ function contrast(want: string, v: string): string {
 		+ show(s.slice(from, if (from + 100 < s.length) from + 100 else s.length))
 		+ (if (from + 100 < s.length) "…" else "")
 	return `expected ${cut(want)}, got ${cut(v)}`
+}
+
+/// The first character of s that is not a space, "" if none.
+function initial(s: string): string {
+	const t = trim(s)
+	return if (t == "") "" else t.slice(0, 1)
 }
 
 /// v quoted, or none.

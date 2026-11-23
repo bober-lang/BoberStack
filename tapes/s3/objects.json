@@ -1,0 +1,834 @@
+{
+	"region": "eu-north-1",
+	"volatile": [
+		"RequestId",
+		"HostId",
+		"LastModified",
+		"last-modified"
+	],
+	"steps": [
+		{
+			"name": "create the bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o",
+			"body": "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>eu-north-1</LocationConstraint></CreateBucketConfiguration>",
+			"response": {
+				"status": 200,
+				"headers": {
+					"location": "http://boberstack-ab-00000000-o.s3.amazonaws.com/",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/k",
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc64nvme": "M3eFcAZSQlc=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			}
+		},
+		{
+			"name": "head",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/k",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-length": "5",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "put with metadata and content headers",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/meta",
+			"contentType": "text/plain; charset=utf-8",
+			"headers": {
+				"x-amz-meta-color": "Blue",
+				"X-Amz-Meta-Two-Words": "a  b",
+				"cache-control": "max-age=60",
+				"content-disposition": "attachment; filename=\"m.txt\"",
+				"content-encoding": "identity",
+				"content-language": "sl",
+				"expires": "Thu, 01 Dec 2033 16:00:00 GMT",
+				"x-amz-storage-class": "STANDARD",
+				"x-amz-website-redirect-location": "/other"
+			},
+			"body": "0123456789",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-checksum-crc64nvme": "Ffmx7kz9nB0=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get with metadata",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/meta",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-meta-color": "Blue",
+					"x-amz-meta-two-words": "a  b",
+					"cache-control": "max-age=60",
+					"content-encoding": "identity",
+					"content-type": "text/plain; charset=utf-8",
+					"content-language": "sl",
+					"content-disposition": "attachment; filename=\"m.txt\"",
+					"expires": "Thu, 01 Dec 2033 16:00:00 GMT",
+					"x-amz-website-redirect-location": "/other",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "head with metadata",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/meta",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"x-amz-website-redirect-location": "/other",
+					"x-amz-meta-color": "Blue",
+					"cache-control": "max-age=60",
+					"content-disposition": "attachment; filename=\"m.txt\"",
+					"x-amz-meta-two-words": "a  b",
+					"content-encoding": "identity",
+					"expires": "Thu, 01 Dec 2033 16:00:00 GMT",
+					"content-language": "sl",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "text/plain; charset=utf-8"
+				}
+			}
+		},
+		{
+			"name": "get overriding the response's headers",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/meta",
+			"params": {
+				"response-content-type": "application/json",
+				"response-cache-control": "no-cache",
+				"response-content-disposition": "inline",
+				"response-expires": "Fri, 01 Jan 2038 00:00:00 GMT"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "10",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-meta-color": "Blue",
+					"x-amz-meta-two-words": "a  b",
+					"cache-control": "no-cache",
+					"content-encoding": "identity",
+					"content-type": "application/json",
+					"content-language": "sl",
+					"content-disposition": "inline",
+					"expires": "Fri, 01 Jan 2038 00:00:00 GMT",
+					"x-amz-website-redirect-location": "/other",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 10,
+				"sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882"
+			}
+		},
+		{
+			"name": "put without a content type",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/bare",
+			"body": "0123456789",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-checksum-crc64nvme": "Ffmx7kz9nB0=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get without a content type",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/bare",
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"781e5e245d69b566979b86e28d23f2c7\"",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-length": "10",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "put empty",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/empty",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+					"x-amz-checksum-crc64nvme": "AAAAAAAAAAA=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get empty",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/empty",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "0",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				}
+			}
+		},
+		{
+			"name": "put bytes",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/bytes",
+			"contentType": "application/octet-stream",
+			"base64": "AAECA/7/gA==",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"8895f645fafbd1d764466527cd025271\"",
+					"x-amz-checksum-crc64nvme": "hNJOliyMX+8=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get bytes",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/bytes",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "7",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"8895f645fafbd1d764466527cd025271\"",
+					"content-type": "application/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 7,
+				"sha256": "4ac336f8d9815c4a4cbf2e552e01324229e0cf9f8fe27c86906982d6d7f32905"
+			}
+		},
+		{
+			"name": "put with the right Content-MD5",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/md5",
+			"headers": {
+				"content-md5": "XUFAKrxLKna5cZ2REBfFkg=="
+			},
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc64nvme": "M3eFcAZSQlc=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "put with a wrong Content-MD5",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/md5",
+			"headers": {
+				"content-md5": "XUFAKrxLKna5cZ2REBfFkg=="
+			},
+			"body": "hellO",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match what we received.</Message><CalculatedDigest>BmEsDZxz1HpwQq/XAk18gg==</CalculatedDigest><ExpectedDigest>5d41402abc4b2a76b9719d911017c592</ExpectedDigest><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with a Content-MD5 not base64",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/md5",
+			"headers": {
+				"content-md5": "not an md5"
+			},
+			"body": "hello",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidDigest</Code><Message>The Content-MD5 you specified was invalid.</Message><Content-MD5>not an md5</Content-MD5><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with a Content-MD5 too short",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/md5",
+			"headers": {
+				"content-md5": "XUFAKrxLKna5cZ2R"
+			},
+			"body": "hello",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidDigest</Code><Message>The Content-MD5 you specified was invalid.</Message><Content-MD5>XUFAKrxLKna5cZ2R</Content-MD5><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with the right CRC32",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/crc",
+			"headers": {
+				"x-amz-checksum-crc32": "NhCmhg=="
+			},
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc32": "NhCmhg==",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "head the CRC32 with checksums",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/crc",
+			"headers": {
+				"x-amz-checksum-mode": "ENABLED"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc32": "NhCmhg==",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"x-amz-server-side-encryption": "AES256",
+					"accept-ranges": "bytes",
+					"content-length": "5",
+					"content-type": "binary/octet-stream"
+				}
+			}
+		},
+		{
+			"name": "get the CRC32 with checksums",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/crc",
+			"headers": {
+				"x-amz-checksum-mode": "ENABLED"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc32": "NhCmhg==",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			}
+		},
+		{
+			"name": "put with the right SHA-256",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/sha",
+			"headers": {
+				"x-amz-checksum-sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+			},
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get the SHA-256 with checksums",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/sha",
+			"headers": {
+				"x-amz-checksum-mode": "ENABLED"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			}
+		},
+		{
+			"name": "get the SHA-256 without",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/sha",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-length": "5",
+					"accept-ranges": "bytes",
+					"last-modified": "x, x x x x:x:x x",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"content-type": "binary/octet-stream",
+					"x-amz-server-side-encryption": "AES256"
+				},
+				"size": 5,
+				"sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			}
+		},
+		{
+			"name": "put with a wrong CRC32",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/crc2",
+			"headers": {
+				"x-amz-checksum-crc32": "NhCmhg=="
+			},
+			"body": "hellO",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BadDigest</Code><Message>The CRC32 you specified did not match the calculated checksum.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with a wrong SHA-256",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/sha2",
+			"headers": {
+				"x-amz-checksum-sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+			},
+			"body": "hellO",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BadDigest</Code><Message>The SHA256 you specified did not match the calculated checksum.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with a CRC32 not base64",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/crc2",
+			"headers": {
+				"x-amz-checksum-crc32": "nope"
+			},
+			"body": "hello",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRequest</Code><Message>Value for x-amz-checksum-crc32 header is invalid.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with two checksums",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/crc2",
+			"headers": {
+				"x-amz-checksum-crc32": "NhCmhg==",
+				"x-amz-checksum-sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+			},
+			"body": "hello",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRequest</Code><Message>Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.</Message><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put with a wrong X-Amz-Content-Sha256",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/crc2",
+			"headers": {
+				"x-amz-content-sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+			},
+			"body": "hello",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>XAmzContentSHA256Mismatch</Code><Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message><ClientComputedContentSHA256>0000000000000000000000000000000000000000000000000000000000000000</ClientComputedContentSHA256><S3ComputedContentSHA256>2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824</S3ComputedContentSHA256><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "put unsigned payload",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-o/unsigned",
+			"headers": {
+				"x-amz-content-sha256": "UNSIGNED-PAYLOAD"
+			},
+			"body": "hello",
+			"response": {
+				"status": 200,
+				"headers": {
+					"x-amz-server-side-encryption": "AES256",
+					"etag": "\"5d41402abc4b2a76b9719d911017c592\"",
+					"x-amz-checksum-crc64nvme": "M3eFcAZSQlc=",
+					"x-amz-checksum-type": "FULL_OBJECT",
+					"content-length": "0"
+				}
+			}
+		},
+		{
+			"name": "get missing key",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/none",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>none</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head missing key",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-o/none",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "get from a missing bucket",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-none/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "head in a missing bucket",
+			"service": "s3",
+			"method": "HEAD",
+			"path": "/${prefix}-none/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				}
+			}
+		},
+		{
+			"name": "put to a missing bucket",
+			"service": "s3",
+			"method": "PUT",
+			"path": "/${prefix}-none/k",
+			"body": "hello",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete a missing key",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/none",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete in a missing bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-none/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>boberstack-ab-00000000-none</BucketName><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		},
+		{
+			"name": "delete",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "get deleted",
+			"service": "s3",
+			"method": "GET",
+			"path": "/${prefix}-o/k",
+			"response": {
+				"status": 404,
+				"headers": {
+					"content-type": "application/xml"
+				},
+				"body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>k</Key><RequestId>x</RequestId><HostId>x</HostId></Error>"
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "delete meta",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/meta",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete bare",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/bare",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete empty",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/empty",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete bytes",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/bytes",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete md5",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/md5",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete crc",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/crc",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete crc2",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/crc2",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete sha",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/sha",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete sha2",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/sha2",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete unsigned",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/unsigned",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete k",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o/k",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		},
+		{
+			"name": "delete the bucket",
+			"service": "s3",
+			"method": "DELETE",
+			"path": "/${prefix}-o",
+			"response": {
+				"status": 204,
+				"headers": {}
+			}
+		}
+	]
+}
