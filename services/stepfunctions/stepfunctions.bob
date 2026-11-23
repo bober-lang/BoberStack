@@ -43,20 +43,28 @@
 //!   ResultPath, of a Pass or Task state, and the matching retrier or catcher; nothing more at TRACE than at DEBUG.
 //! - A redrive takes the execution again from the task whose failure ended it, its history kept, the task's earlier
 //!   events not made again; any other failed or aborted execution is taken again from its start, its steps replayed.
-//! - The other aws-sdk integrations and map runs are not implemented; nor is JSONata, which
-//!   CreateStateMachine refuses.
+//! - A DISTRIBUTED Map is processed inline within the request, like everything else here: its map run is kept and
+//!   described, MapRunStarted and MapRunSucceeded or MapRunFailed in the history, but its child executions run one
+//!   after the other within the run, their events not kept and none of them listed, even by the map run's ARN; and
+//!   its ARN is of the machine's name, a slash, the state's Label or else its name, a colon and a UUID. Its ItemReader
+//!   reads an S3 object, JSON, JSONL or CSV (not MANIFEST), or an S3 listing, through S3's handler as the role, as does
+//!   its ResultWriter write SUCCEEDED_0.json, FAILED_0.json if any failed, and manifest.json under the Prefix and the
+//!   run's UUID, all child executions dated the execution's start. A run with no ResultWriter outputs each item's
+//!   result, or {"Error", "Cause"} of a tolerated failure. UpdateMapRun keeps the limits it sets, which change nothing.
+//! - The other aws-sdk integrations are not implemented; nor is JSONata, which CreateStateMachine refuses.
 //! - Branches of a Parallel and iterations of a Map run one after the other, and a pause in one stops the others.
 //!   Timeouts never pass, and an EXPRESS machine's executions are kept and described as a STANDARD one's.
 //! - A history's previousEventId is the event before it, whatever branch or iteration it is of.
 
 import * as api from "./api"
 import * as asl from "./asl"
-import { Activity, Alias, Execution, Machine, Tables, Version } from "./records"
-import { boolean, Json, JsonError, nul, num, obj, parse, str, write } from "./value"
+import { Activity, Alias, Execution, Machine, MapRun, Tables, Version } from "./records"
+import { arr, boolean, Json, JsonError, nul, num, obj, parse, str, write } from "./value"
 import * as dynamodbApi from "../dynamodb/api"
 import * as eventsApi from "../events/api"
 import * as kinesisApi from "../kinesis/api"
 import * as lambdaApi from "../lambda/api"
+import * as s3Api from "../s3/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import { actAs, passRole } from "../sts/sts"
@@ -87,6 +95,7 @@ export class Handler {
 	events: eventsApi.EventBridge
 	kinesis: kinesisApi.Kinesis | null = null
 	lambda: lambdaApi.Lambda | null = null
+	s3: s3Api.S3 | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, dynamodb: dynamodbApi.DynamoDB, events: eventsApi.EventBridge) {
 		this.sqs = sqs
@@ -565,14 +574,79 @@ export class Handler {
 		return out
 	}
 
+	listMapRuns(caller: Caller, input: api.ListMapRunsInput): api.ListMapRunsOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const all = new Tables(caller.regional()).mapRuns.scan(null, 2147483647,
+			`${e.machine}/`).filter(m => m[1].execution == input.executionArn)
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListMapRunsOutput()
+		out.mapRuns = page.map(m => {
+			const w = new api.MapRunListItem()
+			w.executionArn = m[1].execution
+			w.mapRunArn = `arn:aws:states:${caller.region}:${caller.account}:mapRun:${m[0]}`
+			w.stateMachineArn = m[1].machine
+			w.startDate = m[1].started
+			w.stopDate = m[1].stopped
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	describeMapRun(caller: Caller, input: api.DescribeMapRunInput): api.DescribeMapRunOutput throws Fault {
+		const [_, m] = mapRun(caller, input.mapRunArn)
+		const out = new api.DescribeMapRunOutput()
+		out.mapRunArn = input.mapRunArn
+		out.executionArn = m.execution
+		out.status = if (m.status == "SUCCEEDED") "SUCCEEDED"
+			else if (m.status == "FAILED") "FAILED"
+			else if (m.status == "ABORTED") "ABORTED"
+			else "RUNNING"
+		out.startDate = m.started
+		out.stopDate = m.stopped
+		out.maxConcurrency = m.concurrency
+		out.toleratedFailurePercentage = m.percentage
+		out.toleratedFailureCount = m.count
+		const i = out.itemCounts
+		i.succeeded = m.succeeded
+		i.failed = m.failed
+		i.total = m.total
+		i.resultsWritten = m.written
+		i.failuresNotRedrivable = 0
+		i.pendingRedrive = 0
+		const x = out.executionCounts
+		x.total = m.executions
+		x.failed = if (m.total == 0) 0 else m.executions * m.failed / m.total
+		x.succeeded = m.executions - x.failed
+		x.resultsWritten = if (m.written == 0) 0 else x.total
+		x.failuresNotRedrivable = 0
+		x.pendingRedrive = 0
+		out.redriveCount = 0
+		return out
+	}
+
+	updateMapRun(caller: Caller, input: api.UpdateMapRunInput): api.UpdateMapRunOutput throws Fault {
+		const [k, m] = mapRun(caller, input.mapRunArn)
+		if (input.maxConcurrency == null && input.toleratedFailurePercentage == null
+			&& input.toleratedFailureCount == null) {
+			throw api.validationException("At least one of the parameters maxConcurrency, toleratedFailurePercentage, toleratedFailureCount "
+				+ "must be specified")
+		}
+		m.concurrency = input.maxConcurrency ?? m.concurrency
+		m.percentage = input.toleratedFailurePercentage ?? m.percentage
+		m.count = input.toleratedFailureCount ?? m.count
+		save(new Tables(caller.regional()).mapRuns, k, m)
+		return new api.UpdateMapRunOutput()
+	}
+
 	listExecutions(caller: Caller, input: api.ListExecutionsInput): api.ListExecutionsOutput throws Fault {
 		if (input.stateMachineArn != null && input.mapRunArn != null) {
 			throw api.validationException("Cannot provide both a StateMachine ARN and a MapRun ARN")
 		}
 		if (input.mapRunArn != null) {
-			// No map run is kept: a Map state's iterations run within its execution.
-			caller.allow(input.mapRunArn!)
-			throw api.resourceNotFound(`Resource not found: '${input.mapRunArn!}'`)
+			// A map run's child executions run within its execution's run, and are not kept.
+			mapRun(caller, input.mapRunArn!)
+			return new api.ListExecutionsOutput()
 		}
 		if (input.stateMachineArn == null) {
 			throw api.validationException("Must provide a StateMachine ARN or MapRun ARN")
@@ -994,9 +1068,13 @@ export class Handler {
 				|| op == "states:startExecution.sync:2") {
 				return this.child(c, op, parameters)
 			}
+			if ((op == "s3:getObject" || op == "s3:listObjectsV2" || op == "s3:putObject") && this.s3 != null) {
+				return this.object(c, op, parameters)
+			}
 		} catch (f: Fault) {
 			const service = split(op, ":")[if (startsWith(op, "aws-sdk:")) 1 else 0]
 			const named = if (service == "dynamodb") "DynamoDB"
+				else if (service == "s3") "S3"
 				else if (service == "kinesis") "Kinesis"
 				else if (service == "events") "EventBridge"
 				else if (service == "sns") "SNS"
@@ -1010,6 +1088,48 @@ export class Handler {
 			throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
 		}
 		throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
+	}
+
+	/// The result of the S3 call op, s3:getObject, s3:listObjectsV2 or s3:putObject, a Distributed Map's ItemReader's or
+	/// ResultWriter's, of parameters as the session c: an object's {"Body"}, a listing's {"Contents"}, each item as the
+	/// ItemReader has it, all pages of it; or the written object's {"ETag"}.
+	private object(c: Caller, op: string, parameters: Json): Json throws Fault {
+		const bucket = parameters.str("Bucket") ?? ""
+		if (op == "s3:getObject") {
+			c.actions = ["s3:GetObject"]
+			const r = new s3Api.GetObjectRequest()
+			r.Bucket = bucket
+			r.Key = parameters.str("Key") ?? ""
+			return obj([["Body", str(this.s3!.getObject(c, r).Body)]])
+		}
+		if (op == "s3:putObject") {
+			c.actions = ["s3:PutObject"]
+			const r = new s3Api.PutObjectRequest()
+			r.Bucket = bucket
+			r.Key = parameters.str("Key") ?? ""
+			r.Body = parameters.str("Body") ?? ""
+			return obj([["ETag", str(this.s3!.putObject(c, r).ETag ?? "")]])
+		}
+		c.actions = ["s3:ListBucket"]
+		const items: Json[] = []
+		let token: string | null = null
+		while (true) {
+			const r = new s3Api.ListObjectsV2Request()
+			r.Bucket = bucket
+			r.Prefix = parameters.str("Prefix")
+			r.ContinuationToken = token
+			const out = this.s3!.listObjectsV2(c, r)
+			for (const o of out.Contents ?? []) {
+				items.push(obj([["Etag", str(o.ETag ?? "")], ["Key", str(o.Key ?? "")],
+					["LastModified", num(((o.LastModified ?? 0) / second) as f64)], ["Size", num((o.Size ?? 0) as f64)],
+					["StorageClass", str(o.StorageClass ?? "STANDARD")]]))
+			}
+			if (out.IsTruncated != true || out.NextContinuationToken == null) {
+				break
+			}
+			token = out.NextContinuationToken
+		}
+		return obj([["Contents", arr(items)]])
 	}
 
 	/// The result of the Lambda task op, lambda:invoke, aws-sdk:lambda:invoke or "" for the function's ARN resource
@@ -1329,6 +1449,36 @@ class Host {
 		this.record(num(x))
 		return x
 	}
+
+	mapRun(label: string, id: string, run: Json): string {
+		const k = `${this.e.machine}/${label}:${id}`
+		const arn = `arn:aws:states:${this.caller.region}:${this.caller.account}:mapRun:${k}`
+		try {
+			const db = new Tables(this.caller.regional())
+			const m = db.mapRuns.get(k) ?? new MapRun()
+			if (m.execution == "") {
+				m.execution = executionArn(this.caller, this.e)
+				m.machine = this.arn
+				m.started = now()
+				m.concurrency = (run.get("concurrency")?.number() ?? 0.0) as i32
+				m.percentage = (run.get("percentage")?.number() ?? 0.0) as f32
+				m.count = (run.get("count")?.number() ?? 0.0) as i64
+			}
+			m.status = run.str("status") ?? "RUNNING"
+			m.total = (run.get("total")?.number() ?? 0.0) as i64
+			m.succeeded = (run.get("succeeded")?.number() ?? 0.0) as i64
+			m.failed = (run.get("failed")?.number() ?? 0.0) as i64
+			m.written = (run.get("written")?.number() ?? 0.0) as i64
+			m.executions = (run.get("executions")?.number() ?? 0.0) as i64
+			m.stopped = if (m.status == "RUNNING") null else now()
+			if (!this.paused) {
+				save(db.mapRuns, k, m)
+			}
+		} catch (f: Fault) {
+			this.fault = f
+		}
+		return arn
+	}
 }
 
 /// The task token of the task numbered n of the execution of the ARN arn, of its secret.
@@ -1398,6 +1548,21 @@ function nameOf(arn: string, kind: string): string throws Fault {
 		throw api.invalidArn(`Invalid Arn: 'Resource path not valid: ${arn}'`)
 	}
 	return if (kind == "execution") `${parts[6]}\x00${parts[7]}` else parts[6]
+}
+
+/// The key and the map run of the ARN arn, the caller allowed it; InvalidArn or ResourceNotFound if none.
+function mapRun(caller: Caller, arn: string): [string, MapRun] throws Fault {
+	const parts = split(arn, ":")
+	if (parts.length != 8 || parts[0] != "arn" || parts[2] != "states" || parts[5] != "mapRun") {
+		throw api.invalidArn(`Invalid Arn: 'Resource path not valid: ${arn}'`)
+	}
+	caller.allow(arn)
+	const k = `${parts[6]}:${parts[7]}`
+	const m = new Tables(caller.regional()).mapRuns.get(k)
+	if (m == null) {
+		throw api.resourceNotFound(`Resource not found: '${arn}'`)
+	}
+	return [k, m!]
 }
 
 function machineName(arn: string): string throws Fault { return nameOf(arn, "stateMachine") }

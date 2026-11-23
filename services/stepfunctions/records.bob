@@ -83,6 +83,24 @@ export class Alias {
 	updated: i64 = 0
 }
 
+/// A map run of a DISTRIBUTED Map state, its items processed within its execution's run: the execution's ARN, its
+/// limits, and the counts of its items, those run as child executions.
+export class MapRun {
+	execution = ""
+	machine = ""
+	status = "RUNNING"
+	started: i64 = 0
+	stopped: i64 | null = null
+	concurrency = 0
+	percentage: f32 = 0.0
+	count: i64 = 0
+	total: i64 = 0
+	succeeded: i64 = 0
+	failed: i64 = 0
+	written: i64 = 0
+	executions: i64 = 0
+}
+
 export class Activity {
 	name = ""
 	created: i64 = 0
@@ -97,8 +115,11 @@ export class Tables {
 	/// Versions and aliases by the machine's name, a NUL and the version's number or the alias's name.
 	versions: Table[Version]
 	aliases: Table[Alias]
+	/// Map runs by their ARN's resource: the machine's name, a slash, the label, a colon and the run's id.
+	mapRuns: Table[MapRun]
 
 	constructor(s: Store) {
+		this.mapRuns = new Table[MapRun](s, "states/mapruns")
 		this.machines = new Table[Machine](s, "states/machines")
 		this.executions = new Table[Execution](s, "states/executions")
 		this.activities = new Table[Activity](s, "states/activities")

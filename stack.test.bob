@@ -1700,3 +1700,42 @@ test "CloudFormation makes policies, a user, a key, alias, stream, log stream, s
 	assert fails(res, 400, "ValidationError", "Stack with id more does not exist")
 	assert json11(g, "kms", "DescribeKey", `{"KeyId": "alias/cf"}`).status == 404
 }
+
+test "Step Functions: a DISTRIBUTED map reads a CSV in a bucket as the role may, and writes its results there" {
+	const g = gateway()
+	assert s3(g, "PUT", "/rows").status == 200
+	assert s3(g, "PUT", "/rows/in.csv", "id,name\n1,a\n2,b\n").status == 200
+	role(g, "reader", "states.amazonaws.com", policy([statement("Allow", `"s3:GetObject"`, "arn:aws:s3:::rows/*")]))
+	const definition = `{"StartAt":"M","States":{"M":{"Type":"Map","End":true,`
+		+ `"ItemReader":{"Resource":"arn:aws:states:::s3:getObject","ReaderConfig":{"InputType":"CSV",`
+		+ `"CSVHeaderLocation":"FIRST_ROW"},"Parameters":{"Bucket":"rows","Key":"in.csv"}},`
+		+ `"ResultWriter":{"Resource":"arn:aws:states:::s3:putObject","Parameters":{"Bucket":"rows","Prefix":"out"}},`
+		+ `"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED","ExecutionType":"STANDARD"},"StartAt":"P",`
+		+ `"States":{"P":{"Type":"Pass","End":true}}}}}}`
+	const sm = json11Of(g, "states", "CreateStateMachine",
+		`{"name":"d","roleArn":"arn:aws:iam::000000000000:role/reader","definition":${json.quoted(definition)}}`)
+	assert sm.status == 200
+	const machine = member(sm, "stateMachineArn")
+	// The role may read the object but not write the results.
+	assert json11Of(g, "states", "StartExecution", `{"stateMachineArn":"${machine}","name":"e"}`).status == 200
+	let x = json11Of(g, "states", "DescribeExecution",
+		`{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:d:e"}`).body.whole ?? ""
+	assert indexOf(x, `"status":"FAILED"`) >= 0 && indexOf(x, `"error":"S3.AccessDeniedException"`) >= 0
+	assert query(g, "iam",
+		[["Action", "PutRolePolicy"], ["RoleName", "reader"], ["PolicyName", "w"],
+		["PolicyDocument", policy([statement("Allow", `"s3:PutObject"`, "arn:aws:s3:::rows/out/*")])]]).status == 200
+	assert json11Of(g, "states", "StartExecution", `{"stateMachineArn":"${machine}","name":"f"}`).status == 200
+	const f = "arn:aws:states:us-east-1:000000000000:execution:d:f"
+	x = json11Of(g, "states", "DescribeExecution", `{"executionArn":"${f}"}`).body.whole ?? ""
+	assert indexOf(x, `"status":"SUCCEEDED"`) >= 0
+	const run = member(json11Of(g, "states", "ListMapRuns", `{"executionArn":"${f}"}`), "mapRunArn")
+	const prefix = "arn:aws:states:us-east-1:000000000000:mapRun:d/M:"
+	assert startsWith(run, prefix)
+	const id = run.slice(prefix.length, run.length)
+	const described = json11Of(g, "states", "DescribeMapRun", `{"mapRunArn":"${run}"}`).body.whole ?? ""
+	assert indexOf(described, `"succeeded":2`) >= 0 && indexOf(described, `"resultsWritten":2`) >= 0
+	const manifest = s3(g, "GET", `/rows/out/${id}/manifest.json`)
+	assert manifest.status == 200 && indexOf(manifest.body.whole ?? "", `"MapRunArn":"${run}"`) >= 0
+	const results = s3(g, "GET", `/rows/out/${id}/SUCCEEDED_0.json`).body.whole ?? ""
+	assert indexOf(results, `"Output":"{\\"id\\":\\"1\\",\\"name\\":\\"a\\"}"`) >= 0
+}
