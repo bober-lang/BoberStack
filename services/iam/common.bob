@@ -1,0 +1,560 @@
+//! What IAM's operations share: whether a caller may act on a user, role, group or managed policy; finding them;
+//! checking names, paths, documents and tags as IAM does; attaching and embedding policies; pages of listings; and
+//! records as IAM gives them.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { Violations } from "../../core/protocol/model"
+import { Caller } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+
+import { AccessKey, arn, Attachment, Group, Inline, key, number, Policy, Role, save, stamp, Tables, User, Version,
+	within } from "./records"
+
+import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isGraphic } from "std/ascii"
+import { HashMap } from "std/collections/hashmap"
+import * as base64 from "std/encoding/base64"
+import { lower, ParseError, parseInt } from "std/string"
+import { Decodable } from "std/types"
+import { escape } from "std/url"
+
+/// Throws unless the caller may perform the operation on the user named name, or if null on itself: on its ARN, of its
+/// path if it exists, which IAM's message names as user <name>.
+export function onUser(caller: Caller, name: string | null) throws Fault {
+	const a = caller.arn
+	const n = name ?? (if (indexOf(a, ":user/") >= 0) a.slice(lastIndexOf(a, "/") + 1, a.length) else "")
+	if (n == "") {
+		caller.allow(a)
+		return
+	}
+	const u = new Tables(caller.store()).users.get(key(n))
+	caller.allow(arn(caller.account, "user", u?.path ?? "/", u?.name ?? n), null, [], `user ${n}`)
+}
+
+/// Throws unless the caller may perform the operation on the role named name, as onUser on a user.
+export function onRole(caller: Caller, name: string) throws Fault {
+	const r = new Tables(caller.store()).roles.get(key(name))
+	caller.allow(arn(caller.account, "role", r?.path ?? "/", r?.name ?? name), null, [], `role ${name}`)
+}
+
+/// Throws unless the caller may perform the operation on the group named name, as onUser on a user.
+export function onGroup(caller: Caller, name: string) throws Fault {
+	const g = new Tables(caller.store()).groups.get(key(name))
+	caller.allow(arn(caller.account, "group", g?.path ?? "/", g?.name ?? name), null, [], `group ${name}`)
+}
+
+/// Throws unless the caller may perform the operation on the managed policy of ARN a, which IAM's message names as
+/// policy <a>.
+export function onPolicy(caller: Caller, a: string) throws Fault { caller.allow(a, null, [], `policy ${a}`) }
+
+/// Drops the tagging action of the operation's, its last, unless tags are given.
+export function tagging(caller: Caller, tags: api.Tag[] | null) {
+	if (tags == null || tags.length == 0) {
+		caller.actions = caller.actions.slice(0, caller.actions.length - 1)
+	}
+}
+
+/// The user named name.
+export function user(db: Tables, name: string): User throws Fault {
+	const u = db.users.get(key(name))
+	if (u == null) {
+		throw api.noSuchEntityException(`The user with name ${name} cannot be found.`)
+	}
+	return u
+}
+
+/// The user named name, or if none the caller, which must then be a user or the account's root.
+export function owner(caller: Caller, db: Tables, name: string | null): User throws Fault {
+	if (name != null) {
+		return user(db, name)
+	}
+	if (caller.arn == arn(caller.account, "root", "", "")) {
+		const found = db.root.get("")
+		if (found != null) {
+			return found
+		}
+		const r = { ...new User(), path: "", id: caller.account, created: stamp() }
+		save(db.root, "", r)
+		return r
+	}
+	if (indexOf(caller.arn, ":user/") < 0) {
+		throw new Fault(400, "ValidationError", "Must specify userName when calling with non-User credentials")
+	}
+	return user(db, caller.arn.slice(lastIndexOf(caller.arn, "/") + 1, caller.arn.length))
+}
+
+/// The group named name.
+export function group(db: Tables, name: string): Group throws Fault {
+	const g = db.groups.get(key(name))
+	if (g == null) {
+		throw api.noSuchEntityException(`The group with name ${name} cannot be found.`)
+	}
+	return g
+}
+
+/// The role named name.
+export function role(db: Tables, name: string): Role throws Fault {
+	const r = db.roles.get(key(name))
+	if (r == null) {
+		throw api.noSuchEntityException(`The role with name ${name} cannot be found.`)
+	}
+	return r
+}
+
+/// The managed policy of the caller's account that a names.
+export function policy(caller: Caller, db: Tables, a: string, missing = "was not found."): Policy throws Fault {
+	if (!startsWith(a, "arn:aws:iam::") || indexOf(a, ":policy/") < 0) {
+		throw api.invalidInputException(`ARN ${a} is not valid.`)
+	}
+	const p = db.policies.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
+	if (p == null || arn(caller.account, "policy", p.path, p.name) != a) {
+		throw api.noSuchEntityException(`Policy ${a} ${missing}`)
+	}
+	return p
+}
+
+/// The managed policy that a names, the caller's account's or AWS's; one of AWS's counts no attachments.
+export function managed(caller: Caller, db: Tables, catalog: Catalog, a: string,
+	missing = "was not found."): Policy throws Fault {
+	if (!aws(a)) {
+		return policy(caller, db, a, missing)
+	}
+	const i = catalog.find(a)
+	if (i < 0) {
+		throw api.noSuchEntityException(`Policy ${a} ${missing}`)
+	}
+	return catalog.policy(i)
+}
+
+/// The managed policy of the caller's account that a names, to do what is denied on AWS's, as "delete policies"; if
+/// there is none, missing says so, after its ARN.
+export function owned(caller: Caller, db: Tables, a: string, what: string,
+	missing = "was not found."): Policy throws Fault {
+	if (aws(a)) {
+		throw new Fault(403, "AccessDenied", `Cannot ${what} outside your own account.`)
+	}
+	return policy(caller, db, a, missing)
+}
+
+/// The managed policy of the caller's account that a names, to be tagged; AWS's take none.
+export function taggable(caller: Caller, db: Tables, a: string): Policy throws Fault {
+	if (aws(a)) {
+		throw api.invalidInputException("Tags not supported for policies in this domain")
+	}
+	return policy(caller, db, a)
+}
+
+/// The ARN a of the permissions boundary to set in place of the one of ARN was, "" for none, of the caller's account's
+/// or AWS's, whose count of those it bounds it keeps.
+export function bound(caller: Caller, db: Tables, catalog: Catalog, was: string, a: string): string throws Fault {
+	if (a != "") {
+		try {
+			managed(caller, db, catalog, a)
+		} catch (f: Fault) {
+			if (f.code == "NoSuchEntity") {
+				throw api.noSuchEntityException(`Scope ARN: ${a} does not exist or is not attachable.`)
+			}
+			throw f
+		}
+	}
+	if (was != a) {
+		count(db, was, -1)
+		count(db, a, 1)
+	}
+	return a
+}
+
+/// Adds by to the number of those the account's managed policy of ARN a bounds, if a is one.
+export function count(db: Tables, a: string, by: i32) throws Fault {
+	const p = if (a == "" || aws(a)) null else db.policies.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
+	if (p != null) {
+		p.bounds += by
+		save(db.policies, key(p.name), p)
+	}
+}
+
+/// Whether a is the ARN of one of AWS's managed policies, of the account aws.
+export function aws(a: string): bool { return startsWith(a, "arn:aws:iam::aws:") }
+
+/// The number of users, roles and groups each managed policy is attached to, and the number it bounds, by its ARN.
+export function uses(db: Tables): [HashMap[string, i32], HashMap[string, i32]] {
+	const n = new HashMap[string, i32]()
+	for (const t of [db.userAttached, db.roleAttached, db.groupAttached]) {
+		for (const [_, at] of t.scan(null, 2147483647)) {
+			n.set(at.arn, (n.get(at.arn) ?? 0) + 1)
+		}
+	}
+	const b = new HashMap[string, i32]()
+	const boundaries = db.users.scan(null, 2147483647).map(e => e[1].boundary)
+	boundaries.append(db.roles.scan(null, 2147483647).map(e => e[1].boundary))
+	for (const x of boundaries) {
+		b.set(x, (b.get(x) ?? 0) + 1)
+	}
+	return [n, b]
+}
+
+/// The key and version of p, of the ARN a, whose id is v.
+export function version(db: Tables, p: Policy, a: string, v: string): [string, Version] throws Fault {
+	let n = 0
+	try {
+		n = if (startsWith(v, "v")) parseInt(v.slice(1, v.length)) else 0
+	} catch (e: ParseError) {}
+	const k = within(key(p.name), number(n))
+	const found = db.versions.get(k)
+	if (found == null || found.id != v) {
+		throw unknownVersion(a, v)
+	}
+	return [k, found]
+}
+
+/// v, if it is a version id.
+export function versionId(v: string): string throws Fault {
+	let digits = 1
+	while (digits < v.length && isDigit(v[digits])) {
+		digits++
+	}
+	const rest = v.slice(digits, v.length)
+	if (!startsWith(v, "v") || digits == 1 || v[1] == 48
+		|| rest != "" && (rest[0] != 46 || !rest.slice(1, rest.length).every(c => isAlphanumeric(c) || c == 45))) {
+		throw new Violations(api.validation).fault(v, "versionId",
+			"Member must satisfy regular expression pattern: v[1-9][0-9]*(\\.[A-Za-z0-9-]*)?")
+	}
+	return v
+}
+
+/// The fault of the version v, of the policy of ARN a, that does not exist.
+export function unknownVersion(a: string, v: string): Fault {
+	return api.noSuchEntityException(`Policy ${a} version ${v} does not exist or is not attachable.`)
+}
+
+/// The access key k of the user that k names, whose id is id.
+export function accessKey(db: Tables, k: string, id: string): AccessKey throws Fault {
+	const a = db.keys.get(k)
+	if (a == null) {
+		throw api.noSuchEntityException(`The Access Key with id ${id} cannot be found.`)
+	}
+	return a
+}
+
+/// Attaches the policy of ARN a to the user or role, as kind names it, of key owner, whose attachments are in t, unless
+/// it is already; a service role's policy of AWS's is reserved to the roles AWS makes.
+export function attach(caller: Caller, db: Tables, catalog: Catalog, t: Table[Attachment], owner: string, a: string,
+	kind: string) throws Fault {
+	const p = managed(caller, db, catalog, a, "does not exist or is not attachable.")
+	if (aws(a) && startsWith(p.path, "/aws-service-role/")) {
+		throw api.policyNotAttachableException(`Cannot attach AWS reserved policy to an IAM ${kind}.`)
+	}
+	const k = within(owner, placed(caller, a))
+	if (t.get(k) == null) {
+		const at = new Attachment()
+		at.name = p.name
+		at.path = p.path
+		at.arn = a
+		at.serial = db.next()
+		save(t, k, at)
+		if (!aws(a)) {
+			p.attachments++
+			save(db.policies, key(p.name), p)
+		}
+	}
+}
+
+/// Detaches the policy of ARN a from the user or role of key owner, whose attachments are in t.
+export function detach(caller: Caller, db: Tables, t: Table[Attachment], owner: string, a: string) throws Fault {
+	const k = within(owner, placed(caller, a))
+	const at = t.get(k)
+	if (at == null || at.arn != a) {
+		throw api.noSuchEntityException(`Policy ${a} was not found.`)
+	}
+	t.delete(k)
+	if (!aws(a)) {
+		const p = policy(caller, db, a)
+		p.attachments--
+		save(db.policies, key(p.name), p)
+	}
+}
+
+/// The place of the managed policy of ARN a among those of a listing or attached to a user or role: its key, then its
+/// account's, the caller's or aws, as AWS's may share a name with the account's own.
+export function placed(caller: Caller, a: string): string {
+	return within(key(a.slice(lastIndexOf(a, "/") + 1, a.length)), if (aws(a)) "aws" else caller.account)
+}
+
+/// A page of the policies attached to the user or role of key owner, of t, whose paths start with prefix, in the order
+/// attached.
+export function attached(t: Table[Attachment], owner: string, prefix: string | null, marker: string | null,
+	max: i32 | null): [api.AttachedPolicy[], string | null] throws Fault {
+	const all = t.scan(null, 2147483647,
+		within(owner, "")).map(e => e[1]).filter(a => startsWith(a.path, prefix ?? "/"))
+	sortBy(all, (a, b) => a.serial < b.serial)
+	const [policies, next] = part(all, marker, max)
+	return [policies.map(a => ({ ...new api.AttachedPolicy(), PolicyName: a.name, PolicyArn: a.arn })), next]
+}
+
+/// Puts the policy named name of the document doc into the user or role of key owner, whose inline policies are in t.
+export function embed(t: Table[Inline], owner: string, name: string, doc: string) throws Fault {
+	const p = new Inline()
+	p.name = named(name, "policyName", 128)
+	p.document = document(doc, "identity")
+	save(t, within(owner, key(name)), p)
+}
+
+/// The inline policy named name of the user or role, as kind names it, of key owner, of t.
+export function inline(t: Table[Inline], owner: string, name: string, kind: string): Inline throws Fault {
+	const p = t.get(within(owner, key(name)))
+	if (p == null) {
+		throw api.noSuchEntityException(`The ${kind} policy with name ${name} cannot be found.`)
+	}
+	return p
+}
+
+/// Moves the records of t that belong to the key from to the key to, each as edit changes it.
+export function move[V extends Decodable](t: Table[V], from: string, to: string, edit: (v: V) => void) throws Fault {
+	for (const [k, v] of t.scan(null, 2147483647, within(from, ""))) {
+		t.delete(k)
+		edit(v)
+		save(t, within(to, k.slice(from.length + 1, k.length)), v)
+	}
+}
+
+/// A page of the records of t whose keys start with prefix, those that keep takes, after the one that marker names, of
+/// at most max (100 if null, 1 to 1000); and the marker of the next page, null after the last.
+export function page[V extends Decodable](t: Table[V], prefix: string, marker: string | null, max: i32 | null,
+	keep: (v: V) => bool): [V[], string | null] throws Fault {
+	const n = max ?? 100
+	const got = take(t, prefix, cursor(marker, prefix), n + 1, keep)
+	return [got.slice(0, if (got.length < n) got.length else n).map(e => e[1]),
+		if (got.length > n) base64.encode(got[n - 1][0]) else null]
+}
+
+/// The key after which the page that marker names starts, null for the first; a key of a table, its names', starts
+/// with prefix.
+export function cursor(marker: string | null, prefix: string): string | null throws Fault {
+	if (marker == null) {
+		return null
+	}
+	let k = ""
+	try {
+		k = base64.decode(marker!)
+	} catch (e: ParseError) {
+		throw invalidMarker()
+	}
+	if (!startsWith(k, prefix) || !k.every(c => c == 0 || isGraphic(c))) {
+		throw invalidMarker()
+	}
+	return k
+}
+
+/// The fault of a marker that names no page.
+export function invalidMarker(): Fault { return new Fault(400, api.validation.code, "Invalid Marker.") }
+
+/// Up to n records of t, with their keys, whose keys start with prefix and come after after, those that keep takes.
+export function take[V extends Decodable](t: Table[V], prefix: string, after: string | null, n: i32,
+	keep: (v: V) => bool): [string, V][] {
+	const out: [string, V][] = []
+	let from = after
+	while (true) {
+		const chunk = t.scan(from, 100, prefix)
+		for (const [k, v] of chunk) {
+			if (keep(v)) {
+				out.push([k, v])
+				if (out.length == n) {
+					return out
+				}
+			}
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+/// A page of items as page has one, its marker the index of the first of the next.
+export function part[T](items: T[], marker: string | null, max: i32 | null): [T[], string | null] throws Fault {
+	const n = max ?? 100
+	let from = 0
+	try {
+		from = if (marker == null) 0 else parseInt(marker)
+	} catch (e: ParseError) {
+		throw invalidMarker()
+	}
+	if (from < 0 || from > items.length) {
+		throw invalidMarker()
+	}
+	const to = if (from + n < items.length) from + n else items.length
+	return [items.slice(from, to), if (to < items.length) `${to}` else null]
+}
+
+/// A page of tags as part has one.
+export function tagPage(tags: [string, string][], marker: string | null,
+	max: i32 | null): [api.Tag[], string | null] throws Fault {
+	const [page, next] = part(tags, marker, max)
+	return [page.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] })), next]
+}
+
+/// tags with given set over them by key, whatever its case, of a resource of a kind, as User, in the order IAM lists
+/// them: a policy's as added, a user's or role's the latest first; at most 50.
+export function tagged(tags: [string, string][], given: api.Tag[], kind: string): [string, string][] throws Fault {
+	for (let i = 0; i < given.length; i++) {
+		for (let j = 0; j < i; j++) {
+			if (lower(given[i].Key) == lower(given[j].Key)) {
+				throw api.invalidInputException("Duplicate tag keys found. Please note that Tag keys are case insensitive.")
+			}
+		}
+	}
+	const kept = tags.filter(t => !given.some(g => lower(g.Key) == lower(t[0])))
+	const out: [string, string][] = if (kind == "Policy") kept else []
+	for (const g of given) {
+		out.push([g.Key, g.Value])
+	}
+	if (kind != "Policy") {
+		out.append(kept)
+	}
+	if (out.length > 50) {
+		throw api.limitExceededException(`Cannot exceed quota for TagsPer${kind}: 50`)
+	}
+	return out
+}
+
+/// Throws unless the key of each of tags is one: of a letter, digit, space or _.:/=+-@ or more, as IAM checks them.
+export function keys(tags: api.Tag[] | null) throws Fault {
+	const v = new Violations(api.validation)
+	const given = tags ?? []
+	for (let i = 0; i < given.length; i++) {
+		const k = given[i].Key
+		const at = `tags.${i + 1}.member.key`
+		if (k.length == 0) {
+			v.note(k, at, "Member must have length greater than or equal to 1")
+		}
+		if (!k.every(c => c >= 128 || isAlphanumeric(c) || indexOf(" _.:/=+-@", chr(c)) >= 0) || k.length == 0) {
+			v.note(k, at, "Member must satisfy regular expression pattern: [\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]+")
+		}
+	}
+	v.check()
+}
+
+/// name, of the member m, if it is a name of at most max characters of IAM's: as IAM checks one, its characters
+/// first, their fault in IAM's own words.
+export function named(name: string, m: string, max: i32): string throws Fault {
+	if (name.length < 1 || !name.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
+		throw invalidValue(m, "It must contain only alphanumeric characters and/or the following: +=,.@_-")
+	}
+	if (name.length > max) {
+		throw new Violations(api.validation).fault(name, m, `Member must have length less than or equal to ${max}`)
+	}
+	return name
+}
+
+/// The path p of the member m, / if null; one starts and ends with a /, its characters checked first, as by named.
+export function path(p: string | null, m: string): string throws Fault {
+	const s = p ?? "/"
+	if (!startsWith(s, "/") || !endsWith(s, "/") || !s.every(isGraphic)) {
+		throw invalidValue(m,
+			"It must begin and end with / and contain only alphanumeric characters and/or / characters.")
+	}
+	if (s.length > 512) {
+		throw new Violations(api.validation).fault(s, m, "Member must have length less than or equal to 512")
+	}
+	return s
+}
+
+/// The fault of a value of the member m not of the pattern that why words.
+export function invalidValue(m: string, why: string): Fault {
+	return new Fault(400, api.validation.code, `The specified value for ${m} is invalid. ${why}`)
+}
+
+/// d, if it is a policy document of kind k, as IAM checks one.
+export function document(d: string, k: auth.Kind): string throws Fault {
+	auth.parse(d, k)
+	return d
+}
+
+/// tags as IAM gives them, none if there are none.
+export function tagsOf(tags: [string, string][]): api.Tag[] | null {
+	return if (tags.length == 0) null else tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+}
+
+/// u of account as IAM gives it, with its tags if full.
+export function userOf(account: string, u: User, full: bool): api.User {
+	const w = new api.User()
+	w.Path = u.path
+	w.UserName = u.name
+	w.UserId = u.id
+	w.Arn = identity(account, u)
+	w.CreateDate = u.created
+	w.PermissionsBoundary = if (full) boundaryOf(u.boundary) else null
+	w.Tags = if (full) tagsOf(u.tags) else null
+	return w
+}
+
+/// The permissions boundary of ARN a as IAM gives it, none if "".
+export function boundaryOf(a: string): api.AttachedPermissionsBoundary | null {
+	return if (a == "") null
+		else ({ ...new api.AttachedPermissionsBoundary(), PermissionsBoundaryType: "PermissionsBoundaryPolicy",
+		PermissionsBoundaryArn: a })
+}
+
+/// The ARN of u of account: the root's if u is.
+export function identity(account: string, u: User): string {
+	return if (u.name == "") arn(account, "root", "", "") else arn(account, "user", u.path, u.name)
+}
+
+/// g of account as IAM gives it.
+export function groupOf(account: string, g: Group): api.Group {
+	const w = new api.Group()
+	w.Path = g.path
+	w.GroupName = g.name
+	w.GroupId = g.id
+	w.Arn = arn(account, "group", g.path, g.name)
+	w.CreateDate = g.created
+	return w
+}
+
+/// r of account as IAM gives it, its trust policy URL-encoded, with its tags if full.
+export function roleOf(account: string, r: Role, full: bool): api.Role {
+	const w = new api.Role()
+	w.Path = r.path
+	w.RoleName = r.name
+	w.RoleId = r.id
+	w.Arn = arn(account, "role", r.path, r.name)
+	w.CreateDate = r.created
+	w.AssumeRolePolicyDocument = escape(r.trust, "component")
+	w.Description = r.description
+	w.MaxSessionDuration = r.maxSession
+	w.MaxSigninSessionDuration = r.maxSession
+	w.PermissionsBoundary = if (full) boundaryOf(r.boundary) else null
+	w.Tags = if (full) tagsOf(r.tags) else null
+	return w
+}
+
+/// p of account as IAM gives it, with its description and tags if full: none for AWS's, an empty list.
+export function policyOf(account: string, p: Policy, full: bool): api.Policy {
+	const w = new api.Policy()
+	w.PolicyName = p.name
+	w.PolicyId = p.id
+	w.Arn = arn(account, "policy", p.path, p.name)
+	w.Path = p.path
+	w.DefaultVersionId = p.defaultVersion
+	w.AttachmentCount = p.attachments
+	w.PermissionsBoundaryUsageCount = p.bounds
+	w.IsAttachable = true
+	w.Description = if (full) p.description else null
+	w.CreateDate = p.created
+	w.UpdateDate = p.updated
+	w.Tags = if (!full) null else if (account == "aws") [] else tagsOf(p.tags)
+	return w
+}
+
+/// v of p as IAM gives it, with its document URL-encoded if full.
+export function versionOf(p: Policy, v: Version, full: bool): api.PolicyVersion {
+	const w = new api.PolicyVersion()
+	w.Document = if (full) escape(v.document, "component") else null
+	w.VersionId = v.id
+	w.IsDefaultVersion = v.id == p.defaultVersion
+	w.CreateDate = v.created
+	return w
+}

@@ -13,9 +13,9 @@ import { ParseError, parseInt, split } from "std/string"
 /// How IAM sees a caller, the AWS managed policies of catalog.
 export function identify(catalog: Catalog): Identify { return caller => identity(catalog, caller) }
 
-/// The caller as policies see it, and the policies that apply to it: a user's own and its permissions boundary, or
-/// those of the user a federated user's session was issued to; a role session's role's; and the session's session
-/// policies, of which a federated user without any has none that allow.
+/// The caller as policies see it, and the policies that apply to it: a user's own, its groups' and its permissions
+/// boundary, or those of the user a federated user's session was issued to; a role session's role's; and the
+/// session's session policies, of which a federated user without any has none that allow.
 function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Policies] throws Fault {
 	const a = caller.arn
 	const p = new auth.Principal()
@@ -44,6 +44,10 @@ function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Polic
 		if (u != null) {
 			p.tags = u.tags
 			ps.identity = policies(catalog, db, caller.account, db.userInline, db.userAttached, key(u.name))
+			for (const [_, m] of db.members.scan(null, 2147483647).filter(e => key(e[1].user) == key(u.name))) {
+				ps.identity.append(policies(catalog, db, caller.account, db.groupInline, db.groupAttached,
+					key(m.group)))
+			}
 			ps.boundary = boundary(catalog, db, caller.account, u.boundary)
 		}
 	}
@@ -66,7 +70,7 @@ function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Polic
 	return [p, ps]
 }
 
-/// The policies of the user or role of key owner, of account, whose tables are db: those embedded, in inline, and
+/// The policies of the user, role or group of key owner, of account, whose tables are db: those embedded, in inline, and
 /// those attached, in attached.
 function policies(catalog: Catalog, db: Tables, account: string, inline: Table[Inline], attached: Table[Attachment],
 	owner: string): auth.Policy[] throws Fault {

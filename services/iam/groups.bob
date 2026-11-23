@@ -1,0 +1,211 @@
+//! IAM's groups: users, the members, take the policies embedded in or attached to the groups they belong to, as
+//! ./identities reads them. The operations of the Handler of ./iam that it mixes in.
+
+import { id } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import * as api from "./api"
+import { Catalog } from "./catalog"
+
+import { attach, attached, detach, embed, group, groupOf, inline, move, named, onGroup, onUser, page, part, path, user,
+	userOf } from "./common"
+
+import { arn, Group, key, Member, save, stamp, Tables, within } from "./records"
+import { startsWith } from "std/algo"
+import { escape } from "std/url"
+
+/// The operations on groups.
+export class Groups {
+	/// AWS's managed policies, which the Handler sets.
+	catalog: Catalog = new Catalog(0, 0)
+
+	createGroup(caller: Caller, input: api.CreateGroupRequest): api.CreateGroupResponse throws Fault {
+		const k = key(named(input.GroupName, "groupName", 128))
+		const p = path(input.Path, "path")
+		caller.allow(arn(caller.account, "group", p, input.GroupName))
+		const db = new Tables(caller.store())
+		if (db.groups.get(k) != null) {
+			throw api.entityAlreadyExistsException(`Group with name ${input.GroupName} already exists.`)
+		}
+		const g = new Group()
+		g.name = input.GroupName
+		g.path = p
+		g.id = id("AGPA", 17)
+		g.created = stamp()
+		save(db.groups, k, g)
+		const r = new api.CreateGroupResponse()
+		r.Group = groupOf(caller.account, g)
+		return r
+	}
+
+	/// The group and a page of its users, in the order of their names.
+	getGroup(caller: Caller, input: api.GetGroupRequest): api.GetGroupResponse throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const g = group(db, input.GroupName)
+		const [members, next] = page(db.members, within(key(g.name), ""), input.Marker, input.MaxItems, m => true)
+		const r = new api.GetGroupResponse()
+		r.Group = groupOf(caller.account, g)
+		r.Users = members.map(m => userOf(caller.account, db.users.get(key(m.user))!, false))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	listGroups(caller: Caller, input: api.ListGroupsRequest): api.ListGroupsResponse throws Fault {
+		const prefix = input.PathPrefix ?? "/"
+		caller.allow(arn(caller.account, "group", prefix, ""))
+		const [groups, next] = page(new Tables(caller.store()).groups, "", input.Marker, input.MaxItems,
+			g => startsWith(g.path, prefix))
+		const r = new api.ListGroupsResponse()
+		r.Groups = groups.map(g => groupOf(caller.account, g))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	updateGroup(caller: Caller, input: api.UpdateGroupRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const g = group(db, input.GroupName)
+		const was = key(g.name)
+		const name = named(input.NewGroupName ?? g.name, "newGroupName", 128)
+		const k = key(name)
+		if (k != was && db.groups.get(k) != null) {
+			throw api.entityAlreadyExistsException(`Group with name ${name} already exists.`)
+		}
+		g.name = name
+		if (input.NewPath != null) {
+			g.path = path(input.NewPath, "newPath")
+		}
+		db.groups.delete(was)
+		save(db.groups, k, g)
+		move(db.members, was, k, m => {
+			m.group = name
+		})
+		move(db.groupAttached, was, k, a => {})
+		move(db.groupInline, was, k, p => {})
+		return new Unit()
+	}
+
+	deleteGroup(caller: Caller, input: api.DeleteGroupRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const k = key(group(db, input.GroupName).name)
+		if (db.members.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must remove users from group first.")
+		}
+		if (db.groupAttached.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must detach all policies first.")
+		}
+		if (db.groupInline.scan(null, 1, within(k, "")).length > 0) {
+			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
+		}
+		db.groups.delete(k)
+		return new Unit()
+	}
+
+	/// Of a user already a member, nothing.
+	addUserToGroup(caller: Caller, input: api.AddUserToGroupRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const g = group(db, input.GroupName)
+		save(db.members, within(key(g.name), key(u.name)), { ...new Member(), user: u.name, group: g.name })
+		return new Unit()
+	}
+
+	removeUserFromGroup(caller: Caller, input: api.RemoveUserFromGroupRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		const k = within(key(group(db, input.GroupName).name), key(u.name))
+		if (db.members.get(k) == null) {
+			throw api.noSuchEntityException(`The user with name ${input.UserName} cannot be found.`)
+		}
+		db.members.delete(k)
+		return new Unit()
+	}
+
+	/// In the order of the groups' names.
+	listGroupsForUser(caller: Caller, input: api.ListGroupsForUserRequest): api.ListGroupsForUserResponse throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = key(user(db, input.UserName).name)
+		const all = db.members.scan(null, 2147483647).filter(e => key(e[1].user) == u)
+		const [groups, next] = part(all.map(e => db.groups.get(key(e[1].group))!), input.Marker, input.MaxItems)
+		const r = new api.ListGroupsForUserResponse()
+		r.Groups = groups.map(g => groupOf(caller.account, g))
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	putGroupPolicy(caller: Caller, input: api.PutGroupPolicyRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		embed(db.groupInline, key(group(db, input.GroupName).name), input.PolicyName, input.PolicyDocument)
+		return new Unit()
+	}
+
+	getGroupPolicy(caller: Caller, input: api.GetGroupPolicyRequest): api.GetGroupPolicyResponse throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const g = group(db, input.GroupName)
+		const p = inline(db.groupInline, key(g.name), input.PolicyName, "group")
+		const r = new api.GetGroupPolicyResponse()
+		r.GroupName = g.name
+		r.PolicyName = p.name
+		r.PolicyDocument = escape(p.document, "component")
+		return r
+	}
+
+	listGroupPolicies(caller: Caller, input: api.ListGroupPoliciesRequest): api.ListGroupPoliciesResponse throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const owner = key(group(db, input.GroupName).name)
+		const [policies, next] = page(db.groupInline, within(owner, ""), input.Marker, input.MaxItems, p => true)
+		const r = new api.ListGroupPoliciesResponse()
+		r.PolicyNames = policies.map(p => p.name)
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+
+	deleteGroupPolicy(caller: Caller, input: api.DeleteGroupPolicyRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const owner = key(group(db, input.GroupName).name)
+		inline(db.groupInline, owner, input.PolicyName, "group")
+		db.groupInline.delete(within(owner, key(input.PolicyName)))
+		return new Unit()
+	}
+
+	attachGroupPolicy(caller: Caller, input: api.AttachGroupPolicyRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		attach(caller, db, this.catalog, db.groupAttached, key(group(db, input.GroupName).name), input.PolicyArn,
+			"group")
+		return new Unit()
+	}
+
+	detachGroupPolicy(caller: Caller, input: api.DetachGroupPolicyRequest): Unit throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		detach(caller, db, db.groupAttached, key(group(db, input.GroupName).name), input.PolicyArn)
+		return new Unit()
+	}
+
+	listAttachedGroupPolicies(caller: Caller,
+		input: api.ListAttachedGroupPoliciesRequest): api.ListAttachedGroupPoliciesResponse throws Fault {
+		onGroup(caller, input.GroupName)
+		const db = new Tables(caller.store())
+		const owner = key(group(db, input.GroupName).name)
+		const [policies, next] = attached(db.groupAttached, owner, input.PathPrefix, input.Marker, input.MaxItems)
+		const r = new api.ListAttachedGroupPoliciesResponse()
+		r.AttachedPolicies = policies
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
+	}
+}

@@ -1,5 +1,5 @@
 //! IAM's state in an account's tree: a table of records of each kind, keyed by the name lower-cased, as IAM's names
-//! are unique whatever their case; and those of a user or role, by its key, a NUL and their own.
+//! are unique whatever their case; and those of a user, role or group, by its key, a NUL and their own.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -31,6 +31,20 @@ export class Role {
 	maxSession: i32 = 3600
 	boundary = ""
 	tags: [string, string][] = []
+}
+
+export class Group {
+	name = ""
+	path = "/"
+	id = ""
+	created: i64 = 0
+}
+
+/// A user's membership of a group.
+export class Member {
+	/// The user's name, and the group's.
+	user = ""
+	group = ""
 }
 
 /// A managed policy.
@@ -70,7 +84,7 @@ export class AccessKey {
 	serial: i64 = 0
 }
 
-/// A managed policy attached to a user or role.
+/// A managed policy attached to a user, role or group.
 export class Attachment {
 	name = ""
 	path = ""
@@ -84,7 +98,7 @@ export class Serial {
 	n: i64 = 0
 }
 
-/// A policy embedded in a user or role.
+/// A policy embedded in a user, role or group.
 export class Inline {
 	name = ""
 	document = ""
@@ -101,12 +115,17 @@ export class Tables {
 	versions: Table[Version]
 	/// By the user's key, "" for the root's, which no name has, and the access key's id.
 	keys: Table[AccessKey]
-	/// By the user's or role's key, the policy's and its account, the account's own or aws, as AWS's managed policies,
+	/// By the user's, role's or group's key, the policy's and its account, the account's own or aws, as AWS's managed policies,
 	/// which are not in the tree, may share a name with the account's.
 	userAttached: Table[Attachment]
 	roleAttached: Table[Attachment]
 	userInline: Table[Inline]
 	roleInline: Table[Inline]
+	groups: Table[Group]
+	/// By the group's key and the user's.
+	members: Table[Member]
+	groupAttached: Table[Attachment]
+	groupInline: Table[Inline]
 	/// By "".
 	serial: Table[Serial]
 
@@ -121,6 +140,10 @@ export class Tables {
 		this.roleAttached = new Table[Attachment](s, "iam/role-attached")
 		this.userInline = new Table[Inline](s, "iam/user-inline")
 		this.roleInline = new Table[Inline](s, "iam/role-inline")
+		this.groups = new Table[Group](s, "iam/groups")
+		this.members = new Table[Member](s, "iam/members")
+		this.groupAttached = new Table[Attachment](s, "iam/group-attached")
+		this.groupInline = new Table[Inline](s, "iam/group-inline")
 		this.serial = new Table[Serial](s, "iam/serial")
 	}
 

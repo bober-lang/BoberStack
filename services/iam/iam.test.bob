@@ -262,6 +262,51 @@ test "a deleted access key is refused, where one never issued is taken for a roo
 	g.close()
 }
 
+test "groups: their members take their policies, and neither goes while the other holds it" {
+	const g = gateway()
+	g.identify = identify(catalog(managed))
+	call(g, "CreateUser", [["UserName", "bob"]])
+	let res = call(g, "CreateAccessKey", [["UserName", "bob"]])
+	const key = text(res, "AccessKeyId")!
+	const secret = text(res, "SecretAccessKey")!
+	assert text(call(g, "CreateGroup", [["GroupName", "devs"], ["Path", "/team/"]]), "Arn")
+		== "arn:aws:iam::000000000000:group/team/devs"
+	assert fails(call(g, "CreateGroup", [["GroupName", "DEVS"]]), 409, "EntityAlreadyExists")
+	assert fails(call(g, "AddUserToGroup", [["GroupName", "ops"], ["UserName", "bob"]]), 404, "NoSuchEntity",
+		"The group with name ops cannot be found.")
+	call(g, "AddUserToGroup", [["GroupName", "devs"], ["UserName", "bob"]])
+	assert texts(call(g, "GetGroup", [["GroupName", "devs"]]), "UserName") == ["bob"]
+	assert texts(call(g, "ListGroupsForUser", [["UserName", "bob"]]), "GroupName") == ["devs"]
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	call(g, "PutGroupPolicy", [["GroupName", "devs"], ["PolicyName", "own"], ["PolicyDocument", aws("iam:GetUser")]])
+	assert text(call(g, "GetUser", [], key, secret), "UserName") == "bob"
+	const deny = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"iam:GetUser","Resource":"*"}]}`
+	call(g, "CreatePolicy", [["PolicyName", "deny"], ["PolicyDocument", deny]])
+	const p = "arn:aws:iam::000000000000:policy/deny"
+	call(g, "AttachGroupPolicy", [["GroupName", "devs"], ["PolicyArn", p]])
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", p]]), "GroupName") == ["devs"]
+	assert fails(call(g, "DeleteUser", [["UserName", "bob"]]), 409, "DeleteConflict")
+	call(g, "UpdateGroup", [["GroupName", "devs"], ["NewGroupName", "builders"]])
+	assert texts(call(g, "ListGroupsForUser", [["UserName", "bob"]]), "GroupName") == ["builders"]
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must remove users from group first.")
+	call(g, "RemoveUserFromGroup", [["GroupName", "builders"], ["UserName", "bob"]])
+	assert fails(call(g, "RemoveUserFromGroup", [["GroupName", "builders"], ["UserName", "bob"]]), 404, "NoSuchEntity",
+		"The user with name bob cannot be found.")
+	assert fails(call(g, "GetUser", [], key, secret), 403, "AccessDenied")
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must detach all policies first.")
+	call(g, "DetachGroupPolicy", [["GroupName", "builders"], ["PolicyArn", p]])
+	assert fails(call(g, "DeleteGroup", [["GroupName", "builders"]]), 409, "DeleteConflict",
+		"Cannot delete entity, must delete policies first.")
+	call(g, "DeleteGroupPolicy", [["GroupName", "builders"], ["PolicyName", "own"]])
+	assert call(g, "DeleteGroup", [["GroupName", "builders"]]).status == 200
+	assert texts(call(g, "ListGroups"), "GroupName") == []
+	g.close()
+}
+
 test "roles: create, get, list, update the trust policy, delete" {
 	const g = gateway()
 	let res = call(g, "CreateRole",
@@ -640,7 +685,7 @@ test "a handler that fails after writing leaves no trace" {
 
 test "an operation not implemented" {
 	const g = gateway()
-	const res = call(g, "CreateGroup", [["GroupName", "g"]])
-	assert fails(res, 501, "NotImplemented", "The operation CreateGroup is not implemented")
+	const res = call(g, "CreateInstanceProfile", [["InstanceProfileName", "p"]])
+	assert fails(res, 501, "NotImplemented", "The operation CreateInstanceProfile is not implemented")
 	g.close()
 }
