@@ -53,12 +53,13 @@ class Recording {
 		}
 	}
 
-	/// s as AWS answers it, retried until its status is s.until, if that is not 0; its answer is set on s, normalised,
-	/// the values of members and headers named volatile or ignored, there or on s, as their forms, and captured values
-	/// of 8 characters or more as ${name}.
+	/// s as AWS answers it, retried until its status is s.until, if that is not 0, and its body holds s.untilBody, if
+	/// that is not ""; its answer is set on s, normalised, the values of members and headers named volatile or ignored,
+	/// there or on s, as their forms, and captured values of 8 characters or more as ${name}.
 	run(s: Step, t: Tape) throws IoError | ParseError | CryptoError | Failure {
 		let [res, body] = this.send(s)
-		for (let tries = 1; s.until != 0 && res.status != s.until && tries < 15; tries++) {
+		for (let tries = 1; (s.until != 0 && res.status != s.until
+			|| s.untilBody != "" && indexOf(body, s.untilBody) < 0) && tries < 15; tries++) {
 			sleep(2 * second)
 			[res, body] = this.send(s)
 		}

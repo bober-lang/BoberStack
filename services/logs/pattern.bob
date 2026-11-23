@@ -590,6 +590,32 @@ function split(s: string, sep: string): string[] {
 	return out
 }
 
+/// The fields of message if it is a JSON object, as Logs Insights discovers them: each scalar by its dotted path, an
+/// item by its index; a string's text, any other value's JSON.
+export function discovered(message: string): [string, string][] {
+	const out: [string, string][] = []
+	const v = document(message)
+	if (v != null && v!.kind == "object") {
+		flatten(v!, "", out)
+	}
+	return out
+}
+
+function flatten(v: Value, path: string, out: [string, string][]): void {
+	const dot = if (path == "") "" else path + "."
+	if (v.kind == "object") {
+		for (const [k, m] of v.members) {
+			flatten(m, dot + k, out)
+		}
+	} else if (v.kind == "array") {
+		for (let i = 0; i < v.items.length; i++) {
+			flatten(v.items[i], `${dot}${i}`, out)
+		}
+	} else {
+		out.push([path, v.text])
+	}
+}
+
 /// The JSON value message is, null if it is none.
 function document(message: string): Value | null {
 	const r = new Reader(message)

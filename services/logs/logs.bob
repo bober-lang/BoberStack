@@ -1,6 +1,6 @@
 //! Amazon CloudWatch Logs: log groups, their retention, tags and deletion protection; streams; putting, getting and
-//! filtering events, by the filter patterns of ./pattern; metric filters, subscription filters and resource policies.
-//! Logs Insights, exports, deliveries, anomaly detection, transformers and the rest are not implemented. Where AWS
+//! filtering events, by the filter patterns of ./pattern; metric filters, subscription filters and resource policies;
+//! Logs Insights queries and query definitions, of ./insights. Exports, deliveries, anomaly detection, transformers and the rest are not implemented. Where AWS
 //! differs:
 //!
 //! - Nothing runs between requests: retention hides events older than it at each request, and a metric filter
@@ -17,6 +17,7 @@ import { Fault } from "../../core/fault"
 import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
+import * as insights from "./insights"
 import { match, parse } from "./pattern"
 import { list, member } from "../events/pattern"
 import * as firehoseApi from "../firehose/api"
@@ -651,6 +652,51 @@ export class Handler {
 			throw api.resourceNotFoundException(`Policy with name [${name}] does not exist.`)
 		}
 		return new Unit()
+	}
+
+	startQuery(caller: Caller, input: api.StartQueryRequest): api.StartQueryResponse throws Fault {
+		return insights.startQuery(caller, input)
+	}
+
+	getQueryResults(caller: Caller, input: api.GetQueryResultsRequest): api.GetQueryResultsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.getQueryResults(caller, input)
+	}
+
+	stopQuery(caller: Caller, input: api.StopQueryRequest): api.StopQueryResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.stopQuery(caller, input)
+	}
+
+	describeQueries(caller: Caller, input: api.DescribeQueriesRequest): api.DescribeQueriesResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.describeQueries(caller, input)
+	}
+
+	getLogRecord(caller: Caller, input: api.GetLogRecordRequest): api.GetLogRecordResponse throws Fault {
+		return insights.getLogRecord(caller, input)
+	}
+
+	getLogGroupFields(caller: Caller, input: api.GetLogGroupFieldsRequest): api.GetLogGroupFieldsResponse throws Fault {
+		return insights.getLogGroupFields(caller, input)
+	}
+
+	putQueryDefinition(caller: Caller,
+		input: api.PutQueryDefinitionRequest): api.PutQueryDefinitionResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.putQueryDefinition(caller, input)
+	}
+
+	describeQueryDefinitions(caller: Caller,
+		input: api.DescribeQueryDefinitionsRequest): api.DescribeQueryDefinitionsResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.describeQueryDefinitions(caller, input)
+	}
+
+	deleteQueryDefinition(caller: Caller,
+		input: api.DeleteQueryDefinitionRequest): api.DeleteQueryDefinitionResponse throws Fault {
+		caller.allow(`arn:aws:logs:${caller.region}:${caller.account}:*`)
+		return insights.deleteQueryDefinition(caller, input)
 	}
 }
 

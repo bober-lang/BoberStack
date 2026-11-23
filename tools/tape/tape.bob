@@ -27,7 +27,8 @@
 //! earlier steps `capture`, each the text at a path of its answer: segments separated by /, each the first element of
 //! XML, or member or index of JSON, of that name below the one before. A JSON string that is `${now}`, `${now-n}` or
 //! `${now+n}` whole is the number of the time in ms the recording, or replay, started at, less or plus n.
-//! Recording retries a step `until` its answer has that status, for what AWS makes eventually consistent, and runs
+//! Recording retries a step `until` its answer has that status, and `untilBody` its body holds that text, for what
+//! AWS makes eventually consistent or answers asynchronously, and runs
 //! `cleanup` even after a step failed. A step is sent as the scenario's caller unless `as` names others, whose access
 //! key, secret and session token, if any, earlier steps capture as `<as>.key`, `<as>.secret` and `<as>.token`; a tape
 //! holds them as captures, `${<as>.secret}`.
@@ -50,7 +51,7 @@
 //!
 //! A replay compares the status, the headers in `headers`, and the body as a tree: of XML elements, or JSON members
 //! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
-//! does not, but for the elements a step names `unordered`, which AWS answers in an order of its own. A captured
+//! does not, a whole number as 12.0 the same as 12, but for the elements a step names `unordered`, which AWS answers in an order of its own. A captured
 //! value is expected where AWS's was, as is a volatile member, of the same form: its runs of letters, digits and +/=
 //! the same in number, between the same other characters; an ignored member need only be there; a `${name}` not yet bound, as `${owner}`, binds it to what is there; and the random id of an authorization
 //! that IAM's denials link to is not compared. Of S3 it compares the headers in `s3Headers`, Content-Length only of an
@@ -147,6 +148,9 @@ export class Step {
 	as: string @OmitEmpty = ""
 	/// The status to retry for while recording, 0 for none.
 	until: i32 @OmitEmpty = 0
+	/// Text to retry for while recording until its answer's body holds it, as an asynchronous query's status; "" for
+	/// none. A replay sends it once.
+	untilBody: string @OmitEmpty = ""
 	/// Why BoberStack answers otherwise than AWS, "" if it does not.
 	differs: string @OmitEmpty = ""
 	/// What AWS answered, once recorded.
@@ -738,13 +742,13 @@ function compare(e: Tree, a: Tree, path: string, volatile: string[], ignored: st
 		return
 	}
 	if (volatile.includes(e.name) && e.leaf && a.leaf) {
-		if (form(want) != form(a.text)) {
+		if (form(want) != form(a.text) && !(want == "x.x" && digits(a.text))) {
 			out.push(`${at}: expected the form of ${show(want)}, got ${show(a.text)}`)
 		}
 		return
 	}
 	if (e.leaf || a.leaf) {
-		if (e.leaf && a.leaf && unlinked(want) != unlinked(a.text)) {
+		if (e.leaf && a.leaf && unlinked(whole(want)) != unlinked(whole(a.text))) {
 			out.push(`${at}: ${contrast(want, a.text)}`)
 		} else if (!e.leaf || !a.leaf) {
 			out.push(`${at}: expected ${if (e.leaf) show(want) else outline(e)}, got ${if (a.leaf) show(a.text) else outline(a)}`)
@@ -798,6 +802,24 @@ export function form(v: string): string {
 		}
 	}
 	return fromBytes(out)
+}
+
+/// v without the ".0" of a whole number written as a float, as AWS writes a JSON double: 12.0 is 12.
+function whole(v: string): string {
+	if (v.length < 3 || v.slice(v.length - 2, v.length) != ".0" || !digits(v.slice(0, v.length - 2))) {
+		return v
+	}
+	return v.slice(0, v.length - 2)
+}
+
+/// Whether v is digits only, and some.
+function digits(v: string): bool {
+	for (let i = 0; i < v.length; i++) {
+		if (v[i] < 48 || v[i] > 57) {
+			return false
+		}
+	}
+	return v.length > 0
 }
 
 /// Whether c is a letter, digit or +/=.

@@ -1,0 +1,113 @@
+import { sign } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import * as api from "./api"
+import { Handler } from "./logs"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+
+/// now() of a test, in ms.
+const t: i64 = 1435327200000
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `Logs_20140328.${op}`)
+	sign(req, body, "logs", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function has(res: Response, text: string): bool { return indexOf(res.body.whole ?? "", text) >= 0 }
+
+/// A gateway with the log group /g, whose stream s has three events, one a JSON message.
+function made(): Gateway {
+	const g = gateway()
+	assert call(g, "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert call(g, "CreateLogStream", `{"logGroupName":"/g","logStreamName":"s"}`).status == 200
+	assert call(g, "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"s","logEvents":[`
+		+ `{"timestamp":${t - 2000},"message":"GET /a 200 12"},`
+		+ `{"timestamp":${t - 1000},"message":"GET /b 500 30"},`
+		+ `{"timestamp":${t},"message":"{\\"level\\":\\"error\\",\\"req\\":{\\"ms\\":7}}"}]}`).status == 200
+	return g
+}
+
+/// The results of the query q over /g.
+function query(g: Gateway, q: string): Response {
+	const start = call(g, "StartQuery",
+		`{"logGroupName":"/g","startTime":${t / 1000 - 60},"endTime":${t / 1000},` + `"queryString":${quote(q)}}`)
+	assert start.status == 200
+	const body = start.body.whole ?? ""
+	const id = body.slice(indexOf(body, `"queryId":"`) + 11, body.length - 2)
+	return call(g, "GetQueryResults", `{"queryId":"${id}"}`)
+}
+
+function quote(s: string): string {
+	let out = ""
+	for (let i = 0; i < s.length; i++) {
+		const c = s.slice(i, i + 1)
+		out += if (c == "\"") "\\\"" else if (c == "\n") "\\n" else c
+	}
+	return `"${out}"`
+}
+
+test "a query is Complete at once, its rows newest first with their pointers" {
+	const g = made()
+	const r = query(g, "fields @timestamp, @message | filter @message like /GET/ | limit 1")
+	assert has(r, `"status":"Complete"`) && has(r, `"recordsMatched":2,`) && has(r, `"recordsScanned":3,`)
+	assert has(r,
+		`[[{"field":"@timestamp","value":"2015-06-26 13:59:59.000"},{"field":"@message",`
+		+ `"value":"GET /b 500 30"},{"field":"@ptr","value":"`)
+	g.close()
+}
+
+test "parse, stats by a field, and sort" {
+	const g = made()
+	const r = query(g,
+		`parse @message "* * * *" as verb, path, status, ms | filter ispresent(verb) `
+		+ `| stats count(*) as n, sum(ms) as total, avg(ms) by verb | sort n desc`)
+	assert has(r,
+		`[[{"field":"verb","value":"GET"},{"field":"n","value":"2"},{"field":"total","value":"42"},`
+		+ `{"field":"avg(ms)","value":"21"}]]`)
+	g.close()
+}
+
+test "JSON fields by their dotted paths, and functions" {
+	const g = made()
+	const r = query(g,
+		"filter level = 'error' # the JSON one\n| fields toupper(level) as l, req.ms * 2 as d, "
+		+ "strlen(level), bin(1m)")
+	assert has(r,
+		`{"field":"l","value":"ERROR"},{"field":"d","value":"14"},{"field":"strlen(level)","value":"5"},`
+		+ `{"field":"bin(1m)","value":"2015-06-26 14:00:00.000"}`)
+	g.close()
+}
+
+test "a malformed query is answered with where it is wrong" {
+	const g = made()
+	const r = call(g, "StartQuery", `{"logGroupName":"/g","startTime":0,"endTime":1,"queryString":"fields a | nope"}`)
+	assert r.status == 400 && has(r, `"__type":"MalformedQueryException"`)
+		&& has(r, "unexpected symbol found nope at line 1 and position 63 (Service: AWSLogs;")
+	g.close()
+}
+
+test "a record by its pointer, the group's fields, and query definitions" {
+	const g = made()
+	const r = query(g, "fields @message | filter @message like 'b 500'")
+	const body = r.body.whole ?? ""
+	const at = indexOf(body, `"@ptr","value":"`) + 16
+	const ptr = body.slice(at, indexOf(body, `"`, at))
+	assert has(call(g, "GetLogRecord", `{"logRecordPointer":"${ptr}"}`), `"@message":"GET /b 500 30"`)
+	assert has(call(g, "GetLogGroupFields", `{"logGroupName":"/g"}`), `{"name":"req.ms","percent":33}`)
+	const d = call(g, "PutQueryDefinition", `{"name":"q","queryString":"fields @message"}`)
+	assert d.status == 200
+	assert has(call(g, "DescribeQueryDefinitions", "{}"), `"name":"q","queryString":"fields @message"`)
+	assert has(call(g, "DescribeQueries", `{"logGroupName":"/g","status":"Complete"}`), `"status":"Complete"`)
+	g.close()
+}
