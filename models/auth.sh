@@ -1,0 +1,13 @@
+#!/bin/sh
+# Fetches AWS's service authorization reference of each service below, by its signing name, as <service>-auth.json:
+# the actions that authorize each operation, the resources' ARN formats and the condition keys, but not the SDKs that
+# call each operation. The URL is not versioned; these were fetched on 2026-11-23.
+set -eu
+cd "$(dirname "$0")"
+for service in iam sts sqs dynamodb sns events s3 secretsmanager ssm logs kms kinesis lambda states route53 firehose acm ses cloudformation scheduler; do
+	curl -fsS -A curl "https://servicereference.us-east-1.amazonaws.com/v1/$service/$service.json" \
+		| jq "del(.Operations[].SDK)" >"$service-auth.json"
+done
+# CloudWatch signs as monitoring.
+curl -fsS -A curl "https://servicereference.us-east-1.amazonaws.com/v1/cloudwatch/cloudwatch.json" \
+	| jq "del(.Operations[].SDK)" >monitoring-auth.json
