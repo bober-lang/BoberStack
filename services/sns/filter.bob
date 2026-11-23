@@ -1,0 +1,377 @@
+//! Subscription filter policies: a JSON object whose keys name message attributes, or members of a message body that
+//! is a JSON object, nested in the body's scope, each with the values it matches, or $or with policies of which one
+//! must match. A value matches as a string, number, true, false or null equal to it, or by prefix, suffix,
+//! equals-ignore-case, anything-but (values, or a prefix or suffix), numeric ranges or exists; an array in the message
+//! matches if any of its items does.
+
+import * as api from "./api"
+import { endsWith, startsWith } from "std/algo"
+import { Fault } from "../../core/fault"
+import * as json from "std/encoding/json"
+import { parseFloat } from "std/float"
+import { lower, ParseError, trim } from "std/string"
+
+/// A policy, or one nested in it, which matches where all its keys and one policy of each $or do.
+export class Rule {
+	keys: Key[] = []
+	any: Rule[][] = []
+}
+
+/// A key of a policy, with the values it matches, or the policy that its members match.
+class Key {
+	name = ""
+	conditions: Condition[] = []
+	nested: Rule | null = null
+}
+
+/// What matches a value: equals, prefix, suffix, equals-ignore-case, anything-but, numeric or exists.
+class Condition {
+	kind = ""
+	/// What equals and anything-but compare with.
+	values: Scalar[] = []
+	/// The string of a prefix, suffix or equals-ignore-case, or anything-but's of prefix or suffix, as but names.
+	text = ""
+	but = ""
+	/// numeric's comparisons, by operator.
+	range: [string, f64][] = []
+	exists = false
+}
+
+/// A JSON scalar: a string, number, bool or null, its text a string's value or the JSON of the others.
+class Scalar {
+	kind = ""
+	text = ""
+	number = 0.0
+}
+
+/// An item of a JSON array, as std/encoding/json decodes any.
+type Item = i64 | f64 | string | bool | json.Keys | null | (i64 | f64 | string | bool | json.Keys | null)[]
+
+/// The rule of the policy, of a message's body if body, else of its attributes, or the InvalidParameter it is, as SNS
+/// words it.
+export function parse(policy: string, body: bool): Rule throws Fault {
+	const r = rule(policy, body)
+	if (leaves(r) > 5) {
+		throw invalid("Filter policy can not have more than 5 keys")
+	}
+	if (combinations(r) > 150) {
+		throw invalid("Filter policy is too complex")
+	}
+	return r
+}
+
+/// Whether r matches doc, the text of a JSON object: a message's body, or its attributes as one.
+export function matches(r: Rule, doc: string): bool { return kind(doc) == "object" && all(r, [doc]) }
+
+function rule(s: string, body: bool): Rule throws Fault {
+	const r = new Rule()
+	for (const [k, v] of members(s)) {
+		if (k == "$or") {
+			const branches = if (kind(v) == "array") items(v) else []
+			if (branches.length < 2 || !branches.every(b => kind(b) == "object")) {
+				throw invalid("$or must be an array of at least 2 filter policies")
+			}
+			const any: Rule[] = []
+			for (const b of branches) {
+				any.push(rule(b, body))
+			}
+			r.any.push(any)
+			continue
+		}
+		const key = new Key()
+		key.name = k
+		switch (kind(v)) {
+			case "array":
+				const xs = items(v)
+				if (xs.length == 0) {
+					throw invalid("Empty arrays are not allowed")
+				}
+				for (const x of xs) {
+					key.conditions.push(condition(x))
+				}
+			case "object":
+				if (!body) {
+					throw invalid("Filter policy scope MessageAttributes does not support nested filter policy")
+				}
+				key.nested = rule(v, body)
+			default: throw invalid(`"${k}" must be an object or an array`)
+		}
+		r.keys.push(key)
+	}
+	return r
+}
+
+/// The condition of x, an item of a key's array.
+function condition(x: string): Condition throws Fault {
+	const c = new Condition()
+	if (kind(x) == "array") {
+		throw invalid("Match value must be String, number, true, false, or null")
+	}
+	if (kind(x) != "object") {
+		c.kind = "equals"
+		c.values = [scalar(x)!]
+		return c
+	}
+	const ms = members(x)
+	if (ms.length != 1) {
+		throw invalid("Only one match type is allowed in a pattern")
+	}
+	const [op, v] = ms[0]
+	c.kind = op
+	switch (op) {
+		case "prefix", "suffix", "equals-ignore-case":
+			if (kind(v) != "string") {
+				throw invalid(`${op} match pattern must be a string`)
+			}
+			c.text = text(v)
+		case "exists":
+			if (kind(v) != "bool") {
+				throw invalid("exists match pattern must be either true or false.")
+			}
+			c.exists = v == "true"
+		case "anything-but": anythingBut(c, v)
+		case "numeric": c.range = numeric(v)
+		default: throw invalid(`Unrecognized match type ${op}`)
+	}
+	return c
+}
+
+/// Sets c to anything-but v: a string or number, an array of them, or an object of a prefix or suffix.
+function anythingBut(c: Condition, v: string) throws Fault {
+	switch (kind(v)) {
+		case "string", "number": c.values = [scalar(v)!]
+		case "array":
+			const xs = items(v)
+			if (xs.length == 0) {
+				throw invalid("Empty arrays are not allowed")
+			}
+			for (const x of xs) {
+				const k = kind(x)
+				if (k != "string" && k != "number") {
+					throw invalid("Inside anything but list, start|null|boolean is not supported.")
+				}
+				c.values.push(scalar(x)!)
+			}
+		case "object":
+			const ms = members(v)
+			if (ms.length != 1 || ms[0][0] != "prefix" && ms[0][0] != "suffix" || kind(ms[0][1]) != "string") {
+				throw invalid("Unsupported anything-but pattern")
+			}
+			c.but = ms[0][0]
+			c.text = text(ms[0][1])
+		default: throw invalid("Value of anything-but must be an array or single string/number value.")
+	}
+}
+
+/// The comparisons of numeric's array v: = and a number, or a lower bound by > or >=, an upper by < or <=, or both.
+function numeric(v: string): [string, f64][] throws Fault {
+	if (kind(v) != "array") {
+		throw invalid("Value of numeric must be an array.")
+	}
+	const xs = items(v)
+	const out: [string, f64][] = []
+	let i = 0
+	while (i < xs.length) {
+		const op = if (kind(xs[i]) == "string") text(xs[i]) else xs[i]
+		if (op != "=" && op != ">" && op != ">=" && op != "<" && op != "<=") {
+			throw invalid(`Unrecognized numeric range operator: ${op}`)
+		}
+		if (i > 0) {
+			const first = out[0][0]
+			if (first == "=" || first == "<" || first == "<=" || out.length == 2) {
+				throw invalid("Too many elements in numeric expression")
+			}
+			if (op != "<" && op != "<=") {
+				throw invalid(`Bad numeric range operator: ${op}`)
+			}
+		}
+		if (i + 1 >= xs.length || kind(xs[i + 1]) != "number") {
+			throw invalid(`Value of ${op} must be numeric`)
+		}
+		out.push([op, scalar(xs[i + 1])!.number])
+		i += 2
+	}
+	if (out.length == 0) {
+		throw invalid("Empty arrays are not allowed")
+	}
+	if (out.length == 2 && out[0][1] >= out[1][1]) {
+		throw invalid("Bottom must be less than top")
+	}
+	return out
+}
+
+/// The keys of r that hold values, those of each $or's branches added.
+function leaves(r: Rule): i32 {
+	let n = 0
+	for (const k of r.keys) {
+		n += if (k.nested == null) 1 else leaves(k.nested!)
+	}
+	for (const any of r.any) {
+		for (const b of any) {
+			n += leaves(b)
+		}
+	}
+	return n
+}
+
+/// The combinations of values that r matches, which SNS bounds: the product of its keys' values, of each $or the
+/// sum of its branches'.
+function combinations(r: Rule): i64 {
+	let n: i64 = 1
+	for (const k of r.keys) {
+		n *= if (k.nested == null) k.conditions.length as i64 else combinations(k.nested!)
+	}
+	for (const any of r.any) {
+		let sum: i64 = 0
+		for (const b of any) {
+			sum += combinations(b)
+		}
+		n *= sum
+	}
+	return n
+}
+
+/// Whether r matches the objects of docs, the members at its place in a message.
+function all(r: Rule, docs: string[]): bool {
+	for (const k of r.keys) {
+		const values = at(docs, k.name)
+		if (k.nested != null) {
+			if (!all(k.nested!, values.filter(v => kind(v) == "object"))) {
+				return false
+			}
+		} else if (!k.conditions.some(c => holds(c, values))) {
+			return false
+		}
+	}
+	return r.any.every(any => any.some(b => all(b, docs)))
+}
+
+/// The values of the member name of docs, an array's items in its place.
+function at(docs: string[], name: string): string[] {
+	const out: string[] = []
+	for (const d of docs) {
+		let ms: json.Unknown[] = []
+		try {
+			ms = json.decode[json.Keys](d).all
+		} catch (e: ParseError) {}
+		for (const [k, v] of ms) {
+			if (k == name) {
+				if (kind(v) != "array") {
+					out.push(v)
+				} else {
+					try {
+						out.append(items(v))
+					} catch (f: Fault) {} // an array of arrays, which matches nothing
+				}
+			}
+		}
+	}
+	return out
+}
+
+/// Whether c holds for values, those of a key, none if it is absent.
+function holds(c: Condition, values: string[]): bool {
+	if (c.kind == "exists") {
+		return c.exists == (values.length > 0)
+	}
+	return values.some(v => {
+		const s = scalar(v)
+		return s != null && test(c, s!)
+	})
+}
+
+/// Whether c holds for the scalar s.
+function test(c: Condition, s: Scalar): bool {
+	switch (c.kind) {
+		case "equals": return equal(c.values[0], s)
+		case "prefix": return s.kind == "string" && startsWith(s.text, c.text)
+		case "suffix": return s.kind == "string" && endsWith(s.text, c.text)
+		case "equals-ignore-case": return s.kind == "string" && lower(s.text) == lower(c.text)
+		case "anything-but": switch (c.but) {
+			case "prefix": return s.kind == "string" && !startsWith(s.text, c.text)
+			case "suffix": return s.kind == "string" && !endsWith(s.text, c.text)
+			default: return (s.kind == "string" || s.kind == "number") && !c.values.some(x => equal(x, s))
+		}
+		case "numeric": return s.kind == "number" && c.range.every(r => {
+			switch (r[0]) {
+				case "=": return s.number == r[1]
+				case ">": return s.number > r[1]
+				case ">=": return s.number >= r[1]
+				case "<": return s.number < r[1]
+				default: return s.number <= r[1]
+			}
+		})
+		default: return false
+	}
+}
+
+function equal(a: Scalar, b: Scalar): bool {
+	return a.kind == b.kind && (if (a.kind == "number") a.number == b.number else a.text == b.text)
+}
+
+/// The kind of the JSON value v: object, array, string, number, bool or null.
+function kind(v: string): string {
+	const t = trim(v)
+	switch (t.slice(0, 1)) {
+		case "{": return "object"
+		case "[": return "array"
+		case "\"": return "string"
+		case "t", "f": return "bool"
+		case "n": return "null"
+		default: return "number"
+	}
+}
+
+/// The scalar of the JSON value v, null for an object or array, or a number JSON cannot hold.
+function scalar(v: string): Scalar | null {
+	const s = new Scalar()
+	s.kind = kind(v)
+	switch (s.kind) {
+		case "object", "array": return null
+		case "string": s.text = text(v)
+		case "number": try {
+			s.number = parseFloat(trim(v))
+		} catch (e: ParseError) {
+			return null
+		}
+		default: s.text = trim(v)
+	}
+	return s
+}
+
+/// The value of the JSON string v.
+function text(v: string): string {
+	try {
+		return json.decode[string](v)
+	} catch (e: ParseError) {
+		return ""
+	}
+}
+
+/// The members of the JSON object s.
+function members(s: string): json.Unknown[] throws Fault {
+	try {
+		return json.decode[json.Keys](s).all
+	} catch (e: ParseError) {
+		throw invalid("failed to parse JSON.")
+	}
+}
+
+/// The items of the JSON array s, each as JSON.
+function items(s: string): string[] throws Fault {
+	try {
+		return json.decode[Item[]](s).map(x => encoded(x))
+	} catch (e: ParseError) {
+		throw invalid("failed to parse JSON.")
+	}
+}
+
+function encoded(x: Item): string {
+	try {
+		return json.encode(x)
+	} catch (e: json.EncodeError) {
+		return "null" // a float of JSON is finite
+	}
+}
+
+function invalid(why: string): Fault { return api.invalidParameterException(`Invalid parameter: FilterPolicy: ${why}`) }

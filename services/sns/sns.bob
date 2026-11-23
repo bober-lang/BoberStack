@@ -1,0 +1,1096 @@
+//! Amazon Simple Notification Service: topics, standard and FIFO, their subscriptions with filter policies, and
+//! publishing to them, which delivers to the Amazon SQS queues subscribed by a call of the SQS service within the
+//! publishing request, as SNS's principal on behalf of the topic. Known differences from AWS:
+//!
+//! - Only sqs subscriptions are delivered to. Those of http, https, email and email-json are kept pending
+//!   confirmation, as AWS keeps them until the endpoint confirms, but no confirmation request is sent, so their token
+//!   is never told; those of sms, lambda, firehose and application are confirmed at once and never delivered to.
+//! - A message is delivered once, within the publish: no retries, delays or delivery policies. One that a queue
+//!   refuses, as one that does not exist or whose policy denies SNS, goes to the subscription's dead-letter queue if
+//!   it has one, else is dropped, without the attributes AWS adds to it there.
+//! - Notifications are not signed: their Signature is random, their SigningCertURL names no certificate, and their
+//!   UnsubscribeURL is of the endpoint the publish came to.
+//! - Publishing to a phone number or a platform endpoint, platform applications, SMS and data protection policies are
+//!   not implemented.
+
+import { secret } from "../../core/auth/credentials"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as sqsApi from "../sqs/api"
+import * as api from "./api"
+import { matches, parse } from "./filter"
+import { attribute, Published, save, set, Subscription, Tables, Topic, within } from "./records"
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { isAlphanumeric } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { sha256 } from "std/crypto/hash"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import { formatFloat, parseFloat } from "std/float"
+import { lower, ParseError, split } from "std/string"
+import { millisecond, minute, rfc3339, second } from "std/time"
+import { Decodable } from "std/types"
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	/// What delivers to the queues subscribed.
+	sqs: sqsApi.SQS
+
+	constructor(sqs: sqsApi.SQS) { this.sqs = sqs }
+
+	createTopic(caller: Caller, input: api.CreateTopicInput): api.CreateTopicResponse throws Fault {
+		const name = input.Name
+		const arn = `arn:aws:sns:${caller.region}:${caller.account}:${name}`
+		const db = new Tables(caller.regional())
+		const found = db.topics.get(name)
+		caller.allow(arn, policy(found))
+		if (input.DataProtectionPolicy != null) {
+			throw new Fault(501, "NotImplemented", "Data protection policies are not implemented")
+		}
+		const given = normalized(input.Attributes ?? [])
+		const fifo = attribute(given, "FifoTopic") == "true"
+		if (fifo && (!named(name) || !endsWith(name, ".fifo"))) {
+			throw invalid("Fifo Topic names must end with .fifo and must be made up of only uppercase and lowercase ASCII "
+				+ "letters, numbers, underscores, and hyphens, and must be between 1 and 256 characters long.")
+		}
+		if (!fifo && (!named(name) || endsWith(name, ".fifo"))) {
+			throw invalid("Topic Name")
+		}
+		for (const [k, v] of given) {
+			topicAttribute(k, v, fifo, true)
+		}
+		const r = new api.CreateTopicResponse()
+		r.TopicArn = arn
+		if (found != null) {
+			const f = found!
+			if (given.some(a => attribute(f.attributes, a[0]) != a[1])) {
+				throw invalid("Attributes Reason: Topic already exists with different attributes")
+			}
+			const tags = input.Tags
+			if (tags != null && (tags.length != f.tags.length || tags.some(t => attribute(f.tags, t.Key) != t.Value))) {
+				throw invalid("Tags Reason: Topic already exists with different tags")
+			}
+			return r
+		}
+		const t = new Topic()
+		t.name = name
+		t.attributes = given
+		t.tags = tagged([], input.Tags ?? [])
+		save(db.topics, name, t)
+		return r
+	}
+
+	deleteTopic(caller: Caller, input: api.DeleteTopicInput): Unit throws Fault {
+		const p = place(caller, input.TopicArn, "TopicArn")
+		const t = p.db.topics.get(p.name)
+		caller.allow(p.arn, policy(t))
+		if (t != null) {
+			for (const [k, _] of subscriptions(p.db, p.name)) {
+				p.db.subscriptions.delete(k)
+			}
+			for (const [k, _] of p.db.published.scan(null, 2147483647, within(p.name, ""))) {
+				p.db.published.delete(k)
+			}
+			p.db.topics.delete(p.name)
+		}
+		return new Unit()
+	}
+
+	listTopics(caller: Caller, input: api.ListTopicsInput): api.ListTopicsResponse throws Fault {
+		caller.allow(`arn:aws:sns:${caller.region}:${caller.account}:*`)
+		const [topics, next] = page(new Tables(caller.regional()).topics, "", input.NextToken)
+		const r = new api.ListTopicsResponse()
+		r.Topics = topics.map(e => ({ ...new api.Topic(), TopicArn: topicArn(caller, caller.account, e[1].name) }))
+		r.NextToken = next
+		return r
+	}
+
+	getTopicAttributes(caller: Caller,
+		input: api.GetTopicAttributesInput): api.GetTopicAttributesResponse throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		let confirmed = 0
+		let pending = 0
+		for (const [_, s] of subscriptions(p.db, t.name)) {
+			if (s.confirmed) {
+				confirmed++
+			} else {
+				pending++
+			}
+		}
+		const out: [string, string][] = [["Policy", policy(t) ?? defaultPolicy(p)], ["Owner", p.account],
+			["SubscriptionsPending", `${pending}`], ["TopicArn", p.arn],
+			["EffectiveDeliveryPolicy", attribute(t.attributes, "DeliveryPolicy") ?? deliveryPolicy],
+			["SubscriptionsConfirmed", `${confirmed}`], ["DisplayName", attribute(t.attributes, "DisplayName") ?? ""],
+			["SubscriptionsDeleted", "0"]]
+		out.append(t.attributes.filter(a => a[0] != "Policy" && a[0] != "DisplayName"))
+		if (fifo(t) && attribute(t.attributes, "ContentBasedDeduplication") == null) {
+			out.push(["ContentBasedDeduplication", "false"])
+		}
+		const r = new api.GetTopicAttributesResponse()
+		r.Attributes = out
+		return r
+	}
+
+	setTopicAttributes(caller: Caller, input: api.SetTopicAttributesInput): Unit throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		const v = normal(input.AttributeName, input.AttributeValue ?? "")
+		topicAttribute(input.AttributeName, v, fifo(t), false)
+		t.attributes = set(t.attributes, input.AttributeName, v)
+		save(p.db.topics, t.name, t)
+		return new Unit()
+	}
+
+	addPermission(caller: Caller, input: api.AddPermissionInput): Unit throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		if (input.AWSAccountId.length == 0) {
+			throw invalid("AWSAccountId")
+		}
+		if (input.ActionName.length == 0 || !input.ActionName.every(a => actions.includes(a))) {
+			throw invalid("Policy statement action out of service scope!")
+		}
+		const doc = policy(t) ?? defaultPolicy(p)
+		const statements = statementsOf(doc)
+		if (statements.some(s => sid(s) == input.Label)) {
+			throw invalid("Statement already exists")
+		}
+		const principals = input.AWSAccountId.map(a => json.quoted(`arn:aws:iam::${a}:root`))
+		const acts = input.ActionName.map(a => json.quoted(`SNS:${a}`))
+		statements.push(`{"Sid":${json.quoted(input.Label)},"Effect":"Allow","Principal":{"AWS":${list(principals)}},`
+			+ `"Action":${list(acts)},"Resource":${json.quoted(p.arn)}}`)
+		t.attributes = set(t.attributes, "Policy", withStatements(doc, statements))
+		save(p.db.topics, t.name, t)
+		return new Unit()
+	}
+
+	removePermission(caller: Caller, input: api.RemovePermissionInput): Unit throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		const doc = policy(t) ?? defaultPolicy(p)
+		const statements = statementsOf(doc)
+		const kept = statements.filter(s => sid(s) != input.Label)
+		if (kept.length != statements.length) {
+			t.attributes = set(t.attributes, "Policy", withStatements(doc, kept))
+			save(p.db.topics, t.name, t)
+		}
+		return new Unit()
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): api.TagResourceResponse throws Fault {
+		const [p, t] = resource(caller, input.ResourceArn)
+		t.tags = tagged(t.tags, input.Tags)
+		save(p.db.topics, t.name, t)
+		return new api.TagResourceResponse()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): api.UntagResourceResponse throws Fault {
+		const [p, t] = resource(caller, input.ResourceArn)
+		t.tags = t.tags.filter(x => !input.TagKeys.includes(x[0]))
+		save(p.db.topics, t.name, t)
+		return new api.UntagResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		const [_, t] = resource(caller, input.ResourceArn)
+		const r = new api.ListTagsForResourceResponse()
+		r.Tags = t.tags.map(x => ({ ...new api.Tag(), Key: x[0], Value: x[1] }))
+		return r
+	}
+
+	subscribe(caller: Caller, input: api.SubscribeInput): api.SubscribeResponse throws Fault {
+		const p = place(caller, input.TopicArn, "TopicArn")
+		const protocol = input.Protocol
+		if (!protocols.includes(protocol)) {
+			throw invalid(`Amazon SNS does not support this protocol string: ${protocol}`)
+		}
+		const [_, t] = topic(caller, input.TopicArn, "TopicArn")
+		const endpoint = input.Endpoint ?? ""
+		endpointOf(protocol, endpoint)
+		if (fifo(t) && protocol != "sqs") {
+			throw invalid(`Invalid protocol type: ${protocol}`)
+		}
+		if (!fifo(t) && protocol == "sqs" && endsWith(endpoint, ".fifo")) {
+			throw invalid("Invalid parameter: Endpoint Reason: FIFO SQS Queues can not be subscribed to standard SNS topics")
+		}
+		const given = normalized(input.Attributes ?? [])
+		for (const [k, v] of given) {
+			subscriptionAttribute(k, v, protocol, attribute(given, "FilterPolicyScope"),
+				attribute(given, "FilterPolicy"))
+		}
+		const r = new api.SubscribeResponse()
+		for (const [_, s] of subscriptions(p.db, t.name)) {
+			if (s.protocol == protocol && s.endpoint == endpoint) {
+				if (given.some(a => attribute(s.attributes, a[0]) != a[1])) {
+					throw invalid("Attributes Reason: Subscription already exists with different attributes")
+				}
+				r.SubscriptionArn = if (s.confirmed || input.ReturnSubscriptionArn) `${p.arn}:${s.id}`
+					else "pending confirmation"
+				return r
+			}
+		}
+		const s = new Subscription()
+		s.id = uuid(random(16))
+		s.topic = t.name
+		s.protocol = protocol
+		s.endpoint = endpoint
+		s.owner = caller.account
+		s.principal = caller.arn
+		s.confirmed = !pending.includes(protocol)
+		s.token = if (s.confirmed) "" else hex.encode(random(64))
+		s.attributes = given
+		save(p.db.subscriptions, within(t.name, s.id), s)
+		r.SubscriptionArn = if (s.confirmed || input.ReturnSubscriptionArn) `${p.arn}:${s.id}`
+			else "pending confirmation"
+		return r
+	}
+
+	confirmSubscription(caller: Caller,
+		input: api.ConfirmSubscriptionInput): api.ConfirmSubscriptionResponse throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		for (const [k, s] of subscriptions(p.db, t.name)) {
+			if (s.token != "" && s.token == input.Token) {
+				s.confirmed = true
+				save(p.db.subscriptions, k, s)
+				const r = new api.ConfirmSubscriptionResponse()
+				r.SubscriptionArn = `${p.arn}:${s.id}`
+				return r
+			}
+		}
+		throw invalid("Token")
+	}
+
+	unsubscribe(caller: Caller, input: api.UnsubscribeInput): Unit throws Fault {
+		const [p, id] = subscriptionPlace(caller, input.SubscriptionArn)
+		caller.allow(p.arn, policy(p.db.topics.get(p.name)))
+		p.db.subscriptions.delete(within(p.name, id))
+		return new Unit()
+	}
+
+	listSubscriptions(caller: Caller, input: api.ListSubscriptionsInput): api.ListSubscriptionsResponse throws Fault {
+		caller.allow(`arn:aws:sns:${caller.region}:${caller.account}:*`)
+		const [subs, next] = page(new Tables(caller.regional()).subscriptions, "", input.NextToken)
+		const r = new api.ListSubscriptionsResponse()
+		r.Subscriptions = subs.map(e => listed(caller, e[1]))
+		r.NextToken = next
+		return r
+	}
+
+	listSubscriptionsByTopic(caller: Caller,
+		input: api.ListSubscriptionsByTopicInput): api.ListSubscriptionsByTopicResponse throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		const [subs, next] = page(p.db.subscriptions, within(t.name, ""), input.NextToken)
+		const r = new api.ListSubscriptionsByTopicResponse()
+		r.Subscriptions = subs.map(e => listed(caller, e[1]))
+		r.NextToken = next
+		return r
+	}
+
+	getSubscriptionAttributes(caller: Caller,
+		input: api.GetSubscriptionAttributesInput): api.GetSubscriptionAttributesResponse throws Fault {
+		const [p, s] = subscription(caller, input.SubscriptionArn)
+		const out: [string, string][] = [["Owner", s.owner],
+			["RawMessageDelivery", attribute(s.attributes, "RawMessageDelivery") ?? "false"], ["TopicArn", p.arn],
+			["Endpoint", s.endpoint], ["Protocol", s.protocol], ["PendingConfirmation", `${!s.confirmed}`],
+			["ConfirmationWasAuthenticated", `${s.confirmed}`], ["SubscriptionArn", `${p.arn}:${s.id}`],
+			["SubscriptionPrincipal", s.principal]]
+		out.append(s.attributes.filter(a => a[0] != "RawMessageDelivery"))
+		if (attribute(s.attributes, "FilterPolicy") != null && attribute(s.attributes, "FilterPolicyScope") == null) {
+			out.push(["FilterPolicyScope", "MessageAttributes"])
+		}
+		if (s.protocol == "http" || s.protocol == "https") {
+			out.push(["EffectiveDeliveryPolicy", attribute(s.attributes, "DeliveryPolicy") ?? deliveryPolicy])
+		}
+		const r = new api.GetSubscriptionAttributesResponse()
+		r.Attributes = out
+		return r
+	}
+
+	setSubscriptionAttributes(caller: Caller, input: api.SetSubscriptionAttributesInput): Unit throws Fault {
+		const [p, s] = subscription(caller, input.SubscriptionArn)
+		const name = input.AttributeName
+		const v = normal(name, input.AttributeValue ?? "")
+		const attributes = set(s.attributes, name, v)
+		subscriptionAttribute(name, v, s.protocol, attribute(attributes, "FilterPolicyScope"),
+			attribute(attributes, "FilterPolicy"))
+		s.attributes = attributes.filter(a => a[1] != "" || a[0] == "RawMessageDelivery")
+		save(p.db.subscriptions, within(p.name, s.id), s)
+		return new Unit()
+	}
+
+	publish(caller: Caller, input: api.PublishInput): api.PublishResponse throws Fault {
+		if (input.TopicArn != null && input.PhoneNumber != null) {
+			throw invalid("TopicArn Reason: Both TopicArn and PhoneNumber specified. Use only one or the other.")
+		}
+		if (input.TopicArn != null && input.TargetArn != null) {
+			throw invalid("TopicArn Reason: Both TopicArn and TargetArn specified. Use only one or the other.")
+		}
+		if (input.TargetArn != null && input.PhoneNumber != null) {
+			throw invalid("TargetArn Reason: Both TargetArn and PhoneNumber specified. Use only one or the other.")
+		}
+		if (input.PhoneNumber != null) {
+			throw new Fault(501, "NotImplemented", "Publishing to a phone number is not implemented")
+		}
+		const a = input.TopicArn ?? input.TargetArn
+		if (a == null) {
+			throw invalid("TopicArn or TargetArn Reason: no value for required parameter")
+		}
+		if (input.TargetArn != null && indexOf(a!, ":endpoint/") >= 0) {
+			throw new Fault(501, "NotImplemented", "Publishing to a platform endpoint is not implemented")
+		}
+		const [p, t] = topic(caller, a!, if (input.TopicArn != null) "TopicArn" else "TargetArn")
+		const m = new Message()
+		m.message = input.Message
+		m.subject = input.Subject
+		m.structure = input.MessageStructure
+		m.attributes = input.MessageAttributes ?? []
+		m.dedup = input.MessageDeduplicationId
+		m.group = input.MessageGroupId
+		checked(m, t)
+		if (m.message.length + size(m.attributes) > 262144) {
+			throw invalid("Message too long")
+		}
+		const [id, seq] = this.send(caller, p, t, m)
+		const r = new api.PublishResponse()
+		r.MessageId = id
+		r.SequenceNumber = seq
+		return r
+	}
+
+	publishBatch(caller: Caller, input: api.PublishBatchInput): api.PublishBatchResponse throws Fault {
+		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
+		const entries = input.PublishBatchRequestEntries
+		if (entries.length == 0) {
+			throw api.emptyBatchRequestException("The batch request doesn't contain any entries")
+		}
+		if (entries.length > 10) {
+			throw api.tooManyEntriesInBatchRequestException("The batch request contains more entries than permissible.")
+		}
+		for (let i = 0; i < entries.length; i++) {
+			const e = entries[i]
+			if (e.Id.length < 1 || e.Id.length > 80 || !e.Id.every(c => isAlphanumeric(c) || c == 45 || c == 95)) {
+				throw api.invalidBatchEntryIdException("The Id of a batch entry in a batch request doesn't abide by the specification.")
+			}
+			for (let j = 0; j < i; j++) {
+				if (entries[j].Id == e.Id) {
+					throw api.batchEntryIdsNotDistinctException("Two or more batch entries in the request have the same Id.")
+				}
+			}
+		}
+		let total = 0
+		for (const e of entries) {
+			total += e.Message.length + size(e.MessageAttributes ?? [])
+		}
+		if (total > 262144) {
+			throw api.batchRequestTooLongException("The length of all the messages put together is more than the limit.")
+		}
+		const r = new api.PublishBatchResponse()
+		const ok: api.PublishBatchResultEntry[] = []
+		const failed: api.BatchResultErrorEntry[] = []
+		for (const e of entries) {
+			const m = new Message()
+			m.message = e.Message
+			m.subject = e.Subject
+			m.structure = e.MessageStructure
+			m.attributes = e.MessageAttributes ?? []
+			m.dedup = e.MessageDeduplicationId
+			m.group = e.MessageGroupId
+			try {
+				checked(m, t)
+				const [id, seq] = this.send(caller, p, t, m)
+				ok.push({ ...new api.PublishBatchResultEntry(), Id: e.Id, MessageId: id, SequenceNumber: seq })
+			} catch (f: Fault) {
+				failed.push({ ...new api.BatchResultErrorEntry(), Id: e.Id, Code: f.code, Message: f.message,
+					SenderFault: f.sender })
+			}
+		}
+		r.Successful = ok
+		r.Failed = failed
+		return r
+	}
+
+	/// Publishes m, checked, to t at p: its id and, on a FIFO topic, its sequence number, those of the message of
+	/// its deduplication id if one was published within five minutes, which is not delivered again.
+	private send(caller: Caller, p: Place, t: Topic, m: Message): [string, string | null] throws Fault {
+		let key = ""
+		if (fifo(t)) {
+			if (m.dedup == null) {
+				m.dedup = hex.encode(digest(m.message))
+			}
+			key = within(t.name,
+				if (attribute(t.attributes, "FifoThroughputScope") == "MessageGroup") within(m.group!, m.dedup!)
+				else m.dedup!)
+			const before = p.db.published.get(key)
+			if (before != null && now() - before.at < 5 * minute) {
+				return [before.id, before.sequence]
+			}
+		}
+		const id = uuid(random(16))
+		let seq: string | null = null
+		if (fifo(t)) {
+			t.published++
+			save(p.db.topics, t.name, t)
+			seq = sequence(t.published)
+			save(p.db.published, key, { ...new Published(), id: id, sequence: seq!, at: now() })
+		}
+		for (const [_, s] of subscriptions(p.db, t.name)) {
+			if (s.confirmed && s.protocol == "sqs") {
+				this.deliver(caller, p, t, s, m, id, seq)
+			}
+		}
+		return [id, seq]
+	}
+
+	/// Sends m, of id and sequence number seq, published to t at p, to the queue of s unless its filter policy does
+	/// not match; or to its dead-letter queue if the queue refuses it.
+	private deliver(caller: Caller, p: Place, t: Topic, s: Subscription, m: Message, id: string,
+		seq: string | null) throws Fault {
+		const payload = payloadOf(m, s.protocol)
+		if (!passes(s, m, payload)) {
+			return
+		}
+		const input = new sqsApi.SendMessageRequest()
+		input.QueueUrl = queueUrl(caller, s.endpoint)
+		if (attribute(s.attributes, "RawMessageDelivery") == "true") {
+			input.MessageBody = payload
+			input.MessageAttributes = if (m.attributes.length == 0) null
+				else m.attributes.map(a => [a[0],
+				{ ...new sqsApi.MessageAttributeValue(), DataType: a[1].DataType, StringValue: a[1].StringValue,
+				BinaryValue: a[1].BinaryValue }])
+		} else {
+			input.MessageBody = envelope(caller, p, t, s, m, payload, id, seq)
+		}
+		const queueFifo = endsWith(s.endpoint, ".fifo")
+		if (m.group != null && (queueFifo || !fifo(t))) {
+			input.MessageGroupId = m.group
+		}
+		if (queueFifo) {
+			input.MessageDeduplicationId = m.dedup
+		}
+		const as = caller.internal("sns.amazonaws.com", p.arn)
+		try {
+			this.sqs.sendMessage(as, input)
+		} catch (f: Fault) {
+			const dlq = deadLetter(s)
+			if (dlq != null) {
+				input.QueueUrl = queueUrl(caller, dlq!)
+				try {
+					this.sqs.sendMessage(as, input)
+				} catch (g: Fault) {} // dropped
+			}
+		}
+	}
+}
+
+/// A topic's place: the tables of its account in the caller's region, its name, account and ARN.
+class Place {
+	db: Tables
+	name: string
+	account: string
+	arn: string
+
+	constructor(db: Tables, name: string, account: string, arn: string) {
+		this.db = db
+		this.name = name
+		this.account = account
+		this.arn = arn
+	}
+}
+
+/// A message to publish, of Publish or an entry of PublishBatch.
+class Message {
+	message = ""
+	subject: string | null = null
+	structure: string | null = null
+	attributes: [string, api.MessageAttributeValue][] = []
+	dedup: string | null = null
+	group: string | null = null
+}
+
+/// The protocols a subscription may be of, and those of which it waits for its endpoint to confirm.
+const protocols = ["http", "https", "email", "email-json", "sms", "sqs", "application", "lambda", "firehose"]
+const pending = ["http", "https", "email", "email-json"]
+
+/// The actions that AddPermission grants.
+const actions = ["AddPermission", "ConfirmSubscription", "DeleteTopic", "GetDataProtectionPolicy",
+	"GetSubscriptionAttributes", "GetTopicAttributes", "ListSubscriptionsByTopic", "ListTagsForResource", "Publish",
+	"PutDataProtectionPolicy", "RemovePermission", "SetSubscriptionAttributes", "SetTopicAttributes", "Subscribe",
+	"TagResource", "Unsubscribe", "UntagResource"]
+
+/// The topic attributes besides those of FIFO topics, Policy, DisplayName and DeliveryPolicy, that take any value:
+/// a KMS key's id, and the roles and sample rates of delivery status logging.
+const free = ["KmsMasterKeyId", "ArchivePolicy", "ApplicationSuccessFeedbackRoleArn",
+	"ApplicationSuccessFeedbackSampleRate", "ApplicationFailureFeedbackRoleArn", "HTTPSuccessFeedbackRoleArn",
+	"HTTPSuccessFeedbackSampleRate", "HTTPFailureFeedbackRoleArn", "LambdaSuccessFeedbackRoleArn",
+	"LambdaSuccessFeedbackSampleRate", "LambdaFailureFeedbackRoleArn", "SQSSuccessFeedbackRoleArn",
+	"SQSSuccessFeedbackSampleRate", "SQSFailureFeedbackRoleArn", "FirehoseSuccessFeedbackRoleArn",
+	"FirehoseSuccessFeedbackSampleRate", "FirehoseFailureFeedbackRoleArn"]
+
+/// AWS's delivery policy of a topic or HTTP/S subscription that sets none.
+const deliveryPolicy = `{"http":{"defaultHealthyRetryPolicy":{"minDelayTarget":20,"maxDelayTarget":20,"numRetries":3,`
+	+ `"numMaxDelayRetries":0,"numNoDelayRetries":0,"numMinDelayRetries":0,"backoffFunction":"linear"},`
+	+ `"disableSubscriptionOverrides":false,"defaultRequestPolicy":{"headerContentType":"text/plain; charset=UTF-8"}}}`
+
+/// An item of a JSON array, as std/encoding/json decodes any.
+type Item = i64 | f64 | string | bool | json.Keys | null | (i64 | f64 | string | bool | json.Keys | null)[]
+
+/// The ARN of the topic name of account in the caller's region.
+function topicArn(caller: Caller, account: string, name: string): string {
+	return `arn:aws:sns:${caller.region}:${account}:${name}`
+}
+
+/// The place of the topic of ARN a, given as the member m, or the InvalidParameter it is.
+function place(caller: Caller, a: string, m: string): Place throws Fault {
+	const parts = split(a, ":")
+	if (parts.length < 6) {
+		throw invalid(`${m} Reason: An ARN must have at least 6 elements, not ${parts.length}`)
+	}
+	return placeOf(caller, parts, m)
+}
+
+/// The place of the topic of the parts of an ARN, given as the member m.
+function placeOf(caller: Caller, parts: string[], m: string): Place throws Fault {
+	if (parts[0] != "arn" || parts[1] != "aws" || parts[2] != "sns" || parts[3] != caller.region) {
+		throw invalid(m)
+	}
+	if (!named(parts[5])) {
+		throw invalid("Topic Name")
+	}
+	const account = parts[4]
+	if (account.length != 12 || !account.every(c => c >= 48 && c <= 57)) {
+		throw new Fault(403, "InvalidClientTokenId", "No account found for the given parameters")
+	}
+	const name = parts[5]
+	return new Place(new Tables(caller.tree(`${account}/${caller.region}`)), name, account,
+		topicArn(caller, account, name))
+}
+
+/// The topic of ARN a, given as the member m, and its place, once the caller is allowed it.
+function topic(caller: Caller, a: string, m: string): [Place, Topic] throws Fault {
+	const p = place(caller, a, m)
+	const t = p.db.topics.get(p.name)
+	caller.allow(p.arn, policy(t))
+	if (t == null) {
+		throw api.notFoundException("Topic does not exist")
+	}
+	return [p, t!]
+}
+
+/// The topic of the ARN a of a resource, and its place, once the caller is allowed it.
+function resource(caller: Caller, a: string): [Place, Topic] throws Fault {
+	const p = place(caller, a, "ResourceArn")
+	const t = p.db.topics.get(p.name)
+	caller.allow(p.arn, policy(t))
+	if (t == null) {
+		throw api.resourceNotFoundException("Resource does not exist")
+	}
+	return [p, t!]
+}
+
+/// The place of the topic of the subscription of ARN a, and the subscription's id.
+function subscriptionPlace(caller: Caller, a: string): [Place, string] throws Fault {
+	const parts = split(a, ":")
+	if (parts.length < 6) {
+		throw invalid(`SubscriptionArn Reason: An ARN must have at least 6 elements, not ${parts.length}`)
+	}
+	if (parts.length != 7) {
+		throw invalid("SubscriptionId")
+	}
+	return [placeOf(caller, parts, "SubscriptionArn"), parts[6]]
+}
+
+/// The subscription of ARN a, and its topic's place, once the caller is allowed the topic.
+function subscription(caller: Caller, a: string): [Place, Subscription] throws Fault {
+	const [p, id] = subscriptionPlace(caller, a)
+	caller.allow(p.arn, policy(p.db.topics.get(p.name)))
+	const s = p.db.subscriptions.get(within(p.name, id))
+	if (s == null) {
+		throw api.notFoundException("Subscription does not exist")
+	}
+	return [p, s!]
+}
+
+/// The subscriptions of the topic name, with their keys.
+function subscriptions(db: Tables, name: string): [string, Subscription][] {
+	return db.subscriptions.scan(null, 2147483647, within(name, ""))
+}
+
+/// s as a listing gives it, its ARN PendingConfirmation while it is.
+function listed(caller: Caller, s: Subscription): api.Subscription {
+	const w = new api.Subscription()
+	const arn = topicArn(caller, caller.account, s.topic)
+	w.SubscriptionArn = if (s.confirmed) `${arn}:${s.id}` else "PendingConfirmation"
+	w.Owner = s.owner
+	w.Protocol = s.protocol
+	w.Endpoint = s.endpoint
+	w.TopicArn = arn
+	return w
+}
+
+/// A page of up to 100 records of t whose keys start with prefix, after the one that token names; and the token of
+/// the next page, null after the last.
+function page[V extends Decodable](t: Table[V], prefix: string,
+	token: string | null): [[string, V][], string | null] throws Fault {
+	let after: string | null = null
+	try {
+		after = if (token == null) null else base64.decode(token!)
+	} catch (e: ParseError) {
+		throw invalid("NextToken")
+	}
+	const got = t.scan(after, 101, prefix)
+	return [got.slice(0, if (got.length < 100) got.length else 100),
+		if (got.length > 100) base64.encode(got[99][0]) else null]
+}
+
+/// Whether name is a topic's: up to 256 letters, digits, hyphens and underscores, .fifo after them for a FIFO topic.
+function named(name: string): bool {
+	const base = if (endsWith(name, ".fifo")) name.slice(0, name.length - 5) else name
+	return base.length > 0 && name.length <= 256 && base.every(c => isAlphanumeric(c) || c == 45 || c == 95)
+}
+
+/// The topic's policy, null if it has none of its own or there is no topic.
+function policy(t: Topic | null): string | null { return if (t == null) null else attribute(t.attributes, "Policy") }
+/// Whether t is a FIFO topic.
+function fifo(t: Topic): bool { return attribute(t.attributes, "FifoTopic") == "true" }
+
+/// The value v of the attribute name, lower-cased if it is a boolean.
+function normal(name: string, v: string): string {
+	switch (name) {
+		case "FifoTopic", "ContentBasedDeduplication", "RawMessageDelivery": return lower(v)
+		default: return v
+	}
+}
+
+/// attributes, each value as normal makes it.
+function normalized(attributes: [string, string][]): [string, string][] {
+	const out: [string, string][] = []
+	for (const [k, v] of attributes) {
+		out.push([k, normal(k, v)])
+	}
+	return out
+}
+
+/// Throws unless the topic attribute name may have the value v, on a FIFO topic if fifo, as created if create.
+function topicAttribute(name: string, v: string, fifo: bool, create: bool) throws Fault {
+	switch (name) {
+		case "DisplayName": if (v.length > 100) {
+			throw invalid("DisplayName")
+		}
+		case "Policy", "DeliveryPolicy": if (!object(v)) {
+			throw invalid(name)
+		}
+		case "SignatureVersion": if (v != "1" && v != "2") {
+			throw invalid(name)
+		}
+		case "TracingConfig": if (v != "PassThrough" && v != "Active") {
+			throw invalid(name)
+		}
+		case "FifoTopic":
+			if (!create) {
+				throw invalid("AttributeName")
+			}
+			if (v != "true" && v != "false") {
+				throw invalid(name)
+			}
+		case "ContentBasedDeduplication":
+			if (!fifo) {
+				throw invalid("ContentBasedDeduplication Reason: Content based deduplication can only be set for FIFO "
+					+ "topics")
+			}
+			if (v != "true" && v != "false") {
+				throw invalid(name)
+			}
+		case "FifoThroughputScope": if (!fifo || v != "Topic" && v != "MessageGroup") {
+			throw invalid(name)
+		}
+		default: if (!free.includes(name)) {
+			throw invalid("AttributeName")
+		}
+	}
+}
+
+/// Throws unless the subscription attribute name may have the value v on a subscription of protocol, whose filter
+/// policy and its scope are filter and scope, as they are with it.
+function subscriptionAttribute(name: string, v: string, protocol: string, scope: string | null,
+	filter: string | null) throws Fault {
+	switch (name) {
+		case "RawMessageDelivery":
+			if (v != "true" && v != "false") {
+				throw invalid(name)
+			}
+			if (protocol != "sqs" && protocol != "http" && protocol != "https" && protocol != "firehose") {
+				throw invalid(`Delivery protocol [${protocol}] does not support raw message delivery.`)
+			}
+		case "FilterPolicy", "FilterPolicyScope":
+			if (scope != null && scope != "MessageAttributes" && scope != "MessageBody") {
+				throw invalid(`FilterPolicyScope: Invalid filter policy scope: ${scope}`)
+			}
+			if (filter != null && filter != "") {
+				parse(filter!, scope == "MessageBody")
+			}
+		case "RedrivePolicy": if (v != "" && (!object(v) || deadLetterOf(v) == null)) {
+			throw invalid("RedrivePolicy: Invalid deadLetterTargetArn")
+		}
+		case "DeliveryPolicy": if (v != "" && !object(v)) {
+			throw invalid(name)
+		}
+		case "SubscriptionRoleArn": return
+		default: throw invalid("AttributeName")
+	}
+}
+
+/// Throws unless endpoint is one of protocol.
+function endpointOf(protocol: string, endpoint: string) throws Fault {
+	switch (protocol) {
+		case "sqs": if (sqsArn(endpoint) == null) {
+			throw invalid("SQS endpoint ARN")
+		}
+		case "http", "https": if (!startsWith(endpoint, `${protocol}://`)) {
+			throw invalid("Endpoint must match the specified protocol")
+		}
+		case "email", "email-json": if (indexOf(endpoint, "@") <= 0) {
+			throw invalid("Email address")
+		}
+		case "sms":
+			const digits = if (startsWith(endpoint, "+")) endpoint.slice(1, endpoint.length) else endpoint
+			if (digits.length == 0 || !digits.every(c => c >= 48 && c <= 57)) {
+				throw invalid("SMS endpoint")
+			}
+		case "lambda": if (!startsWith(endpoint, "arn:aws:lambda:")) {
+			throw invalid("Lambda endpoint ARN")
+		}
+		case "firehose": if (!startsWith(endpoint, "arn:aws:firehose:")) {
+			throw invalid("Firehose endpoint ARN")
+		}
+		default: if (!startsWith(endpoint, "arn:aws:sns:") || indexOf(endpoint, ":endpoint/") < 0) {
+			throw invalid("Endpoint")
+		}
+	}
+}
+
+/// The parts of a, if it is a queue's ARN.
+function sqsArn(a: string): string[] | null {
+	const parts = split(a, ":")
+	return if (parts.length == 6 && parts[0] == "arn" && parts[1] == "aws" && parts[2] == "sqs" && parts[5] != "") parts
+		else null
+}
+
+/// The URL of the queue of ARN a, at the endpoint the request came to, as SQS finds a queue: its account and name.
+function queueUrl(caller: Caller, a: string): string {
+	const parts = split(a, ":")
+	return `${caller.endpoint}/${parts[4]}/${parts[5]}`
+}
+
+/// The ARN of the dead-letter queue of the subscription s, null if none.
+function deadLetter(s: Subscription): string | null {
+	const r = attribute(s.attributes, "RedrivePolicy")
+	return if (r == null || r == "") null else deadLetterOf(r!)
+}
+
+/// The queue's ARN that the redrive policy r names, null if none.
+function deadLetterOf(r: string): string | null {
+	for (const [k, v] of members(r)) {
+		if (k == "deadLetterTargetArn") {
+			const a = text(v)
+			return if (a == null || sqsArn(a!) == null) null else a
+		}
+	}
+	return null
+}
+
+/// Throws unless m may be published to t, as SNS checks one.
+function checked(m: Message, t: Topic) throws Fault {
+	if (m.message == "") {
+		throw invalid("Empty message")
+	}
+	const subject = m.subject
+	if (subject != null && (subject.length == 0 || subject.length > 100 || !subject.every(c => c >= 32 && c < 127))) {
+		throw invalid("Subject")
+	}
+	if (m.structure != null) {
+		if (m.structure != "json") {
+			throw invalid("MessageStructure")
+		}
+		if (!object(m.message)) {
+			throw invalid("Message Structure - No JSON message body is parseable")
+		}
+		if (structured(m.message, "default") == null) {
+			throw invalid("Message Structure - No default entry in JSON message body")
+		}
+	}
+	for (const [name, v] of m.attributes) {
+		const kind = v.DataType
+		const dot = indexOf(kind, ".")
+		const base = if (dot < 0) kind else kind.slice(0, dot)
+		if (base != "String" && base != "Number" && base != "Binary") {
+			throw api.invalidParameterValueException(`The message attribute '${name}' has an invalid message attribute `
+				+ "type, the set of supported type prefixes is Binary, Number, and String.")
+		}
+		const value = if (base == "Binary") v.BinaryValue else v.StringValue
+		if (value == null || value == "") {
+			throw api.invalidParameterValueException(`The message attribute '${name}' must contain non-empty message `
+				+ `attribute value for message attribute type '${kind}'.`)
+		}
+		if (base == "Number" && number(value!) == null) {
+			throw api.invalidParameterValueException(`Could not cast message attribute '${name}' value to number.`)
+		}
+		if (kind == "String.Array" && array(value!) == null) {
+			throw api.invalidParameterValueException(`The message attribute '${name}' with type 'String.Array' has an invalid value: ${value}`)
+		}
+	}
+	if (fifo(t)) {
+		if (m.group == null) {
+			throw invalid("The MessageGroupId parameter is required for FIFO topics")
+		}
+		if (m.dedup == null && attribute(t.attributes, "ContentBasedDeduplication") != "true") {
+			throw invalid("The topic should either have ContentBasedDeduplication enabled or MessageDeduplicationId "
+				+ "provided explicitly")
+		}
+	} else if (m.dedup != null) {
+		throw invalid("MessageDeduplicationId Reason: The request includes MessageDeduplicationId parameter that is not "
+			+ "valid for this topic type")
+	}
+	token(m.group, "MessageGroupId")
+	token(m.dedup, "MessageDeduplicationId")
+}
+
+/// Throws unless id, of the member m, is null or of 1 to 128 of ASCII's printable characters but space.
+function token(id: string | null, m: string) throws Fault {
+	if (id != null && (id.length == 0 || id.length > 128 || !id.every(c => c > 32 && c < 127))) {
+		throw invalid(m)
+	}
+}
+
+/// The sequence number of a FIFO topic's nth message: 20 digits.
+function sequence(n: i64): string {
+	let s = `${n}`
+	while (s.length < 19) {
+		s = "0" + s
+	}
+	return "1" + s
+}
+
+/// The bytes of attributes that count toward a message's size: their names, types and values.
+function size(attributes: [string, api.MessageAttributeValue][]): i32 {
+	let n = 0
+	for (const [name, v] of attributes) {
+		n += name.length + v.DataType.length + (v.StringValue ?? "").length + (v.BinaryValue ?? "").length
+	}
+	return n
+}
+
+/// The message of m for a subscription of protocol: its own of a JSON structure, else the default.
+function payloadOf(m: Message, protocol: string): string {
+	return if (m.structure == null) m.message else structured(m.message, protocol) ?? structured(m.message, "default")!
+}
+
+/// The string of the member key of the JSON object s, null if none.
+function structured(s: string, key: string): string | null {
+	for (const [k, v] of members(s)) {
+		if (k == key) {
+			return text(v)
+		}
+	}
+	return null
+}
+
+/// Whether m, whose message to s is payload, passes the filter policy of s.
+function passes(s: Subscription, m: Message, payload: string): bool {
+	const f = attribute(s.attributes, "FilterPolicy")
+	if (f == null || f == "") {
+		return true
+	}
+	const body = attribute(s.attributes, "FilterPolicyScope") == "MessageBody"
+	try {
+		return matches(parse(f!, body), if (body) payload else attributesDoc(m))
+	} catch (e: Fault) {
+		return false
+	}
+}
+
+/// The attributes of m as a JSON object for a filter policy: a string's, a number's or an array's value, by name; a
+/// binary one is not filtered on.
+function attributesDoc(m: Message): string {
+	const out: string[] = []
+	for (const [name, v] of m.attributes) {
+		const value = v.StringValue ?? ""
+		if (startsWith(v.DataType, "Number")) {
+			out.push(`${json.quoted(name)}:${formatFloat(number(value) ?? 0.0)}`)
+		} else if (v.DataType == "String.Array") {
+			out.push(`${json.quoted(name)}:${value}`)
+		} else if (startsWith(v.DataType, "String")) {
+			out.push(`${json.quoted(name)}:${json.quoted(value)}`)
+		}
+	}
+	return `{${out.join(",")}}`
+}
+
+/// The notification of m, whose message to s is payload, of id and sequence number seq, published to t at p, as SNS
+/// delivers it to a queue: a JSON object of AWS's members in AWS's order, unsigned on a FIFO topic.
+function envelope(caller: Caller, p: Place, t: Topic, s: Subscription, m: Message, payload: string, id: string,
+	seq: string | null): string throws Fault {
+	const members: [string, string][] = [["Type", "Notification"], ["MessageId", id]]
+	if (seq != null) {
+		members.push(["SequenceNumber", seq!])
+	}
+	members.push(["TopicArn", p.arn])
+	if (m.subject != null) {
+		members.push(["Subject", m.subject!])
+	}
+	members.push(["Message", payload])
+	members.push(["Timestamp", timestamp(now())])
+	if (seq == null) {
+		members.push(["SignatureVersion", attribute(t.attributes, "SignatureVersion") ?? "1"])
+		members.push(["Signature", `${secret(342)}==`])
+		members.push(["SigningCertURL",
+			`https://sns.${caller.region}.amazonaws.com/SimpleNotificationService-0000000000000000000000000000000.pem`])
+	}
+	members.push(["UnsubscribeURL", `${caller.endpoint}/?Action=Unsubscribe&SubscriptionArn=${p.arn}:${s.id}`])
+	let out = `{${members.map(x => `${json.quoted(x[0])}:${json.quoted(x[1])}`).join(",")}`
+	if (m.attributes.length > 0) {
+		const attrs = m.attributes.map(a => {
+			const v = if (startsWith(a[1].DataType, "Binary")) base64.encode(a[1].BinaryValue ?? "")
+				else a[1].StringValue ?? ""
+			return `${json.quoted(a[0])}:{"Type":${json.quoted(a[1].DataType)},"Value":${json.quoted(v)}}`
+		})
+		out += `,"MessageAttributes":{${attrs.join(",")}}`
+	}
+	return out + "}"
+}
+
+/// The instant t as SNS stamps a notification: in UTC to the millisecond.
+function timestamp(t: i64): string {
+	const s = rfc3339(t - t % second)
+	return `${s.slice(0, s.length - 1)}.${`${1000 + t % second / millisecond}`.slice(1, 4)}Z`
+}
+
+/// tags with given set over them by key, at most 50.
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] throws Fault {
+	let out = tags
+	for (const g of given) {
+		out = set(out, g.Key, g.Value)
+	}
+	if (out.length > 50) {
+		throw api.tagLimitExceededException("Could not complete request: tag quota of per resource exceeded")
+	}
+	return out
+}
+
+/// AWS's policy of a topic that has none of its own: the account's own may do all with it.
+function defaultPolicy(p: Place): string {
+	return `{"Version":"2008-10-17","Id":"__default_policy_ID","Statement":[{"Sid":"__default_statement_ID",`
+		+ `"Effect":"Allow","Principal":{"AWS":"*"},"Action":["SNS:GetTopicAttributes","SNS:SetTopicAttributes",`
+		+ `"SNS:AddPermission","SNS:RemovePermission","SNS:DeleteTopic","SNS:Subscribe","SNS:ListSubscriptionsByTopic",`
+		+ `"SNS:Publish"],"Resource":"${p.arn}","Condition":{"StringEquals":{"AWS:SourceOwner":"${p.account}"}}}]}`
+}
+
+/// The statements of the policy doc, each as JSON.
+function statementsOf(doc: string): string[] {
+	for (const [k, v] of members(doc)) {
+		if (k == "Statement") {
+			return items(v) ?? [v]
+		}
+	}
+	return []
+}
+
+/// The policy doc with statements in place of its own.
+function withStatements(doc: string, statements: string[]): string {
+	const ms = members(doc).filter(m => m[0] != "Statement")
+	ms.push(["Statement", `[${statements.join(",")}]`])
+	return `{${ms.map(m => `${json.quoted(m[0])}:${m[1]}`).join(",")}}`
+}
+
+/// The Sid of the statement s, "" if none.
+function sid(s: string): string {
+	for (const [k, v] of members(s)) {
+		if (k == "Sid") {
+			return text(v) ?? ""
+		}
+	}
+	return ""
+}
+
+/// xs, JSON values, as a policy has them: the one, or an array.
+function list(xs: string[]): string { return if (xs.length == 1) xs[0] else `[${xs.join(",")}]` }
+
+/// Whether s is a JSON object.
+function object(s: string): bool {
+	try {
+		json.decode[json.Keys](s)
+		return true
+	} catch (e: ParseError) {
+		return false
+	}
+}
+
+/// The members of the JSON object s, none if it is not one.
+function members(s: string): json.Unknown[] {
+	try {
+		return json.decode[json.Keys](s).all
+	} catch (e: ParseError) {
+		return []
+	}
+}
+
+/// The items of the JSON array s, each as JSON, null if it is not an array.
+function items(s: string): string[] | null {
+	try {
+		return json.decode[Item[]](s).map(x => json.encode(x))
+	} catch (e: ParseError | json.EncodeError) {
+		return null
+	}
+}
+
+/// The items of the JSON array s, null if it is not an array of scalars.
+function array(s: string): string[] | null {
+	const xs = items(s)
+	return if (xs == null || xs!.some(j => startsWith(j, "{") || startsWith(j, "["))) null else xs
+}
+
+/// The string of the JSON value v, null if it is not a string.
+function text(v: string): string | null {
+	try {
+		return json.decode[string](v)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The number s is, null if none.
+function number(s: string): f64 | null {
+	try {
+		return parseFloat(s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// A UUID of the 16 bytes b, as AWS's message and subscription ids are.
+function uuid(b: string): string {
+	const h = hex.encode(b)
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+/// n random bytes.
+function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}
+
+/// The SHA-256 of s, by which a FIFO topic of content-based deduplication deduplicates.
+function digest(s: string): string throws Fault {
+	try {
+		return sha256(s)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", e.what)
+	}
+}
+
+function invalid(why: string): Fault { return api.invalidParameterException(`Invalid parameter: ${why}`) }

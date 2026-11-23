@@ -1,0 +1,99 @@
+import { Fault } from "../../core/fault"
+import { matches, parse } from "./filter"
+
+/// Whether the policy, of a body if body, matches doc.
+function match(policy: string, doc: string, body = true): bool { return matches(parse(policy, body), doc) }
+
+/// The message of the fault that the policy is, "" if it is valid.
+function why(policy: string, body = false): string {
+	try {
+		parse(policy, body)
+	} catch (f: Fault) {
+		assert f.code == "InvalidParameter" && f.status == 400
+		return f.message
+	}
+	return ""
+}
+
+test "exact strings and numbers, arrays as any of" {
+	assert match(`{"color":["red","blue"]}`, `{"color":"blue"}`)
+	assert !match(`{"color":["red"]}`, `{"color":"green"}`)
+	assert !match(`{"color":["red"]}`, `{}`)
+	assert match(`{"color":["red"]}`, `{"color":["green","red"]}`)
+	assert match(`{"n":[5]}`, `{"n":5.0}`)
+	assert !match(`{"n":[5]}`, `{"n":"5"}`)
+	assert !match(`{"n":["5"]}`, `{"n":5}`)
+	assert match(`{"b":[true,null]}`, `{"b":null}`)
+	assert match(`{}`, `{"x":1}`)
+	assert !match(`{}`, `not json`)
+	assert match(`{"a":["x"],"b":["y"]}`, `{"a":"x","b":"y"}`)
+	assert !match(`{"a":["x"],"b":["y"]}`, `{"a":"x","b":"z"}`)
+}
+
+test "prefix, suffix, equals-ignore-case, anything-but" {
+	assert match(`{"s":[{"prefix":"ab"}]}`, `{"s":"abc"}`)
+	assert !match(`{"s":[{"prefix":"ab"}]}`, `{"s":"cab"}`)
+	assert match(`{"s":[{"suffix":".png"}]}`, `{"s":"a.png"}`)
+	assert match(`{"s":[{"equals-ignore-case":"ReD"}]}`, `{"s":"rEd"}`)
+	assert match(`{"s":[{"anything-but":["a","b"]}]}`, `{"s":"c"}`)
+	assert !match(`{"s":[{"anything-but":["a","b"]}]}`, `{"s":"a"}`)
+	assert !match(`{"s":[{"anything-but":"a"}]}`, `{}`)
+	assert match(`{"n":[{"anything-but":[1,2]}]}`, `{"n":3}`)
+	assert !match(`{"n":[{"anything-but":[1,2]}]}`, `{"n":2.0}`)
+	assert match(`{"s":[{"anything-but":{"prefix":"x"}}]}`, `{"s":"yx"}`)
+	assert !match(`{"s":[{"anything-but":{"prefix":"x"}}]}`, `{"s":"xy"}`)
+	assert !match(`{"s":[{"anything-but":{"suffix":"x"}}]}`, `{"s":"yx"}`)
+}
+
+test "numeric ranges and exists" {
+	assert match(`{"n":[{"numeric":[">",0,"<=",10]}]}`, `{"n":10}`)
+	assert !match(`{"n":[{"numeric":[">",0,"<=",10]}]}`, `{"n":0}`)
+	assert match(`{"n":[{"numeric":["=",3.5]}]}`, `{"n":3.5}`)
+	assert match(`{"n":[{"numeric":["<",0]}]}`, `{"n":-1e3}`)
+	assert !match(`{"n":[{"numeric":["<",0]}]}`, `{"n":"-1"}`)
+	assert match(`{"a":[{"exists":true}]}`, `{"a":{"b":1}}`)
+	assert !match(`{"a":[{"exists":true}]}`, `{"b":1}`)
+	assert match(`{"a":[{"exists":false}]}`, `{"b":1}`)
+}
+
+test "nested keys and $or" {
+	const p = `{"store":{"city":["Lyon"],"open":[true]}}`
+	assert match(p, `{"store":{"city":"Lyon","open":true}}`)
+	assert !match(p, `{"store":{"city":"Paris","open":true}}`)
+	assert match(p, `{"store":[{"city":"Nice"},{"city":"Lyon","open":true}]}`)
+	assert !match(p, `{"store":"Lyon"}`)
+	const or = `{"a":["1"],"$or":[{"b":["2"]},{"c":[{"exists":true}]}]}`
+	assert match(or, `{"a":"1","c":0}`)
+	assert match(or, `{"a":"1","b":"2"}`)
+	assert !match(or, `{"a":"1","b":"3"}`)
+	assert !match(or, `{"b":"2"}`)
+}
+
+test "validation, in SNS's words" {
+	const head = "Invalid parameter: FilterPolicy: "
+	assert why(`{"a":["x"]}`) == ""
+	assert why(`{"a":`) == head + "failed to parse JSON."
+	assert why(`{"a":"x"}`) == head + `"a" must be an object or an array`
+	assert why(`{"a":[]}`) == head + "Empty arrays are not allowed"
+	assert why(`{"a":[["x"]]}`) == head + "Match value must be String, number, true, false, or null"
+	assert why(`{"a":{"b":["x"]}}`)
+		== head + "Filter policy scope MessageAttributes does not support nested filter policy"
+	assert why(`{"a":{"b":["x"]}}`, true) == ""
+	assert why(`{"a":[{"prefix":1}]}`) == head + "prefix match pattern must be a string"
+	assert why(`{"a":[{"exists":"yes"}]}`) == head + "exists match pattern must be either true or false."
+	assert why(`{"a":[{"wildcard*":"x"}]}`) == head + "Unrecognized match type wildcard*"
+	assert why(`{"a":[{"anything-but":true}]}`)
+		== head + "Value of anything-but must be an array or single string/number value."
+	assert why(`{"a":[{"anything-but":[null]}]}`)
+		== head + "Inside anything but list, start|null|boolean is not supported."
+	assert why(`{"a":[{"numeric":[">","x"]}]}`) == head + "Value of > must be numeric"
+	assert why(`{"a":[{"numeric":["~",1]}]}`) == head + "Unrecognized numeric range operator: ~"
+	assert why(`{"a":[{"numeric":[">",1,">",2]}]}`) == head + "Bad numeric range operator: >"
+	assert why(`{"a":[{"numeric":["=",1,"<",2]}]}`) == head + "Too many elements in numeric expression"
+	assert why(`{"a":[{"numeric":[">",5,"<",2]}]}`) == head + "Bottom must be less than top"
+	assert why(`{"a":["1"],"b":["1"],"c":["1"],"d":["1"],"e":["1"],"f":["1"]}`)
+		== head + "Filter policy can not have more than 5 keys"
+	const many = `["0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19"]`
+	assert why(`{"a":${many},"b":${many}}`) == head + "Filter policy is too complex"
+	assert why(`{"$or":[{"a":["1"]}]}`) == head + "$or must be an array of at least 2 filter policies"
+}
