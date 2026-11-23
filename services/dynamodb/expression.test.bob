@@ -94,6 +94,14 @@ test "condition errors as DynamoDB words them" {
 	assert check("a < :l")
 		== "Invalid ConditionExpression: Incorrect operand type for operator or function; operator "
 		+ "or function: <, operand type: L"
+	const word = "Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: "
+	assert check("a = :x AND (b = :x OR attribute_exists(m.Data))") == word + "Data"
+	assert check("Status = :v")
+		== "Invalid ConditionExpression: An expression attribute value used in expression is "
+		+ "not defined; attribute value: :v"
+	assert check("size = :x OR #m = :x") == "false"
+	assert updated("SET status = :x")
+		== "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved " + "keyword: status"
 }
 
 test "unused placeholders" {
@@ -111,9 +119,9 @@ test "updates" {
 	assert updated("SET n = n + :one, e = :x REMOVE t")
 		== `{"pk":{"S":"abc"},"n":{"N":"2.5"},"s":{"SS":["a","b"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[{"N":"1"},`
 		+ `{"S":"y"},{"N":"3"}]}}},"e":{"S":"x"}}`
-	assert updated("set m.l[1] = :two, m.l[9] = :x, m.new = if_not_exists(m.k, :ab) remove m.l[0], m.l[2]")
+	assert updated("set m.l[1] = :two, m.l[9] = :x, m.fresh = if_not_exists(m.k, :ab) remove m.l[0], m.l[2]")
 		== `{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a","b"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[{"N":"2"},`
-		+ `{"S":"x"}]},"new":{"S":"x"}}},"t":{"BOOL":true},"e":{"S":""}}`
+		+ `{"S":"x"}]},"fresh":{"S":"x"}}},"t":{"BOOL":true},"e":{"S":""}}`
 	const u = updated("SET m.l = list_append(:l, m.l), z = :two - n ADD s :ss, c :one")
 	assert u
 		== `{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a","b","z"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[`

@@ -1,6 +1,5 @@
 //! DynamoDB's expressions: conditions, as ConditionExpression, KeyConditionExpression and FilterExpression take them;
 //! updates; and projections. Each is parsed into a tree, its placeholders resolved, then evaluated against an item.
-//! Unlike DynamoDB, a name that is one of its reserved words is taken as a name.
 
 import { Fault } from "../../core/fault"
 import * as api from "./api"
@@ -8,6 +7,7 @@ import { add, compare as compareNumbers, format, negate, parse } from "./number"
 import { indexOf, startsWith, stableSort } from "std/algo"
 import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
 import { lower } from "std/string"
+import { reserved } from "./reserved"
 
 /// An item, or a map: its attributes by name.
 export type Item = [string, api.AttributeValue][]
@@ -91,6 +91,7 @@ export function condition(s: string, what: string, c: Context): Node throws Faul
 	const p = new Parser(s, what, c)
 	const n = p.condition()
 	p.end()
+	p.unreserved()
 	return n
 }
 
@@ -140,6 +141,7 @@ export function update(s: string, c: Context): Action[] throws Fault {
 	if (out.length == 0) {
 		throw invalid("UpdateExpression", "The expression can not be empty;")
 	}
+	p.unreserved()
 	overlaps(out.map(a => a.path), "UpdateExpression")
 	return out
 }
@@ -153,6 +155,7 @@ export function projection(s: string, c: Context): Step[][] throws Fault {
 		out.push(p.path())
 	}
 	p.end()
+	p.unreserved()
 	overlaps(out, "ProjectionExpression")
 	return out
 }
@@ -252,6 +255,8 @@ class Parser {
 	c: Context
 	toks: Token[]
 	i = 0
+	/// The first name read that is a reserved word, "" if none.
+	word = ""
 
 	constructor(src: string, what: string, c: Context) throws Fault {
 		this.src = src
@@ -293,6 +298,13 @@ class Parser {
 	end() throws Fault {
 		if (this.peek().kind != "eof") {
 			throw this.syntax(this.i)
+		}
+	}
+
+	/// Throws if a name read is a reserved word, which DynamoDB checks once the rest of the expression is.
+	unreserved() throws Fault {
+		if (this.word != "") {
+			throw invalid(this.what, `Attribute name is a reserved keyword; reserved keyword: ${this.word}`)
 		}
 	}
 
@@ -529,6 +541,11 @@ class Parser {
 		const s = new Step()
 		if (t.kind == "name") {
 			s.name = t.text
+			// size, a function's name, is taken as a name, as AWS takes it
+			const u = upper(t.text)
+			if (this.word == "" && u != "SIZE" && reserved.includes(u)) {
+				this.word = t.text
+			}
 		} else if (t.kind == "#") {
 			s.name = this.c.name(t.text, this.what)
 		} else {
@@ -832,6 +849,11 @@ export function apply(actions: Action[], item: Item): Item throws Fault {
 				const was = resolve(a.path, out)
 				if (was == null) {
 					put(out, a.path, v)
+				} else if (was instanceof api.AttributeValue$L && v instanceof api.AttributeValue$L) {
+					// only AttributeUpdates adds to a list, at its end
+					const all = was.L.slice(0, was.L.length)
+					all.append(v.L)
+					put(out, a.path, { ...new api.AttributeValue$L(), L: all })
 				} else if (was instanceof api.AttributeValue$N && v instanceof api.AttributeValue$N) {
 					put(out, a.path, { ...new api.AttributeValue$N(), N: format(add(parse(was.N), parse(v.N))) })
 				} else if (typeName(was!) == typeName(v)) {

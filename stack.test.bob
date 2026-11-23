@@ -365,7 +365,8 @@ test "a user with no policy is denied by each service, as each words it" {
 	let res = call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k)
 	assert fails(res, 403, "AccessDenied",
 		`${who} sqs:sendmessage on resource: ${queueArn("q")} because no `
-		+ "identity-based policy allows the sqs:sendmessage action")
+		+ "identity-based policy allows the sqs:sendmessage action. Go to https://us-east-1.console.aws.amazon.com/iam/"
+		+ "home?region=us-east-1#/authorization-details/")
 	res = publish(g, topicArn("t"), "x", "", k)
 	assert fails(res, 403, "AuthorizationError",
 		`${who} SNS:Publish on resource: ${topicArn("t")} because no `
@@ -474,7 +475,8 @@ test "an explicit deny in a resource policy binds the owner's users" {
 	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k), 403,
 		"AccessDenied",
 		"User: arn:aws:iam::000000000000:user/bob is not authorized to perform: sqs:sendmessage on "
-		+ `resource: ${queueArn("q")} with an explicit deny in a resource-based policy`)
+		+ `resource: ${queueArn("q")} with an explicit deny in a resource-based policy. Go to https://us-east-1.console.`
+		+ "aws.amazon.com/iam/home?region=us-east-1#/authorization-details/")
 	assert fails(publish(g, topicArn("t"), "x", "", k), 403, "AuthorizationError")
 	assert call(g, "sqs", "ReceiveMessage", `{"QueueUrl":"${queueUrl("q")}"}`, k).status == 200
 	g.close()

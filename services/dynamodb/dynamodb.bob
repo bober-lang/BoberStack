@@ -1,11 +1,13 @@
 //! Amazon DynamoDB: tables with their secondary indexes, tags and time to live; items, read and written one at a time,
-//! in batches and in transactions, with condition, update and projection expressions; and Query and Scan. A request is
-//! one transaction over the state, so a write and its indexes' entries commit together or not at all. Known
-//! differences from AWS, as nothing here runs but requests: tables and indexes are ACTIVE at once, time to live is
-//! stored but nothing expires, and streams are described but never written. A Query in descending order reads its
-//! whole range first; Scan returns items in the order of their keys' encoding.
+//! in batches and in transactions, with condition, update and projection expressions or the parameters they replaced;
+//! Query and Scan; and PartiQL's statements, as the operations they amount to. A request is one transaction over the
+//! state, so a write and its indexes' entries commit together or not at all. Known differences from AWS, as nothing
+//! here runs but requests: tables and indexes are ACTIVE at once, time to live is stored but nothing expires, streams
+//! are described but never written, and point-in-time recovery is stored but nothing can be restored. Scan, and a
+//! SELECT, which is one, return items in the order of their keys' encoding.
 
 import { Fault } from "../../core/fault"
+import { result } from "../../core/protocol/json"
 import { Violations } from "../../core/protocol/model"
 import { Caller, requestTags, Unit } from "../../core/service"
 import * as service from "../../core/service"
@@ -15,14 +17,19 @@ import { Action, apply, condition, Context, copy, holds, invalid, Item, Node, pr
 	typeName, update, validation } from "./expression"
 
 import { encode, escaped } from "./key"
+import { attributes, expected, filter, unmixed, updates } from "./legacy"
 import { format, parse } from "./number"
+import { joined, statement, Statement, Term } from "./partiql"
 
 import { attribute, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected, sizeOf,
-	stored, Tables, typeOf } from "./records"
+	stored, Tables, Token, typeOf } from "./records"
 
 import { id } from "../../core/auth/credentials"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as b64 from "std/encoding/base64"
+import { EncodeError } from "std/encoding/json"
+import { ParseError } from "std/string"
+import { minute } from "std/time"
 
 /// The service, of the operations implemented.
 export class Handler {
@@ -275,21 +282,34 @@ export class Handler {
 
 	describeContinuousBackups(caller: Caller,
 		input: api.DescribeContinuousBackupsInput): api.DescribeContinuousBackupsOutput throws Fault {
-		table(caller, input.TableName)
 		const r = new api.DescribeContinuousBackupsOutput()
-		r.ContinuousBackupsDescription = new api.ContinuousBackupsDescription()
-		r.ContinuousBackupsDescription!.ContinuousBackupsStatus = "ENABLED"
-		r.ContinuousBackupsDescription!.PointInTimeRecoveryDescription = { ...new api.PointInTimeRecoveryDescription(),
-			PointInTimeRecoveryStatus: "DISABLED" }
+		r.ContinuousBackupsDescription = backups(table(caller, input.TableName))
+		return r
+	}
+
+	updateContinuousBackups(caller: Caller,
+		input: api.UpdateContinuousBackupsInput): api.UpdateContinuousBackupsOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const s = input.PointInTimeRecoverySpecification
+		if (s.PointInTimeRecoveryEnabled && !d.recovery) {
+			d.recoverySince = now()
+		}
+		d.recovery = s.PointInTimeRecoveryEnabled
+		d.recoveryDays = if (d.recovery) s.RecoveryPeriodInDays ?? 35 else 0
+		new Tables(caller.regional()).save(d)
+		const r = new api.UpdateContinuousBackupsOutput()
+		r.ContinuousBackupsDescription = backups(d)
 		return r
 	}
 
 	putItem(caller: Caller, input: api.PutItemInput): api.PutItemOutput throws Fault {
 		let cond: Node | null = null
 		try {
+			unmixed([["Expected", input.Expected != null], ["ConditionalOperator", input.ConditionalOperator != null]],
+				[["ConditionExpression", input.ConditionExpression != null]])
 			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
 			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
-				input.ExpressionAttributeValues)
+				input.ExpressionAttributeValues) ?? expected(input.Expected, input.ConditionalOperator)
 			allOldOrNone(input.ReturnValues)
 			values(input.Item)
 		} catch (f: Fault) {
@@ -309,9 +329,12 @@ export class Handler {
 	}
 
 	getItem(caller: Caller, input: api.GetItemInput): api.GetItemOutput throws Fault {
+		unmixed([["AttributesToGet", input.AttributesToGet != null]],
+			[["ProjectionExpression", input.ProjectionExpression != null]])
 		const c = new Context(input.ExpressionAttributeNames, null)
-		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
-		placeholders(c, paths != null, input.ExpressionAttributeNames, null)
+		const paths = if (input.ProjectionExpression == null) attributes(input.AttributesToGet)
+			else projection(input.ProjectionExpression!, c)
+		placeholders(c, input.ProjectionExpression != null, input.ExpressionAttributeNames, null)
 		caller.actions = ["dynamodb:GetItem"]
 		const d = table(caller, input.TableName, null, d => keys(d, [input.Key], attributesOf(paths)))
 		const db = new Tables(caller.regional())
@@ -326,9 +349,11 @@ export class Handler {
 	deleteItem(caller: Caller, input: api.DeleteItemInput): api.DeleteItemOutput throws Fault {
 		let cond: Node | null = null
 		try {
+			unmixed([["Expected", input.Expected != null], ["ConditionalOperator", input.ConditionalOperator != null]],
+				[["ConditionExpression", input.ConditionExpression != null]])
 			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
 			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
-				input.ExpressionAttributeValues)
+				input.ExpressionAttributeValues) ?? expected(input.Expected, input.ConditionalOperator)
 			allOldOrNone(input.ReturnValues)
 		} catch (f: Fault) {
 			throw counted(f)
@@ -352,10 +377,16 @@ export class Handler {
 		let actions: Action[] = []
 		let cond: Node | null = null
 		try {
+			unmixed([["Expected", input.Expected != null], ["ConditionalOperator", input.ConditionalOperator != null],
+				["AttributeUpdates", input.AttributeUpdates != null]],
+				[["ConditionExpression", input.ConditionExpression != null],
+				["UpdateExpression", input.UpdateExpression != null]])
 			const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
-			actions = if (input.UpdateExpression == null) [] else update(input.UpdateExpression!, c)
+			actions = if (input.UpdateExpression == null) updates(input.AttributeUpdates ?? [])
+				else update(input.UpdateExpression!, c)
 			cond = conditional(c, input.ConditionExpression, input.ExpressionAttributeNames,
 				input.ExpressionAttributeValues, input.UpdateExpression != null)
+				?? expected(input.Expected, input.ConditionalOperator)
 		} catch (f: Fault) {
 			throw counted(f)
 		}
@@ -392,29 +423,37 @@ export class Handler {
 	}
 
 	query(caller: Caller, input: api.QueryInput): api.QueryOutput throws Fault {
+		unmixed([["AttributesToGet", input.AttributesToGet != null], ["QueryFilter", input.QueryFilter != null],
+			["ConditionalOperator", input.ConditionalOperator != null], ["KeyConditions", input.KeyConditions != null]],
+			[["ProjectionExpression", input.ProjectionExpression != null],
+			["FilterExpression", input.FilterExpression != null],
+			["KeyConditionExpression", input.KeyConditionExpression != null]])
 		const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
-		if (input.KeyConditionExpression == null) {
+		const old = input.KeyConditions != null
+		if (input.KeyConditionExpression == null && !old) {
 			throw validation("Either the KeyConditions or KeyConditionExpression parameter must be specified in the "
 				+ "request.")
 		}
-		const keyed = condition(input.KeyConditionExpression!, "KeyConditionExpression", c)
-		const filter = if (input.FilterExpression == null) null
+		const keyed = if (old) filter(input.KeyConditions, null)!
+			else condition(input.KeyConditionExpression!, "KeyConditionExpression", c)
+		const kept = if (input.FilterExpression == null) filter(input.QueryFilter, input.ConditionalOperator)
 			else condition(input.FilterExpression!, "FilterExpression", c)
-		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
-		placeholders(c, true, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+		const paths = if (input.ProjectionExpression == null) attributes(input.AttributesToGet)
+			else projection(input.ProjectionExpression!, c)
+		placeholders(c, !old, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
 		limited(input.Limit)
 		const d = table(caller, input.TableName, input.IndexName, d => {
 			const x = indexed(d, input.IndexName, null)
 			const out = keys(d, [], attributesOf(paths))
 			if (x == null) {
-				const [hash, _] = keyConditions(d, x, keyed)
+				const [hash, _] = keyConditions(d, x, keyed, old)
 				out.push(["dynamodb:LeadingKeys", [text(hash.args[1].value!)]])
 			}
 			return out
 		})
 		const x = indexed(d, input.IndexName, input.ConsistentRead)
-		const select = selected(input.Select, paths, x)
-		const [hash, range] = keyConditions(d, x, keyed)
+		const select = selected(input.Select, paths, x, input.AttributesToGet != null)
+		const [hash, range] = keyConditions(d, x, keyed, old)
 		const prefix = (if (x == null) items(d.name) else entries(d.name, x!.name)) + encode(hash.args[1].value!)
 		let from = prefix
 		if (range != null && range!.kind == "begins_with") {
@@ -424,7 +463,7 @@ export class Handler {
 			from = prefix + lo.slice(0, lo.length - 1)
 		}
 		const p = read(new Tables(caller.regional()), d, x, prefix, from, input.ScanIndexForward ?? true,
-			start(d, x, input.ExclusiveStartKey), input.Limit, keyed, filter, 0, 1)
+			start(d, x, input.ExclusiveStartKey), input.Limit, keyed, kept, 0, 1)
 		return { ...new api.QueryOutput(), Items: shaped(caller, d, x, p.items, select, paths), Count: p.items.length,
 			ScannedCount: p.scanned, LastEvaluatedKey: p.last,
 			ConsumedCapacity: consumed(input.ReturnConsumedCapacity, d.name,
@@ -432,12 +471,17 @@ export class Handler {
 	}
 
 	scan(caller: Caller, input: api.ScanInput): api.ScanOutput throws Fault {
+		unmixed([["AttributesToGet", input.AttributesToGet != null], ["ScanFilter", input.ScanFilter != null],
+			["ConditionalOperator", input.ConditionalOperator != null]],
+			[["ProjectionExpression", input.ProjectionExpression != null],
+			["FilterExpression", input.FilterExpression != null]])
 		const c = new Context(input.ExpressionAttributeNames, input.ExpressionAttributeValues)
-		const filter = if (input.FilterExpression == null) null
+		const kept = if (input.FilterExpression == null) filter(input.ScanFilter, input.ConditionalOperator)
 			else condition(input.FilterExpression!, "FilterExpression", c)
-		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
-		placeholders(c, filter != null || paths != null, input.ExpressionAttributeNames,
-			input.ExpressionAttributeValues)
+		const paths = if (input.ProjectionExpression == null) attributes(input.AttributesToGet)
+			else projection(input.ProjectionExpression!, c)
+		placeholders(c, input.FilterExpression != null || input.ProjectionExpression != null,
+			input.ExpressionAttributeNames, input.ExpressionAttributeValues)
 		limited(input.Limit)
 		if (input.Segment != null && input.TotalSegments == null) {
 			throw validation("The TotalSegments parameter is required but was not present in the request when Segment "
@@ -460,10 +504,10 @@ export class Handler {
 		caller.actions = ["dynamodb:Scan"]
 		const d = table(caller, input.TableName, input.IndexName, d => keys(d, [], attributesOf(paths)))
 		const x = indexed(d, input.IndexName, input.ConsistentRead)
-		const select = selected(input.Select, paths, x)
+		const select = selected(input.Select, paths, x, input.AttributesToGet != null)
 		const prefix = if (x == null) items(d.name) else entries(d.name, x!.name)
 		const p = read(new Tables(caller.regional()), d, x, prefix, prefix, true, start(d, x, input.ExclusiveStartKey),
-			input.Limit, null, filter, segment, total)
+			input.Limit, null, kept, segment, total)
 		return { ...new api.ScanOutput(), Items: shaped(caller, d, x, p.items, select, paths), Count: p.items.length,
 			ScannedCount: p.scanned, LastEvaluatedKey: p.last,
 			ConsumedCapacity: consumed(input.ReturnConsumedCapacity, d.name,
@@ -484,9 +528,12 @@ export class Handler {
 		r.UnprocessedKeys = []
 		const used: api.ConsumedCapacity[] = []
 		for (const [name, ka] of input.RequestItems) {
+			unmixed([["AttributesToGet", ka.AttributesToGet != null]],
+				[["ProjectionExpression", ka.ProjectionExpression != null]])
 			const c = new Context(ka.ExpressionAttributeNames, null)
-			const paths = if (ka.ProjectionExpression == null) null else projection(ka.ProjectionExpression!, c)
-			placeholders(c, paths != null, ka.ExpressionAttributeNames, null)
+			const paths = if (ka.ProjectionExpression == null) attributes(ka.AttributesToGet)
+				else projection(ka.ProjectionExpression!, c)
+			placeholders(c, ka.ProjectionExpression != null, ka.ExpressionAttributeNames, null)
 			const d = table(caller, name, null, d => keys(d, ka.Keys, attributesOf(paths)))
 			const seen: string[] = []
 			const found: Item[] = []
@@ -610,6 +657,16 @@ export class Handler {
 				}
 			}
 		}
+		// A token used within 10 minutes answers for its request, written once, and refuses another.
+		const request = result({ ...new api.TransactWriteItemsInput(), TransactItems: input.TransactItems })
+		const token = if (input.ClientRequestToken == null) null else db.tokens.get(input.ClientRequestToken!)
+		if (token != null && now() - token!.at < 10 * minute) {
+			if (token!.request != request) {
+				throw api.idempotentParameterMismatchException("DynamoDB rejected the request because you retried a "
+					+ "request with a different payload but with an idempotent token that was already used.")
+			}
+			return new api.TransactWriteItemsOutput()
+		}
 		const reasons: api.CancellationReason[] = []
 		let failed = false
 		for (const p of planned) {
@@ -639,8 +696,226 @@ export class Handler {
 				write(db, p.d, p.k, p.before, after)
 			}
 		}
+		if (input.ClientRequestToken != null) {
+			try {
+				db.tokens.put(input.ClientRequestToken!, { ...new Token(), at: now(), request: request })
+			} catch (e: EncodeError) {
+				throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+			}
+		}
 		return new api.TransactWriteItemsOutput()
 	}
+
+	executeStatement(caller: Caller, input: api.ExecuteStatementInput): api.ExecuteStatementOutput throws Fault {
+		const s = statement(input.Statement, input.Parameters)
+		const inner = partiql(caller, s)
+		if (s.kind != "select") {
+			this.change(inner, s, input.ReturnValuesOnConditionCheckFailure)
+			return { ...new api.ExecuteStatementOutput(), Items: [] }
+		}
+		let from: Item | null = null
+		if (input.NextToken != null) {
+			try {
+				from = parsed(b64.decode(input.NextToken!))
+			} catch (e: ParseError) {
+				throw validation("Invalid NextToken")
+			}
+		}
+		const r = this.scan(inner,
+			{ ...new api.ScanInput(), TableName: s.table, IndexName: s.index, Limit: input.Limit,
+			ConsistentRead: input.ConsistentRead, ProjectionExpression: s.projection, FilterExpression: joined(s.terms),
+			ExpressionAttributeNames: namesOf(s.names, s.terms), ExpressionAttributeValues: valuesOf([], s.terms),
+			ExclusiveStartKey: from, ReturnConsumedCapacity: input.ReturnConsumedCapacity })
+		return { ...new api.ExecuteStatementOutput(), Items: r.Items, LastEvaluatedKey: r.LastEvaluatedKey,
+			NextToken: if (r.LastEvaluatedKey == null) null else base64(stored(r.LastEvaluatedKey!)),
+			ConsumedCapacity: r.ConsumedCapacity }
+	}
+
+	batchExecuteStatement(caller: Caller,
+		input: api.BatchExecuteStatementInput): api.BatchExecuteStatementOutput throws Fault {
+		const out: api.BatchStatementResponse[] = []
+		for (const q of input.Statements) {
+			const r = new api.BatchStatementResponse()
+			try {
+				const s = statement(q.Statement, q.Parameters)
+				const inner = partiql(caller, s)
+				if (s.kind == "select") {
+					r.Item = this.got(inner, s, q.ConsistentRead)
+				} else {
+					this.change(inner, s, q.ReturnValuesOnConditionCheckFailure)
+				}
+				r.TableName = s.table
+			} catch (f: Fault) {
+				const code = if (f.code == "ValidationException") "ValidationError"
+					else if (lastIndexOf(f.code, "Exception") == f.code.length - 9) f.code.slice(0, f.code.length - 9)
+					else f.code
+				r.Error = { ...new api.BatchStatementError(), Code: code as api.BatchStatementErrorCodeEnum,
+					Message: f.message }
+			}
+			out.push(r)
+		}
+		return { ...new api.BatchExecuteStatementOutput(), Responses: out }
+	}
+
+	executeTransaction(caller: Caller, input: api.ExecuteTransactionInput): api.ExecuteTransactionOutput throws Fault {
+		const ss: Statement[] = []
+		for (let i = 0; i < input.TransactStatements.length; i++) {
+			const t = input.TransactStatements[i]
+			try {
+				ss.push(statement(t.Statement, t.Parameters))
+			} catch (f: Fault) {
+				throw if (f.code
+					== "ValidationException") validation(`Validation failed in TransactStatements[${i}]: ` + f.message)
+					else f
+			}
+		}
+		const reads = ss.filter(s => s.kind == "select").length
+		if (reads > 0 && reads < ss.length) {
+			throw validation("ExecuteTransaction API does not support both read and write operations in the same "
+				+ "request.")
+		}
+		const r = new api.ExecuteTransactionOutput()
+		const writes: api.TransactWriteItem[] = []
+		let inner = caller
+		for (let i = 0; i < ss.length; i++) {
+			inner = partiql(caller, ss[i])
+			if (reads > 0) {
+				r.Responses = r.Responses ?? []
+				r.Responses!.push({ ...new api.ItemResponse(), Item: this.got(inner, ss[i], true) })
+			} else {
+				writes.push(transacted(inner, ss[i], input.TransactStatements[i].ReturnValuesOnConditionCheckFailure))
+			}
+		}
+		if (writes.length > 0) {
+			this.transactWriteItems(inner,
+				{ ...new api.TransactWriteItemsInput(), TransactItems: writes,
+				ClientRequestToken: input.ClientRequestToken })
+		}
+		return r
+	}
+
+	/// The item that the SELECT s reads by its key, as a GetItem, if its other terms hold for it.
+	got(caller: Caller, s: Statement, consistent: bool | null): Item | null throws Fault {
+		const d = table(caller, s.table)
+		const [key, rest] = keyed(d, s.terms)
+		const item = this.getItem(caller,
+			{ ...new api.GetItemInput(), TableName: s.table, Key: key, ConsistentRead: consistent }).Item
+		if (item == null
+			|| rest.length > 0
+			&& !holds(condition(joined(rest)!, "ConditionExpression",
+			new Context(namesOf([], rest), valuesOf([], rest))), item!)) {
+			return null
+		}
+		return if (s.projection == null) item else project(item!, projection(s.projection!, new Context(s.names, null)))
+	}
+
+	/// Does the write s, an INSERT of an item whose key no other has, an UPDATE or a DELETE.
+	change(caller: Caller, s: Statement, onFailure: api.ReturnValuesOnConditionCheckFailure | null) throws Fault {
+		const w = transacted(caller, s, onFailure)
+		if (w.Put != null) {
+			const p = w.Put!
+			try {
+				this.putItem(caller,
+					{ ...new api.PutItemInput(), TableName: p.TableName, Item: p.Item,
+					ConditionExpression: p.ConditionExpression, ExpressionAttributeNames: p.ExpressionAttributeNames })
+			} catch (f: Fault) {
+				throw if (f.code == "ConditionalCheckFailedException") api.duplicateItemException("Duplicate primary key exists in table")
+					else f
+			}
+		} else if (w.Update != null) {
+			const u = w.Update!
+			this.updateItem(caller,
+				{ ...new api.UpdateItemInput(), TableName: u.TableName, Key: u.Key,
+				UpdateExpression: u.UpdateExpression, ConditionExpression: u.ConditionExpression,
+				ExpressionAttributeNames: u.ExpressionAttributeNames,
+				ExpressionAttributeValues: u.ExpressionAttributeValues,
+				ReturnValuesOnConditionCheckFailure: onFailure })
+		} else {
+			const x = w.Delete!
+			this.deleteItem(caller,
+				{ ...new api.DeleteItemInput(), TableName: x.TableName, Key: x.Key,
+				ConditionExpression: x.ConditionExpression, ExpressionAttributeNames: x.ExpressionAttributeNames,
+				ExpressionAttributeValues: x.ExpressionAttributeValues,
+				ReturnValuesOnConditionCheckFailure: onFailure })
+		}
+	}
+}
+
+/// The caller allowed to do the statement s on its table, or index, as dynamodb:PartiQLSelect, PartiQLInsert,
+/// PartiQLUpdate or PartiQLDelete; then the account's root, as which the operations it becomes are served.
+function partiql(caller: Caller, s: Statement): Caller throws Fault {
+	caller.actions = [if (s.kind == "select") "dynamodb:PartiQLSelect"
+		else if (s.kind == "insert") "dynamodb:PartiQLInsert"
+		else if (s.kind == "update") "dynamodb:PartiQLUpdate"
+		else "dynamodb:PartiQLDelete"]
+	const a = arn(caller, s.table)
+	caller.allow(if (s.index == null) a else `${a}/index/${s.index!}`)
+	return caller.internal(`arn:aws:iam::${caller.account}:root`, "", [])
+}
+
+/// The write s, of the table of caller's that it names, as a transaction's: an INSERT a Put of an item whose key no
+/// other has, an UPDATE an Update of an item that exists.
+function transacted(caller: Caller, s: Statement,
+	onFailure: api.ReturnValuesOnConditionCheckFailure | null): api.TransactWriteItem throws Fault {
+	const d = table(caller, s.table)
+	const w = new api.TransactWriteItem()
+	const exists: [string, string][] = [["#key", d.hash.name]]
+	if (s.kind == "insert") {
+		w.Put = { ...new api.Put(), TableName: s.table, Item: s.item, ConditionExpression: "attribute_not_exists(#key)",
+			ExpressionAttributeNames: exists, ReturnValuesOnConditionCheckFailure: onFailure }
+		return w
+	}
+	const [key, rest] = keyed(d, s.terms)
+	const test = joined(rest)
+	if (s.kind == "update") {
+		w.Update = { ...new api.Update(), TableName: s.table, Key: key, UpdateExpression: s.update,
+			ConditionExpression: "attribute_exists(#key)" + (if (test == null) "" else ` AND ${test!}`),
+			ExpressionAttributeNames: namesOf([...exists, ...s.names], rest),
+			ExpressionAttributeValues: valuesOf(s.values, rest), ReturnValuesOnConditionCheckFailure: onFailure }
+	} else {
+		w.Delete = { ...new api.Delete(), TableName: s.table, Key: key, ConditionExpression: test,
+			ExpressionAttributeNames: namesOf([], rest), ExpressionAttributeValues: valuesOf([], rest),
+			ReturnValuesOnConditionCheckFailure: onFailure }
+	}
+	return w
+}
+
+/// The key of table d that terms give, each of its attributes equal to a value, and the terms left.
+function keyed(d: Definition, terms: Term[]): [Item, Term[]] throws Fault {
+	const key: Item = []
+	const rest: Term[] = []
+	for (const t of terms) {
+		if (t.name != null && (t.name == d.hash.name || d.range != null && t.name == d.range!.name)
+			&& !key.some(e => e[0] == t.name)) {
+			key.push([t.name!, t.value!])
+		} else {
+			rest.push(t)
+		}
+	}
+	if (key.length < (if (d.range == null) 1 else 2)) {
+		throw validation("Where clause does not contain a mandatory equality on all key attributes")
+	}
+	return [key, rest]
+}
+
+/// The names of names and of terms, null if none.
+function namesOf(names: [string, string][], terms: Term[]): [string, string][] | null {
+	const out: [string, string][] = []
+	out.append(names)
+	for (const t of terms) {
+		out.append(t.names)
+	}
+	return if (out.length == 0) null else out
+}
+
+/// The values of values and of terms, null if none.
+function valuesOf(values: Item, terms: Term[]): Item | null {
+	const out: Item = []
+	out.append(values)
+	for (const t of terms) {
+		out.append(t.values)
+	}
+	return if (out.length == 0) null else out
 }
 
 /// A write of a transaction, read but not done: of a kind, Put, Update, Delete or ConditionCheck, at the key k of
@@ -738,59 +1013,44 @@ class Page {
 /// The size of a page, at most, as DynamoDB reads one.
 const pageBytes: i64 = 1048576
 
-/// A page of the entries of the table d, or its index x if not null, whose keys start with prefix, from the first
-/// after from, in order or reversed; after the entry of key start if not null; at most limit of them read, and
-/// those of total segments in segment; those the key condition keyed holds for, then those of them filter keeps.
+/// A page of the entries of the table d, or its index x if not null, whose keys start with prefix, in order from the
+/// first after from or in reverse from the last; after the entry of key start if not null; at most limit of them read,
+/// and those of total segments in segment; those the key condition keyed holds for, then those of them filter keeps.
 function read(db: Tables, d: Definition, x: Index | null, prefix: string, from: string, forward: bool,
 	start: string | null, limit: i32 | null, keyed: Node | null, filter: Node | null, segment: i32,
 	total: i32): Page throws Fault {
-	const matched: [string, Item][] = []
 	const p = new Page()
-	let after = if (forward && start != null && start! > from) start! else from
-	let done = false
-	while (!done) {
-		const chunk = db.store.scan(prefix, after, 100)
+	let after = if (!forward) start else if (start != null && start! > from) start! else from
+	let matched = false // keyed holds for a range of keys: past its first, its first miss ends it
+	while (true) {
+		const chunk = db.store.scan(prefix, after, 100, !forward)
 		for (const [k, v] of chunk) {
 			const item = parsed(v)
 			if (keyed != null && !holds(keyed!, item)) {
-				done = matched.length > 0
-				if (done) {
-					break
+				if (matched) {
+					return p
 				}
 				continue
 			}
+			matched = true
 			if (total > 1 && segmentOf(k.slice(prefix.length, k.length), d, x) % total != segment) {
 				continue
 			}
-			if (!forward && start != null && k >= start!) {
-				continue
+			p.scanned++
+			p.bytes += sizeOf(item)
+			if (filter == null || holds(filter!, item)) {
+				p.items.push(item)
 			}
-			matched.push([k, item])
-			if (forward && (limit != null && matched.length == limit!)) {
-				done = true
-				break
+			if (limit != null && p.scanned == limit! || p.bytes >= pageBytes) {
+				p.last = project(item, keyNames(d, x).map(n => [{ ...new Step(), name: n }]))
+				return p
 			}
 		}
 		if (chunk.length < 100) {
-			break
+			return p
 		}
 		after = chunk[chunk.length - 1][0]
 	}
-	if (!forward) {
-		matched.reverse()
-	}
-	for (const [k, item] of matched) {
-		p.scanned++
-		p.bytes += sizeOf(item)
-		if (filter == null || holds(filter!, item)) {
-			p.items.push(item)
-		}
-		if (limit != null && p.scanned == limit! || p.bytes >= pageBytes) {
-			p.last = project(item, keyNames(d, x).map(n => [{ ...new Step(), name: n }]))
-			break
-		}
-	}
-	return p
 }
 
 /// The segment of an entry of the table d or its index x, of the hash of its partition key, for the key after the
@@ -871,12 +1131,12 @@ function shaped(caller: Caller, d: Definition, x: Index | null, found: Item[], s
 	return out
 }
 
-/// The Select of a Query or Scan, checked against its projection paths and its index x: as given, or by default all
-/// that the table or index has.
-function selected(select: api.Select | null, paths: Step[][] | null, x: Index | null): string throws Fault {
+/// The Select of a Query or Scan, checked against its projection paths, of AttributesToGet if old, and its index x: as
+/// given, or by default all that the table or index has.
+function selected(select: api.Select | null, paths: Step[][] | null, x: Index | null, old: bool): string throws Fault {
 	if (select == "COUNT" && paths != null) {
-		throw validation("1 validation error detected: Cannot specify the ProjectionExpression when choosing to get "
-			+ "only the Count")
+		const by = if (old) "AttributesToGet" else "ProjectionExpression"
+		throw validation(`1 validation error detected: Cannot specify the ${by} when choosing to get only the Count`)
 	}
 	if (select == "SPECIFIC_ATTRIBUTES" && paths == null) {
 		throw validation("1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when "
@@ -919,15 +1179,18 @@ function indexed(d: Definition, name: string | null, consistent: bool | null): I
 	return x
 }
 
-/// The conditions of a key condition on the partition key and, if any, the sort key of the table d or its index x:
-/// each a comparison of a key attribute, first, with a value.
-function keyConditions(d: Definition, x: Index | null, n: Node): [Node, Node | null] throws Fault {
+/// The conditions of a key condition on the partition key and, if any, the sort key of the table d or its index x, of
+/// KeyConditions if old: each a comparison of a key attribute, first, with a value.
+function keyConditions(d: Definition, x: Index | null, n: Node, old: bool): [Node, Node | null] throws Fault {
 	const hash = if (x == null) d.hash else x!.hash
 	const range = if (x == null) d.range else x!.range
 	const parts = if (n.kind == "and") n.args else [n]
 	const found: Node[] = []
 	for (const p of parts) {
 		if (!["=", "<", "<=", ">", ">=", "between", "begins_with"].includes(p.kind)) {
+			if (old) {
+				throw invalidParameters("Attempted conditional constraint is not an indexable operation")
+			}
 			throw invalid("KeyConditionExpression", "Invalid operator used in KeyConditionExpression")
 		}
 		let args = p.args
@@ -1580,6 +1843,21 @@ function describe(caller: Caller, d: Definition, status: api.TableStatus): api.T
 		else ({ ...new api.TableClassSummary(), TableClass: d.tableClass as api.TableClass })
 	t.DeletionProtectionEnabled = d.deletionProtection
 	return t
+}
+
+/// The continuous backups of d as DescribeContinuousBackups gives them: restorable from when recovery was enabled to
+/// five minutes ago, as AWS's are.
+function backups(d: Definition): api.ContinuousBackupsDescription {
+	const p = new api.PointInTimeRecoveryDescription()
+	p.PointInTimeRecoveryStatus = if (d.recovery) "ENABLED" else "DISABLED"
+	if (d.recovery) {
+		const latest = now() - 5 * minute
+		p.RecoveryPeriodInDays = d.recoveryDays
+		p.EarliestRestorableDateTime = d.recoverySince
+		p.LatestRestorableDateTime = if (latest > d.recoverySince) latest else d.recoverySince
+	}
+	return { ...new api.ContinuousBackupsDescription(), ContinuousBackupsStatus: "ENABLED",
+		PointInTimeRecoveryDescription: p }
 }
 
 /// A key schema of hash and range.

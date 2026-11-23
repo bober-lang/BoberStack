@@ -99,15 +99,21 @@ export class Violations {
 /// The bucket of the key k in a Java HashMap, made empty, of n keys: as String.hashCode spreads it, in a table of 16
 /// slots doubled while n is more than 3/4 of them.
 function bucket(k: string, n: i32): i32 {
-	let h: i64 = 0
-	for (const c of k) {
-		h = (31 * h + (c as i64)) & 4294967295
-	}
+	const h = hash(k)
 	let slots: i64 = 16
 	while ((n as i64) * 4 > slots * 3) {
 		slots *= 2
 	}
 	return ((h ^ (h >> 16)) & (slots - 1)) as i32
+}
+
+/// The String.hashCode of s, of its bytes, unsigned.
+function hash(s: string): i64 {
+	let h: i64 = 0
+	for (const c of s) {
+		h = (31 * h + (c as i64)) & 4294967295
+	}
+	return h
 }
 
 /// The member path at, of a structure's member named n, as AWS gives it: n lowered at its start.
@@ -155,17 +161,17 @@ export function check[T](x: T, at: string, tags: Type[], v: Violations, bytes: b
 	}
 }
 
-/// The values of the enum T, a union of literals, as AWS lists them: in the order of a Java HashSet of them.
+/// The values of the enum T, a union of literals, as AWS lists them: by the low five bits of their String.hashCode, as
+/// AWS did for each enum observed on 2026-11-23.
 export function values[T](): string {
-	const all: string[] = []
+	const all: [i64, i32, string][] = [] // a value's bits, its place and it
 	for (const M of T.members) {
 		if (M.kind == "literal") {
-			all.push(`${M.value}`)
+			all.push([hash(`${M.value}`) & 31, all.length, `${M.value}`])
 		}
 	}
-	const n = all.length
-	sortBy(all, (a, b) => bucket(a, n) < bucket(b, n))
-	return `[${all.join(", ")}]`
+	sortBy(all, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+	return `[${all.map(a => a[2]).join(", ")}]`
 }
 
 /// The text of x as AWS quotes it.

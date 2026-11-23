@@ -33,6 +33,9 @@ export class Timestamp[F extends string = "date-time"] {}
 /// Tags a string member, or its items, as bytes, base64 on the wire.
 export class Blob {}
 
+/// The XML namespace of AWS's generic faults, which no service's model declares.
+const awsFault = "http://webservices.amazon.com/AWSFault/2005-15-09"
+
 /// A request from caller to the service of API version and XML namespace ns, which answers a request breaking its
 /// model by validation.
 export class Call {
@@ -65,11 +68,11 @@ export class Call {
 		}
 	}
 
-	/// The answer where its action is none of the service's.
+	/// The answer where its action is none of the service's, in the namespace of AWS's generic faults.
 	invalidAction(): Response {
 		const p = this.params
 		const why = `Could not find operation ${p.get("Action") ?? ""} for version ${p.get("Version") ?? ""}`
-		return error(new Fault(400, "InvalidAction", why), this.caller.requestId, this.ns)
+		return error(new Fault(400, "InvalidAction", why), this.caller.requestId, awsFault)
 	}
 }
 

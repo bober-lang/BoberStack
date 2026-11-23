@@ -1,0 +1,527 @@
+//! PartiQL for DynamoDB, as far as it goes here: SELECT of * or of paths, from a table or "table"."index", with a
+//! WHERE; INSERT INTO a table VALUE a tuple; UPDATE with SET, set_add and set_delete among them, and REMOVE; and
+//! DELETE; values written as literals, as tuples, lists and sets of them, or as ? for the statement's parameters. A
+//! statement becomes the expressions of the API's requests, its names and values placeholders, for the handler to
+//! serve as it serves those. ORDER BY, RETURNING and EXISTS are not read.
+
+import { Fault } from "../../core/fault"
+import * as api from "./api"
+import { Item, validation } from "./expression"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import { lower, split } from "std/string"
+
+/// A statement, parsed.
+export class Statement {
+	/// select, insert, update or delete.
+	kind = ""
+	table = ""
+	index: string | null = null
+	/// SELECT's projection, null for *.
+	projection: string | null = null
+	/// WHERE's terms, each joined to the next by AND.
+	terms: Term[] = []
+	/// INSERT's item.
+	item: Item = []
+	/// UPDATE's actions, as an UpdateExpression.
+	update = ""
+	/// The names and values of the projection and of the update.
+	names: [string, string][] = []
+	values: Item = []
+}
+
+/// A term of a WHERE: its condition, its names and values, and, if it is an attribute's equality to a value, the
+/// attribute's name and the value.
+export class Term {
+	text = ""
+	names: [string, string][] = []
+	values: Item = []
+	name: string | null = null
+	value: api.AttributeValue | null = null
+}
+
+/// The statement text, of the parameters given.
+export function statement(text: string, parameters: api.AttributeValue[] | null): Statement throws Fault {
+	const r = new Reader(text, parameters ?? [])
+	const s = r.statement()
+	const n = s.table.length
+	if (n < 3 || n > 255 || !s.table.every(c => isAlphanumeric(c) || c == 45 || c == 95 || c == 46)) {
+		throw validation("Table name should be within the length [3, 255] and only contain 'a-z', 'A-Z', '0-9', '-', "
+			+ "'_', '.'.")
+	}
+	if (r.used != (parameters ?? []).length) {
+		throw validation("Number of parameters in request and statement don't match.")
+	}
+	return s
+}
+
+/// The condition of terms, null if there are none.
+export function joined(terms: Term[]): string | null {
+	return if (terms.length == 0) null else terms.map(t => `(${t.text})`).join(" AND ")
+}
+
+class Token {
+	kind = ""
+	text = ""
+	at = 0
+}
+
+/// The tokens of s, then one of kind eof: words, "names", 'strings', numbers, ? and punctuation.
+function tokens(s: string): Token[] throws Fault {
+	const out: Token[] = []
+	let i = 0
+	while (true) {
+		while (i < s.length && isSpace(s[i])) {
+			i++
+		}
+		const t = new Token()
+		t.at = i
+		if (i == s.length) {
+			t.kind = "eof"
+			out.push(t)
+			return out
+		}
+		const c = s[i]
+		if (c == 34 || c == 39) {
+			// " or ', doubled within
+			let text = ""
+			let j = i + 1
+			while (true) {
+				if (j >= s.length) {
+					throw malformed(if (c == 34) "Unterminated quoted identifier" else "Unterminated string literal")
+				}
+				if (s[j] == c) {
+					if (j + 1 < s.length && s[j + 1] == c) {
+						text += chr(c)
+						j += 2
+						continue
+					}
+					break
+				}
+				text += chr(s[j])
+				j++
+			}
+			t.kind = if (c == 34) "name" else "string"
+			t.text = text
+			i = j + 1
+		} else if (isDigit(c)) {
+			let j = i
+			while (j < s.length
+				&& (isDigit(s[j]) || s[j] == 46 || s[j] == 101 || s[j] == 69
+				|| (s[j] == 45 || s[j] == 43) && (s[j - 1] == 101 || s[j - 1] == 69))) {
+				j++
+			}
+			t.kind = "number"
+			t.text = s.slice(i, j)
+			i = j
+		} else if (isAlphanumeric(c) || c == 95) {
+			let j = i
+			while (j < s.length && (isAlphanumeric(s[j]) || s[j] == 95)) {
+				j++
+			}
+			t.kind = "word"
+			t.text = s.slice(i, j)
+			i = j
+		} else {
+			const two = s.slice(i, if (i + 2 < s.length) i + 2 else s.length)
+			i += if (["<>", "!=", "<=", ">=", "<<", ">>"].includes(two)) 2 else 1
+			t.kind = s.slice(t.at, i)
+			t.text = t.kind
+		}
+		out.push(t)
+	}
+}
+
+/// The fault of a statement that does not parse, as why says.
+function malformed(why: string): Fault { return validation(`Statement wasn't well formed, can't be processed: ${why}`) }
+
+/// What reads a statement's tokens.
+class Reader {
+	src: string
+	toks: Token[]
+	i = 0
+	parameters: api.AttributeValue[]
+	/// The parameters taken.
+	used = 0
+	/// The names and values of what is being read, and the count of values in the whole statement.
+	names: [string, string][] = []
+	values: Item = []
+	count = 0
+	/// The count of name placeholders in the whole statement.
+	named = 0
+
+	constructor(src: string, parameters: api.AttributeValue[]) throws Fault {
+		this.src = src
+		this.toks = tokens(src)
+		this.parameters = parameters
+	}
+
+	peek(): Token { return this.toks[this.i] }
+
+	next(): Token {
+		const t = this.toks[this.i]
+		if (t.kind != "eof") {
+			this.i++
+		}
+		return t
+	}
+
+	/// Whether the next token is the keyword k, in lower case, which it then takes.
+	keyword(k: string): bool {
+		if (this.at(k)) {
+			this.i++
+			return true
+		}
+		return false
+	}
+
+	/// Whether the next token is the keyword k, in lower case.
+	at(k: string): bool {
+		const t = this.peek()
+		return t.kind == "word" && lower(t.text) == k
+	}
+
+	expect(kind: string, shown: string) throws Fault {
+		if (this.peek().kind != kind) {
+			throw malformed(`Expected ${shown}`)
+		}
+		this.i++
+	}
+
+	need(k: string, shown: string) throws Fault {
+		if (!this.keyword(k)) {
+			throw malformed(`Expected ${shown}`)
+		}
+	}
+
+	statement(): Statement throws Fault {
+		const s = new Statement()
+		if (this.keyword("select")) {
+			s.kind = "select"
+			if (this.peek().kind == "*") {
+				this.i++
+			} else {
+				const paths = [this.path()]
+				while (this.peek().kind == ",") {
+					this.i++
+					paths.push(this.path())
+				}
+				s.projection = paths.join(", ")
+			}
+			this.need("from", "FROM")
+			s.table = this.name()
+			if (this.peek().kind == ".") {
+				this.i++
+				s.index = this.name()
+			}
+		} else if (this.keyword("insert")) {
+			s.kind = "insert"
+			this.need("into", "INTO")
+			s.table = this.name()
+			this.need("value", "VALUE")
+			if (this.peek().kind != "{") {
+				throw malformed("Expected LEFT_CURLY")
+			}
+			s.item = (this.value() as api.AttributeValue$M).M
+		} else if (this.keyword("update")) {
+			s.kind = "update"
+			s.table = this.name()
+			// The actions of SET, ADD, REMOVE and DELETE, in that order.
+			const actions: string[][] = [[], [], [], []]
+			while (true) {
+				if (this.keyword("set")) {
+					this.assignment(actions)
+					while (this.peek().kind == ",") {
+						this.i++
+						this.assignment(actions)
+					}
+				} else if (this.keyword("remove")) {
+					actions[2].push(this.path())
+					while (this.peek().kind == ",") {
+						this.i++
+						actions[2].push(this.path())
+					}
+				} else {
+					break
+				}
+			}
+			const clauses: string[] = []
+			for (let k = 0; k < 4; k++) {
+				if (actions[k].length > 0) {
+					clauses.push(`${["SET", "ADD", "REMOVE", "DELETE"][k]} ${actions[k].join(", ")}`)
+				}
+			}
+			if (clauses.length == 0) {
+				throw malformed("Expected SET or REMOVE")
+			}
+			s.update = clauses.join(" ")
+		} else if (this.keyword("delete")) {
+			s.kind = "delete"
+			this.need("from", "FROM")
+			s.table = this.name()
+		} else {
+			throw malformed("Expected data manipulation")
+		}
+		s.names = this.names
+		s.values = this.values
+		if (this.keyword("where")) {
+			s.terms = this.terms()
+		}
+		if (this.peek().kind != "eof") {
+			throw malformed("Unexpected token after expression")
+		}
+		return s
+	}
+
+	/// A table's or an index's name, quoted or not.
+	name(): string throws Fault {
+		const t = this.next()
+		if (t.kind != "name" && t.kind != "word") {
+			throw malformed("Expected identifier")
+		}
+		return t.text
+	}
+
+	/// A path, as an expression's, of name placeholders.
+	path(): string throws Fault {
+		let out = this.placeholder(this.name())
+		while (true) {
+			const t = this.peek()
+			if (t.kind == ".") {
+				this.i++
+				out += "." + this.placeholder(this.name())
+			} else if (t.kind == "[" && this.toks[this.i + 1].kind == "number") {
+				this.i += 2
+				out += `[${this.toks[this.i - 1].text}]`
+				this.expect("]", "RIGHT_BRACKET")
+			} else {
+				return out
+			}
+		}
+	}
+
+	/// The placeholder of the attribute name, the same for each use.
+	placeholder(name: string): string {
+		const found = this.names.find(e => e[1] == name)
+		if (found != null) {
+			return found[0]
+		}
+		const p = `#n${this.named}`
+		this.named++
+		this.names.push([p, name])
+		return p
+	}
+
+	/// An assignment of SET, as an action of an UpdateExpression's among actions: of set_add(path, set) to the path
+	/// itself an ADD, of set_delete a DELETE, else a SET.
+	assignment(actions: string[][]) throws Fault {
+		const left = this.path()
+		this.expect("=", "EQ")
+		const k = if (this.at("set_add")) 1 else if (this.at("set_delete")) 3 else 0
+		if (k == 0 || this.toks[this.i + 1].kind != "(") {
+			actions[0].push(`${left} = ${this.operands(["set", "remove", "where"], true)}`)
+			return
+		}
+		this.i += 2
+		if (this.path() != left) {
+			throw malformed("Unexpected term")
+		}
+		this.expect(",", "COMMA")
+		actions[k].push(`${left} ${this.literal()}`)
+		this.expect(")", "RIGHT_PAREN")
+	}
+
+	/// WHERE's terms: one for each condition joined by AND, or one for all if any are joined by OR.
+	terms(): Term[] throws Fault {
+		const out: Term[] = []
+		while (true) {
+			this.names = []
+			this.values = []
+			const from = this.i
+			const t = new Term()
+			t.text = this.operands([], false)
+			t.names = this.names
+			t.values = this.values
+			if (this.i - from == 3 && this.toks[from + 1].kind == "=" && t.values.length == 1
+				&& ["word", "name"].includes(this.toks[from].kind)) {
+				t.name = this.toks[from].text
+				t.value = t.values[0][1]
+			}
+			out.push(t)
+			if (!this.keyword("and")) {
+				return out
+			}
+		}
+	}
+
+	/// The tokens up to the keywords in stops, or the end, at no depth, as an expression's; up to an AND too unless
+	/// whole, or if an OR is read.
+	operands(stops: string[], whole: bool): string throws Fault {
+		let out = ""
+		let depth = 0
+		let between = false
+		let lists = 0
+		let last = 0
+		// Whether what was read last is an operand, after which - subtracts.
+		let operand = false
+		const start = this.i
+		while (true) {
+			const t = this.peek()
+			if (t.kind == "eof" || depth == 0 && (t.kind == "," && whole || stops.some(k => this.at(k)))) {
+				break
+			}
+			if (depth == 0 && !whole && this.at("and")) {
+				if (!between) {
+					// Taken whole if any OR joins at no depth.
+					let ors = false
+					for (let j = start; j < this.toks.length && this.toks[j].kind != "eof"; j++) {
+						ors = ors || this.toks[j].kind == "word" && lower(this.toks[j].text) == "or"
+					}
+					if (!ors) {
+						break
+					}
+				}
+				between = false
+			}
+			const sep = if (out == "") "" else " "
+			const k = ["AND", "OR", "NOT", "BETWEEN", "IN"].find(k => lower(k) == lower(t.text))
+			if (t.kind == "word" && k != null) {
+				between = between || k == "BETWEEN"
+				out += sep + k
+				operand = false
+				this.i++
+				if (lower(t.text) == "in" && this.peek().kind == "[") {
+					this.i++
+					out += " ("
+					lists++
+				}
+			} else if (t.kind == "word" && lower(t.text) == "is") {
+				this.i++
+				const not = this.keyword("not")
+				this.need("missing", "MISSING")
+				out = out.slice(0, last) + (if (not) "attribute_exists(" else "attribute_not_exists(")
+					+ out.slice(last, out.length) + ")"
+			} else if (t.kind == "word" && this.toks[this.i + 1].kind == "(") {
+				out += sep + t.text
+				operand = false
+				this.i++
+			} else if (t.kind == "name" || t.kind == "word" && !["true", "false", "null"].includes(lower(t.text))) {
+				last = out.length + sep.length
+				out += sep + this.path()
+				operand = true
+			} else if (t.kind == "]" && lists > 0) {
+				out += ")"
+				lists--
+				operand = true
+				this.i++
+			} else if (t.kind == "(" || t.kind == ")") {
+				depth += if (t.kind == "(") 1 else -1
+				out += sep + t.kind
+				operand = t.kind == ")"
+				this.i++
+			} else if (["=", "<>", "!=", "<", "<=", ">", ">=", ",", "+"].includes(t.kind) || t.kind == "-" && operand) {
+				out += (if (t.kind == ",") "" else sep) + (if (t.kind == "!=") "<>" else t.kind)
+				operand = false
+				this.i++
+			} else {
+				out += sep + this.literal()
+				operand = true
+			}
+		}
+		if (out == "") {
+			throw malformed("Expected expression")
+		}
+		return out
+	}
+
+	/// A value's placeholder.
+	literal(): string throws Fault {
+		const p = `:v${this.count}`
+		this.count++
+		this.values.push([p, this.value()])
+		return p
+	}
+
+	/// A value: a string, a number, true, false, null, ?, or a tuple, list or set of them.
+	value(): api.AttributeValue throws Fault {
+		const t = this.next()
+		if (t.kind == "string") {
+			return { ...new api.AttributeValue$S(), S: t.text }
+		}
+		if (t.kind == "number") {
+			return { ...new api.AttributeValue$N(), N: t.text }
+		}
+		if (t.kind == "-" && this.peek().kind == "number") {
+			return { ...new api.AttributeValue$N(), N: "-" + this.next().text }
+		}
+		if (t.kind == "?") {
+			this.used++
+			if (this.used <= this.parameters.length) {
+				return this.parameters[this.used - 1]
+			}
+			// Too few parameters, which the statement is refused for once read.
+			return { ...new api.AttributeValue$NULL(), NULL: true }
+		}
+		if (t.kind == "word" && ["true", "false"].includes(lower(t.text))) {
+			return { ...new api.AttributeValue$BOOL(), BOOL: lower(t.text) == "true" }
+		}
+		if (t.kind == "word" && lower(t.text) == "null") {
+			return { ...new api.AttributeValue$NULL(), NULL: true }
+		}
+		if (t.kind == "{") {
+			const m: Item = []
+			while (this.peek().kind != "}") {
+				const k = this.next()
+				if (k.kind != "string") {
+					throw malformed("Expected string literal as tuple key")
+				}
+				if (m.some(e => e[0] == k.text)) {
+					const line = split(this.src.slice(0, k.at), "\n")
+					throw validation(`Duplicate keys in tuple. Key: ${k.text} under root at ${line.length}:`
+						+ `${line[line.length - 1].length + 1}:${k.text.length + 2}`)
+				}
+				this.expect(":", "COLON")
+				m.push([k.text, this.value()])
+				if (this.peek().kind != ",") {
+					break
+				}
+				this.i++
+			}
+			this.expect("}", "RIGHT_CURLY")
+			return { ...new api.AttributeValue$M(), M: m }
+		}
+		if (t.kind == "[") {
+			const l: api.AttributeValue[] = []
+			while (this.peek().kind != "]") {
+				l.push(this.value())
+				if (this.peek().kind != ",") {
+					break
+				}
+				this.i++
+			}
+			this.expect("]", "RIGHT_BRACKET")
+			return { ...new api.AttributeValue$L(), L: l }
+		}
+		if (t.kind == "<<") {
+			const xs: api.AttributeValue[] = []
+			while (this.peek().kind != ">>") {
+				xs.push(this.value())
+				if (this.peek().kind != ",") {
+					break
+				}
+				this.i++
+			}
+			this.expect(">>", "ANGLE_DOUBLE_RIGHT")
+			if (xs.length > 0 && xs.every(x => x instanceof api.AttributeValue$N)) {
+				return { ...new api.AttributeValue$NS(), NS: xs.map(x => (x as api.AttributeValue$N).N) }
+			}
+			if (xs.length > 0 && xs.every(x => x instanceof api.AttributeValue$B)) {
+				return { ...new api.AttributeValue$BS(), BS: xs.map(x => (x as api.AttributeValue$B).B) }
+			}
+			if (!xs.every(x => x instanceof api.AttributeValue$S)) {
+				throw validation("Unsupported type passed in set")
+			}
+			return { ...new api.AttributeValue$SS(), SS: xs.map(x => (x as api.AttributeValue$S).S) }
+		}
+		throw malformed("Unexpected term")
+	}
+}

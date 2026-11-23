@@ -1,7 +1,7 @@
 //! DynamoDB's state in the tree of an account's region: the definitions of its tables, by name; each table's items,
-//! by the table's name, a NUL and the encoding of their key; and each index's entries, the items as it projects
-//! them, by the table's and the index's names, each followed by a NUL, the encoding of the item's key in the index,
-//! then of its key in the table.
+//! by the table's name, a NUL and the encoding of their key; each index's entries, the items as it projects them, by
+//! the table's and the index's names, each followed by a NUL, the encoding of the item's key in the index, then of its
+//! key in the table; and the client tokens of the transactions written, by token.
 
 import { Fault } from "../../core/fault"
 import { decode, result } from "../../core/protocol/json"
@@ -55,18 +55,30 @@ export class Definition {
 	deletionProtection = false
 	ttl = ""
 	ttlEnabled = false
+	/// Whether point-in-time recovery is enabled, since when, ns since 1970, and for how many days back.
+	recovery = false
+	recoverySince: i64 = 0
+	recoveryDays = 0
 	count: i64 = 0
 	size: i64 = 0
+}
+
+/// The client token of a transaction written: when, ns since 1970, and its request, as JSON.
+export class Token {
+	at: i64 = 0
+	request = ""
 }
 
 /// The state of a region of an account.
 export class Tables {
 	store: Store
 	definitions: Table[Definition]
+	tokens: Table[Token]
 
 	constructor(s: Store) {
 		this.store = s
 		this.definitions = new Table[Definition](s, "dynamodb/tables")
+		this.tokens = new Table[Token](s, "dynamodb/tokens")
 	}
 
 	/// The definition of the table named name, null if there is none.

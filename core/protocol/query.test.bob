@@ -127,7 +127,7 @@ test "values outside their constraints, together, in the order AWS lists them" {
 test "a value not of its type" {
 	const int = message("Value 'x' at 'count' failed to satisfy constraint: Member must be an integer")
 	assert decode[Scalars](query("Name=&Count=x")) throws new Fault(400, "ValidationError", int)
-	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [fast, safe]")
+	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [safe, fast]")
 	assert decode[Scalars](query("Name=&Mode=slow")) throws new Fault(400, "ValidationError", mode)
 	const on = message("Value 'yes' at 'on' failed to satisfy constraint: Member must be true or false")
 	assert decode[Scalars](query("Name=&On=yes")) throws new Fault(400, "ValidationError", on)
@@ -249,7 +249,9 @@ test "an action of another version" {
 	const c = new Call(caller(), query("Action=XmlTest&Version=2019-01-01"), "2020-07-02", ns)
 	assert c.action == "" && c.invalidAction().status == 400
 	const why = "Could not find operation XmlTest for version 2019-01-01"
-	assert c.invalidAction().body.whole == error("InvalidAction", why)
+	const fault = `<ErrorResponse xmlns="http://webservices.amazon.com/AWSFault/2005-15-09"><Error><Type>Sender</Type>`
+		+ `<Code>InvalidAction</Code><Message>${why}</Message></Error><RequestId>${id}</RequestId></ErrorResponse>`
+	assert c.invalidAction().body.whole == fault
 }
 
 class Chosen$Name {
