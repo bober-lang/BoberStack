@@ -1,0 +1,478 @@
+//! Containers on macOS by Apple's container daemon, spoken to over XPC as its CLI speaks to it. The routes, keys and
+//! JSON are those of github.com/apple/container 1.7.1 (on apple/containerization 0.54.0), in its Sources/Services:
+//! internal to it, and apt to change in another release. Its services run once `container system start` has run.
+
+import { Arch, ContainerError, Containers, Spec } from "./container"
+
+import { cx_bytes, cx_file, cx_int, cx_new, cx_release, cx_send, cx_set_bool, cx_set_data, cx_set_int,
+	cx_set_string } from "./xpc.c"
+
+import { indexOf, lastIndexOf } from "std/algo"
+import { EncodeError, Mapping, Name, OmitEmpty, Raw, Rest, Unknown, decode, encode, quoted } from "std/encoding/json"
+import { fromCString } from "std/c"
+import { readFile } from "std/fs"
+import { arch } from "std/os"
+import { ParseError } from "std/string"
+import { Decodable } from "std/types"
+import { v4 } from "std/uuid"
+import { free } from "stdlib.h"
+
+const api = "com.apple.container.apiserver"
+const images = "com.apple.container.core.container-core-images"
+/// The least the daemon gives a container, its VM's kernel and agent included.
+const leastMb = 200
+
+/// The daemon's containers.
+export class AppleContainers implements Containers {
+	pull(image: string) throws ContainerError {
+		const ref = normalized(image)
+		const found = listed(ref)
+		if (found == null || content(found!.descriptor.digest) == null) {
+			fetch(ref, null)
+		}
+	}
+
+	start(spec: Spec): string throws ContainerError {
+		const platform = platformOf(spec.arch)
+		const [image, settings] = resolve(normalized(spec.image), platform)
+		const config = new Config()
+		config.id = unique()
+		config.image = image
+		config.platform = platform
+		config.rosetta = spec.arch == "x86_64" && arch == "arm64"
+		config.resources.memoryInBytes = ((if (spec.memoryMb < leastMb) leastMb else spec.memoryMb) as u64) << 20
+		config.initProcess = process(spec, settings)
+		for (const m of spec.mounts) {
+			const fs = new Filesystem()
+			fs.source = m.host
+			fs.destination = m.path
+			fs.options = if (m.readOnly) ["ro"] else []
+			config.mounts.push(fs)
+		}
+		const attachment = new Attachment()
+		attachment.network = builtin().id
+		attachment.options.hostname = config.id
+		config.networks = [attachment]
+		const here = json(platformOf(if (arch == "x86_64") "x86_64" else "arm64"))
+		const [kernel, _] = new Message("getDefaultKernel").data("systemPlatform", here).send(api, "kernel")
+		const create = new Message("containerCreate").data("containerConfig", json(config)).data("kernel", kernel)
+		create.data("containerOptions", `{"autoRemove":false}`).send(api)
+		try {
+			new Message("containerBootstrap").string("id", config.id).data("dynamicEnv", "{}").send(api)
+			const run = new Message("containerStartProcess").string("id", config.id)
+			run.string("processIdentifier", config.id).send(api)
+		} catch (e: ContainerError) {
+			try {
+				this.stop(config.id)
+			} catch (ignored: ContainerError) {}
+			throw e
+		}
+		return config.id
+	}
+
+	host(): string throws ContainerError {
+		const status = builtin().status
+		if (status == null) {
+			throw new ContainerError("Unavailable", "the default network is not running")
+		}
+		return status!.ipv4Gateway
+	}
+
+	output(id: string): string throws ContainerError {
+		try {
+			return new Message("containerLogs").string("id", id).send(api, "logs")[0]
+		} catch (e: ContainerError) {
+			// The daemon's logs turns notFound into internalError.
+			const filters = `{"ids":[${quoted(id)}],"labels":{}}`
+			if (new Message("containerList").data("listFilters", filters).send(api, "containers")[0] == "[]") {
+				throw new ContainerError("NotFound", e.message)
+			}
+			throw e
+		}
+	}
+
+	wait(id: string): i32 throws ContainerError {
+		const m = new Message("containerWait").string("id", id).string("processIdentifier", id)
+		const [_, status] = m.send(api, "exitCode")
+		return status as i32
+	}
+
+	stop(id: string) throws ContainerError {
+		try {
+			new Message("containerDelete").string("id", id).bool("forceDelete", true).send(api)
+		} catch (e: ContainerError) {
+			if (e.kind != "NotFound") {
+				throw e
+			}
+		}
+	}
+}
+
+/// A request to one of the daemon's services, to send once.
+class Message {
+	private h: u64
+
+	constructor(route: string) {
+		this.h = cx_new()
+		this.string("com.apple.container.xpc.route", route)
+	}
+
+	string(key: string, value: string): Message {
+		cx_set_string(this.h, key, value)
+		return this
+	}
+
+	data(key: string, value: string): Message {
+		cx_set_data(this.h, key, value, value.length as u64)
+		return this
+	}
+
+	bool(key: string, value: bool): Message {
+		cx_set_bool(this.h, key, value)
+		return this
+	}
+
+	int(key: string, value: i64): Message {
+		cx_set_int(this.h, key, value)
+		return this
+	}
+
+	/// The answer's string, data or file at key, or "", and its integer there; sent from an isolate of its own, as an
+	/// answer may take minutes, a pull's or a wait's, and blocks the thread it is awaited on.
+	send(service: string, key: string = ""): [string, i64] throws ContainerError {
+		try {
+			return await spawn deliver(service, this.h, key)
+		} finally {
+			cx_release(this.h)
+		}
+	}
+}
+
+function deliver(service: string, m: u64, key: string): [string, i64] throws ContainerError {
+	const out = new u64[](1)
+	const r = cx_send(service, m, out)
+	if (r == 0) {
+		const why = fromCString(out[0])
+		free(out[0])
+		throw new ContainerError("Unavailable", `${service}: ${why}; is \`container system start\` run?`)
+	}
+	try {
+		const failed = bytes(r, "com.apple.container.xpc.error")
+		if (failed != null) {
+			throw failure(failed!)
+		}
+		return [if (key == "logs") file(r, key) else bytes(r, key) ?? "", cx_int(r, key)]
+	} finally {
+		cx_release(r)
+	}
+}
+
+function bytes(r: u64, key: string): string | null {
+	const n = new u64[](1)
+	const p = cx_bytes(r, key, n)
+	return if (p == 0) null else fromBytes(p, n[0])
+}
+
+function file(r: u64, key: string): string throws ContainerError {
+	const n = new u64[](1)
+	const p = cx_file(r, key, n)
+	if (p == 0) {
+		throw new ContainerError("Failed", `no ${key} to read`)
+	}
+	const s = fromBytes(p, n[0])
+	free(p)
+	return s
+}
+
+/// What the daemon failed with, as its XPCMessage.error() reads it.
+class Failure {
+	code = ""
+	message = ""
+}
+
+function failure(text: string): ContainerError {
+	try {
+		const f = decode[Failure](text)
+		return new ContainerError(if (f.code == "notFound") "NotFound" else "Failed", f.message)
+	} catch (e: ParseError) {
+		return new ContainerError("Failed", text)
+	}
+}
+
+function json[T](v: T): string throws ContainerError {
+	try {
+		return encode(v)
+	} catch (e: EncodeError) {
+		throw new ContainerError("Failed", `${e.value} has no JSON`)
+	}
+}
+
+function parse[T extends Decodable](text: string): T throws ContainerError {
+	try {
+		return decode[T](text)
+	} catch (e: ParseError) {
+		throw new ContainerError("Failed", `the daemon answered what this does not read: ${text}`)
+	}
+}
+
+/// ref as the daemon keeps it, with a registry, docker.io by default, and a tag, latest by default.
+function normalized(ref: string): string {
+	const slash = indexOf(ref, "/")
+	const first = if (slash < 0) "" else ref.slice(0, slash)
+	let r = ref
+	if (indexOf(first, ".") < 0 && indexOf(first, ":") < 0 && first != "localhost") {
+		r = (if (slash < 0) "docker.io/library/" else "docker.io/") + ref
+	}
+	const name = r.slice(lastIndexOf(r, "/") + 1, r.length)
+	return if (indexOf(name, ":") < 0 && indexOf(name, "@") < 0) r + ":latest" else r
+}
+
+function unique(): string throws ContainerError {
+	try {
+		return v4()
+	} catch (e: IoError) {
+		throw new ContainerError("Failed", e.message())
+	}
+}
+
+class Platform {
+	architecture = ""
+	os = "linux"
+	rest: Unknown[] @Rest = []
+}
+
+function platformOf(a: Arch): Platform {
+	const p = new Platform()
+	p.architecture = if (a == "x86_64") "amd64" else "arm64"
+	return p
+}
+
+/// Of content in the image store, by digest.
+class Descriptor {
+	digest = ""
+	platform: Platform | null @OmitEmpty = null
+	rest: Unknown[] @Rest = []
+}
+
+class Image {
+	reference = ""
+	descriptor = new Descriptor()
+	rest: Unknown[] @Rest = []
+}
+
+class Index {
+	manifests: Descriptor[] = []
+	rest: Unknown[] @Rest = []
+}
+
+class Manifest {
+	config = new Descriptor()
+	rest: Unknown[] @Rest = []
+}
+
+class ImageConfig {
+	config: Settings | null = null
+	rest: Unknown[] @Rest = []
+}
+
+/// How an image runs its program, which a container takes unless told otherwise.
+class Settings {
+	entrypoint: string[] | null @Name["Entrypoint"] = null
+	cmd: string[] | null @Name["Cmd"] = null
+	env: string[] | null @Name["Env"] = null
+	workingDir: string @Name["WorkingDir"] = ""
+	user: string @Name["User"] = ""
+	rest: Unknown[] @Rest = []
+}
+
+/// The image ref names, if the image store has it.
+function listed(ref: string): Image | null throws ContainerError {
+	const all = parse[Image[]](new Message("imageList").send(images, "imageDescriptions")[0])
+	for (const image of all) {
+		if (image.reference == ref) {
+			return image
+		}
+	}
+	return null
+}
+
+/// Pulls ref's layers for platform, or for each it has if null; 0 downloads at once, as a missing key reads, downloads
+/// nothing and still succeeds.
+function fetch(ref: string, platform: Platform | null): Image throws ContainerError {
+	const m = new Message("imagePull").string("imageReference",
+		ref).bool("insecureFlag", false).int("maxConcurrentDownloads", 3)
+	if (platform != null) {
+		m.data("ociPlatform", json(platform!))
+	}
+	return parse[Image](m.send(images, "imageDescription")[0])
+}
+
+/// The bytes of the content of digest, if the store has them.
+function content(digest: string): string | null throws ContainerError {
+	let path = ""
+	try {
+		path = new Message("contentGet").string("digest", digest).send(images, "contentPath")[0]
+	} catch (e: ContainerError) {
+		if (e.kind == "NotFound") {
+			return null
+		}
+		throw e
+	}
+	try {
+		return readFile(path)
+	} catch (e: IoError) {
+		throw new ContainerError("Failed", e.message())
+	}
+}
+
+/// The image of ref and how it runs on platform, pulling what is not here.
+function resolve(ref: string, platform: Platform): [Image, Settings] throws ContainerError {
+	let image = listed(ref)
+	let manifest = if (image == null) null else manifestOf(image!, platform)
+	if (manifest == null) {
+		image = fetch(ref, platform)
+		manifest = manifestOf(image!, platform)
+	}
+	if (manifest == null) {
+		throw new ContainerError("NotFound", `${ref} has no ${platform.os}/${platform.architecture} image`)
+	}
+	const config = content(manifest!.config.digest)
+	if (config == null) {
+		throw new ContainerError("NotFound", `${ref} lacks its config`)
+	}
+	return [image!, parse[ImageConfig](config!).config ?? new Settings()]
+}
+
+/// The manifest of image's for platform, if the store has it.
+function manifestOf(image: Image, platform: Platform): Manifest | null throws ContainerError {
+	const index = content(image.descriptor.digest)
+	if (index == null) {
+		return null
+	}
+	for (const d of parse[Index](index!).manifests) {
+		const p = d.platform
+		if (p != null && p!.os == platform.os && p!.architecture == platform.architecture) {
+			const manifest = content(d.digest)
+			return if (manifest == null) null else parse[Manifest](manifest!)
+		}
+	}
+	return null
+}
+
+class Network {
+	id = ""
+	status: NetworkStatus | null = null
+	configuration = new NetworkConfiguration()
+	rest: Unknown[] @Rest = []
+}
+
+class NetworkStatus {
+	ipv4Gateway = ""
+	rest: Unknown[] @Rest = []
+}
+
+class NetworkConfiguration {
+	labels: [string, string][] @Mapping = []
+	rest: Unknown[] @Rest = []
+}
+
+/// The network the daemon makes itself, which containers join by default.
+function builtin(): Network throws ContainerError {
+	for (const n of parse[Network[]](new Message("networkList").send(api, "networkResources")[0])) {
+		for (const [k, v] of n.configuration.labels) {
+			if (k == "com.apple.container.resource.role" && v == "builtin") {
+				return n
+			}
+		}
+	}
+	throw new ContainerError("Unavailable", "the daemon has no default network")
+}
+
+/// A ContainerConfiguration, of the members whose defaults do not do.
+class Config {
+	id = ""
+	image = new Image()
+	mounts: Filesystem[] = []
+	networks: Attachment[] = []
+	dns = new Dns()
+	rosetta = false
+	initProcess = new Process()
+	platform = new Platform()
+	resources = new Resources()
+}
+
+class Filesystem {
+	kind: Raw @Name["type"] = new Raw(`{"virtiofs":{}}`)
+	source = ""
+	destination = ""
+	options: string[] = []
+}
+
+class Attachment {
+	network = ""
+	options = new AttachmentOptions()
+}
+
+class AttachmentOptions {
+	hostname = ""
+	mtu = 1280
+}
+
+/// The CLI's when nothing is configured: the network's resolver.
+class Dns {
+	nameservers: string[] = []
+	searchDomains: string[] = []
+	options: string[] = []
+}
+
+class Process {
+	executable = ""
+	arguments: string[] = []
+	environment: string[] = []
+	workingDirectory = "/"
+	terminal = false
+	user = new Raw(`{"id":{"uid":0,"gid":0}}`)
+	supplementalGroups: u32[] = []
+	rlimits: Raw[] = []
+}
+
+class Resources {
+	memoryInBytes: u64 = 0
+}
+
+/// The program spec runs and how, from the image's settings where spec says nothing.
+function process(spec: Spec, settings: Settings): Process throws ContainerError {
+	let argv = spec.command
+	if (argv.length == 0) {
+		argv = []
+		for (const a of settings.entrypoint ?? []) {
+			argv.push(a)
+		}
+		for (const a of settings.cmd ?? []) {
+			argv.push(a)
+		}
+	}
+	if (argv.length == 0) {
+		throw new ContainerError("Failed", `${spec.image} names no program, nor does the spec`)
+	}
+	const p = new Process()
+	p.executable = argv[0]
+	p.arguments = argv.slice(1, argv.length)
+	for (const e of settings.env ?? []) {
+		const eq = indexOf(e, "=")
+		const name = if (eq < 0) e else e.slice(0, eq)
+		if (!spec.env.some((kv: [string, string]) => kv[0] == name)) {
+			p.environment.push(e)
+		}
+	}
+	for (const [k, v] of spec.env) {
+		p.environment.push(`${k}=${v}`)
+	}
+	if (settings.workingDir != "") {
+		p.workingDirectory = settings.workingDir
+	}
+	if (settings.user != "") {
+		p.user = new Raw(`{"raw":{"userString":${quoted(settings.user)}}}`)
+	}
+	return p
+}

@@ -1,0 +1,74 @@
+import { AppleContainers, normalized } from "./apple"
+import { ContainerError, Mount, Spec } from "./container"
+import { indexOf } from "std/algo"
+import { makeTempDir, removeAll, writeFile } from "std/fs"
+import { replace } from "std/string"
+
+const image = "public.ecr.aws/lambda/provided:al2023"
+
+test "normalized names a registry and a tag" {
+	assert normalized("alpine") == "docker.io/library/alpine:latest"
+	assert normalized("me/app:1") == "docker.io/me/app:1"
+	assert normalized("localhost:5000/app") == "localhost:5000/app:latest"
+	assert normalized(image) == image
+	assert normalized("public.ecr.aws/lambda/nodejs@sha256:ab") == "public.ecr.aws/lambda/nodejs@sha256:ab"
+}
+
+/// Runs spec to its end: its status and output, the container removed even if an assert would trap.
+function run(c: AppleContainers, spec: Spec): [i32, string] throws ContainerError {
+	const id = c.start(spec)
+	try {
+		return [c.wait(id), c.output(id)]
+	} finally {
+		c.stop(id)
+	}
+}
+
+// One test, so that its containers' ids, which v4 makes the same in each test, differ. A server here would not do for
+// the container to reach: a test's sockets are bober's own, which nothing outside the test process connects to.
+test "containers of either arch read a mount and see their env" {
+	const c = new AppleContainers()
+	let host = ""
+	try {
+		host = c.host()
+	} catch (e: ContainerError) {
+		assert e.kind == "Unavailable"
+		print(`skipped: ${e.message}`)
+		return
+	}
+	assert indexOf(host, ".") > 0
+	c.pull(image)
+	const dir = makeTempDir("container")
+	writeFile(`${dir}/hello.txt`, "hello from a mount")
+	const m = new Mount()
+	m.host = dir
+	m.path = "/mnt/code"
+	const spec = new Spec()
+	spec.image = image
+	spec.arch = "arm64"
+	spec.command = ["/bin/sh", "-c",
+		"cat /mnt/code/hello.txt; echo; touch /mnt/code/new 2>/dev/null || echo read-only; uname -m; "
+		+ "echo \"$GREETING\" >&2; exit 7"]
+	spec.env = [["GREETING", "hi there"]]
+	spec.mounts = [m]
+	const [status, out] = run(c, spec)
+	removeAll(dir)
+	// Of stderr's line, which reaches the log by a pipe of its own, only that it is there whole.
+	assert status == 7 && indexOf(out, "hi there\n") >= 0
+	assert replace(out, "hi there\n", "") == "hello from a mount\nread-only\naarch64\n"
+	const x86 = new Spec()
+	x86.image = image
+	x86.command = ["uname", "-m"]
+	assert run(c, x86) == [0, "x86_64\n"]
+}
+
+test "stop and output of a container there is not" {
+	const c = new AppleContainers()
+	try {
+		c.stop("bober-none")
+		c.output("bober-none")
+		assert false
+	} catch (e: ContainerError) {
+		assert e.kind == "NotFound" || e.kind == "Unavailable"
+	}
+}

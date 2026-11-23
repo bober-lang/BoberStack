@@ -1,0 +1,50 @@
+//! Containers to run Lambda functions in, whatever runs them: on macOS Apple's container daemon (apple.bob).
+
+export type Arch = "arm64" | "x86_64"
+
+/// A directory of this machine's, seen at path in the container.
+export class Mount {
+	host = ""
+	path = ""
+	readOnly = true
+}
+
+export class Spec {
+	/// As a registry names it, as public.ecr.aws/lambda/provided:al2023.
+	image = ""
+	/// The program and its arguments, in place of the image's entrypoint and command both; empty for the image's.
+	command: string[] = []
+	/// Added to the image's, replacing those of the same names.
+	env: [string, string][] = []
+	mounts: Mount[] = []
+	memoryMb = 128
+	arch: Arch = "x86_64"
+}
+
+/// NotFound for a container or image there is not; Unavailable when nothing that runs containers answers.
+export type Kind = "NotFound" | "Unavailable" | "Failed"
+
+export class ContainerError {
+	kind: Kind
+	message: string
+
+	constructor(kind: Kind, message: string) {
+		this.kind = kind
+		this.message = message
+	}
+}
+
+export interface Containers {
+	/// Makes image available here; nothing if it is.
+	pull(image: string) throws ContainerError
+	/// Creates and starts a container of spec, pulling its image if it is not here: its id.
+	start(spec: Spec): string throws ContainerError
+	/// The address a container reaches this machine at, for a server listening on all of its addresses.
+	host(): string throws ContainerError
+	/// What the container has written so far, its stdout and stderr as they came.
+	output(id: string): string throws ContainerError
+	/// Parks until the container's program has exited: its status.
+	wait(id: string): i32 throws ContainerError
+	/// Stops and removes the container; nothing if it is gone.
+	stop(id: string) throws ContainerError
+}
