@@ -1,0 +1,293 @@
+import { sign } from "../../core/auth/sigv4"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import * as protocol from "../../core/protocol/json"
+import { Handler } from "./acm"
+import * as api from "./api"
+import { indexOf, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Request, Response } from "std/http"
+import { second } from "std/time"
+import { Decodable } from "std/types"
+
+const arn = "arn:aws:acm:us-east-1:000000000000:certificate/"
+
+/// Self-signed by openssl: RSA 2048 of SHA-256 with two names, and EC P-256 of SHA-384 with none; their keys.
+const pem = `-----BEGIN CERTIFICATE-----
+MIIDuDCCAqCgAwIBAgIUUltLiyKuUCOa6Y45/V6KwQg2++cwDQYJKoZIhvcNAQEL
+BQAwUjELMAkGA1UEBhMCVVMxEzARBgNVBAgMCldhc2hpbmd0b24xFDASBgNVBAoM
+C0V4YW1wbGUgT3JnMRgwFgYDVQQDDA9yc2EuZXhhbXBsZS5jb20wHhcNMjYxMTIz
+MDM0MDI4WhcNMjcxMTIzMDM0MDI4WjBSMQswCQYDVQQGEwJVUzETMBEGA1UECAwK
+V2FzaGluZ3RvbjEUMBIGA1UECgwLRXhhbXBsZSBPcmcxGDAWBgNVBAMMD3JzYS5l
+eGFtcGxlLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALpxzW0/
+f76EwsnPC7PJ+X1MfAIewZoVJkiVQacQCcQtJtsw3BZ3jkLXRmv5Mp5lgg7/FlTz
+t1g17cTOwxFPXi/lCWE0SDw1FuqF4FcVebjCAL/T/dBsTUaI5wCLlxxDnG9Ale8n
+Ad0VHcv45eSma+nG174CB0dVby9gOQrQDCUXHDffV/i7hjsQtOGMOq69x7riYxEq
+wGHS9XFWv0yAJbdF6+1XTm83qG6aJuMv+6aSK+v53rz0+dAu1wZa3nLSJOlb3pfC
+Ga3ByeU3pO/mIODv0Bq36T4NXOdyKvlRcOsFcfAzE2/wocrldDY3WZDZJE7QfPAe
+vh/b7wrw4q65N1cCAwEAAaOBhTCBgjAdBgNVHQ4EFgQUB/9UYhkfcUr9QLnls89B
+qrS3dU0wHwYDVR0jBBgwFoAUB/9UYhkfcUr9QLnls89BqrS3dU0wDwYDVR0TAQH/
+BAUwAwEB/zAvBgNVHREEKDAmgg9yc2EuZXhhbXBsZS5jb22CE3d3dy5yc2EuZXhh
+bXBsZS5jb20wDQYJKoZIhvcNAQELBQADggEBADcurCFqpcTTZ4ZYMUrv1P1ts5y4
+VwYnMM7NbLpwNwpGTaJOcVpXaqvspBoe2UYa5fQHdTeDP8N63aUsCfm+TYUOTWIG
+Lb1O1mJiTrsUjMYdEvzr1N4e5xL3xJXLMopFjkL0tvLeoncSk3Q4ipAz0lK1GYLC
+x10jMpIBeGhKPh8qvxOKmIM1t4J4l2qLW1O1sx0EKCOJK70dqd7glXZ48TKQoqsX
+alttrhDcDDu5AWWIuCvZhXDUqEh8LWjjQgWkUkFmnPdif0XopodyH6ZmLgiNFqOW
+2uqsji9mywL0+lR9YaXW6BFtHtBF0EEik6alkf83kN4OlH5y1vkiyAKazr0=
+-----END CERTIFICATE-----
+`
+
+const key = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC6cc1tP3++hMLJ
+zwuzyfl9THwCHsGaFSZIlUGnEAnELSbbMNwWd45C10Zr+TKeZYIO/xZU87dYNe3E
+zsMRT14v5QlhNEg8NRbqheBXFXm4wgC/0/3QbE1GiOcAi5ccQ5xvQJXvJwHdFR3L
++OXkpmvpxte+AgdHVW8vYDkK0AwlFxw331f4u4Y7ELThjDquvce64mMRKsBh0vVx
+Vr9MgCW3RevtV05vN6humibjL/umkivr+d689PnQLtcGWt5y0iTpW96Xwhmtwcnl
+N6Tv5iDg79Aat+k+DVzncir5UXDrBXHwMxNv8KHK5XQ2N1mQ2SRO0HzwHr4f2+8K
+8OKuuTdXAgMBAAECggEAOJsbpRsd1ECniTD42xWrz0x87AHdgsQAExJp0+iNJogU
+34CmmZWj1gxZH6gRo8Cq65Wr+I/kLv50mYey9trzfDQcFGyUr97ofby2v4nQInWY
+V6Vrzq9LCOrAw8wdzWGDqc1gmDLuIGrsWITRe4nBgsExuEkSX6iDMM2UlAFVZp7o
+b/buJXWC9Jya1OPFY2bBVWsYyonyPO/VhcTaZRrCH0YDETxQ660mFTeU/ny8NmOb
+wCrQJne3IGYbW3yTZnM5L1RX6VrfnNWV6zvSIXbWpXtoApPmrqW601E0Bv0V7FhZ
+BnKlu9kkvz36YJuD8188Zd0t8CaVJeARluleEM1pIQKBgQDdsypkDui17On36Han
+QkIZ83jhD8jOA++R8LuHuSm95Bs4rwzA5kREA9G0XhDpl5NyoAglZQ6CPTzMKyQU
+tjEvzEm4iKyaqbMuQ2qgfRmxLZZIhFDOvTw4PC/ZNYO3lQKZTSy/IFqHI/D8e6TZ
+igQ4SzYt8N/333iv0Jz+c+IZdwKBgQDXSkjJlFVvrI+QaxaJiLjVg18cBZSNJT65
+eKMxHgy2hoDdixiPbSWFY0ewUhXu40+ffzUutZKMPDg5CZIjPQd6W+UYcbeOUTSB
++sxCkWTovTyMmVgAg2xnPkCFKWx7/fjyk8HPOCB7g81kbcU60NmsI8x9AFucDUFy
+2KMeyXdJIQKBgQCHs6pn8qRI70pLX7R5LtptLhW4lUPRrqEO0K7JJfLB9AUhjiyd
+SpVQmJHc+JMbmJc9W22BDjlySO+U/XcpYlf7LO2XEbmtNeCimcuDju+R/xh1LOCV
+m0loFpcnOlV0orYjhhS0rKYdAEf7E+fU7GEm4Aq61i0ReW1TGLtwGRi1gwKBgFKp
+L/dN39vn6pttspKOD0HTlhIBRn9HHKVD34y9V+5BCHuHq59uLejgLKdTbR5y4qB/
+zCCqEKGNgZzMwvKKvTNK01SmXO7k2P9LF2A7yP3for7tJa/UxiuB6G34cLHO2uXw
+u4pfp4ElIxh7WS3zAJCqkhowp/vrzwRUj5UDj6xhAoGBALBrSboqhUkHuvnjkEqT
+RiccwNvcRIVDNhW4S10AMF/g1SX7DOv8L9w0XvM2GMnTx9cJycqfCiFDLwsgKe1f
+lhqiXs+VwXFfZXT0Caxixbcgc+6rshGyKD5ILtwzeeq3GPPNJtF+Er0xNUsj3bgV
+vRPsX5trx/XBsk1Mm5ukTDyD
+-----END PRIVATE KEY-----
+`
+
+const ecPem = `-----BEGIN CERTIFICATE-----
+MIIBhzCCAS2gAwIBAgIUCZzqECjP5g/THru9diWgcKJmLZUwCgYIKoZIzj0EAwMw
+GTEXMBUGA1UEAwwOZWMuZXhhbXBsZS5jb20wHhcNMjYxMTIzMDM0MDI4WhcNMjYx
+MjIzMDM0MDI4WjAZMRcwFQYDVQQDDA5lYy5leGFtcGxlLmNvbTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABL6USRbDBtKRQHdviPNSpNUg7kVhnrWBt5mJJg+wMej4
+pj0SSWIVubZTAs5oFD1ZJIlLty9iYINHapW1yN+mhGWjUzBRMB0GA1UdDgQWBBTF
+iwt/IEIqEgF+XHkrjHt4Ld4+mzAfBgNVHSMEGDAWgBTFiwt/IEIqEgF+XHkrjHt4
+Ld4+mzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMDA0gAMEUCIHJr9XCiCHvt
+NTKBfx3/DGcdHRV3m9JyjGLPzeTXHUEEAiEA2zi0jmQ1Z1Nd0shbOisy5Ct1bkes
+ZBo/3OQFRqNS6xI=
+-----END CERTIFICATE-----
+`
+
+const ecKey = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIbExb/4/tM983DS/
+293wgYG7nuvPQmaOMNbzyVCpHO+hRANCAAS+lEkWwwbSkUB3b4jzUqTVIO5FYZ61
+gbeZiSYPsDHo+KY9EkliFbm2UwLOaBQ9WSSJS7cvYmCDR2qVtcjfpoRl
+-----END PRIVATE KEY-----
+`
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `CertificateManager.${op}`)
+	sign(req, body, "acm", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function out[T extends Decodable](res: Response): T {
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+function fails(res: Response, code: string, why = ""): bool {
+	const body = res.body.whole ?? ""
+	return res.status == 400 && indexOf(body, `"__type":"${code}"`) >= 0 && indexOf(body, why) >= 0
+}
+
+function request(g: Gateway, body: string): string {
+	return out[api.RequestCertificateResponse](call(g, "RequestCertificate", body)).CertificateArn!
+}
+
+function described(g: Gateway, a: string): api.CertificateDetail {
+	return out[api.DescribeCertificateResponse](call(g, "DescribeCertificate",
+		`{"CertificateArn":"${a}"}`)).Certificate!
+}
+
+test "certificates: requested by DNS, issued at once, described with their validation records" {
+	const g = gateway()
+	const a = request(g,
+		`{"DomainName":"example.com","ValidationMethod":"DNS",`
+		+ `"SubjectAlternativeNames":["example.com","*.example.com"],"IdempotencyToken":"one",`
+		+ `"Tags":[{"Key":"env","Value":"dev"}]}`)
+	assert startsWith(a, arn) && a.length == arn.length + 36
+	assert request(g, `{"DomainName":"example.com","ValidationMethod":"DNS","IdempotencyToken":"one"}`) == a
+	const d = described(g, a)
+	assert d.Status == "ISSUED" && d.Type == "AMAZON_ISSUED" && d.Subject == "CN=example.com" && d.Issuer == "Amazon"
+	assert d.KeyAlgorithm == "RSA-2048" && d.SignatureAlgorithm == "SHA256WITHRSA" && d.Serial!.length == 47
+	assert d.SubjectAlternativeNames!.length == 2 && d.InUseBy!.length == 0 && d.RenewalEligibility == "INELIGIBLE"
+	const v = d.DomainValidationOptions!
+	assert v.length == 2 && v[1].DomainName == "*.example.com" && v[1].ValidationStatus == "SUCCESS"
+	const r = v[1].ResourceRecord!
+	assert startsWith(r.Name, "_") && r.Name.length == 1 + 32 + ".example.com.".length && r.Type == "CNAME"
+	assert indexOf(r.Value, ".acm-validations.aws.") == 1 + 32 + 1 + 10
+	assert d.Options!.CertificateTransparencyLoggingPreference == "ENABLED" && d.Options!.Export == "DISABLED"
+	const tags = out[api.ListTagsForCertificateResponse](call(g, "ListTagsForCertificate", `{"CertificateArn":"${a}"}`))
+	assert tags.Tags!.length == 1 && tags.Tags![0].Value == "dev"
+	assert call(g, "RemoveTagsFromCertificate", `{"CertificateArn":"${a}","Tags":[{"Key":"env"}]}`).status == 200
+	assert call(g, "AddTagsToCertificate", `{"CertificateArn":"${a}","Tags":[{"Key":"a","Value":"b"}]}`).status == 200
+	assert out[api.ListTagsForCertificateResponse](call(g, "ListTagsForCertificate",
+		`{"CertificateArn":"${a}"}`)).Tags![0].Key == "a"
+	assert fails(call(g, "ResendValidationEmail",
+		`{"CertificateArn":"${a}","Domain":"example.com",` + `"ValidationDomain":"example.com"}`),
+		"InvalidStateException", `Certificate ${a} is not in pending`)
+	const got = out[api.GetCertificateResponse](call(g, "GetCertificate", `{"CertificateArn":"${a}"}`))
+	assert startsWith(got.Certificate!, "-----BEGIN CERTIFICATE-----\nMII") && got.CertificateChain == null
+	assert call(g, "DeleteCertificate", `{"CertificateArn":"${a}"}`).status == 200
+	assert fails(call(g, "DescribeCertificate", `{"CertificateArn":"${a}"}`), "ResourceNotFoundException",
+		`Could not find certificate ${a}.`)
+}
+
+test "certificates: validations listed; revoked, exported and tagged by resource as AWS refuses" {
+	const g = gateway()
+	const a = request(g,
+		`{"DomainName":"example.com","ValidationMethod":"DNS","SubjectAlternativeNames":["a.example.com"]}`)
+	const first = out[api.ListCertificateDomainValidationsResponse](call(g, "ListCertificateDomainValidations",
+		`{"CertificateArn":"${a}","MaxItems":1}`))
+	const v = first.DomainValidationSummaryList!
+	assert v.length == 1 && v[0].DomainName == "example.com" && first.NextToken != null
+	assert v[0].ActiveValidationConfiguration!.ValidationMethod == "DNS"
+	const rest = out[api.ListCertificateDomainValidationsResponse](call(g, "ListCertificateDomainValidations",
+		`{"CertificateArn":"${a}","NextToken":"${first.NextToken!}"}`))
+	assert rest.DomainValidationSummaryList![0].DomainName == "a.example.com" && rest.NextToken == null
+	assert fails(call(g, "RevokeCertificate", `{"CertificateArn":"${a}","RevocationReason":"SUPERSEDED"}`),
+		"ValidationException", `Export not allowed for certificate ${a}`)
+	assert fails(call(g, "ExportCertificate", `{"CertificateArn":"${a}","Passphrase":"cGFzc3dvcmQ="}`),
+		"ValidationException", `Certificate ARN: ${a} is not an export enabled certificate`)
+	assert fails(call(g, "ListTagsForResource", `{"ResourceArn":"${a}"}`), "ValidationException",
+		`Resource ${a} is a certificate resource. Use ListTagsForCertificate API instead.`)
+	assert fails(call(g, "TagResource", `{"ResourceArn":"${a}","Tags":[{"Key":"k","Value":"v"}]}`),
+		"ValidationException", "Use AddTagsToCertificate API instead.")
+}
+
+test "certificates: domain names checked as AWS does" {
+	const g = gateway()
+	for (const n of ["nodot", "bad_domain.com", "-a.com", "a.c", "a..com"]) {
+		assert fails(call(g, "RequestCertificate", `{"DomainName":"${n}"}`), "ValidationException",
+			"Value of the input at 'domainName' failed to satisfy constraint")
+	}
+	// as ACM answered on 2026-11-23
+	const pattern = `(\\\\*\\\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])`
+	assert fails(call(g, "RequestCertificate", `{"DomainName":"nodot","IdempotencyToken":"bad token!"}`),
+		"ValidationException",
+		"2 validation errors detected: Value of the input at 'domainName' failed to satisfy "
+		+ `constraint: Member must satisfy regular expression pattern: ${pattern}; Value of the input at `
+		+ `'idempotencyToken' failed to satisfy constraint: Member must satisfy regular expression pattern: \\\\w+"`)
+	const a = request(g, `{"DomainName":"*.a.example.org"}`)
+	const d = described(g, a)
+	assert d.DomainValidationOptions![0].ValidationMethod == "EMAIL"
+	assert d.DomainValidationOptions![0].ValidationEmails![0] == "admin@*.a.example.org"
+}
+
+test "certificates: listed by key type, status and order, in pages" {
+	const g = gateway()
+	const a = request(g, `{"DomainName":"a.example.com"}`)
+	const b = request(g, `{"DomainName":"b.example.com","KeyAlgorithm":"EC_prime256v1"}`)
+	const c = request(g, `{"DomainName":"c.example.com"}`)
+	const rsa = out[api.ListCertificatesResponse](call(g, "ListCertificates", `{}`)).CertificateSummaryList!
+	assert rsa.length == 2 && rsa.every(s => s.KeyAlgorithm == "RSA-2048")
+	const first = out[api.ListCertificatesResponse](call(g, "ListCertificates",
+		`{"Includes":{"keyTypes":["RSA_2048","EC_prime256v1"]},"MaxItems":2}`))
+	assert first.CertificateSummaryList!.length == 2 && first.NextToken != null
+	const rest = out[api.ListCertificatesResponse](call(g, "ListCertificates",
+		`{"Includes":{"keyTypes":["RSA_2048","EC_prime256v1"]},"NextToken":"${first.NextToken!}"}`))
+	assert rest.CertificateSummaryList!.length == 1 && rest.NextToken == null
+	const arns = [...first.CertificateSummaryList!, ...rest.CertificateSummaryList!].map(s => s.CertificateArn!)
+	assert arns.some(x => x == a) && arns.some(x => x == b) && arns.some(x => x == c)
+	assert out[api.ListCertificatesResponse](call(g, "ListCertificates",
+		`{"CertificateStatuses":["PENDING_VALIDATION"]}`)).CertificateSummaryList!.length == 0
+	assert fails(call(g, "ListCertificates", `{"CertificateStatuses":["NOPE"]}`), "ValidationException")
+}
+
+function imported(cert: string, k: string, arn = ""): string {
+	const onto = if (arn == "") "" else `"CertificateArn":"${arn}",`
+	return `{${onto}"Certificate":"${base64.encode(cert)}","PrivateKey":"${base64.encode(k)}"}`
+}
+
+test "certificates: imported, read from their DER, and re-imported onto their ARN" {
+	const g = gateway()
+	const a = out[api.ImportCertificateResponse](call(g, "ImportCertificate", imported(pem, key))).CertificateArn!
+	assert startsWith(a, arn)
+	assert out[api.GetCertificateResponse](call(g, "GetCertificate", `{"CertificateArn":"${a}"}`)).Certificate == pem
+	assert out[api.ImportCertificateResponse](call(g, "ImportCertificate", imported(pem, key, a))).CertificateArn == a
+	const d = described(g, a)
+	assert d.Type == "IMPORTED" && d.CertificateKeyPairOrigin == "CUSTOMER_PROVIDED" && d.ImportedAt != null
+	assert d.DomainName == "rsa.example.com" && d.SubjectAlternativeNames!.length == 2
+	assert d.SubjectAlternativeNames![1] == "www.rsa.example.com"
+	assert d.Subject == "CN=rsa.example.com,O=Example Org,ST=Washington,C=US" && d.Issuer == "Example Org"
+	assert d.Serial == "52:5b:4b:8b:22:ae:50:23:9a:e9:8e:39:fd:5e:8a:c1:08:36:fb:e7"
+	assert d.KeyAlgorithm == "RSA-2048" && d.SignatureAlgorithm == "SHA256WITHRSA"
+	assert d.NotBefore == 1795405228 * second && d.NotAfter == 1826941228 * second
+	const e = described(g,
+		out[api.ImportCertificateResponse](call(g, "ImportCertificate", imported(ecPem, ecKey))).CertificateArn!)
+	assert e.DomainName == "ec.example.com" && e.SubjectAlternativeNames == null && e.Issuer == "ec.example.com"
+	assert e.KeyAlgorithm == "EC-prime256v1" && e.SignatureAlgorithm == "SHA384WITHECDSA"
+	const ecs = out[api.ListCertificatesResponse](call(g, "ListCertificates",
+		`{"Includes":{"keyTypes":["EC_prime256v1"]}}`)).CertificateSummaryList!
+	assert ecs.length == 1 && ecs[0].KeyAlgorithm == "EC-prime256v1" && ecs[0].DomainName == "ec.example.com"
+	const garbage = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ0VSVA==\n-----END CERTIFICATE-----\n"
+	assert fails(call(g, "ImportCertificate", imported(garbage, key)), "ValidationException",
+		"The certificate is not PEM-encoded or is not valid.")
+	assert fails(call(g, "ImportCertificate", imported("hello", key)), "ValidationException",
+		"The certificate field contains more than one certificate.")
+	assert fails(call(g, "ImportCertificate", imported(pem, ecKey)), "ValidationException",
+		"Key provided does not match the certificate.")
+	assert fails(call(g, "ImportCertificate",
+		imported(pem, "-----BEGIN PRIVATE KEY-----\nMC4=\n-----END PRIVATE KEY-----\n")), "ValidationException",
+		"Passed PEM could not be parsed.")
+}
+
+test "certificates searched by a tree of filter statements, sorted and paged" {
+	const g = gateway()
+	const a = request(g, `{"DomainName":"a.example.org","ValidationMethod":"DNS"}`)
+	const b = out[api.ImportCertificateResponse](call(g, "ImportCertificate", imported(pem, key))).CertificateArn!
+	const search = (body: string) => out[api.SearchCertificatesResponse](call(g, "SearchCertificates", body))
+	const both = search(`{"SortBy":"NOT_AFTER","SortOrder":"DESCENDING"}`).Results!
+	assert both.length == 2 && both[0].CertificateArn == b
+	const x = both[0].X509Attributes!
+	assert x.Subject!.CommonName == "rsa.example.com" && x.Subject!.Organization == "Example Org"
+	assert x.Issuer!.Country == "US" && x.KeyAlgorithm == "RSA_2048" && x.SubjectAlternativeNames!.length == 2
+	const m = (both[0].CertificateMetadata as api.CertificateMetadata$AcmCertificateMetadata).AcmCertificateMetadata
+	assert m.Type == "IMPORTED" && m.Status == "ISSUED" && m.CertificateKeyPairOrigin == "CUSTOMER_PROVIDED"
+	const page = search(`{"MaxResults":1}`)
+	assert page.Results!.length == 1 && page.NextToken != null
+	assert search(`{"NextToken":"${page.NextToken!}"}`).Results![0].CertificateArn != page.Results![0].CertificateArn
+	const dns = search(`{"FilterStatement":{"And":[{"Filter":{"X509AttributeFilter":{"SubjectAlternativeName":`
+		+ `{"DnsName":{"Value":"www.","ComparisonOperator":"CONTAINS"}}}}},{"Not":{"Filter":{"AcmCertificateMetadataFilter":`
+		+ `{"Type":"AMAZON_ISSUED"}}}}]}}`).Results!
+	assert dns.length == 1 && dns[0].CertificateArn == b
+	const either = search(`{"FilterStatement":{"Or":[{"Filter":{"CertificateArn":"${a}"}},{"Filter":{"X509AttributeFilter":`
+		+ `{"Subject":{"CommonName":{"Value":"rsa.example","ComparisonOperator":"EQUALS"}}}}}]}}`).Results!
+	assert either.length == 1 && either[0].CertificateArn == a
+	assert search(`{"FilterStatement":{"Filter":{"AcmCertificateMetadataFilter":{"InUse":true}}}}`).Results!.length == 0
+}
+
+test "account configuration: 45 days unless put" {
+	const g = gateway()
+	const read = () => out[api.GetAccountConfigurationResponse](call(g, "GetAccountConfiguration", `{}`))
+	assert read().ExpiryEvents!.DaysBeforeExpiry == 45
+	assert call(g, "PutAccountConfiguration", `{"IdempotencyToken":"t","ExpiryEvents":{"DaysBeforeExpiry":30}}`).status
+		== 200
+	assert read().ExpiryEvents!.DaysBeforeExpiry == 30
+}

@@ -1,0 +1,650 @@
+//! AWS Certificate Manager: public certificates requested by DNS or email validation, imported certificates, their
+//! tags and options, and the account's configuration. Where AWS differs:
+//!
+//! - A requested certificate is ISSUED at once, each domain's validation SUCCESS: nobody proves control of a domain.
+//! - Its PEM is self-signed by an Ed25519 key of its own, with no chain, whatever its key algorithm.
+//! - An imported certificate's key is not checked against it, nor its signature or chain: std has no RSA or ECDSA.
+//! - No certificate is ever exported: RevokeCertificate refuses each, and ExportCertificate exports none, as std has
+//!   no cipher to encrypt its key with.
+//! - SearchCertificates finds none by key usage, renewal status, managing service, ACME or private hierarchy;
+//!   CONTAINS compares case-sensitively.
+//! - Private certificates and the ACME operations are not implemented; RenewCertificate does nothing.
+
+import { Fault } from "../../core/fault"
+import { random, uuid } from "../../core/random"
+import { Caller, notImplemented, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import * as der from "./der"
+import { Account, accounts, Certificate, certificates, Domain, save } from "./records"
+import { selfSigned } from "./x509"
+import { indexOf, stableSort, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { lower, ParseError, parseInt, split, trim } from "std/string"
+import { day } from "std/time"
+
+const validity = 198
+
+export class Handler {
+	...api.Unimplemented
+
+	requestCertificate(caller: Caller,
+		input: api.RequestCertificateRequest): api.RequestCertificateResponse throws Fault {
+		caller.actions = caller.actions.filter(a => a == "acm:RequestCertificate"
+			|| a == "acm:AddTagsToCertificate" && (input.Tags ?? []).length > 0)
+		const db = certificates(caller.regional())
+		if (input.IdempotencyToken != null) {
+			for (const c of all(db)) {
+				if (c.token == input.IdempotencyToken && c.domain == input.DomainName) {
+					caller.allow(c.arn)
+					return { ...new api.RequestCertificateResponse(), CertificateArn: c.arn }
+				}
+			}
+		}
+		const id = uuid()
+		const arn = `arn:aws:acm:${caller.region}:${caller.account}:certificate/${id}`
+		caller.allow(arn)
+		if (input.CertificateAuthorityArn != null) {
+			throw api.invalidParameterException("Private certificates are not implemented.")
+		}
+		const names = [input.DomainName]
+		for (const n of input.SubjectAlternativeNames ?? []) {
+			if (!names.some(m => m == n)) {
+				names.push(n)
+			}
+		}
+		const options = input.DomainValidationOptions ?? []
+		for (const o of options) {
+			if (!names.some(n => n == o.DomainName)) {
+				throw api.invalidDomainValidationOptionsException(`DomainValidationOption DomainName ${o.DomainName} `
+					+ "is not one of the domain names requested.")
+			}
+		}
+		const t = now()
+		const number = random(16)
+		const c = { ...new Certificate(), id: id, arn: arn, type: "AMAZON_ISSUED", domain: input.DomainName,
+			method: input.ValidationMethod ?? "EMAIL", keyAlgorithm: input.KeyAlgorithm ?? "RSA_2048",
+			serial: colons(number), token: input.IdempotencyToken, created: t, notBefore: t,
+			notAfter: t + validity * day, subject: `CN=${input.DomainName}`, issuer: "Amazon", issuedBy: "O=Amazon" }
+		c.signatureAlgorithm = signature(c.keyAlgorithm)
+		c.body = selfSigned(names, number, t, c.notAfter, random(32))
+		for (const n of names) {
+			const o = options.find(o => o.DomainName == n)
+			const base = if (startsWith(n, "*.")) n.slice(2, n.length) else n
+			c.domains.push({ ...new Domain(), name: n, validation: o?.ValidationDomain ?? n,
+				record: `_${hex.encode(random(16))}.${lower(base)}.`,
+				value: `_${hex.encode(random(16))}.${letters(10)}.acm-validations.aws.` })
+		}
+		const opts = input.Options
+		if (opts != null) {
+			c.transparency = opts.CertificateTransparencyLoggingPreference ?? "ENABLED"
+			c.exportable = opts.Export ?? "DISABLED"
+		}
+		c.tags = tagged([], input.Tags ?? [])
+		save(db, c)
+		return { ...new api.RequestCertificateResponse(), CertificateArn: arn }
+	}
+
+	importCertificate(caller: Caller, input: api.ImportCertificateRequest): api.ImportCertificateResponse throws Fault {
+		caller.actions = caller.actions.filter(a => a == "acm:ImportCertificate"
+			|| a == "acm:AddTagsToCertificate" && (input.Tags ?? []).length > 0)
+		const db = certificates(caller.regional())
+		let c = new Certificate()
+		if (input.CertificateArn != null) {
+			const [_, old] = found(caller, input.CertificateArn!)
+			if (old.type != "IMPORTED") {
+				throw api.validationException("Only imported certificates can be re-imported.")
+			}
+			if ((input.Tags ?? []).length > 0) {
+				throw api.invalidParameterException("Tags cannot be specified when reimporting a certificate.")
+			}
+			c = old
+		} else {
+			c.id = uuid()
+			c.arn = `arn:aws:acm:${caller.region}:${caller.account}:certificate/${c.id}`
+			caller.allow(c.arn)
+			c.type = "IMPORTED"
+			c.created = now()
+			c.tags = tagged([], input.Tags ?? [])
+		}
+		const p = read(input.Certificate, input.PrivateKey)
+		if (input.CertificateChain != null) {
+			try {
+				for (const b of blocks(input.CertificateChain!, "CERTIFICATE") ?? [""]) {
+					der.certificate(b)
+				}
+			} catch (e: der.Malformed) {
+				throw api.validationException("The certificate chain is not PEM-encoded or is not valid.")
+			}
+		}
+		c.keyAlgorithm = p.keyAlgorithm
+		c.signatureAlgorithm = p.signatureAlgorithm
+		c.serial = colons(p.serial)
+		c.subject = p.subject
+		c.issuer = p.issuerName
+		c.issuedBy = p.issuer
+		c.notBefore = p.notBefore
+		c.notAfter = p.notAfter
+		c.domain = p.commonName ?? (if (p.names.length > 0) p.names[0] else null)
+		c.domains = p.names.map(n => ({ ...new Domain(), name: n, validation: n }))
+		c.body = input.Certificate
+		c.key = input.PrivateKey
+		c.chain = input.CertificateChain
+		c.imported = now()
+		save(db, c)
+		return { ...new api.ImportCertificateResponse(), CertificateArn: c.arn }
+	}
+
+	describeCertificate(caller: Caller,
+		input: api.DescribeCertificateRequest): api.DescribeCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		return { ...new api.DescribeCertificateResponse(), Certificate: detail(c) }
+	}
+
+	getCertificate(caller: Caller, input: api.GetCertificateRequest): api.GetCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		return { ...new api.GetCertificateResponse(), Certificate: c.body, CertificateChain: c.chain }
+	}
+
+	listCertificates(caller: Caller, input: api.ListCertificatesRequest): api.ListCertificatesResponse throws Fault {
+		caller.allow("*")
+		const db = certificates(caller.regional())
+		const statuses = input.CertificateStatuses ?? []
+		const includes = input.Includes ?? new api.Filters()
+		const keys: string[] = (includes.keyTypes ?? ["RSA_2048"]).map(k => k as string)
+		const origins: string[] = (input.CertificateKeyPairOrigins ?? []).map(o => o as string)
+		const cs = all(db).filter(c => (statuses.length == 0 || statuses.some(s => s == "ISSUED"))
+			&& keys.some(k => k == c.keyAlgorithm) && (origins.length == 0 || origins.some(o => o == origin(c)))
+			&& (includes.exportOption == null || includes.exportOption == c.exportable) && (includes.managedBy == null))
+		const descending = input.SortOrder == "DESCENDING"
+		stableSort(cs, (a, b) => if (descending) a.created > b.created else a.created < b.created)
+		const [from, to, next] = paged(cs.length, input.NextToken, input.MaxItems)
+		const r = new api.ListCertificatesResponse()
+		r.CertificateSummaryList = cs.slice(from, to).map(c => summary(c))
+		r.NextToken = next
+		return r
+	}
+
+	deleteCertificate(caller: Caller, input: api.DeleteCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		db.delete(c.id)
+		return new Unit()
+	}
+
+	addTagsToCertificate(caller: Caller, input: api.AddTagsToCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		const tags = tagged(c.tags, input.Tags)
+		if (tags.length > 50) {
+			throw api.tooManyTagsException("the TagSet: {} contains too many Tags")
+		}
+		c.tags = tags
+		save(db, c)
+		return new Unit()
+	}
+
+	removeTagsFromCertificate(caller: Caller, input: api.RemoveTagsFromCertificateRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		c.tags = c.tags.filter(t => !input.Tags.some(g => g.Key == t[0] && (g.Value == null || g.Value == t[1])))
+		save(db, c)
+		return new Unit()
+	}
+
+	listTagsForCertificate(caller: Caller,
+		input: api.ListTagsForCertificateRequest): api.ListTagsForCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		const r = new api.ListTagsForCertificateResponse()
+		r.Tags = c.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return r
+	}
+
+	updateCertificateOptions(caller: Caller, input: api.UpdateCertificateOptionsRequest): Unit throws Fault {
+		const [db, c] = found(caller, input.CertificateArn)
+		if (c.type == "IMPORTED") {
+			throw api.invalidStateException("The selected certificate is not Issued and/or Valid.")
+		}
+		c.transparency = input.Options.CertificateTransparencyLoggingPreference ?? c.transparency
+		save(db, c)
+		return new Unit()
+	}
+
+	resendValidationEmail(caller: Caller, input: api.ResendValidationEmailRequest): Unit throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		throw api.invalidStateException(`Certificate ${c.arn} is not in pending validation state`)
+	}
+
+	renewCertificate(caller: Caller, input: api.RenewCertificateRequest): Unit throws Fault {
+		found(caller, input.CertificateArn)
+		return new Unit()
+	}
+
+	listCertificateDomainValidations(caller: Caller,
+		input: api.ListCertificateDomainValidationsRequest): api.ListCertificateDomainValidationsResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		const all = if (c.type == "IMPORTED") [] else c.domains
+		const [from, to, next] = paged(all.length, input.NextToken, input.MaxItems)
+		const r = new api.ListCertificateDomainValidationsResponse()
+		r.DomainValidationSummaryList = all.slice(from, to).map(n => {
+			const v = validation(c, n)
+			const active = { ...new api.ValidationConfiguration(), ValidationMethod: v.ValidationMethod,
+				ValidationStatus: v.ValidationStatus }
+			if (c.method == "DNS") {
+				active.ValidationChallenge = { ...new api.ValidationChallenge$DnsValidationChallenge(),
+					DnsValidationChallenge: { ...new api.DnsValidationChallenge(), ResourceRecord: v.ResourceRecord } }
+			} else {
+				active.ValidationChallenge = { ...new api.ValidationChallenge$EmailValidationChallenge(),
+					EmailValidationChallenge: { ...new api.EmailValidationChallenge(),
+					ValidationEmails: v.ValidationEmails, ValidationDomain: v.ValidationDomain } }
+			}
+			return { ...new api.DomainValidationSummary(), DomainName: n.name, ActiveValidationConfiguration: active }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	revokeCertificate(caller: Caller, input: api.RevokeCertificateRequest): api.RevokeCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		throw api.validationException(`Export not allowed for certificate ${c.arn}`)
+	}
+
+	exportCertificate(caller: Caller, input: api.ExportCertificateRequest): api.ExportCertificateResponse throws Fault {
+		const [_, c] = found(caller, input.CertificateArn)
+		if (c.type == "IMPORTED" || c.exportable != "ENABLED") {
+			throw api.validationException(`Certificate ARN: ${c.arn} is not an export enabled certificate`)
+		}
+		throw notImplemented("ExportCertificate")
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		throw certificateResource(caller, "ListTagsForResource", input.ResourceArn, "ListTagsForCertificate")
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): Unit throws Fault {
+		throw certificateResource(caller, "TagResource", input.ResourceArn, "AddTagsToCertificate")
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
+		throw certificateResource(caller, "UntagResource", input.ResourceArn, "RemoveTagsFromCertificate")
+	}
+
+	searchCertificates(caller: Caller,
+		input: api.SearchCertificatesRequest): api.SearchCertificatesResponse throws Fault {
+		caller.allow("*")
+		const cs = all(certificates(caller.regional())).filter(c => input.FilterStatement == null
+			|| matches(c, input.FilterStatement!))
+		const descending = input.SortOrder == "DESCENDING"
+		const by = if (input.SortBy == "NOT_AFTER") (c: Certificate) => c.notAfter
+			else if (input.SortBy == "CREATED_AT") (c: Certificate) => c.created
+			else (c: Certificate) => 0 as i64
+		stableSort(cs, (a, b) => if (descending) by(a) > by(b) else by(a) < by(b))
+		const [from, to, next] = paged(cs.length, input.NextToken, input.MaxResults)
+		const r = new api.SearchCertificatesResponse()
+		r.Results = cs.slice(from, to).map(c => searched(c))
+		r.NextToken = next
+		return r
+	}
+
+	getAccountConfiguration(caller: Caller, input: Unit): api.GetAccountConfigurationResponse throws Fault {
+		caller.allow("*")
+		const a = accounts(caller.regional()).get("") ?? new Account()
+		const e = { ...new api.ExpiryEventsConfiguration(), DaysBeforeExpiry: a.daysBeforeExpiry }
+		return { ...new api.GetAccountConfigurationResponse(), ExpiryEvents: e }
+	}
+
+	putAccountConfiguration(caller: Caller, input: api.PutAccountConfigurationRequest): Unit throws Fault {
+		caller.allow("*")
+		const t = accounts(caller.regional())
+		const a = t.get("") ?? new Account()
+		const days = input.ExpiryEvents?.DaysBeforeExpiry
+		if (days != null) {
+			if (days > 45) {
+				throw api.validationException("DaysBeforeExpiry must be between 1 and 45.")
+			}
+			a.daysBeforeExpiry = days!
+		}
+		t.put("", a)
+		return new Unit()
+	}
+}
+
+function found(caller: Caller, arn: string): [Table[Certificate], Certificate] throws Fault {
+	caller.allow(arn)
+	const db = certificates(caller.regional())
+	const prefix = `arn:aws:acm:${caller.region}:${caller.account}:certificate/`
+	const c = if (startsWith(arn, prefix)) db.get(arn.slice(prefix.length, arn.length)) else null
+	if (c == null) {
+		throw api.resourceNotFoundException(`Could not find certificate ${arn}.`)
+	}
+	return [db, c!]
+}
+
+/// The fault of op, an operation of tags by resource, on arn: for a certificate AWS's, naming the operation to use
+/// instead.
+function certificateResource(caller: Caller, op: string, arn: string, instead: string): Fault throws Fault {
+	caller.allow(arn)
+	if (indexOf(arn, ":certificate/") < 0) {
+		return notImplemented(op)
+	}
+	return api.validationException(`${op} only supports non-certificate resource types. Resource ${arn} is a `
+		+ `certificate resource. Use ${instead} API instead.`)
+}
+
+function all(db: Table[Certificate]): Certificate[] {
+	const out: Certificate[] = []
+	let after: string | null = null
+	while (true) {
+		const chunk = db.scan(after, 100)
+		for (const [_, c] of chunk) {
+			out.push(c)
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+}
+
+function blocks(s: string, label: string): string[] | null {
+	const begin = `-----BEGIN ${label}-----`
+	const end = `-----END ${label}-----`
+	const out: string[] = []
+	let rest = s
+	while (true) {
+		const trimmed = trim(rest)
+		if (trimmed == "") {
+			return if (out.length == 0) null else out
+		}
+		const e = indexOf(trimmed, end)
+		if (!startsWith(trimmed, begin) || e < 0) {
+			return null
+		}
+		const body = split(trimmed.slice(begin.length, e), "\n").map(l => trim(l)).join("")
+		try {
+			out.push(base64.decode(body))
+		} catch (x: ParseError) {
+			out.push("")
+		}
+		rest = trimmed.slice(e + end.length, trimmed.length)
+	}
+}
+
+/// The certificate of the PEM body, whose private key is the PEM key, checked in AWS's order and words.
+function read(body: string, key: string): der.Parsed throws Fault {
+	const bodies = blocks(body, "CERTIFICATE")
+	if (bodies == null || bodies.length != 1) {
+		throw api.validationException("The certificate field contains more than one certificate. You can specify only "
+			+ "one certificate in this field.")
+	}
+	let p = new der.Parsed()
+	try {
+		p = der.certificate(bodies[0])
+	} catch (e: der.Malformed) {
+		throw api.validationException("The certificate is not PEM-encoded or is not valid.")
+	}
+	if (p.keyAlgorithm == "") {
+		throw api.validationException("Passed PEM was not a private key of a valid type.")
+	}
+	let algorithm: string | null = null
+	for (const label of ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"]) {
+		const keys = blocks(key, label)
+		if (keys != null && keys.length == 1) {
+			try {
+				algorithm = der.privateKey(keys[0], label)
+			} catch (e: der.Malformed) {}
+		}
+	}
+	if (algorithm == null) {
+		throw api.validationException("Passed PEM could not be parsed.")
+	}
+	if (algorithm != p.keyAlgorithm) {
+		throw api.validationException("Key provided does not match the certificate.")
+	}
+	return p
+}
+
+function answered(k: string): string {
+	const i = indexOf(k, "_")
+	return if (i < 0) k else `${k.slice(0, i)}-${k.slice(i + 1, k.length)}`
+}
+
+function detail(c: Certificate): api.CertificateDetail {
+	const d = new api.CertificateDetail()
+	d.CertificateArn = c.arn
+	d.DomainName = c.domain
+	d.SubjectAlternativeNames = if (c.domains.length == 0) null else c.domains.map(n => n.name)
+	d.Serial = c.serial
+	d.Status = "ISSUED"
+	d.KeyAlgorithm = answered(c.keyAlgorithm)
+	d.SignatureAlgorithm = c.signatureAlgorithm
+	d.Subject = c.subject
+	d.Issuer = c.issuer
+	d.NotBefore = c.notBefore
+	d.InUseBy = []
+	d.Type = c.type as api.CertificateType
+	d.RenewalEligibility = "INELIGIBLE"
+	d.KeyUsages = []
+	d.ExtendedKeyUsages = []
+	d.CreatedAt = c.created
+	d.NotAfter = c.notAfter
+	d.CertificateKeyPairOrigin = origin(c) as api.CertificateKeyPairOrigin
+	if (c.type == "IMPORTED") {
+		d.ImportedAt = c.imported
+		return d
+	}
+	d.IssuedAt = c.created
+	d.DomainValidationOptions = c.domains.map(n => validation(c, n))
+	d.KeyUsages = [{ ...new api.KeyUsage(), Name: "DIGITAL_SIGNATURE" },
+		{ ...new api.KeyUsage(), Name: "KEY_ENCIPHERMENT" }]
+	d.ExtendedKeyUsages = [{ ...new api.ExtendedKeyUsage(), Name: "TLS_WEB_SERVER_AUTHENTICATION",
+		OID: "1.3.6.1.5.5.7.3.1" }]
+	d.Options = { ...new api.CertificateOptions(),
+		CertificateTransparencyLoggingPreference: c.transparency as api.CertificateTransparencyLoggingPreference,
+		Export: c.exportable as api.CertificateExport }
+	return d
+}
+
+function validation(c: Certificate, n: Domain): api.DomainValidation {
+	const v = { ...new api.DomainValidation(), DomainName: n.name, ValidationDomain: n.validation,
+		ValidationStatus: "SUCCESS", ValidationMethod: c.method as api.ValidationMethod }
+	if (c.method == "DNS") {
+		v.ResourceRecord = { ...new api.ResourceRecord(), Name: n.record, Value: n.value }
+	} else {
+		v.ValidationEmails = ["admin", "administrator", "hostmaster", "postmaster",
+			"webmaster"].map(u => `${u}@${n.validation}`)
+	}
+	return v
+}
+
+function summary(c: Certificate): api.CertificateSummary {
+	const s = new api.CertificateSummary()
+	s.CertificateArn = c.arn
+	s.DomainName = c.domain
+	s.SubjectAlternativeNameSummaries = if (c.domains.length == 0) null else c.domains.map(n => n.name)
+	s.HasAdditionalSubjectAlternativeNames = false
+	s.Status = "ISSUED"
+	s.Type = c.type as api.CertificateType
+	s.KeyAlgorithm = answered(c.keyAlgorithm)
+	s.NotBefore = c.notBefore
+	s.KeyUsages = []
+	s.ExtendedKeyUsages = []
+	s.ExportOption = c.exportable as api.CertificateExport
+	s.InUse = false
+	s.Exported = false
+	s.RenewalEligibility = "INELIGIBLE"
+	s.CreatedAt = c.created
+	s.NotAfter = c.notAfter
+	s.CertificateKeyPairOrigin = origin(c) as api.CertificateKeyPairOrigin
+	if (c.type == "IMPORTED") {
+		s.ImportedAt = c.imported
+	} else {
+		s.IssuedAt = c.created
+	}
+	return s
+}
+
+function matches(c: Certificate, s: api.CertificateFilterStatement): bool {
+	if (s instanceof api.CertificateFilterStatement$And) {
+		return s.And.every(x => matches(c, x))
+	}
+	if (s instanceof api.CertificateFilterStatement$Or) {
+		return s.Or.some(x => matches(c, x))
+	}
+	if (s instanceof api.CertificateFilterStatement$Not) {
+		return !matches(c, s.Not)
+	}
+	const f = (s as api.CertificateFilterStatement$Filter).Filter
+	if (f instanceof api.CertificateFilter$CertificateArn) {
+		return f.CertificateArn == c.arn
+	}
+	if (f instanceof api.CertificateFilter$X509AttributeFilter) {
+		return x509Matches(c, f.X509AttributeFilter)
+	}
+	return metadataMatches(c, (f as api.CertificateFilter$AcmCertificateMetadataFilter).AcmCertificateMetadataFilter)
+}
+
+function x509Matches(c: Certificate, f: api.X509AttributeFilter): bool {
+	if (f instanceof api.X509AttributeFilter$Subject) {
+		const cn = (f.Subject as api.SubjectFilter$CommonName).CommonName
+		return compared(distinguished(c.subject).CommonName ?? "", cn.ComparisonOperator, cn.Value)
+	}
+	if (f instanceof api.X509AttributeFilter$SubjectAlternativeName) {
+		const dns = (f.SubjectAlternativeName as api.SubjectAlternativeNameFilter$DnsName).DnsName
+		return c.domains.some(n => compared(n.name, dns.ComparisonOperator, dns.Value))
+	}
+	if (f instanceof api.X509AttributeFilter$KeyAlgorithm) {
+		return f.KeyAlgorithm == c.keyAlgorithm
+	}
+	if (f instanceof api.X509AttributeFilter$SerialNumber) {
+		return f.SerialNumber == c.serial
+	}
+	if (f instanceof api.X509AttributeFilter$NotAfter) {
+		return within(c.notAfter, f.NotAfter)
+	}
+	if (f instanceof api.X509AttributeFilter$NotBefore) {
+		return within(c.notBefore, f.NotBefore)
+	}
+	return false
+}
+
+function metadataMatches(c: Certificate, f: api.AcmCertificateMetadataFilter): bool {
+	return if (f instanceof api.AcmCertificateMetadataFilter$Status) f.Status == "ISSUED"
+		else if (f instanceof api.AcmCertificateMetadataFilter$Type) f.Type == c.type
+		else if (f instanceof api.AcmCertificateMetadataFilter$InUse) !f.InUse
+		else if (f instanceof api.AcmCertificateMetadataFilter$Exported) !f.Exported
+		else if (f instanceof api.AcmCertificateMetadataFilter$ExportOption) f.ExportOption == c.exportable
+		else if (f instanceof api.AcmCertificateMetadataFilter$ValidationMethod) f.ValidationMethod == c.method
+		else if (f instanceof api.AcmCertificateMetadataFilter$CertificateKeyPairOrigin) f.CertificateKeyPairOrigin
+		== origin(c)
+		else false
+}
+
+function compared(value: string, operator: api.ComparisonOperator, operand: string): bool {
+	return if (operator == "EQUALS") value == operand else indexOf(value, operand) >= 0
+}
+
+function within(t: i64, r: api.TimestampRange): bool {
+	return (r.Start == null || t >= r.Start!) && (r.End == null || t <= r.End!)
+}
+
+function attributes(dn: string): [string, string][] {
+	const out: [string, string][] = []
+	for (const part of split(dn, ",")) {
+		const eq = indexOf(part, "=")
+		if (eq > 0) {
+			out.push([part.slice(0, eq), part.slice(eq + 1, part.length)])
+		}
+	}
+	return out
+}
+
+function distinguished(dn: string): api.DistinguishedName {
+	const n = new api.DistinguishedName()
+	for (const [label, value] of attributes(dn)) {
+		if (label == "CN") {
+			n.CommonName = value
+		} else if (label == "O") {
+			n.Organization = value
+		} else if (label == "OU") {
+			n.OrganizationalUnit = value
+		} else if (label == "C") {
+			n.Country = value
+		} else if (label == "ST") {
+			n.State = value
+		} else if (label == "L") {
+			n.Locality = value
+		}
+	}
+	return n
+}
+
+function searched(c: Certificate): api.CertificateSearchResult {
+	const x = { ...new api.X509Attributes(), Subject: distinguished(c.subject), Issuer: distinguished(c.issuedBy),
+		ExtendedKeyUsages: [], KeyUsages: [], KeyAlgorithm: c.keyAlgorithm as api.KeyAlgorithm, SerialNumber: c.serial,
+		NotBefore: c.notBefore, NotAfter: c.notAfter }
+	if (c.domains.length > 0) {
+		x.SubjectAlternativeNames = c.domains.map(n => {
+			const g: api.GeneralName = { ...new api.GeneralName$DnsName(), DnsName: n.name }
+			return g
+		})
+	}
+	const m = { ...new api.AcmCertificateMetadata(), CreatedAt: c.created, Exported: false, InUse: false,
+		RenewalEligibility: "INELIGIBLE", Status: "ISSUED", Type: c.type as api.CertificateType,
+		ExportOption: c.exportable as api.CertificateExport,
+		CertificateKeyPairOrigin: origin(c) as api.CertificateKeyPairOrigin }
+	if (c.type == "IMPORTED") {
+		m.ImportedAt = c.imported
+	} else {
+		m.IssuedAt = c.created
+		m.ValidationMethod = c.method as api.ValidationMethod
+	}
+	return { ...new api.CertificateSearchResult(), CertificateArn: c.arn, X509Attributes: x,
+		CertificateMetadata: { ...new api.CertificateMetadata$AcmCertificateMetadata(), AcmCertificateMetadata: m } }
+}
+
+function origin(c: Certificate): string { return if (c.type == "IMPORTED") "CUSTOMER_PROVIDED" else "AWS_MANAGED" }
+
+function signature(k: string): string {
+	return if (k == "EC_prime256v1") "SHA256WITHECDSA"
+		else if (k == "EC_secp384r1") "SHA384WITHECDSA"
+		else if (k == "EC_secp521r1") "SHA512WITHECDSA"
+		else "SHA256WITHRSA"
+}
+
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	for (const g of given) {
+		out.push([g.Key, g.Value ?? ""])
+	}
+	return out
+}
+
+function paged(n: i32, token: string | null, max: i32 | null): [i32, i32, string | null] throws Fault {
+	let from = 0
+	if (token != null) {
+		try {
+			from = parseInt(base64.decode(token!))
+		} catch (e: ParseError) {
+			throw api.invalidArgsException("The NextToken value is invalid.")
+		}
+	}
+	const to = if (from + (max ?? 1000) < n) from + (max ?? 1000) else n
+	return [from, to, if (to < n) base64.encode(`${to}`) else null]
+}
+
+function colons(b: string): string {
+	const h = hex.encode(b)
+	const pairs: string[] = []
+	for (let i = 0; i < h.length; i += 2) {
+		pairs.push(h.slice(i, i + 2))
+	}
+	return pairs.join(":")
+}
+
+function letters(n: i32): string throws Fault {
+	const out: u8[] = []
+	for (const b of random(n)) {
+		out.push("a"[0] + b % 26)
+	}
+	return fromBytes(out)
+}
