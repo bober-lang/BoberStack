@@ -1,0 +1,162 @@
+import { Fault } from "../../core/fault"
+import { decode, result } from "../../core/protocol/json"
+import * as api from "./api"
+import { apply, condition, Context, holds, Item, project, projection, update } from "./expression"
+
+function item(s: string): Item {
+	try {
+		return decode[api.GetItemOutput](`{"Item":${s}}`).Item!
+	} catch (f: Fault) {
+		assert false
+	}
+	return []
+}
+
+function json(i: Item): string {
+	const s = result({ ...new api.GetItemOutput(), Item: i })
+	return s.slice(8, s.length - 1)
+}
+
+const values = item(`{":one":{"N":"1"},":two":{"N":"2"},":x":{"S":"x"},":ab":{"S":"ab"},":l":{"L":[{"N":"9"}]},`
+	+ `":ss":{"SS":["b","z"]},":S":{"S":"S"},":L":{"S":"L"}}`)
+
+const sample = item(`{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a","b"]},"m":{"M":{"k":{"S":"x"},`
+	+ `"l":{"L":[{"N":"1"},{"S":"y"},{"N":"3"}]}}},"t":{"BOOL":true},"e":{"S":""}}`)
+
+function check(s: string): string {
+	try {
+		return `${holds(condition(s, "ConditionExpression", new Context([["#m", "m"]], values)), sample)}`
+	} catch (f: Fault) {
+		return f.message
+	}
+}
+
+function updated(s: string): string {
+	try {
+		return json(apply(update(s, new Context([["#m", "m"]], values)), sample))
+	} catch (f: Fault) {
+		return f.message
+	}
+}
+
+test "conditions" {
+	assert check("pk = :x") == "false" && check("m.k = :x") == "true" && check("#m.k = :x") == "true"
+	assert check("n = :one") == "false" && check("n > :one AND n < :two") == "true"
+	assert check("n BETWEEN :one AND :two") == "true" && check("NOT n BETWEEN :one AND :two") == "false"
+	assert check("m.l[1] IN (:x, :ab)") == "false" && check("m.k IN (:ab, :x)") == "true"
+	assert check("begins_with(pk, :ab)") == "true" && check("contains(pk, :x)") == "false"
+	assert check("contains(s, :x)") == "false" && check("contains(m.l, :one)") == "true"
+	assert check("attribute_exists(m.l[2]) and attribute_not_exists(m.l[3])") == "true"
+	assert check("attribute_type(s, :S) OR attribute_type(m.l, :L)") == "true"
+	assert check("size(pk) = :one OR (size(m.l) > :two AND size(s) = :two)") == "true"
+	assert check("nope <> :x") == "true" && check("nope = :x") == "false" && check("pk <> :x") == "true"
+	assert check("t < :one") == "false"
+}
+
+test "condition errors as DynamoDB words them" {
+	assert check("") == "Invalid ConditionExpression: The expression can not be empty;"
+	assert check("a = ") == "Invalid ConditionExpression: Syntax error; token: \"<EOF>\", near: \"= \""
+	assert check("a == :x") == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \"== :x\""
+	assert check("a < b < c") == "Invalid ConditionExpression: Syntax error; token: \"<\", near: \"b < c\""
+	assert check("a.b[x] = :x") == "Invalid ConditionExpression: Syntax error; token: \"x\", near: \"[x]\""
+	assert check("a IN ()") == "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\""
+	assert check("attribute_exists(a) AND")
+		== "Invalid ConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""
+	assert check("a = :v")
+		== "Invalid ConditionExpression: An expression attribute value used in expression is not "
+		+ "defined; attribute value: :v"
+	assert check("#n = :x")
+		== "Invalid ConditionExpression: An expression attribute name used in the document path "
+		+ "is not defined; attribute name: #n"
+	assert check("foo(a)") == "Invalid ConditionExpression: Invalid function name; function: foo"
+	assert check("size(a)")
+		== "Invalid ConditionExpression: The function is not allowed to be used this way in an expression; function: size"
+	assert check("a = a")
+		== "Invalid ConditionExpression: The first operand must be distinct from the remaining "
+		+ "operands for this operator or function; operator: =, first operand: [a]"
+	assert check("begins_with(a)")
+		== "Invalid ConditionExpression: Incorrect number of operands for operator or "
+		+ "function; operator or function: begins_with, number of operands: 1"
+	assert check("attribute_exists(:x)")
+		== "Invalid ConditionExpression: Operator or function requires a document "
+		+ "path; operator or function: attribute_exists"
+	assert check("attribute_type(a, :x)")
+		== "Invalid ConditionExpression: Invalid attribute type name found; type: x, "
+		+ "valid types: {S,SS,N,NS,B,BS,BOOL,NULL,L,M}"
+	assert check("a BETWEEN :two AND :one")
+		== "Invalid ConditionExpression: The BETWEEN operator requires upper bound "
+		+ "to be greater than or equal to lower bound; lower bound operand: AttributeValue: {N:2}, upper bound "
+		+ "operand: AttributeValue: {N:1}"
+	assert check("a < :l")
+		== "Invalid ConditionExpression: Incorrect operand type for operator or function; operator "
+		+ "or function: <, operand type: L"
+	const word = "Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: "
+	assert check("a = :x AND (b = :x OR attribute_exists(m.Data))") == word + "Data"
+	assert check("Status = :v")
+		== "Invalid ConditionExpression: An expression attribute value used in expression is "
+		+ "not defined; attribute value: :v"
+	assert check("size = :x OR #m = :x") == "false"
+	assert updated("SET status = :x")
+		== "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved " + "keyword: status"
+}
+
+test "unused placeholders" {
+	const c = new Context([["#a", "a"], ["#b", "b"]], item(`{":v":{"N":"1"},":w":{"N":"1"}}`))
+	try {
+		condition("#a = :v", "ConditionExpression", c)
+		c.unused()
+		assert false
+	} catch (f: Fault) {
+		assert f.message == "Value provided in ExpressionAttributeValues unused in expressions: keys: {:w}"
+	}
+}
+
+test "updates" {
+	assert updated("SET n = n + :one, e = :x REMOVE t")
+		== `{"pk":{"S":"abc"},"n":{"N":"2.5"},"s":{"SS":["a","b"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[{"N":"1"},`
+		+ `{"S":"y"},{"N":"3"}]}}},"e":{"S":"x"}}`
+	assert updated("set m.l[1] = :two, m.l[9] = :x, m.fresh = if_not_exists(m.k, :ab) remove m.l[0], m.l[2]")
+		== `{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a","b"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[{"N":"2"},`
+		+ `{"S":"x"}]},"fresh":{"S":"x"}}},"t":{"BOOL":true},"e":{"S":""}}`
+	const u = updated("SET m.l = list_append(:l, m.l), z = :two - n ADD s :ss, c :one")
+	assert u
+		== `{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a","b","z"]},"m":{"M":{"k":{"S":"x"},"l":{"L":[`
+		+ `{"N":"9"},{"N":"1"},{"S":"y"},{"N":"3"}]}}},"t":{"BOOL":true},"e":{"S":""},"z":{"N":"0.5"},"c":{"N":"1"}}`
+	assert updated("DELETE s :ss, nope :ss")
+		== `{"pk":{"S":"abc"},"n":{"N":"1.50"},"s":{"SS":["a"]},"m":{"M":{"k":`
+		+ `{"S":"x"},"l":{"L":[{"N":"1"},{"S":"y"},{"N":"3"}]}}},"t":{"BOOL":true},"e":{"S":""}}`
+	assert updated("ADD pk :one") == "An operand in the update expression has an incorrect data type"
+	assert updated("SET a = nope") == "The provided expression refers to an attribute that does not exist in the item"
+	assert updated("SET x.y = :one") == "The document path provided in the update expression is invalid for update"
+	assert updated("SET a = :x, a = :x")
+		== "Invalid UpdateExpression: Two document paths overlap with each other; "
+		+ "must remove or rewrite one of these paths; path one: [a], path two: [a]"
+	assert updated("SET a.b = :x REMOVE a")
+		== "Invalid UpdateExpression: Two document paths overlap with each other; "
+		+ "must remove or rewrite one of these paths; path one: [a, b], path two: [a]"
+	assert updated("SET a = :x SET b = :x")
+		== "Invalid UpdateExpression: The \"SET\" section can only be used once in an update expression;"
+	assert updated("ADD a :x")
+		== "Invalid UpdateExpression: Incorrect operand type for operator or function; "
+		+ "operator: ADD, operand type: STRING, typeSet: ALLOWED_FOR_ADD_OPERAND"
+	assert updated("SET a = b + c + d") == "Invalid UpdateExpression: Syntax error; token: \"+\", near: \"c + d\""
+	assert updated("SET a = size(b)")
+		== "Invalid UpdateExpression: The function is not allowed in an update expression; function: size"
+	assert updated("SET a = if_not_exists(:x, b)")
+		== "Invalid UpdateExpression: Operator or function requires a "
+		+ "document path; operator or function: if_not_exists"
+}
+
+test "projections" {
+	const c = new Context(null, null)
+	try {
+		assert json(project(sample, projection("pk, m.l[2], m.l[0], nope", c)))
+			== `{"pk":{"S":"abc"},"m":{"M":{"l":{"L":[{"N":"1"},{"N":"3"}]}}}}`
+		projection("a, a.b", c)
+		assert false
+	} catch (f: Fault) {
+		assert f.message
+			== "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or "
+			+ "rewrite one of these paths; path one: [a], path two: [a, b]"
+	}
+}

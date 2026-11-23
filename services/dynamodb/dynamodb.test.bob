@@ -1,0 +1,357 @@
+import { sign } from "../../core/auth/sigv4"
+import { Gateway } from "../../core/gateway"
+import * as api from "./api"
+import { Handler } from "./dynamodb"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.0")
+	req.headers.set("x-amz-target", `DynamoDB_20120810.${op}`)
+	sign(req, body, "dynamodb", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function body(res: Response): string { return res.body.whole ?? "" }
+
+function ok(res: Response, ...parts: string[]): bool {
+	const b = body(res)
+	const fine = res.status == 200 && parts.every(p => indexOf(b, p) >= 0)
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+function fails(res: Response, code: string, message: string): bool {
+	const b = body(res)
+	const fine = res.status == 400 && indexOf(b, `#${code}"`) >= 0
+		&& (indexOf(b, `"message":"${message}"`) >= 0 || indexOf(b, `"Message":"${message}"`) >= 0)
+	if (!fine) {
+		print(b)
+	}
+	return fine
+}
+
+const keyed = `"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},`
+	+ `{"AttributeName":"sk","AttributeType":"N"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},`
+	+ `{"AttributeName":"sk","KeyType":"RANGE"}],"BillingMode":"PAY_PER_REQUEST"`
+
+test "tables" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"tab1",${keyed}}`), `"TableStatus":"ACTIVE"`,
+		`"TableArn":"arn:aws:dynamodb:us-east-1:000000000000:table/tab1"`)
+	assert fails(call(g, "CreateTable", `{"TableName":"tab1",${keyed}}`), "ResourceInUseException",
+		"Table already exists: tab1")
+	assert fails(call(g, "CreateTable", `{"TableName":"t",${keyed}}`), "ValidationException",
+		"1 validation error "
+		+ "detected: Value 't' at 'tableName' failed to satisfy constraint: Member must have length greater than or "
+		+ "equal to 3")
+	assert ok(call(g, "CreateTable", `{"TableName":"tab0",${keyed}}`))
+	assert ok(call(g, "ListTables", `{"Limit":1}`), `"TableNames":["tab0"]`, `"LastEvaluatedTableName":"tab0"`)
+	assert ok(call(g, "ListTables", `{"ExclusiveStartTableName":"tab0"}`), `"TableNames":["tab1"]}`)
+	assert ok(call(g, "UpdateTable", `{"TableName":"tab0","DeletionProtectionEnabled":true}`),
+		`"DeletionProtectionEnabled":true`)
+	assert fails(call(g, "DeleteTable", `{"TableName":"tab0"}`), "ValidationException",
+		"Resource cannot be deleted as "
+		+ "it is currently protected against deletion. Disable deletion protection first.")
+	const arn = "arn:aws:dynamodb:us-east-1:000000000000:table/tab1"
+	assert ok(call(g, "TagResource",
+		`{"ResourceArn":"${arn}","Tags":[{"Key":"a","Value":"1"},{"Key":"b","Value":"2"}]}`))
+	assert ok(call(g, "UntagResource", `{"ResourceArn":"${arn}","TagKeys":["a"]}`))
+	assert ok(call(g, "ListTagsOfResource", `{"ResourceArn":"${arn}"}`), `"Tags":[{"Key":"b","Value":"2"}]`)
+	assert ok(call(g, "UpdateTimeToLive",
+		`{"TableName":"tab1","TimeToLiveSpecification":{"Enabled":true,` + `"AttributeName":"exp"}}`))
+	assert ok(call(g, "DescribeTimeToLive", `{"TableName":"tab1"}`), `"TimeToLiveStatus":"ENABLED"`,
+		`"AttributeName":"exp"`)
+	assert ok(call(g, "DeleteTable", `{"TableName":"tab1"}`), `"TableStatus":"DELETING"`)
+	assert fails(call(g, "DescribeTable", `{"TableName":"tab1"}`), "ResourceNotFoundException",
+		"Requested resource not found: Table: tab1 not found")
+	assert ok(call(g, "DescribeLimits", "{}"), `"TableMaxReadCapacityUnits":40000`)
+}
+
+test "items" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"items",${keyed}}`))
+	assert ok(call(g, "PutItem",
+		`{"TableName":"items","Item":{"pk":{"S":"a"},"sk":{"N":"1"},"n":{"N":"5"},` + `"l":{"L":[{"S":"x"}]}}}`))
+	assert ok(call(g, "GetItem",
+		`{"TableName":"items","Key":{"pk":{"S":"a"},"sk":{"N":"1.0"}},` + `"ProjectionExpression":"n"}`),
+		`{"Item":{"n":{"N":"5"}}}`)
+	assert fails(call(g, "GetItem", `{"TableName":"items","Key":{"pk":{"S":"a"}}}`), "ValidationException",
+		"The provided key element does not match the schema")
+	assert fails(call(g, "PutItem", `{"TableName":"items","Item":{"pk":{"S":"a"}}}`), "ValidationException",
+		"One or more parameter values were invalid: Missing the key sk in the item")
+	assert fails(call(g, "PutItem",
+		`{"TableName":"items","Item":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"ConditionExpression":"attribute_not_exists(pk)","ReturnValuesOnConditionCheckFailure":"ALL_OLD"}`),
+		"ConditionalCheckFailedException", "The conditional request failed")
+	assert indexOf(body(call(g, "PutItem",
+		`{"TableName":"items","Item":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"ConditionExpression":"attribute_not_exists(pk)","ReturnValuesOnConditionCheckFailure":"ALL_OLD"}`)),
+		`"Item":{"pk":{"S":"a"}`) >= 0
+	assert ok(call(g, "UpdateItem",
+		`{"TableName":"items","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"UpdateExpression":"SET n = n + :one, l = list_append(l, :l) ADD c :one REMOVE gone",`
+		+ `"ExpressionAttributeValues":{":one":{"N":"1"},":l":{"L":[{"S":"y"}]}},"ReturnValues":"UPDATED_NEW"}`),
+		`"Attributes":{"n":{"N":"6"},"l":{"L":[{"S":"x"},{"S":"y"}]},"c":{"N":"1"}}`)
+	assert fails(call(g, "UpdateItem",
+		`{"TableName":"items","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"UpdateExpression":"SET sk = :one","ExpressionAttributeValues":{":one":{"N":"1"}}}`), "ValidationException",
+		"One or more parameter values were invalid: Cannot update attribute sk. This attribute is part of the key")
+	assert fails(call(g, "PutItem", `{"TableName":"items","Item":{"pk":{"S":"a"},"sk":{"N":"1"},"s":{"SS":[]}}}`),
+		"ValidationException",
+		"1 validation error detected: One or more parameter values were invalid: An string set  " + "may not be empty")
+	assert ok(call(g, "DeleteItem",
+		`{"TableName":"items","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"ReturnValues":"ALL_OLD","ReturnConsumedCapacity":"TOTAL"}`), `"Attributes":{"pk":{"S":"a"}`,
+		`"CapacityUnits":1`)
+	assert ok(call(g, "GetItem", `{"TableName":"items","Key":{"pk":{"S":"a"},"sk":{"N":"1"}}}`), "{}")
+}
+
+test "query and scan" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable",
+		`{"TableName":"qqq","AttributeDefinitions":[{"AttributeName":"pk",`
+		+ `"AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"g","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],`
+		+ `"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{`
+		+ `"IndexName":"byg","KeySchema":[{"AttributeName":"g","KeyType":"HASH"}],"Projection":{"ProjectionType":`
+		+ `"KEYS_ONLY"}}]}`))
+	for (const n of ["-2", "10", "3", "0.5", "1e2"]) {
+		assert ok(call(g, "PutItem", `{"TableName":"qqq","Item":{"pk":{"S":"a"},"sk":{"N":"${n}"},"g":{"S":"x"}}}`))
+	}
+	assert ok(call(g, "PutItem", `{"TableName":"qqq","Item":{"pk":{"S":"b"},"sk":{"N":"1"}}}`))
+	const q = `"TableName":"qqq","KeyConditionExpression":"pk = :a AND sk > :z","ExpressionAttributeValues":`
+		+ `{":a":{"S":"a"},":z":{"N":"0"}}`
+	assert ok(call(g, "Query", `{${q}}`), `"Count":4`, `{"N":"0.5"},"g":{"S":"x"}},{"pk":{"S":"a"},"sk":{"N":"3"}`)
+	let res = call(g, "Query", `{${q},"ScanIndexForward":false,"Limit":2}`)
+	assert ok(res, `"Items":[{"pk":{"S":"a"},"sk":{"N":"100"}`, `"LastEvaluatedKey":{"pk":{"S":"a"},"sk":{"N":"10"}}`)
+	assert ok(call(g, "Query", `{${q},"ScanIndexForward":false,"ExclusiveStartKey":{"pk":{"S":"a"},"sk":{"N":"10"}}}`),
+		`"Count":2`, `{"N":"3"}`)
+	assert ok(call(g, "Query",
+		`{"TableName":"qqq","KeyConditionExpression":"pk = :a AND sk > :z","Select":"COUNT",`
+		+ `"FilterExpression":"sk < :ten","ExpressionAttributeValues":{":a":{"S":"a"},":z":{"N":"0"},`
+		+ `":ten":{"N":"10"}}}`), `"Count":2`, `"ScannedCount":4`)
+	assert fails(call(g, "Query",
+		`{"TableName":"qqq","KeyConditionExpression":"pk = :a OR sk > :z",`
+		+ `"ExpressionAttributeValues":{":a":{"S":"a"},":z":{"N":"0"}}}`), "ValidationException",
+		"Invalid KeyConditionExpression: Invalid operator used in KeyConditionExpression")
+	assert ok(call(g, "Query",
+		`{"TableName":"qqq","IndexName":"byg","KeyConditionExpression":"g = :x",`
+		+ `"ExpressionAttributeValues":{":x":{"S":"x"}}}`), `"Count":5`)
+	assert ok(call(g, "Scan", `{"TableName":"qqq"}`), `"Count":6`)
+	assert ok(call(g, "Scan", `{"TableName":"qqq","IndexName":"byg"}`), `"Count":5`)
+	assert fails(call(g, "Scan", `{"TableName":"qqq","Segment":2,"TotalSegments":2}`), "ValidationException",
+		"The Segment parameter is zero-based and must be less than parameter TotalSegments")
+}
+
+test "batches and transactions" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"bbb",${keyed}}`))
+	assert ok(call(g, "BatchWriteItem",
+		`{"RequestItems":{"bbb":[{"PutRequest":{"Item":{"pk":{"S":"a"},"sk":{"N":"1"}}}},`
+		+ `{"PutRequest":{"Item":{"pk":{"S":"a"},"sk":{"N":"2"}}}}]}}`), `"UnprocessedItems":{}`)
+	assert fails(call(g, "BatchWriteItem",
+		`{"RequestItems":{"bbb":[{"PutRequest":{"Item":{"pk":{"S":"a"},`
+		+ `"sk":{"N":"1"}}}},{"DeleteRequest":{"Key":{"pk":{"S":"a"},"sk":{"N":"1"}}}}]}}`), "ValidationException",
+		"Provided list of item keys contains duplicates")
+	assert ok(call(g, "BatchGetItem",
+		`{"RequestItems":{"bbb":{"Keys":[{"pk":{"S":"a"},"sk":{"N":"1"}},` + `{"pk":{"S":"a"},"sk":{"N":"9"}}]}}}`),
+		`"Responses":{"bbb":[{"pk":{"S":"a"},"sk":{"N":"1"}}]}`)
+	const failed = call(g, "TransactWriteItems",
+		`{"TransactItems":[{"Put":{"TableName":"bbb","Item":{"pk":{"S":"c"},`
+		+ `"sk":{"N":"1"}}}},{"ConditionCheck":{"TableName":"bbb","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"ConditionExpression":"attribute_not_exists(pk)"}}]}`)
+	assert fails(failed, "TransactionCanceledException",
+		"Transaction cancelled, please refer cancellation reasons for "
+		+ "specific reasons [None, ConditionalCheckFailed]")
+	assert indexOf(body(failed), `"CancellationReasons":[{"Code":"None"},{"Code":"ConditionalCheckFailed"`) >= 0
+	assert ok(call(g, "GetItem", `{"TableName":"bbb","Key":{"pk":{"S":"c"},"sk":{"N":"1"}}}`), "{}")
+	assert ok(call(g, "TransactWriteItems",
+		`{"TransactItems":[{"Put":{"TableName":"bbb","Item":{"pk":{"S":"c"},`
+		+ `"sk":{"N":"1"}}}},{"Update":{"TableName":"bbb","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},`
+		+ `"UpdateExpression":"SET v = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}}]}`))
+	assert ok(call(g, "TransactGetItems",
+		`{"TransactItems":[{"Get":{"TableName":"bbb","Key":{"pk":{"S":"c"},`
+		+ `"sk":{"N":"1"}}}},{"Get":{"TableName":"bbb","Key":{"pk":{"S":"a"},"sk":{"N":"1"}}}}]}`),
+		`{"Item":{"pk":{"S":"c"},"sk":{"N":"1"}}}`, `"v":{"S":"x"}`)
+}
+
+test "descending queries page exactly, on tables and indexes" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable",
+		`{"TableName":"ddd","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},`
+		+ `{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"g","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],`
+		+ `"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"byg","KeySchema":[`
+		+ `{"AttributeName":"g","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],`
+		+ `"Projection":{"ProjectionType":"ALL"}}]}`))
+	for (let i = 0; i < 250; i++) {
+		assert ok(call(g, "PutItem", `{"TableName":"ddd","Item":{"pk":{"S":"a"},"sk":{"N":"${i}"},"g":{"S":"x"}}}`))
+	}
+	assert ok(call(g, "PutItem", `{"TableName":"ddd","Item":{"pk":{"S":"b"},"sk":{"N":"1"},"g":{"S":"y"}}}`))
+	for (const [index, key] of [["", "pk = :v"], [`"IndexName":"byg",`, "g = :v"]]) {
+		const v = if (index == "") "a" else "x"
+		const query = (forward: bool) => `"TableName":"ddd",${index}"KeyConditionExpression":"${key} AND sk < :hi",`
+			+ `"ScanIndexForward":${forward},"Limit":100,"ExpressionAttributeValues":{":v":{"S":"${v}"},":hi":{"N":"240"}}`
+		const q = query(false)
+		let res = call(g, "Query", `{${q}}`)
+		assert ok(res, `"Count":100`, `"Items":[{"pk":{"S":"a"},"sk":{"N":"239"}`, `"LastEvaluatedKey":{`,
+			`"sk":{"N":"140"}`)
+		const at = (n: string) => if (index == "") `{"pk":{"S":"a"},"sk":{"N":"${n}"}}`
+			else `{"pk":{"S":"a"},"sk":{"N":"${n}"},"g":{"S":"x"}}`
+		res = call(g, "Query", `{${q},"ExclusiveStartKey":${at("140")}}`)
+		assert ok(res, `"Count":100`, `"Items":[{"pk":{"S":"a"},"sk":{"N":"139"}`, `"sk":{"N":"40"}`)
+		res = call(g, "Query", `{${q},"ExclusiveStartKey":${at("40")}}`)
+		assert ok(res, `"Count":40`, `"Items":[{"pk":{"S":"a"},"sk":{"N":"39"}`)
+		assert indexOf(body(res), "LastEvaluatedKey") < 0
+		res = call(g, "Query", `{${query(true)},"ExclusiveStartKey":${at("200")}}`)
+		assert ok(res, `"Count":39`, `"Items":[{"pk":{"S":"a"},"sk":{"N":"201"}`)
+	}
+}
+
+test "parameters of the old kind" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"old",${keyed}}`))
+	for (const n of ["1", "2", "3"]) {
+		assert ok(call(g, "PutItem",
+			`{"TableName":"old","Item":{"pk":{"S":"a"},"sk":{"N":"${n}"},"v":{"S":"v${n}"}},`
+			+ `"Expected":{"pk":{"Exists":false}}}`))
+	}
+	assert fails(call(g, "PutItem",
+		`{"TableName":"old","Item":{"pk":{"S":"a"},"sk":{"N":"1"}},"Expected":{"v":{"Value":{"S":"no"}}}}`),
+		"ConditionalCheckFailedException", "The conditional request failed")
+	assert fails(call(g, "PutItem",
+		`{"TableName":"old","Item":{"pk":{"S":"a"},"sk":{"N":"1"}},"Expected":{"v":{"Exists":true}}}`),
+		"ValidationException",
+		"1 validation error detected: One or more parameter values were invalid: Value must be provided when Exists is "
+		+ "true for Attribute: v")
+	assert fails(call(g, "UpdateItem",
+		`{"TableName":"old","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},"UpdateExpression":"REMOVE v",`
+		+ `"Expected":{"v":{"Exists":false}},"ConditionalOperator":"AND"}`), "ValidationException",
+		"1 validation error detected: Can not use both expression and non-expression parameters in the same request: "
+		+ "Non-expression parameters: {Expected, ConditionalOperator} Expression parameters: {UpdateExpression}")
+	assert ok(call(g, "UpdateItem",
+		`{"TableName":"old","Key":{"pk":{"S":"a"},"sk":{"N":"1"}},"AttributeUpdates":{"v":{"Action":"DELETE"},`
+		+ `"n":{"Action":"ADD","Value":{"N":"2"}},"s":{"Value":{"SS":["x"]}}},"Expected":{"v":{"ComparisonOperator":`
+		+ `"BEGINS_WITH","AttributeValueList":[{"S":"v"}]}},"ReturnValues":"ALL_NEW"}`),
+		`"Attributes":{"pk":{"S":"a"},"sk":{"N":"1"},"n":{"N":"2"},"s":{"SS":["x"]}}`)
+	assert ok(call(g, "Query",
+		`{"TableName":"old","KeyConditions":{"pk":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"a"}]},`
+		+ `"sk":{"ComparisonOperator":"GE","AttributeValueList":[{"N":"2"}]}},"AttributesToGet":["v"]}`),
+		`"Items":[{"v":{"S":"v2"}},{"v":{"S":"v3"}}]`)
+	assert ok(call(g, "Query",
+		`{"TableName":"old","KeyConditions":{"pk":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"a"}]}},`
+		+ `"QueryFilter":{"v":{"ComparisonOperator":"NOT_CONTAINS","AttributeValueList":[{"S":"2"}]}}}`), `"Count":2`,
+		`"ScannedCount":3`)
+	assert ok(call(g, "Scan",
+		`{"TableName":"old","ScanFilter":{"v":{"ComparisonOperator":"IN","AttributeValueList":[{"S":"v3"}]},`
+		+ `"n":{"ComparisonOperator":"NOT_NULL"}},"ConditionalOperator":"OR"}`), `"Count":2`, `"ScannedCount":3`)
+	assert fails(call(g, "Scan",
+		`{"TableName":"old","ScanFilter":{"v":{"ComparisonOperator":"BETWEEN","AttributeValueList":[{"S":"b"},`
+		+ `{"S":"a"}]}}}`), "ValidationException",
+		"One or more parameter values were invalid: The BETWEEN condition was provided a range where the lower bound "
+		+ "is greater than the upper bound")
+	assert fails(call(g, "Scan",
+		`{"TableName":"old","ScanFilter":{"v":{"ComparisonOperator":"NULL"}},` + `"ConditionalOperator":"OR"}`),
+		"ValidationException", "ConditionalOperator can only be used when Filter or Expected has two or more elements")
+	assert ok(call(g, "GetItem", `{"TableName":"old","Key":{"pk":{"S":"a"},"sk":{"N":"2"}},"AttributesToGet":["v"]}`),
+		`{"Item":{"v":{"S":"v2"}}}`)
+}
+
+test "a transaction's client token" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"tok",${keyed}}`))
+	const put = (n: string) => `{"TransactItems":[{"Put":{"TableName":"tok","Item":{"pk":{"S":"a"},"sk":{"N":"${n}"}},`
+		+ `"ConditionExpression":"attribute_not_exists(pk)","ReturnValuesOnConditionCheckFailure":"ALL_OLD"}}]`
+	assert ok(call(g, "TransactWriteItems", `${put("1")},"ClientRequestToken":"t1"}`))
+	assert ok(call(g, "TransactWriteItems", `${put("1")},"ClientRequestToken":"t1"}`))
+	assert fails(call(g, "TransactWriteItems", `${put("2")},"ClientRequestToken":"t1"}`),
+		"IdempotentParameterMismatchException",
+		"DynamoDB rejected the request because you retried a request with a different payload but with an idempotent "
+		+ "token that was already used.")
+	const failed = call(g, "TransactWriteItems", `${put("1")}}`)
+	assert fails(failed, "TransactionCanceledException",
+		"Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]")
+	assert indexOf(body(failed), `"Item":{"pk":{"S":"a"},"sk":{"N":"1"}}`) >= 0
+}
+
+test "partiql" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable",
+		`{"TableName":"pql","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},`
+		+ `{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"g","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}],`
+		+ `"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"byg","KeySchema":[`
+		+ `{"AttributeName":"g","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]}`))
+	const run = (statement: string,
+		parameters: string) => call(g, "ExecuteStatement", `{"Statement":"${statement}","Parameters":[${parameters}]}`)
+	assert ok(run(`INSERT INTO pql VALUE {'pk': 'a', 'sk': 1, 'g': 'x', 'tags': <<'p', 'q'>>, 'l': [1, 'two']}`, ""),
+		`{"Items":[]}`)
+	assert ok(run(`INSERT INTO \\"pql\\" VALUE {'pk': ?, 'sk': ?, 'status': 'new'}`, `{"S":"a"},{"N":"2"}`))
+	assert fails(run(`INSERT INTO pql VALUE {'pk': 'a', 'sk': 1}`, ""), "DuplicateItemException",
+		"Duplicate primary key exists in table")
+	assert ok(run(`SELECT * FROM pql WHERE pk = ? AND sk >= 1`, `{"S":"a"}`), `"tags":{"SS":["p","q"]}`,
+		`"l":{"L":[{"N":"1"},{"S":"two"}]}`, `{"pk":{"S":"a"},"sk":{"N":"2"},"status":{"S":"new"}}`)
+	assert ok(run(`SELECT sk, status FROM pql WHERE pk = 'a' AND status IS NOT MISSING`, ""),
+		`{"Items":[{"sk":{"N":"2"},"status":{"S":"new"}}]}`)
+	assert ok(run(`SELECT pk FROM \\"pql\\".\\"byg\\" WHERE g = 'x' OR sk IN [5, 6]`, ""),
+		`{"Items":[{"pk":{"S":"a"}}]}`)
+	assert ok(run(`UPDATE pql SET n = 5, status = 'old' REMOVE l WHERE pk = 'a' AND sk = 1`, ""))
+	assert ok(run(`UPDATE pql SET n = n - 2 WHERE pk = 'a' AND sk = 1 AND n BETWEEN 1 AND 9`, ""))
+	assert ok(run(`SELECT n, status, l FROM pql WHERE pk = 'a' AND sk = 1`, ""),
+		`{"Items":[{"n":{"N":"3"},"status":{"S":"old"}}]}`)
+	assert fails(run(`UPDATE pql SET n = 1 WHERE pk = 'a' AND sk = 9`, ""), "ConditionalCheckFailedException",
+		"The conditional request failed")
+	assert fails(run(`UPDATE pql SET n = 1 WHERE pk = 'a'`, ""), "ValidationException",
+		"Where clause does not contain a mandatory equality on all key attributes")
+	assert fails(run(`SELECT * FROM pql WHERE pk = ?`, ""), "ValidationException",
+		"Number of parameters in request and statement don't match.")
+	assert fails(run(`SELECT * FROM t`, ""), "ValidationException",
+		"Table name should be within the length [3, 255] and only contain 'a-z', 'A-Z', '0-9', '-', '_', '.'.")
+	assert fails(run(`SELEC * FROM pql`, ""), "ValidationException",
+		"Statement wasn't well formed, can't be processed: Expected data manipulation")
+	let res = call(g, "ExecuteStatement", `{"Statement":"SELECT sk FROM pql","Limit":1}`)
+	assert ok(res, `{"Items":[{"sk":{"N":"1"}}]`, `"NextToken":"`)
+	const b = body(res)
+	const from = indexOf(b, `"NextToken":"`) + 13
+	const token = b.slice(from, from + indexOf(b.slice(from, b.length), `"`))
+	assert ok(call(g, "ExecuteStatement", `{"Statement":"SELECT sk FROM pql","Limit":1,"NextToken":"${token}"}`),
+		`{"Items":[{"sk":{"N":"2"}}]`)
+	res = call(g, "BatchExecuteStatement",
+		`{"Statements":[{"Statement":"SELECT sk FROM pql WHERE pk = 'a' AND sk = 2"},`
+		+ `{"Statement":"DELETE FROM pql WHERE pk = 'a' AND sk = 2"},{"Statement":"SELEC x"}]}`)
+	assert ok(res,
+		`{"Responses":[{"TableName":"pql","Item":{"sk":{"N":"2"}}},{"TableName":"pql"},`
+		+ `{"Error":{"Code":"ValidationError","Message":"Statement wasn't well formed, can't be processed: `)
+	assert fails(call(g, "ExecuteTransaction",
+		`{"TransactStatements":[{"Statement":"SELECT * FROM pql WHERE pk = 'a' AND sk = 1"},`
+		+ `{"Statement":"DELETE FROM pql WHERE pk = 'a' AND sk = 1"}]}`), "ValidationException",
+		"ExecuteTransaction API does not support both read and write operations in the same request.")
+	assert ok(call(g, "ExecuteTransaction",
+		`{"TransactStatements":[{"Statement":"INSERT INTO pql VALUE {'pk': 'b', 'sk': 1}"},`
+		+ `{"Statement":"DELETE FROM pql WHERE pk = ? AND sk = ?","Parameters":[{"S":"a"},{"N":"1"}]}]}`))
+	assert ok(call(g, "ExecuteTransaction",
+		`{"TransactStatements":[{"Statement":"SELECT * FROM pql WHERE pk = 'a' AND sk = 1"},`
+		+ `{"Statement":"SELECT pk FROM pql WHERE pk = 'b' AND sk = 1"}]}`),
+		`{"Responses":[{},{"Item":{"pk":{"S":"b"}}}]}`)
+}
+
+test "continuous backups" {
+	const g = gateway()
+	assert ok(call(g, "CreateTable", `{"TableName":"bak",${keyed}}`))
+	assert ok(call(g, "DescribeContinuousBackups", `{"TableName":"bak"}`), `"PointInTimeRecoveryStatus":"DISABLED"`)
+	assert ok(call(g, "UpdateContinuousBackups",
+		`{"TableName":"bak","PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}`),
+		`"PointInTimeRecoveryStatus":"ENABLED"`, `"RecoveryPeriodInDays":35`)
+	assert ok(call(g, "DescribeContinuousBackups", `{"TableName":"bak"}`), `"PointInTimeRecoveryStatus":"ENABLED"`)
+}

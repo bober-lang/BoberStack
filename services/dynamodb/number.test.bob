@@ -1,0 +1,70 @@
+import { Fault } from "../../core/fault"
+import { add, compare, Decimal, encode, format, negate, parse } from "./number"
+
+function normal(s: string): string {
+	try {
+		return format(parse(s))
+	} catch (f: Fault) {
+		return f.message
+	}
+}
+
+function n(s: string): Decimal {
+	try {
+		return parse(s)
+	} catch (f: Fault) {
+		assert false
+	}
+	return new Decimal()
+}
+
+function sum(a: string, b: string): string {
+	try {
+		return format(add(n(a), n(b)))
+	} catch (f: Fault) {
+		return f.message
+	}
+}
+
+test "parse and format" {
+	assert normal("1") == "1" && normal("-1.50") == "-1.5" && normal("+7") == "7" && normal("1.") == "1"
+	assert normal(".5") == "0.5" && normal("0.001") == "0.001" && normal("1e2") == "100"
+		&& normal("12.5E-3") == "0.0125"
+	assert normal("-0") == "0" && normal("000.000") == "0" && normal("123.456") == "123.456"
+	assert normal("1e125") == normal("10e124") && normal("1e125").length == 126
+	assert normal("abc") == "The parameter cannot be converted to a numeric value: abc"
+	assert normal("") == "The parameter cannot be converted to a numeric value: "
+	assert normal(" 1") == "The parameter cannot be converted to a numeric value:  1"
+	assert normal("1e") == "The parameter cannot be converted to a numeric value: 1e"
+	assert normal("0x10") == "The parameter cannot be converted to a numeric value: 0x10"
+	assert normal("1e126") == "Number overflow. Attempting to store a number with magnitude larger than supported range"
+	assert normal("1e-131")
+		== "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+	assert normal("123456789012345678901234567890123456789")
+		== "Attempting to store more than 38 significant digits in a Number"
+	assert normal("1234567890123456789012345678901234567800") == "1234567890123456789012345678901234567800"
+}
+
+test "compare and encode in the same order" {
+	const sorted = ["-1e125", "-100", "-15", "-1.5", "-1", "-0.01", "0", "1e-130", "0.5", "1", "1.5", "10", "15",
+		"1e125"]
+	for (let i = 0; i < sorted.length; i++) {
+		for (let j = 0; j < sorted.length; j++) {
+			const c = compare(n(sorted[i]), n(sorted[j]))
+			const e = encode(n(sorted[i]))
+			const f = encode(n(sorted[j]))
+			assert (c < 0) == (i < j) && (c == 0) == (i == j) && (e < f) == (i < j)
+		}
+	}
+	assert compare(n("1.0"), n("1")) == 0 && encode(n("1.0")) == encode(n("1"))
+}
+
+test "add and subtract exactly" {
+	assert sum("1", "2") == "3" && sum("0.1", "0.2") == "0.3" && sum("99", "1") == "100"
+	assert sum("1", "-1") == "0" && sum("5", "-7.5") == "-2.5" && sum("-5", "7.5") == "2.5" && sum("0", "-3") == "-3"
+	assert sum("100000000000000000000000000000000000000", "0.1")
+		== "Attempting to store more than 38 significant digits in a Number"
+	assert sum("9.9e125", "1e125")
+		== "Number overflow. Attempting to store a number with magnitude larger than supported range"
+	assert format(negate(n("2.5"))) == "-2.5" && format(negate(n("0"))) == "0"
+}

@@ -1,0 +1,273 @@
+//! DynamoDB's state in the tree of an account's region: the definitions of its tables, by name; each table's items,
+//! by the table's name, a NUL and the encoding of their key; each index's entries, by the table's and the index's
+//! names, each followed by a NUL, the item's key in the index, then in the table; client tokens; and streams.
+
+import { Fault } from "../../core/fault"
+import { decode, result } from "../../core/protocol/json"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { Item } from "./expression"
+import { encode } from "./key"
+
+/// A key attribute: its name and type, S, N or B.
+export class Key {
+	name = ""
+	type = "S"
+}
+
+export class Index {
+	name = ""
+	global = false
+	hash = new Key()
+	range: Key | null = null
+	/// ALL, KEYS_ONLY or INCLUDE, and the attributes INCLUDE adds.
+	projection = "ALL"
+	nonKey: string[] = []
+	read: i64 = 0
+	write: i64 = 0
+	count: i64 = 0
+	size: i64 = 0
+}
+
+export class Destination {
+	arn = ""
+	status = "ACTIVE"
+	precision = "MILLISECOND"
+}
+
+export class Definition {
+	name = ""
+	id = ""
+	created: i64 = 0
+	hash = new Key()
+	range: Key | null = null
+	attributes: [string, string][] = []
+	billing = "PROVISIONED"
+	onDemandSince: i64 = 0
+	read: i64 = 0
+	write: i64 = 0
+	indexes: Index[] = []
+	stream = false
+	streamView = ""
+	streamLabel = ""
+	destinations: Destination[] = []
+	tags: [string, string][] = []
+	tableClass = "STANDARD"
+	deletionProtection = false
+	/// The ARN of its KMS key, of SSE-KMS; null under a key AWS owns.
+	kmsKey: string | null = null
+	ttl = ""
+	ttlEnabled = false
+	recovery = false
+	recoverySince: i64 = 0
+	recoveryDays = 0
+	count: i64 = 0
+	size: i64 = 0
+}
+
+/// The client token of a transaction written: when, ns since 1970, and its request, as JSON.
+export class Token {
+	at: i64 = 0
+	request = ""
+}
+
+/// A table's stream, by its key, the table's name, "/stream/" and its label, which its ARN ends with.
+export class Stream {
+	table = ""
+	label = ""
+	view = ""
+	hash = new Key()
+	range: Key | null = null
+	created: i64 = 0
+	shard = ""
+	last: i64 = 0
+	enabled = true
+}
+
+/// A record of a stream, by the stream's key, a NUL and its sequence number.
+export class Change {
+	n: i64 = 0
+	at: i64 = 0
+	id = ""
+	kind = ""
+	keys = ""
+	newImage: string | null = null
+	oldImage: string | null = null
+	size: i64 = 0
+}
+
+export class Tables {
+	store: Store
+	definitions: Table[Definition]
+	tokens: Table[Token]
+	streams: Table[Stream]
+	changes: Table[Change]
+	/// The Kinesis records of the request's writes, not yet put: the ARN of the stream each goes to, its partition key,
+	/// the table's name, and its data but for its leading awsRegion member.
+	outbox: [string, string, string][] = []
+
+	constructor(s: Store) {
+		this.store = s
+		this.definitions = new Table[Definition](s, "dynamodb/tables")
+		this.tokens = new Table[Token](s, "dynamodb/tokens")
+		this.streams = new Table[Stream](s, "dynamodb/streams")
+		this.changes = new Table[Change](s, "dynamodb/changes")
+	}
+
+	get(name: string): Definition | null { return this.definitions.get(name) }
+	save(d: Definition) throws Fault { this.definitions.put(d.name, d) }
+	saveStream(key: string, s: Stream) throws Fault { this.streams.put(key, s) }
+
+	append(key: string, s: Stream, c: Change) throws Fault {
+		s.last++
+		c.n = s.last
+		this.changes.put(`${key}\x00${sequence(c.n)}`, c)
+		this.saveStream(key, s)
+	}
+
+	item(d: Definition, k: string): Item | null throws Fault {
+		const s = this.store.get(items(d.name) + k)
+		return if (s == null) null else parsed(s)
+	}
+}
+
+export function items(table: string): string { return `dynamodb/items\x00${table}\x00` }
+export function entries(table: string, index: string): string { return `dynamodb/index\x00${table}\x00${index}\x00` }
+export function parsed(text: string): Item throws Fault { return decode[api.GetItemOutput](text).Item ?? [] }
+export function stored(item: Item): string { return result({ ...new api.GetItemOutput(), Item: item }) }
+export function streamKey(table: string, label: string): string { return `${table}/stream/${label}` }
+
+/// The sequence number of a stream's nth record: 21 digits, a 1 and n's, so that their order is the records'.
+export function sequence(n: i64): string {
+	let s = `${n}`
+	while (s.length < 20) {
+		s = "0" + s
+	}
+	return "1" + s
+}
+
+export function sequenced(s: string): i64 | null {
+	if (s.length != 21 || s[0] != 49 || !s.every(c => c >= 48 && c <= 57)) {
+		return null
+	}
+	let n: i64 = 0
+	for (let i = 1; i < s.length; i++) {
+		n = n * 10 + ((s[i] - 48) as i64)
+	}
+	return n
+}
+
+export function attribute(item: Item, name: string): api.AttributeValue | null {
+	const e = item.find(e => e[0] == name)
+	return if (e == null) null else e[1]
+}
+
+export function keyOf(d: Definition, item: Item): string throws Fault {
+	return encode(attribute(item, d.hash.name)!)
+		+ (if (d.range == null) "" else encode(attribute(item, d.range!.name)!))
+}
+
+/// The encoding of item's key in the index x of table d, then of its key in d; null if it lacks the index's key.
+export function indexKeyOf(d: Definition, x: Index, item: Item): string | null throws Fault {
+	const h = attribute(item, x.hash.name)
+	const r = if (x.range == null) null else attribute(item, x.range!.name)
+	if (h == null || x.range != null && r == null || typeOf(h!) != x.hash.type
+		|| x.range != null && typeOf(r!) != x.range!.type) {
+		return null
+	}
+	return encode(h!) + (if (r == null) "" else encode(r!)) + keyOf(d, item)
+}
+
+export function typeOf(v: api.AttributeValue): string {
+	if (v instanceof api.AttributeValue$S) {
+		return "S"
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return "N"
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return "B"
+	}
+	return ""
+}
+
+export function keyNames(d: Definition, x: Index | null): string[] {
+	const out = [d.hash.name]
+	if (d.range != null) {
+		out.push(d.range!.name)
+	}
+	if (x != null) {
+		for (const k of [x!.hash, x!.range]) {
+			if (k != null && !out.includes(k!.name)) {
+				out.push(k!.name)
+			}
+		}
+	}
+	return out
+}
+
+export function projected(d: Definition, x: Index, item: Item): Item {
+	if (x.projection == "ALL") {
+		return item
+	}
+	const keep = keyNames(d, x)
+	if (x.projection == "INCLUDE") {
+		keep.append(x.nonKey)
+	}
+	return item.filter(e => keep.includes(e[0]))
+}
+
+/// The size of item as DynamoDB counts it: its names' bytes and its values'.
+export function sizeOf(item: Item): i64 {
+	let n: i64 = 0
+	for (const [k, v] of item) {
+		n += (k.length as i64) + valueSize(v)
+	}
+	return n
+}
+
+/// The size of v: a string's or binary's bytes, a number's of about two digits each, a set's members', a map's or
+/// list's 3 bytes and 1 for each element, and its elements'.
+function valueSize(v: api.AttributeValue): i64 {
+	if (v instanceof api.AttributeValue$S) {
+		return v.S.length as i64
+	}
+	if (v instanceof api.AttributeValue$B) {
+		return v.B.length as i64
+	}
+	if (v instanceof api.AttributeValue$N) {
+		return ((v.N.length + 1) / 2 + 1) as i64
+	}
+	if (v instanceof api.AttributeValue$SS) {
+		return total(v.SS)
+	}
+	if (v instanceof api.AttributeValue$BS) {
+		return total(v.BS)
+	}
+	if (v instanceof api.AttributeValue$NS) {
+		let n: i64 = 0
+		for (const x of v.NS) {
+			n += ((x.length + 1) / 2 + 1) as i64
+		}
+		return n
+	}
+	if (v instanceof api.AttributeValue$M) {
+		return 3 + (v.M.length as i64) + sizeOf(v.M)
+	}
+	if (v instanceof api.AttributeValue$L) {
+		let n: i64 = 3 + (v.L.length as i64)
+		for (const x of v.L) {
+			n += valueSize(x)
+		}
+		return n
+	}
+	return 1
+}
+
+function total(xs: string[]): i64 {
+	let n: i64 = 0
+	for (const x of xs) {
+		n += x.length as i64
+	}
+	return n
+}

@@ -1,0 +1,197 @@
+//! DynamoDB's numbers: decimals of up to 38 significant digits and of magnitude from 1E-130 to below 1E+126, held
+//! exactly, as their digits and exponent, with an encoding into bytes that sort as the numbers do.
+
+import { Fault } from "../../core/fault"
+import { isDigit } from "std/ascii"
+
+/// A number: its sign, its significant digits without leading or trailing zeros, "" for zero, and the exponent of the
+/// first, so that digits d1d2… stand for d1.d2… × 10^exp.
+export class Decimal {
+	negative = false
+	digits = ""
+	exp = 0
+}
+
+export function parse(s: string): Decimal throws Fault {
+	let i = 0
+	const negative = s.length > 0 && s[0] == 45 // -
+	if (s.length > 0 && (s[0] == 45 || s[0] == 43)) {
+		i++
+	}
+	let all = ""
+	let before = -1 // the digits before the point
+	while (i < s.length && (isDigit(s[i]) || s[i] == 46 && before < 0)) {
+		if (s[i] == 46) {
+			before = all.length
+		} else {
+			all += chr(s[i])
+		}
+		i++
+	}
+	if (before < 0) {
+		before = all.length
+	}
+	let e = 0
+	if (all.length > 0 && i < s.length && (s[i] == 101 || s[i] == 69)) {
+		i++
+		const minus = i < s.length && s[i] == 45
+		if (i < s.length && (s[i] == 45 || s[i] == 43)) {
+			i++
+		}
+		const from = i
+		while (i < s.length && isDigit(s[i])) {
+			e = if (e > 100000) e else e * 10 + ((s[i] - 48) as i32)
+			i++
+		}
+		if (i == from) {
+			throw unreadable(s)
+		}
+		e = if (minus) -e else e
+	}
+	if (all.length == 0 || i < s.length) {
+		throw unreadable(s)
+	}
+	return checked(of(negative, all, before - 1 + e))
+}
+
+function unreadable(s: string): Fault { return invalid(`The parameter cannot be converted to a numeric value: ${s}`) }
+function invalid(why: string): Fault { return new Fault(400, "ValidationException", why) }
+
+function of(negative: bool, all: string, exp: i32): Decimal {
+	let from = 0
+	while (from < all.length && all[from] == 48) {
+		from++
+	}
+	let to = all.length
+	while (to > from && all[to - 1] == 48) {
+		to--
+	}
+	const d = new Decimal()
+	if (from < to) {
+		d.negative = negative
+		d.digits = all.slice(from, to)
+		d.exp = exp - from
+	}
+	return d
+}
+
+function checked(d: Decimal): Decimal throws Fault {
+	if (d.digits.length > 38) {
+		throw invalid("Attempting to store more than 38 significant digits in a Number")
+	}
+	if (d.digits != "" && d.exp > 125) {
+		throw invalid("Number overflow. Attempting to store a number with magnitude larger than supported range")
+	}
+	if (d.digits != "" && d.exp < -130) {
+		throw invalid("Number underflow. Attempting to store a number with magnitude smaller than supported range")
+	}
+	return d
+}
+
+/// d as DynamoDB writes it: in plain notation, without an exponent.
+export function format(d: Decimal): string {
+	if (d.digits == "") {
+		return "0"
+	}
+	const sign = if (d.negative) "-" else ""
+	const n = d.digits.length
+	if (d.exp < 0) {
+		return `${sign}0.${zeros(-d.exp - 1)}${d.digits}`
+	}
+	if (d.exp >= n - 1) {
+		return sign + d.digits + zeros(d.exp - n + 1)
+	}
+	return `${sign}${d.digits.slice(0, d.exp + 1)}.${d.digits.slice(d.exp + 1, n)}`
+}
+
+function zeros(n: i32): string {
+	let s = ""
+	for (let i = 0; i < n; i++) {
+		s += "0"
+	}
+	return s
+}
+
+export function compare(a: Decimal, b: Decimal): i32 {
+	const sa = sign(a)
+	const sb = sign(b)
+	if (sa != sb || sa == 0) {
+		return sa - sb
+	}
+	return if (a.negative) -magnitude(a, b) else magnitude(a, b)
+}
+
+function sign(d: Decimal): i32 { return if (d.digits == "") 0 else if (d.negative) -1 else 1 }
+
+/// How |a| compares to |b|, neither zero.
+function magnitude(a: Decimal, b: Decimal): i32 {
+	if (a.exp != b.exp) {
+		return if (a.exp < b.exp) -1 else 1
+	}
+	return if (a.digits < b.digits) -1 else if (a.digits == b.digits) 0 else 1
+}
+
+export function add(a: Decimal, b: Decimal): Decimal throws Fault {
+	if (a.digits == "" || b.digits == "") {
+		return if (a.digits == "") b else a
+	}
+	const low = min(a.exp - a.digits.length + 1, b.exp - b.digits.length + 1)
+	const high = max(a.exp, b.exp) + 1 // room for a carry
+	const x = places(a, low, high)
+	const y = places(b, low, high)
+	let negative = a.negative
+	if (a.negative == b.negative) {
+		let carry = 0
+		for (let i = 0; i < x.length; i++) {
+			const s = x[i] + y[i] + carry
+			x[i] = s % 10
+			carry = s / 10
+		}
+	} else {
+		const flip = magnitude(a, b) < 0
+		const [big, small] = if (flip) [y, x] else [x, y]
+		negative = if (flip) b.negative else a.negative
+		let borrow = 0
+		for (let i = 0; i < big.length; i++) {
+			let s = big[i] - small[i] - borrow
+			borrow = if (s < 0) 1 else 0
+			x[i] = if (s < 0) s + 10 else s
+		}
+	}
+	let all = ""
+	for (let i = x.length - 1; i >= 0; i--) {
+		all += chr((x[i] + 48) as u8)
+	}
+	return checked(of(negative, all, high))
+}
+
+export function negate(d: Decimal): Decimal {
+	return { ...new Decimal(), negative: !d.negative && d.digits != "", digits: d.digits, exp: d.exp }
+}
+
+/// The digits of |d| at the places from 10^low up to 10^high, the lowest first.
+function places(d: Decimal, low: i32, high: i32): i32[] {
+	const out = new i32[](high - low + 1)
+	for (let i = 0; i < d.digits.length; i++) {
+		out[d.exp - i - low] = (d.digits[i] - 48) as i32
+	}
+	return out
+}
+
+function min(a: i32, b: i32): i32 { return if (a < b) a else b }
+function max(a: i32, b: i32): i32 { return if (a > b) a else b }
+
+/// d as bytes that sort as the numbers do, none a prefix of another's: a byte of its sign, then of a positive's
+/// exponent and its digits and a 0, or of a negative's the same each inverted.
+export function encode(d: Decimal): string {
+	if (d.digits == "") {
+		return "\x02"
+	}
+	let s = if (d.negative) "\x01" else "\x03"
+	const e = (d.exp + 130) as u8
+	s += chr(if (d.negative) 255 - e else e)
+	for (const c of d.digits) {
+		s += chr(if (d.negative) 255 - c else c)
+	}
+	return s + (if (d.negative) "\xff" else "\x00")
+}

@@ -1,0 +1,162 @@
+//! DynamoDB's parameters from before its expressions, which older clients still send: Expected, AttributeUpdates,
+//! KeyConditions, QueryFilter, ScanFilter, AttributesToGet and ConditionalOperator.
+
+import { Fault } from "../../core/fault"
+import * as api from "./api"
+import { Action, Node, order, Step, typeName, validation } from "./expression"
+
+/// Throws if a request gives both parameters of the old kind and expressions, each in the order DynamoDB lists them.
+export function unmixed(old: [string, bool][], expressions: [string, bool][]) throws Fault {
+	const a = old.filter(e => e[1]).map(e => e[0])
+	const b = expressions.filter(e => e[1]).map(e => e[0])
+	if (a.length > 0 && b.length > 0) {
+		throw validation("Can not use both expression and non-expression parameters in the same request: "
+			+ `Non-expression parameters: {${a.join(", ")}} Expression parameters: {${b.join(", ")}}`)
+	}
+}
+
+export function filter(given: [string, api.Condition][] | null,
+	op: api.ConditionalOperator | null): Node | null throws Fault {
+	operator(given?.length ?? 0, op)
+	const parts: Node[] = []
+	for (const [name, c] of given ?? []) {
+		parts.push(compare(name, c.ComparisonOperator, c.AttributeValueList ?? []))
+	}
+	return joined(parts, op)
+}
+
+export function expected(given: [string, api.ExpectedAttributeValue][] | null,
+	op: api.ConditionalOperator | null): Node | null throws Fault {
+	operator(given?.length ?? 0, op)
+	const parts: Node[] = []
+	for (const [name, e] of given ?? []) {
+		if (e.Value != null && e.AttributeValueList != null) {
+			throw member(name, "Value and AttributeValueList cannot be used together")
+		}
+		if (e.Exists != null && e.ComparisonOperator != null) {
+			throw member(name, "Exists and ComparisonOperator cannot be used together")
+		}
+		if (e.ComparisonOperator != null) {
+			const args = e.AttributeValueList ?? (if (e.Value == null) [] else [e.Value!])
+			parts.push(compare(name, e.ComparisonOperator!, args))
+		} else if (e.Exists == false) {
+			if (e.Value != null) {
+				throw member(name, "Value cannot be used when Exists is false")
+			}
+			parts.push(node("attribute_not_exists", [path(name)]))
+		} else {
+			if (e.Value == null) {
+				throw member(name, `Value must be provided when Exists is ${if (e.Exists == true) "true" else "null"}`)
+			}
+			parts.push(compare(name, "EQ", [e.Value!]))
+		}
+	}
+	return joined(parts, op)
+}
+
+export function updates(given: [string, api.AttributeValueUpdate][]): Action[] throws Fault {
+	const out: Action[] = []
+	for (const [name, u] of given) {
+		const a = new Action()
+		a.path = [step(name)]
+		const kind = u.Action ?? "PUT"
+		if (u.Value == null) {
+			if (kind != "DELETE") {
+				throw parameters("Only DELETE action is allowed when no attribute value is specified")
+			}
+			a.kind = "REMOVE"
+			out.push(a)
+			continue
+		}
+		const t = typeName(u.Value!)
+		const sets = ["SS", "NS", "BS"]
+		if (kind == "ADD" && t != "N" && t != "L" && !sets.includes(t)) {
+			throw parameters(`ADD action is not supported for the type ${t}`)
+		}
+		if (kind == "DELETE" && !sets.includes(t)) {
+			throw parameters(`DELETE action with value is not supported for the type ${t}`)
+		}
+		a.kind = if (kind == "PUT") "SET" else kind
+		a.value = value(u.Value!)
+		out.push(a)
+	}
+	return out
+}
+
+export function attributes(names: string[] | null): Step[][] | null throws Fault {
+	if (names == null) {
+		return null
+	}
+	for (let i = 0; i < names!.length; i++) {
+		if (names!.indexOf(names![i]) != i) {
+			throw parameters(`Duplicate value in attribute name: ${names![i]}`)
+		}
+	}
+	return names!.map(n => [step(n)])
+}
+
+function operator(n: i32, op: api.ConditionalOperator | null) throws Fault {
+	if (op != null && n == 0) {
+		throw validation("ConditionalOperator cannot be used without Filter or Expected")
+	}
+	if (op != null && n == 1) {
+		throw validation("ConditionalOperator can only be used when Filter or Expected has two or more elements")
+	}
+}
+
+function compare(name: string, op: api.ComparisonOperator, args: api.AttributeValue[]): Node throws Fault {
+	const counts: [string, i32, string[]][] = [["EQ", 1, []], ["NE", 1, []], ["LE", 1, ["S", "N", "B"]],
+		["LT", 1, ["S", "N", "B"]], ["GE", 1, ["S", "N", "B"]], ["GT", 1, ["S", "N", "B"]], ["NOT_NULL", 0, []],
+		["NULL", 0, []], ["CONTAINS", 1, ["S", "N", "B"]], ["NOT_CONTAINS", 1, ["S", "N", "B"]],
+		["BEGINS_WITH", 1, ["S", "B"]], ["IN", -1, ["S", "N", "B"]], ["BETWEEN", 2, ["S", "N", "B"]]]
+	const [_, n, types] = counts.find(e => e[0] == op)!
+	if (n >= 0 && args.length != n || n < 0 && args.length == 0) {
+		throw parameters(`Invalid number of argument(s) for the ${op} ComparisonOperator`)
+	}
+	for (const a of args) {
+		if (typeName(a) != typeName(args[0])) {
+			throw parameters("AttributeValues inside AttributeValueList must be of same type")
+		}
+		if (types.length > 0 && !types.includes(typeName(a))) {
+			throw parameters(`ComparisonOperator ${op} is not valid for ${typeName(a)} AttributeValue type`)
+		}
+	}
+	if (op == "BETWEEN" && order(args[0], args[1]) > 0) {
+		throw parameters("The BETWEEN condition was provided a range where the lower bound is greater than the upper "
+			+ "bound")
+	}
+	const operands = [path(name), ...args.map(value)]
+	switch (op) {
+		case "EQ": return node("=", operands)
+		case "NE": return node("<>", operands)
+		case "LE": return node("<=", operands)
+		case "LT": return node("<", operands)
+		case "GE": return node(">=", operands)
+		case "GT": return node(">", operands)
+		case "NOT_NULL": return node("attribute_exists", operands)
+		case "NULL": return node("attribute_not_exists", operands)
+		case "CONTAINS": return node("contains", operands)
+		case "NOT_CONTAINS": return node("not", [node("contains", operands)])
+		case "BEGINS_WITH": return node("begins_with", operands)
+		case "IN": return node("in", operands)
+		default: return node("between", operands)
+	}
+}
+
+function joined(parts: Node[], op: api.ConditionalOperator | null): Node | null {
+	if (parts.length == 0) {
+		return null
+	}
+	let n = parts[0]
+	for (const p of parts.slice(1, parts.length)) {
+		n = node(if (op == "OR") "or" else "and", [n, p])
+	}
+	return n
+}
+
+function member(name: string, why: string): Fault { return parameters(`${why} for Attribute: ${name}`) }
+function parameters(why: string): Fault { return validation(`One or more parameter values were invalid: ${why}`) }
+function node(kind: string, args: Node[]): Node { return { ...new Node(), kind: kind, args: args } }
+function step(name: string): Step { return { ...new Step(), name: name } }
+function path(name: string): Node { return { ...new Node(), kind: "path", path: [step(name)] } }
+function value(v: api.AttributeValue): Node { return { ...new Node(), kind: "value", value: v } }
