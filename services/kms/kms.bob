@@ -1,0 +1,1241 @@
+//! AWS KMS: symmetric, HMAC and Ed25519 signing keys, their aliases, tags, key policies, grants, rotation and
+//! scheduled deletion, and the cryptographic operations on them (./ciphertext). Where AWS differs:
+//!
+//! - A key scheduled for deletion is never deleted; automatic rotation never happens; on-demand rotation completes
+//!   at once.
+//! - A ciphertext blob is BoberStack's own, sealed by XChaCha20-Poly1305, not AES-GCM, which std does not have.
+//! - Of asymmetric keys only ECC_NIST_EDWARDS25519 with ED25519_SHA_512 is implemented: std's Ed25519 has no prehash.
+//!   Other key specs, HMAC_224 and HMAC_384, imported material, custom key stores and multi-Region replicas are not.
+//! - Grants take effect at once; a grant token is not checked. ListRetirableGrants lists the caller's account's only.
+//! - AWS managed keys are made on first use of their alias; their key policies merge AWS's two statements into one.
+//! - Messages are AWS's as seen, or as near as AWS's documentation tells.
+
+import * as auth from "../../core/auth/policy"
+import { Fault } from "../../core/fault"
+import { random, uuid } from "../../core/random"
+import { Caller, Context, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as api from "./api"
+import { Blob, mac, open, parse, seal } from "./ciphertext"
+import { Alias, aliases, Grant, Key, keys, Material, save, saveAlias } from "./records"
+import { indexOf, sortBy, startsWith } from "std/algo"
+import { isHexDigit } from "std/ascii"
+import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "std/crypto/curve25519"
+import { CryptoError } from "std/crypto/error"
+import { equal } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { ParseError, parseInt, split } from "std/string"
+import { day } from "std/time"
+
+/// The most plaintext Encrypt takes, and the on-demand rotations a key may have.
+const most = 4096
+const onDemand = 25
+/// The DER of an Ed25519 SubjectPublicKeyInfo up to its key's 32 bytes.
+const spki = "\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00"
+
+/// The AWS managed keys every account has in every region, made on first use: the last part of the alias, alias/aws/…;
+/// the signing name of the service that may use it; the service's name and what the key protects, as AWS words them.
+const predefined: [string, string, string, string][] = [["dynamodb", "dynamodb", "Amazon DynamoDB", "DynamoDB tables"],
+	["ebs", "ec2", "EBS", "EBS volumes"],
+	["elasticfilesystem", "elasticfilesystem", "Amazon Elastic File System", "Elastic File Systems"],
+	["es", "es", "Amazon OpenSearch Service", "OpenSearch domains"],
+	["kinesis", "kinesis", "Amazon Kinesis", "Kinesis streams"], ["lambda", "lambda", "AWS Lambda", "Lambda functions"],
+	["rds", "rds", "RDS", "RDS database volumes"], ["redshift", "redshift", "Amazon Redshift", "Redshift clusters"],
+	["s3", "s3", "S3", "S3 objects"],
+	["secretsmanager", "secretsmanager", "AWS Secrets Manager", "Secrets Manager data"],
+	["sns", "sns", "Amazon SNS", "SNS topics"], ["sqs", "sqs", "Amazon SQS", "SQS messages"],
+	["ssm", "ssm", "AWS Systems Manager", "SSM parameters"]]
+
+export class Handler {
+	...api.Unimplemented
+
+	createKey(caller: Caller, input: api.CreateKeyRequest): api.CreateKeyResponse throws Fault {
+		const spec = input.KeySpec ?? input.CustomerMasterKeySpec ?? "SYMMETRIC_DEFAULT"
+		const expected = if (startsWith(spec, "HMAC_")) "GENERATE_VERIFY_MAC" else "ENCRYPT_DECRYPT"
+		const usage = input.KeyUsage ?? expected
+		const symmetric = spec == "SYMMETRIC_DEFAULT" || spec == "HMAC_256" || spec == "HMAC_512"
+		const edwards = spec == "ECC_NIST_EDWARDS25519"
+		if (edwards && input.KeyUsage == null) {
+			throw new Fault(400, "ValidationException",
+				"You must specify a KeyUsage value for all KMS keys except for symmetric encryption keys.")
+		}
+		if (edwards && usage != "SIGN_VERIFY") {
+			throw new Fault(400, "ValidationException", `KeyUsage ${usage} is not compatible with KeySpec ${spec}`)
+		}
+		if (symmetric && usage != expected) {
+			throw new Fault(400, "ValidationException",
+				`The operation failed because the KeyUsage value of the CMK is `
+				+ `${usage}. To perform this operation, the KeyUsage value must be ${expected}.`)
+		}
+		const origin = input.Origin ?? "AWS_KMS"
+		if (origin != "AWS_KMS" || input.CustomKeyStoreId != null) {
+			throw notImplemented(`CreateKey of Origin ${origin}`)
+		}
+		if (!symmetric && !edwards) {
+			throw notImplemented(`CreateKey of KeySpec ${spec}`)
+		}
+		const tags = (input.Tags ?? []).map(t => [t.TagKey, t.TagValue] as [string, string])
+		caller.actions = caller.actions.filter(a => a == "kms:CreateKey" || a == "kms:TagResource" && tags.length > 0)
+		const multi = input.MultiRegion ?? false
+		const context: Context = [["kms:KeySpec", spec], ["kms:KeyUsage", usage], ["kms:KeyOrigin", origin],
+			["kms:MultiRegion", if (multi) "true" else "false"],
+			["kms:BypassPolicyLockoutSafetyCheck", if (input.BypassPolicyLockoutSafetyCheck) "true" else "false"],
+			...requestTags(tags)]
+		if (multi) {
+			context.push(["kms:MultiRegionKeyType", "PRIMARY"])
+		}
+		caller.allow("*", null, [...base(caller), ...context])
+		tagged(tags)
+		const id = if (multi) `mrk-${hex.encode(random(16))}` else uuid()
+		const t = now()
+		const k = { ...new Key(), id: id, arn: `arn:aws:kms:${caller.region}:${caller.account}:key/${id}`,
+			account: caller.account, created: t, description: input.Description ?? "", usage: usage, spec: spec,
+			multiRegion: multi, tags: tags }
+		k.policy = input.Policy ?? defaultPolicy(caller.account)
+		if (input.Policy != null) {
+			lockout(caller, k, input.Policy!, input.BypassPolicyLockoutSafetyCheck)
+		}
+		k.materials.push(material(spec, t, ""))
+		save(keys(caller.regional()), k)
+		const r = new api.CreateKeyResponse()
+		r.KeyMetadata = metadata(k)
+		return r
+	}
+
+	describeKey(caller: Caller, input: api.DescribeKeyRequest): api.DescribeKeyResponse throws Fault {
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f)
+		const r = new api.DescribeKeyResponse()
+		r.KeyMetadata = metadata(f.key)
+		return r
+	}
+
+	listKeys(caller: Caller, input: api.ListKeysRequest): api.ListKeysResponse throws Fault {
+		caller.allow("*", null, base(caller))
+		const all = every(keys(caller.regional()))
+		const [from, to, next] = paged(all.length, input.Marker, input.Limit, 100)
+		const r = new api.ListKeysResponse()
+		r.Keys = all.slice(from, to).map(k => ({ ...new api.KeyListEntry(), KeyId: k.id, KeyArn: k.arn }))
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	enableKey(caller: Caller, input: api.EnableKeyRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		pending(f.key)
+		f.key.state = "Enabled"
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	disableKey(caller: Caller, input: api.DisableKeyRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		pending(f.key)
+		f.key.state = "Disabled"
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	scheduleKeyDeletion(caller: Caller,
+		input: api.ScheduleKeyDeletionRequest): api.ScheduleKeyDeletionResponse throws Fault {
+		const window = input.PendingWindowInDays ?? 30
+		if (window < 7 || window > 30) {
+			throw new Fault(400, "ValidationException", "PendingWindowInDays must be between 7 and 30")
+		}
+		const f = managed(caller, input.KeyId)
+		pending(f.key)
+		f.key.state = "PendingDeletion"
+		f.key.deleting = now() + window * day
+		f.key.window = window
+		save(f.db, f.key)
+		const r = new api.ScheduleKeyDeletionResponse()
+		r.KeyId = f.key.arn
+		r.DeletionDate = f.key.deleting
+		r.KeyState = "PendingDeletion"
+		r.PendingWindowInDays = window
+		return r
+	}
+
+	cancelKeyDeletion(caller: Caller, input: api.CancelKeyDeletionRequest): api.CancelKeyDeletionResponse throws Fault {
+		const f = managed(caller, input.KeyId)
+		if (f.key.state != "PendingDeletion") {
+			throw api.kmsInvalidStateException(`${f.key.arn} is not pending deletion.`)
+		}
+		f.key.state = "Disabled"
+		f.key.deleting = null
+		f.key.window = null
+		save(f.db, f.key)
+		const r = new api.CancelKeyDeletionResponse()
+		r.KeyId = f.key.arn
+		return r
+	}
+
+	updateKeyDescription(caller: Caller, input: api.UpdateKeyDescriptionRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		pending(f.key)
+		f.key.description = input.Description
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceRequest): Unit throws Fault {
+		const tags = input.Tags.map(t => [t.TagKey, t.TagValue] as [string, string])
+		const f = resolve(caller, input.KeyId, false)
+		authorize(caller, f, requestTags(tags))
+		pending(f.key)
+		tagged(tags)
+		f.key.tags = [...f.key.tags.filter(t => !tags.some(g => g[0] == t[0])), ...tags]
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceRequest): Unit throws Fault {
+		const f = resolve(caller, input.KeyId, false)
+		authorize(caller, f, [["aws:TagKeys", input.TagKeys]])
+		pending(f.key)
+		f.key.tags = f.key.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	listResourceTags(caller: Caller, input: api.ListResourceTagsRequest): api.ListResourceTagsResponse throws Fault {
+		const k = managed(caller, input.KeyId).key
+		const [from, to, next] = paged(k.tags.length, input.Marker, input.Limit, 50)
+		const r = new api.ListResourceTagsResponse()
+		r.Tags = k.tags.slice(from, to).map(t => ({ ...new api.Tag(), TagKey: t[0], TagValue: t[1] }))
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	enableKeyRotation(caller: Caller, input: api.EnableKeyRotationRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		rotatable(f.key)
+		usable(f.key)
+		if (!f.key.rotates) {
+			f.key.since = now()
+		}
+		f.key.rotates = true
+		f.key.period = input.RotationPeriodInDays ?? 365
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	disableKeyRotation(caller: Caller, input: api.DisableKeyRotationRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		rotatable(f.key)
+		usable(f.key)
+		f.key.rotates = false
+		f.key.period = null
+		f.key.since = null
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	getKeyRotationStatus(caller: Caller,
+		input: api.GetKeyRotationStatusRequest): api.GetKeyRotationStatusResponse throws Fault {
+		const k = managed(caller, input.KeyId).key
+		rotatable(k)
+		const r = new api.GetKeyRotationStatusResponse()
+		r.KeyId = k.arn
+		r.KeyRotationEnabled = k.rotates
+		if (k.rotates) {
+			const last = k.materials.filter(m => m.rotation == "AUTOMATIC").map(m => m.created)
+			r.RotationPeriodInDays = k.period
+			r.NextRotationDate = (last.at(last.length - 1) ?? k.since ?? k.created) + (k.period ?? 365) * day
+		}
+		return r
+	}
+
+	rotateKeyOnDemand(caller: Caller, input: api.RotateKeyOnDemandRequest): api.RotateKeyOnDemandResponse throws Fault {
+		const f = managed(caller, input.KeyId)
+		rotatable(f.key)
+		usable(f.key)
+		if (f.key.materials.filter(m => m.rotation == "ON_DEMAND").length >= onDemand) {
+			throw api.limitExceededException(`The on-demand rotations of ${f.key.arn} exceed the limit of ${onDemand}.`)
+		}
+		f.key.materials.push(material(f.key.spec, now(), "ON_DEMAND"))
+		save(f.db, f.key)
+		const r = new api.RotateKeyOnDemandResponse()
+		r.KeyId = f.key.id
+		return r
+	}
+
+	listKeyRotations(caller: Caller, input: api.ListKeyRotationsRequest): api.ListKeyRotationsResponse throws Fault {
+		const k = managed(caller, input.KeyId).key
+		rotatable(k)
+		const all = (input.IncludeKeyMaterial ?? "ROTATIONS_ONLY") == "ALL_KEY_MATERIAL"
+		const listed = k.materials.filter(m => all || m.rotation != "")
+		const [from, to, next] = paged(listed.length, input.Marker, input.Limit, 100)
+		const current = k.materials[k.materials.length - 1].id
+		const r = new api.ListKeyRotationsResponse()
+		r.Rotations = listed.slice(from, to).map(m => ({ ...new api.RotationsListEntry(), KeyId: k.id,
+			KeyMaterialId: m.id, KeyMaterialState: if (m.id == current) "CURRENT" else "NON_CURRENT",
+			RotationDate: if (m.rotation == "") null else m.created,
+			RotationType: if (m.rotation == "") null else m.rotation as api.RotationType }))
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	createAlias(caller: Caller, input: api.CreateAliasRequest): Unit throws Fault {
+		aliased(input.AliasName)
+		const f = target(caller, input.TargetKeyId)
+		const db = aliases(caller.regional())
+		caller.allow(aliasArn(caller, input.AliasName), null, base(caller))
+		authorize(caller, f)
+		reserved(input.AliasName)
+		if (db.get(input.AliasName) != null) {
+			throw api.alreadyExistsException(`An alias with the name ${aliasArn(caller, input.AliasName)} already exists`)
+		}
+		pending(f.key)
+		const t = now()
+		saveAlias(db, { ...new Alias(), name: input.AliasName, target: f.key.id, created: t, updated: t })
+		return new Unit()
+	}
+
+	updateAlias(caller: Caller, input: api.UpdateAliasRequest): Unit throws Fault {
+		aliased(input.AliasName)
+		const db = aliases(caller.regional())
+		const a = db.get(input.AliasName)
+		if (a == null) {
+			throw api.notFoundException(`Alias ${aliasArn(caller, input.AliasName)} is not found.`)
+		}
+		const f = target(caller, input.TargetKeyId)
+		caller.allow(aliasArn(caller, input.AliasName), null, base(caller))
+		const old = keys(caller.regional()).get(a!.target)
+		if (old != null) {
+			authorize(caller, found(caller, old!))
+		}
+		authorize(caller, f)
+		pending(f.key)
+		if (old != null && old!.usage != f.key.usage) {
+			throw api.invalidKeyUsageException(`${f.key.arn} key usage is ${f.key.usage}, but the alias's key's is `
+				+ `${old!.usage}.`)
+		}
+		a!.target = f.key.id
+		a!.updated = now()
+		saveAlias(db, a!)
+		return new Unit()
+	}
+
+	deleteAlias(caller: Caller, input: api.DeleteAliasRequest): Unit throws Fault {
+		aliased(input.AliasName)
+		const db = aliases(caller.regional())
+		const a = db.get(input.AliasName)
+		if (a == null) {
+			throw api.notFoundException(`Alias ${aliasArn(caller, input.AliasName)} is not found.`)
+		}
+		caller.allow(aliasArn(caller, input.AliasName), null, base(caller))
+		const k = keys(caller.regional()).get(a!.target)
+		if (k != null) {
+			authorize(caller, found(caller, k!))
+		}
+		db.delete(input.AliasName)
+		return new Unit()
+	}
+
+	listAliases(caller: Caller, input: api.ListAliasesRequest): api.ListAliasesResponse throws Fault {
+		let of: string | null = null
+		if (input.KeyId != null) {
+			of = keyIdOf(caller, input.KeyId!)
+		}
+		caller.allow("*", null, base(caller))
+		const all = everyAlias(aliases(caller.regional())).filter(a => of == null || a.target == of)
+		if (of == null) {
+			for (const p of predefined) {
+				const name = `alias/aws/${p[0]}`
+				if (!all.some(a => a.name == name)) {
+					all.push({ ...new Alias(), name: name })
+				}
+			}
+			sortBy(all, (a, b) => a.name < b.name)
+		}
+		const [from, to, next] = paged(all.length, input.Marker, input.Limit, 50)
+		const r = new api.ListAliasesResponse()
+		r.Aliases = all.slice(from, to).map(a => {
+			const e = { ...new api.AliasListEntry(), AliasName: a.name, AliasArn: aliasArn(caller, a.name) }
+			if (a.target != "") {
+				e.TargetKeyId = a.target
+				e.CreationDate = a.created
+				e.LastUpdatedDate = a.updated
+			}
+			return e
+		})
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	encrypt(caller: Caller, input: api.EncryptRequest): api.EncryptResponse throws Fault {
+		const context = input.EncryptionContext ?? []
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, crypto(context, "SYMMETRIC_DEFAULT"))
+		encrypting(f.key, "Encrypt", input.EncryptionAlgorithm)
+		const r = new api.EncryptResponse()
+		r.CiphertextBlob = sealed(f.key, input.Plaintext, context)
+		r.KeyId = f.key.arn
+		r.EncryptionAlgorithm = "SYMMETRIC_DEFAULT"
+		return r
+	}
+
+	decrypt(caller: Caller, input: api.DecryptRequest): api.DecryptResponse throws Fault {
+		const context = input.EncryptionContext ?? []
+		const [f, b] = sealedBy(caller, input.CiphertextBlob, input.KeyId)
+		authorize(caller, f, crypto(context, "SYMMETRIC_DEFAULT"))
+		encrypting(f.key, "Decrypt", input.EncryptionAlgorithm)
+		const [plain, m] = opened(f.key, b, context)
+		const r = new api.DecryptResponse()
+		r.KeyId = f.key.arn
+		r.Plaintext = plain
+		r.EncryptionAlgorithm = "SYMMETRIC_DEFAULT"
+		r.KeyMaterialId = m
+		return r
+	}
+
+	reEncrypt(caller: Caller, input: api.ReEncryptRequest): api.ReEncryptResponse throws Fault {
+		const from = input.SourceEncryptionContext ?? []
+		const to = input.DestinationEncryptionContext ?? []
+		const [src, b] = sealedBy(caller, input.CiphertextBlob, input.SourceKeyId)
+		const dst = resolve(caller, input.DestinationKeyId, true)
+		caller.actions = ["kms:ReEncryptFrom"]
+		authorize(caller, src, crypto(from, "SYMMETRIC_DEFAULT"))
+		caller.actions = ["kms:ReEncryptTo"]
+		authorize(caller, dst, crypto(to, "SYMMETRIC_DEFAULT"))
+		encrypting(src.key, "ReEncrypt", input.SourceEncryptionAlgorithm)
+		encrypting(dst.key, "ReEncrypt", input.DestinationEncryptionAlgorithm)
+		const [plain, m] = opened(src.key, b, from)
+		const r = new api.ReEncryptResponse()
+		r.CiphertextBlob = sealed(dst.key, plain, to)
+		r.SourceKeyId = src.key.arn
+		r.KeyId = dst.key.arn
+		r.SourceEncryptionAlgorithm = "SYMMETRIC_DEFAULT"
+		r.DestinationEncryptionAlgorithm = "SYMMETRIC_DEFAULT"
+		r.SourceKeyMaterialId = m
+		r.DestinationKeyMaterialId = current(dst.key).id
+		return r
+	}
+
+	generateDataKey(caller: Caller, input: api.GenerateDataKeyRequest): api.GenerateDataKeyResponse throws Fault {
+		const context = input.EncryptionContext ?? []
+		const f = resolve(caller, input.KeyId, true)
+		const n = dataKeySize(input.NumberOfBytes, input.KeySpec)
+		authorize(caller, f, crypto(context, null))
+		encrypting(f.key, "GenerateDataKey", null)
+		const plain = random(n)
+		const r = new api.GenerateDataKeyResponse()
+		r.CiphertextBlob = sealed(f.key, plain, context)
+		r.Plaintext = plain
+		r.KeyId = f.key.arn
+		r.KeyMaterialId = current(f.key).id
+		return r
+	}
+
+	generateDataKeyWithoutPlaintext(caller: Caller,
+		input: api.GenerateDataKeyWithoutPlaintextRequest): api.GenerateDataKeyWithoutPlaintextResponse throws Fault {
+		const context = input.EncryptionContext ?? []
+		const f = resolve(caller, input.KeyId, true)
+		const n = dataKeySize(input.NumberOfBytes, input.KeySpec)
+		authorize(caller, f, crypto(context, null))
+		encrypting(f.key, "GenerateDataKeyWithoutPlaintext", null)
+		const r = new api.GenerateDataKeyWithoutPlaintextResponse()
+		r.CiphertextBlob = sealed(f.key, random(n), context)
+		r.KeyId = f.key.arn
+		r.KeyMaterialId = current(f.key).id
+		return r
+	}
+
+	generateRandom(caller: Caller, input: api.GenerateRandomRequest): api.GenerateRandomResponse throws Fault {
+		if (input.NumberOfBytes == null) {
+			throw new Fault(400, "ValidationException", "Please specify number of bytes.")
+		}
+		caller.allow("*", null, base(caller))
+		const r = new api.GenerateRandomResponse()
+		r.Plaintext = random(input.NumberOfBytes!)
+		return r
+	}
+
+	generateMac(caller: Caller, input: api.GenerateMacRequest): api.GenerateMacResponse throws Fault {
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, [["kms:MacAlgorithm", input.MacAlgorithm]])
+		const secret = macKey(f.key, "GenerateMac", input.MacAlgorithm)
+		const r = new api.GenerateMacResponse()
+		r.Mac = mac(input.MacAlgorithm, secret, input.Message)
+		r.MacAlgorithm = input.MacAlgorithm
+		r.KeyId = f.key.arn
+		return r
+	}
+
+	verifyMac(caller: Caller, input: api.VerifyMacRequest): api.VerifyMacResponse throws Fault {
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, [["kms:MacAlgorithm", input.MacAlgorithm]])
+		const secret = macKey(f.key, "VerifyMac", input.MacAlgorithm)
+		if (!equal(mac(input.MacAlgorithm, secret, input.Message), input.Mac)) {
+			throw new Fault(400, "KMSInvalidMacException", "")
+		}
+		const r = new api.VerifyMacResponse()
+		r.KeyId = f.key.arn
+		r.MacValid = true
+		r.MacAlgorithm = input.MacAlgorithm
+		return r
+	}
+
+	sign(caller: Caller, input: api.SignRequest): api.SignResponse throws Fault {
+		const kind = input.MessageType ?? "RAW"
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, signing(input.SigningAlgorithm, kind))
+		const seed = signer(f.key, "Sign", input.SigningAlgorithm, kind)
+		const r = new api.SignResponse()
+		try {
+			r.Signature = ed25519Sign(seed, input.Message)
+		} catch (e: CryptoError) {
+			throw new Fault(500, "InternalFailure", "A key's material does not sign")
+		}
+		r.KeyId = f.key.arn
+		r.SigningAlgorithm = input.SigningAlgorithm
+		return r
+	}
+
+	verify(caller: Caller, input: api.VerifyRequest): api.VerifyResponse throws Fault {
+		const kind = input.MessageType ?? "RAW"
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f, signing(input.SigningAlgorithm, kind))
+		const pub = publicOf(signer(f.key, "Verify", input.SigningAlgorithm, kind))
+		let valid = false
+		try {
+			valid = input.Signature.length == 64 && ed25519Verify(pub, input.Message, input.Signature)
+		} catch (e: CryptoError) {}
+		if (!valid) {
+			throw api.kmsInvalidSignatureException("")
+		}
+		const r = new api.VerifyResponse()
+		r.KeyId = f.key.arn
+		r.SignatureValid = true
+		r.SigningAlgorithm = input.SigningAlgorithm
+		return r
+	}
+
+	getPublicKey(caller: Caller, input: api.GetPublicKeyRequest): api.GetPublicKeyResponse throws Fault {
+		const f = resolve(caller, input.KeyId, true)
+		authorize(caller, f)
+		usable(f.key)
+		if (f.key.usage != "SIGN_VERIFY") {
+			throw api.unsupportedOperationException(`${f.key.arn} key spec ${f.key.spec} does not have a public key.`)
+		}
+		const m = metadata(f.key)
+		const r = new api.GetPublicKeyResponse()
+		r.KeyId = f.key.arn
+		r.PublicKey = spki + publicOf(secretOf(current(f.key)))
+		r.CustomerMasterKeySpec = m.CustomerMasterKeySpec
+		r.KeySpec = m.KeySpec
+		r.KeyUsage = m.KeyUsage
+		r.SigningAlgorithms = m.SigningAlgorithms
+		return r
+	}
+
+	getKeyPolicy(caller: Caller, input: api.GetKeyPolicyRequest): api.GetKeyPolicyResponse throws Fault {
+		const k = managed(caller, input.KeyId).key
+		named(input.PolicyName)
+		const r = new api.GetKeyPolicyResponse()
+		r.Policy = k.policy
+		r.PolicyName = "default"
+		return r
+	}
+
+	putKeyPolicy(caller: Caller, input: api.PutKeyPolicyRequest): Unit throws Fault {
+		const f = managed(caller, input.KeyId)
+		named(input.PolicyName)
+		pending(f.key)
+		lockout(caller, f.key, input.Policy, input.BypassPolicyLockoutSafetyCheck)
+		f.key.policy = input.Policy
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	listKeyPolicies(caller: Caller, input: api.ListKeyPoliciesRequest): api.ListKeyPoliciesResponse throws Fault {
+		managed(caller, input.KeyId)
+		const r = new api.ListKeyPoliciesResponse()
+		r.PolicyNames = ["default"]
+		return r
+	}
+
+	createGrant(caller: Caller, input: api.CreateGrantRequest): api.CreateGrantResponse throws Fault {
+		const grantee = input.GranteePrincipal ?? input.GranteeServicePrincipal
+		if (grantee == null) {
+			throw new Fault(400, "ValidationException", "You must specify GranteePrincipal or GranteeServicePrincipal.")
+		}
+		if (input.Operations.length == 0) {
+			throw new Fault(400, "ValidationException", "Operations must not be empty.")
+		}
+		const f = resolve(caller, input.KeyId, false)
+		const ops: Context = [["kms:GrantOperations", input.Operations.map(o => o as string)],
+			["kms:GranteePrincipal", grantee!]]
+		if (input.RetiringPrincipal != null) {
+			ops.push(["kms:RetiringPrincipal", input.RetiringPrincipal!])
+		}
+		authorize(caller, f, ops)
+		usable(f.key)
+		const name = input.Name
+		const old = if (name == null) null
+			else f.key.grants.find(g => g.name == name && g.grantee == grantee
+			&& g.operations == input.Operations.map(o => o as string))
+		const g = old
+			?? { ...new Grant(), id: hex.encode(random(32)), token: base64.encode(random(48)), name: name,
+			created: now(), grantee: grantee, retiring: input.RetiringPrincipal ?? input.RetiringServicePrincipal,
+			issuer: caller.account, operations: input.Operations.map(o => o as string),
+			subset: input.Constraints?.EncryptionContextSubset, equals: input.Constraints?.EncryptionContextEquals }
+		if (old == null) {
+			f.key.grants.push(g)
+			save(f.db, f.key)
+		}
+		const r = new api.CreateGrantResponse()
+		r.GrantId = g.id
+		r.GrantToken = g.token
+		return r
+	}
+
+	listGrants(caller: Caller, input: api.ListGrantsRequest): api.ListGrantsResponse throws Fault {
+		const f = resolve(caller, input.KeyId, false)
+		authorize(caller, f)
+		const all = f.key.grants.filter(g => (input.GrantId == null || g.id == input.GrantId)
+			&& (input.GranteePrincipal == null || g.grantee == input.GranteePrincipal))
+		const [from, to, next] = paged(all.length, input.Marker, input.Limit, 50)
+		const r = new api.ListGrantsResponse()
+		r.Grants = all.slice(from, to).map(g => listed(f.key, g))
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	listRetirableGrants(caller: Caller, input: api.ListRetirableGrantsRequest): api.ListGrantsResponse throws Fault {
+		const who = input.RetiringPrincipal ?? input.RetiringServicePrincipal
+		if (who == null) {
+			throw new Fault(400, "ValidationException",
+				"You must specify RetiringPrincipal or RetiringServicePrincipal.")
+		}
+		caller.allow("*", null, base(caller))
+		const all: api.GrantListEntry[] = []
+		for (const k of every(keys(caller.regional()))) {
+			for (const g of k.grants) {
+				if (g.retiring == who) {
+					all.push(listed(k, g))
+				}
+			}
+		}
+		const [from, to, next] = paged(all.length, input.Marker, input.Limit, 50)
+		const r = new api.ListGrantsResponse()
+		r.Grants = all.slice(from, to)
+		r.NextMarker = next
+		r.Truncated = next != null
+		return r
+	}
+
+	revokeGrant(caller: Caller, input: api.RevokeGrantRequest): Unit throws Fault {
+		const f = resolve(caller, input.KeyId, false)
+		authorize(caller, f)
+		if (!f.key.grants.some(g => g.id == input.GrantId)) {
+			throw api.notFoundException(`Grant ID ${input.GrantId} not found`)
+		}
+		f.key.grants = f.key.grants.filter(g => g.id != input.GrantId)
+		save(f.db, f.key)
+		return new Unit()
+	}
+
+	retireGrant(caller: Caller, input: api.RetireGrantRequest): Unit throws Fault {
+		let f: Found | null = null
+		let g: Grant | null = null
+		if (input.GrantToken != null) {
+			for (const k of every(keys(caller.regional()))) {
+				const hit = k.grants.find(x => x.token == input.GrantToken)
+				if (hit != null) {
+					f = found(caller, k)
+					g = hit
+				}
+			}
+			if (g == null) {
+				throw api.invalidGrantTokenException("The grant token is invalid.")
+			}
+		} else {
+			if (input.KeyId == null || input.GrantId == null) {
+				throw new Fault(400, "ValidationException", "You must specify a grant token, or a key and grant ID.")
+			}
+			f = resolve(caller, input.KeyId!, false)
+			g = f!.key.grants.find(x => x.id == input.GrantId)
+			if (g == null) {
+				throw api.invalidGrantIdException(`Grant ID ${input.GrantId!} not found`)
+			}
+		}
+		const me = principals(caller)
+		const may = me.includes(g!.retiring ?? "")
+			|| g!.operations.includes("RetireGrant") && me.includes(g!.grantee ?? "")
+			|| caller.arn == `arn:aws:iam::${f!.key.account}:root`
+		if (!may) {
+			throw new Fault(400, "AccessDeniedException",
+				`User: ${caller.arn} is not authorized to perform: ` + `kms:RetireGrant on resource: ${f!.key.arn}`)
+		}
+		f!.key.grants = f!.key.grants.filter(x => x.id != g!.id)
+		save(f!.db, f!.key)
+		return new Unit()
+	}
+}
+
+export class Found {
+	db: Table[Key]
+	key: Key
+	alias: string | null
+
+	constructor(db: Table[Key], key: Key, alias: string | null) {
+		this.db = db
+		this.key = key
+		this.alias = alias
+	}
+}
+
+/// The ARN of the key that id names, as the caller may describe it through service: what a service that encrypts under
+/// a customer's key records.
+export function keyArn(caller: Caller, service: string, id: string): string throws Fault {
+	const actions = caller.actions
+	caller.actions = ["kms:DescribeKey"]
+	try {
+		const f = resolve(caller, id, true)
+		onBehalf(caller, f, via(caller, service))
+		return f.key.arn
+	} finally {
+		caller.actions = actions
+	}
+}
+
+/// plain encrypted as the caller may through service, by its signing name. As AWS's services do, the caller is the one
+/// whose request the service serves, so the key policy and the caller's policies decide, of kms:ViaService.
+export function encryptAs(caller: Caller, service: string, id: string, plain: string, context: [string, string][],
+	action = "kms:Encrypt"): string throws Fault {
+	const actions = caller.actions
+	caller.actions = [action]
+	try {
+		const f = resolve(caller, id, true)
+		onBehalf(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		encrypting(f.key, "Encrypt", null)
+		return sealed(f.key, plain, context)
+	} finally {
+		caller.actions = actions
+	}
+}
+
+export function decryptAs(caller: Caller, service: string, blob: string,
+	context: [string, string][]): [string, string] throws Fault {
+	const actions = caller.actions
+	caller.actions = ["kms:Decrypt"]
+	try {
+		const [f, b] = sealedBy(caller, blob, null)
+		onBehalf(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		encrypting(f.key, "Decrypt", null)
+		return [opened(f.key, b, context)[0], f.key.arn]
+	} finally {
+		caller.actions = actions
+	}
+}
+
+export function sealer(blob: string): string | null {
+	const b = parse(blob)
+	return if (b == null) null else `arn:aws:kms:${b!.region}:${b!.account}:key/${b!.key}`
+}
+
+function onBehalf(caller: Caller, f: Found, context: Context) throws Fault {
+	const denied = caller.denied
+	caller.denied = [400, "AccessDeniedException", "linked"]
+	try {
+		authorize(caller, f, context)
+	} finally {
+		caller.denied = denied
+	}
+}
+
+function resolve(caller: Caller, id: string, byAlias: bool): Found throws Fault {
+	let account = caller.account
+	let name = id
+	if (startsWith(id, "arn:")) {
+		const parts = split(id, ":")
+		if (parts.length < 6 || parts[2] != "kms") {
+			throw api.notFoundException(`Invalid arn ${id}`)
+		}
+		if (parts[3] != caller.region) {
+			throw api.notFoundException(`Invalid arn ${parts[3]}`)
+		}
+		account = parts[4]
+		name = parts.slice(5, parts.length).join(":")
+		if (startsWith(name, "key/")) {
+			name = name.slice(4, name.length)
+			if (!keyId(name)) {
+				throw api.notFoundException(`Invalid keyId ${name}`)
+			}
+		} else if (!startsWith(name, "alias/")) {
+			throw api.notFoundException(`Invalid arn ${id}`)
+		}
+	} else if (!startsWith(id, "alias/") && !keyId(id)) {
+		throw api.notFoundException(`Invalid keyId '${id}'`)
+	}
+	const alias = startsWith(name, "alias/")
+	if (alias && !byAlias) {
+		throw api.invalidArnException("Key Aliases are not supported for this operation.")
+	}
+	const store = if (account == caller.account) caller.regional() else caller.existing(`${account}/${caller.region}`)
+	let target = name
+	if (alias) {
+		let a = if (store == null) null else aliases(store!).get(name)
+		if (a == null && account == caller.account) {
+			a = made(caller, name)
+		}
+		if (a == null) {
+			throw absent(caller, account, `Alias arn:aws:kms:${caller.region}:${account}:${name} is not found.`)
+		}
+		target = a!.target
+	}
+	const db = if (store == null) null else keys(store!)
+	const k = if (db == null) null else db!.get(target)
+	if (k == null) {
+		throw absent(caller, account, `Key 'arn:aws:kms:${caller.region}:${account}:key/${target}' does not exist`)
+	}
+	return new Found(db!, k!, if (alias) name else null)
+}
+
+/// A NotFoundException in the caller's account, an access denied in another's, as AWS does not say there whether it
+/// exists.
+function absent(caller: Caller, account: string, why: string): Fault {
+	if (account == caller.account) {
+		return api.notFoundException(why)
+	}
+	return new Fault(400, "AccessDeniedException",
+		`User: ${caller.arn} is not authorized to perform: `
+		+ `${caller.actions.at(0) ?? "kms:DescribeKey"} on this resource because the resource does not exist in this `
+		+ "Region, no resource-based policies allow access, or a resource-based policy explicitly denies access")
+}
+
+function managed(caller: Caller, id: string): Found throws Fault {
+	const f = resolve(caller, id, false)
+	authorize(caller, f)
+	return f
+}
+
+/// The key that an alias is to name, by its id or ARN: AWS answers an alias with its own fault.
+function target(caller: Caller, id: string): Found throws Fault {
+	if (startsWith(id, "alias/") || startsWith(id, "arn:") && indexOf(id, ":alias/") >= 0) {
+		throw new Fault(400, "ValidationException", "Aliases must refer to keys. Not aliases")
+	}
+	return resolve(caller, id, false)
+}
+
+/// The id of the key that id names by its id or ARN, for ListAliases, which answers an alias with its own fault and
+/// a key not found with no aliases.
+function keyIdOf(caller: Caller, id: string): string throws Fault {
+	try {
+		return resolve(caller, id, false).key.id
+	} catch (f: Fault) {
+		if (f.code != "NotFoundException" || indexOf(f.message, "Invalid") == 0) {
+			throw f
+		}
+		const slash = indexOf(id, "key/")
+		return if (slash >= 0) id.slice(slash + 4, id.length) else id
+	}
+}
+
+function found(caller: Caller, k: Key): Found throws Fault {
+	const store = if (k.account == caller.account) caller.regional() else caller.tree(`${k.account}/${caller.region}`)
+	return new Found(keys(store), k, null)
+}
+
+function authorize(caller: Caller, f: Found, context: Context = []) throws Fault {
+	const k = f.key
+	const all: Context = [...base(caller), ["kms:KeySpec", k.spec], ["kms:KeyUsage", k.usage],
+		["kms:KeyOrigin", "AWS_KMS"], ["kms:MultiRegion", if (k.multiRegion) "true" else "false"],
+		...resourceTags(k.tags), ...context]
+	if (k.multiRegion) {
+		all.push(["kms:MultiRegionKeyType", "PRIMARY"])
+	}
+	if (f.alias != null) {
+		all.push(["kms:RequestAlias", f.alias!])
+	}
+	const names = everyAlias(aliases(if (k.account == caller.account) caller.regional()
+		else caller.tree(`${k.account}/${caller.region}`))).filter(a => a.target == k.id).map(a => a.name)
+	if (names.length > 0) {
+		all.push(["kms:ResourceAliases", names])
+	}
+	try {
+		caller.allow(k.arn, k.policy, all, null, null, true)
+	} catch (denied: Fault) {
+		if (denied.code != "AccessDeniedException" || indexOf(denied.message, "explicit deny") >= 0
+			|| !granted(caller, k, context)) {
+			throw denied
+		}
+	}
+}
+
+function granted(caller: Caller, k: Key, context: Context): bool {
+	const me = principals(caller)
+	const pairs: [string, string][] = []
+	for (const [name, v] of context) {
+		if (startsWith(name, "kms:EncryptionContext:") && v instanceof string) {
+			pairs.push([name.slice(22, name.length), v])
+		}
+	}
+	return caller.actions.every(a => k.grants.some(g => me.includes(g.grantee ?? "")
+		&& g.operations.includes(a.slice(4, a.length)) && within(pairs, g)))
+}
+
+function within(context: [string, string][], g: Grant): bool {
+	const subset = g.subset ?? []
+	const equals = g.equals
+	return subset.every(p => context.some(c => c[0] == p[0] && c[1] == p[1]))
+		&& (equals == null
+		|| equals.length == context.length && equals!.every(p => context.some(c => c[0] == p[0] && c[1] == p[1])))
+}
+
+function principals(caller: Caller): string[] {
+	const out = [caller.arn]
+	const parts = split(caller.arn, ":")
+	if (parts.length == 6 && startsWith(parts[5], "assumed-role/")) {
+		const role = split(parts[5], "/")[1]
+		out.push(`arn:aws:iam::${parts[4]}:role/${role}`)
+	}
+	return out
+}
+
+function base(caller: Caller): Context {
+	return if (caller.source != "") [] else [["kms:CallerAccount", caller.account]]
+}
+
+/// The context key of a request that service, by its signing name, makes for the caller: kms:ViaService; none if the
+/// caller is a service principal, which calls KMS itself.
+function via(caller: Caller, service: string): Context {
+	return if (caller.source != "") [] else [["kms:ViaService", `${service}.${caller.region}.amazonaws.com`]]
+}
+
+function crypto(context: [string, string][], algorithm: string | null): Context {
+	const out: Context = []
+	for (const [k, v] of context) {
+		out.push([`kms:EncryptionContext:${k}`, v])
+	}
+	if (context.length > 0) {
+		out.push(["kms:EncryptionContextKeys", context.map(p => p[0])])
+	}
+	if (algorithm != null) {
+		out.push(["kms:EncryptionAlgorithm", algorithm!])
+	}
+	return out
+}
+
+function usable(k: Key) throws Fault {
+	if (k.state == "Disabled") {
+		throw api.disabledException(`${k.arn} is disabled.`)
+	}
+	pending(k)
+}
+
+function pending(k: Key) throws Fault {
+	if (k.state == "PendingDeletion") {
+		throw api.kmsInvalidStateException(`${k.arn} is pending deletion.`)
+	}
+}
+
+function encrypting(k: Key, op: string, algorithm: string | null) throws Fault {
+	usable(k)
+	if (k.usage != "ENCRYPT_DECRYPT") {
+		throw api.invalidKeyUsageException(`${k.arn} key usage is ${k.usage} which is not valid for ${op}.`)
+	}
+	if (algorithm != null && algorithm != "SYMMETRIC_DEFAULT") {
+		throw api.invalidKeyUsageException(`Algorithm ${algorithm} is incompatible with key spec ${k.spec}.`)
+	}
+}
+
+function macKey(k: Key, op: string, algorithm: string): string throws Fault {
+	usable(k)
+	if (k.usage != "GENERATE_VERIFY_MAC") {
+		throw api.invalidKeyUsageException(`${k.arn} key usage is ${k.usage} which is not valid for ${op}.`)
+	}
+	if (algorithm != `HMAC_SHA_${k.spec.slice(5, k.spec.length)}`) {
+		throw api.invalidKeyUsageException(`Algorithm ${algorithm} is incompatible with key spec ${k.spec}.`)
+	}
+	return secretOf(current(k))
+}
+
+function signing(algorithm: api.SigningAlgorithmSpec, kind: api.MessageType): Context {
+	return [["kms:SigningAlgorithm", algorithm], ["kms:MessageType", kind]]
+}
+
+function signer(k: Key, op: string, algorithm: api.SigningAlgorithmSpec, kind: api.MessageType): string throws Fault {
+	usable(k)
+	if (k.usage != "SIGN_VERIFY") {
+		throw api.invalidKeyUsageException(`${k.arn} key usage is ${k.usage} which is not valid for ${op}.`)
+	}
+	if (algorithm != "ED25519_SHA_512" && algorithm != "ED25519_PH_SHA_512") {
+		throw api.invalidKeyUsageException(`Algorithm ${algorithm} is incompatible with key spec ${k.spec}.`)
+	}
+	if (kind == "EXTERNAL_MU" || algorithm == "ED25519_SHA_512" && kind == "DIGEST") {
+		throw new Fault(400, "ValidationException",
+			`MessageType ${kind} is not compatible with signing algorithm ${algorithm}.`)
+	}
+	if (algorithm == "ED25519_PH_SHA_512") {
+		throw notImplemented(`${op} of ED25519_PH_SHA_512`)
+	}
+	return secretOf(current(k))
+}
+
+function publicOf(seed: string): string throws Fault {
+	try {
+		return ed25519PublicKey(seed)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", "A key's material is not an Ed25519 seed")
+	}
+}
+
+function rotatable(k: Key) throws Fault {
+	if (k.spec != "SYMMETRIC_DEFAULT") {
+		throw api.unsupportedOperationException(`${k.arn} key spec ${k.spec} does not support key rotation.`)
+	}
+}
+
+function dataKeySize(n: i32 | null, spec: api.DataKeySpec | null): i32 throws Fault {
+	if ((n == null) == (spec == null)) {
+		throw new Fault(400, "ValidationException", "Please specify either number of bytes or key spec.")
+	}
+	return n ?? (if (spec == "AES_128") 16 else 32)
+}
+
+function sealed(k: Key, plain: string, context: [string, string][]): string throws Fault {
+	const m = current(k)
+	return seal(k.account, split(k.arn, ":")[3], k.id, m.id, secretOf(m), plain, context)
+}
+
+function sealedBy(caller: Caller, blob: string | null, id: string | null): [Found, Blob] throws Fault {
+	const b = if (blob == null) null else parse(blob!)
+	if (b == null || b.region != caller.region) {
+		throw api.invalidCiphertextException("")
+	}
+	const f = resolve(caller, `arn:aws:kms:${b.region}:${b.account}:key/${b.key}`, false)
+	if (id != null && resolve(caller, id!, true).key.arn != f.key.arn) {
+		throw api.incorrectKeyException("The key ID in the request does not identify a CMK that can perform this operation.")
+	}
+	return [f, b!]
+}
+
+function opened(k: Key, b: Blob, context: [string, string][]): [string, string] throws Fault {
+	const m = k.materials.find(m => m.id == b.material)
+	const plain = if (m == null) null else open(b, secretOf(m!), context)
+	if (plain == null) {
+		throw api.invalidCiphertextException("")
+	}
+	return [plain!, m!.id]
+}
+
+function current(k: Key): Material { return k.materials[k.materials.length - 1] }
+
+function secretOf(m: Material): string throws Fault {
+	try {
+		return base64.decode(m.secret)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A key's material does not decode")
+	}
+}
+
+function material(spec: string, t: i64, rotation: string): Material throws Fault {
+	const n = if (spec == "HMAC_512") 64 else 32
+	return { ...new Material(), id: hex.encode(random(32)), secret: base64.encode(random(n)), created: t,
+		rotation: rotation }
+}
+
+/// The metadata of k, as DescribeKey gives it; the deprecated CustomerMasterKeySpec, of no Ed25519 value, only of the
+/// specs it names.
+function metadata(k: Key): api.KeyMetadata {
+	const m = { ...new api.KeyMetadata(), AWSAccountId: k.account, KeyId: k.id, Arn: k.arn, CreationDate: k.created,
+		Enabled: k.state == "Enabled", Description: k.description, KeyUsage: k.usage as api.KeyUsageType,
+		KeyState: k.state as api.KeyState, Origin: "AWS_KMS", KeyManager: k.manager as api.KeyManagerType,
+		CustomerMasterKeySpec: if (k.spec == "ECC_NIST_EDWARDS25519") null else k.spec as api.CustomerMasterKeySpec,
+		KeySpec: k.spec as api.KeySpec, MultiRegion: k.multiRegion, DeletionDate: k.deleting,
+		PendingDeletionWindowInDays: k.window }
+	if (k.usage == "ENCRYPT_DECRYPT") {
+		m.EncryptionAlgorithms = ["SYMMETRIC_DEFAULT"]
+		m.CurrentKeyMaterialId = current(k).id
+	} else if (k.usage == "SIGN_VERIFY") {
+		m.SigningAlgorithms = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+	} else {
+		m.MacAlgorithms = [`HMAC_SHA_${k.spec.slice(5, k.spec.length)}` as api.MacAlgorithmSpec]
+	}
+	if (k.multiRegion) {
+		const self = { ...new api.MultiRegionKey(), Arn: k.arn, Region: split(k.arn, ":")[3] }
+		m.MultiRegionConfiguration = { ...new api.MultiRegionConfiguration(), MultiRegionKeyType: "PRIMARY",
+			PrimaryKey: self, ReplicaKeys: [] }
+	}
+	return m
+}
+
+function listed(k: Key, g: Grant): api.GrantListEntry {
+	const e = { ...new api.GrantListEntry(), KeyId: k.arn, GrantId: g.id, Name: g.name, CreationDate: g.created,
+		RetiringPrincipal: g.retiring, IssuingAccount: `arn:aws:iam::${g.issuer}:root`,
+		Operations: g.operations.map(o => o as api.GrantOperation) }
+	if (g.grantee != null && indexOf(g.grantee!, "arn:") == 0) {
+		e.GranteePrincipal = g.grantee
+	} else {
+		e.GranteeServicePrincipal = g.grantee
+	}
+	if (g.subset != null || g.equals != null) {
+		e.Constraints = { ...new api.GrantConstraints(), EncryptionContextSubset: g.subset,
+			EncryptionContextEquals: g.equals }
+	}
+	return e
+}
+
+/// As AWS's lockout safety check: throws unless the caller may still put k's policy once it is document, unless bypass.
+function lockout(caller: Caller, k: Key, document: string, bypass: bool) throws Fault {
+	try {
+		auth.parse(document, "resource")
+	} catch (f: Fault) {
+		throw api.malformedPolicyDocumentException(f.message)
+	}
+	if (bypass) {
+		return
+	}
+	const actions = caller.actions
+	caller.actions = ["kms:PutKeyPolicy"]
+	try {
+		caller.allow(k.arn, document, base(caller), null, null, true)
+	} catch (f: Fault) {
+		throw api.malformedPolicyDocumentException("The new key policy will not allow you to update the key policy in "
+			+ "the future.")
+	}
+	caller.actions = actions
+}
+
+function made(caller: Caller, name: string): Alias | null throws Fault {
+	for (const [service, signing, title, what] of predefined) {
+		if (name == `alias/aws/${service}`) {
+			const id = uuid()
+			const t = now()
+			const k = { ...new Key(), id: id, arn: `arn:aws:kms:${caller.region}:${caller.account}:key/${id}`,
+				account: caller.account, created: t, manager: "AWS", usage: "ENCRYPT_DECRYPT",
+				spec: "SYMMETRIC_DEFAULT",
+				description: `Default key that protects my ${what} when no other key is defined`, rotates: true,
+				period: 365, since: t }
+			k.policy = managedPolicy(caller, service, signing, title)
+			k.materials.push(material(k.spec, t, ""))
+			save(keys(caller.regional()), k)
+			const a = { ...new Alias(), name: name, target: id, created: t, updated: t }
+			saveAlias(aliases(caller.regional()), a)
+			return a
+		}
+	}
+	return null
+}
+
+/// The key policy of the AWS managed key alias/aws/<service> of the caller's account and region: the principals of
+/// the account may use it through the service, of its signing name and title, and read it directly.
+function managedPolicy(caller: Caller, service: string, signing: string, title: string): string {
+	const who = `all principals in the account that are authorized to use ${title}`
+	return `{\n  "Version" : "2012-10-17",\n  "Id" : "auto-${service}-2",\n  "Statement" : [ {\n`
+		+ `    "Sid" : "Allow access through ${title} for ${who}",\n    "Effect" : "Allow",\n`
+		+ `    "Principal" : {\n      "AWS" : "*"\n    },\n    "Action" : [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", `
+		+ `"kms:GenerateDataKey*", "kms:CreateGrant", "kms:DescribeKey" ],\n    "Resource" : "*",\n`
+		+ `    "Condition" : {\n      "StringEquals" : {\n        "kms:CallerAccount" : "${caller.account}",\n`
+		+ `        "kms:ViaService" : "${signing}.${caller.region}.amazonaws.com"\n      }\n    }\n  }, {\n`
+		+ `    "Sid" : "Allow direct access to key metadata to the account",\n    "Effect" : "Allow",\n`
+		+ `    "Principal" : {\n      "AWS" : "arn:aws:iam::${caller.account}:root"\n    },\n`
+		+ `    "Action" : [ "kms:Describe*", "kms:Get*", "kms:List*", "kms:RevokeGrant" ],\n    "Resource" : "*"\n  } ]\n}`
+}
+
+/// The key policy AWS gives a key created without one: its account may use it as IAM allows.
+function defaultPolicy(account: string): string {
+	return `{\n  "Version" : "2012-10-17",\n  "Id" : "key-default-1",\n  "Statement" : [ {\n`
+		+ `    "Sid" : "Enable IAM User Permissions",\n    "Effect" : "Allow",\n    "Principal" : {\n`
+		+ `      "AWS" : "arn:aws:iam::${account}:root"\n    },\n    "Action" : "kms:*",\n    "Resource" : "*"\n  } ]\n}`
+}
+
+function named(name: string | null) throws Fault {
+	if (name != null && name != "default") {
+		throw api.notFoundException("No such policy exists")
+	}
+}
+
+function aliased(name: string) throws Fault {
+	if (!startsWith(name, "alias/")) {
+		throw new Fault(400, "ValidationException",
+			"Alias must start with the prefix \"alias/\". Please see "
+			+ "https://docs.aws.amazon.com/kms/latest/developerguide/kms-alias.html")
+	}
+}
+
+function reserved(name: string) throws Fault {
+	if (startsWith(name, "alias/aws/")) {
+		throw api.invalidAliasNameException("Alias must not begin with alias/aws/, which is reserved for AWS managed keys.")
+	}
+}
+
+function tagged(tags: [string, string][]) throws Fault {
+	if (tags.some(t => startsWith(t[0], "aws:"))) {
+		throw api.tagException("Tags beginning with aws: are reserved.")
+	}
+}
+
+/// Whether s is a key id: a UUID, or mrk- and 32 hex digits for a multi-Region key.
+function keyId(s: string): bool {
+	if (s.length == 36 && startsWith(s, "mrk-")) {
+		return s.slice(4, 36).every(isHexDigit)
+	}
+	if (s.length != 36) {
+		return false
+	}
+	for (let i = 0; i < 36; i++) {
+		const dash = i == 8 || i == 13 || i == 18 || i == 23
+		if (dash != (s[i] == 45) || !dash && !isHexDigit(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+function aliasArn(caller: Caller, name: string): string {
+	return `arn:aws:kms:${caller.region}:${caller.account}:${name}`
+}
+
+function every(db: Table[Key]): Key[] {
+	const out: Key[] = []
+	let after: string | null = null
+	while (true) {
+		const chunk = db.scan(after, 100)
+		for (const [_, k] of chunk) {
+			out.push(k)
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+}
+
+function everyAlias(db: Table[Alias]): Alias[] {
+	const out: Alias[] = []
+	let after: string | null = null
+	while (true) {
+		const chunk = db.scan(after, 100)
+		for (const [_, a] of chunk) {
+			out.push(a)
+		}
+		if (chunk.length < 100) {
+			return out
+		}
+		after = chunk[chunk.length - 1][0]
+	}
+}
+
+function paged(n: i32, marker: string | null, limit: i32 | null, most: i32): [i32, i32, string | null] throws Fault {
+	let from = 0
+	if (marker != null) {
+		try {
+			from = parseInt(base64.decode(marker!))
+		} catch (e: ParseError) {
+			throw api.invalidMarkerException("Invalid marker")
+		}
+	}
+	const size = limit ?? most
+	const to = if (from + size < n) from + size else n
+	return [from, to, if (to < n) base64.encode(`${to}`) else null]
+}

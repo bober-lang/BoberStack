@@ -1,0 +1,100 @@
+//! KMS's cryptography: a ciphertext blob of BoberStack's own format, sealed by XChaCha20-Poly1305, and HMAC MACs.
+//!
+//! A blob is "bsk1", the key's account, region and id, each after a byte of its length, the material's id (32 bytes),
+//! a random nonce (24 bytes), then the plaintext sealed with a tag over all before the nonce and the encryption
+//! context.
+
+import { Fault } from "../../core/fault"
+import { random } from "../../core/random"
+import * as aead from "std/crypto/aead"
+import { CryptoError } from "std/crypto/error"
+import { hmacSha256, hmacSha512 } from "std/crypto/hash"
+import * as hex from "std/encoding/hex"
+import { sortBy } from "std/algo"
+import { ParseError } from "std/string"
+
+const magic = "bsk1"
+
+export class Blob {
+	account = ""
+	region = ""
+	key = ""
+	material = ""
+	head = ""
+	nonce = ""
+	sealed = ""
+}
+
+export function seal(account: string, region: string, key: string, material: string, secret: string, plain: string,
+	context: [string, string][]): string throws Fault {
+	let id = ""
+	try {
+		id = hex.decode(material)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A key material's id is not hex")
+	}
+	const head = magic + sized(account) + sized(region) + sized(key) + id
+	const nonce = random(24)
+	try {
+		return head + nonce + aead.seal(secret, nonce, plain, head + canonical(context))
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", `A key's material does not seal: ${e.what}`)
+	}
+}
+
+export function parse(b: string): Blob | null {
+	if (b.length < magic.length || b.slice(0, magic.length) != magic) {
+		return null
+	}
+	const out = new Blob()
+	let at = magic.length
+	const parts: string[] = []
+	for (let i = 0; i < 3; i++) {
+		if (at >= b.length) {
+			return null
+		}
+		const n = b[at] as i32
+		if (at + 1 + n > b.length) {
+			return null
+		}
+		parts.push(b.slice(at + 1, at + 1 + n))
+		at += 1 + n
+	}
+	if (at + 32 + 24 + 16 > b.length) {
+		return null
+	}
+	out.account = parts[0]
+	out.region = parts[1]
+	out.key = parts[2]
+	out.material = hex.encode(b.slice(at, at + 32))
+	out.head = b.slice(0, at + 32)
+	out.nonce = b.slice(at + 32, at + 56)
+	out.sealed = b.slice(at + 56, b.length)
+	return out
+}
+
+export function open(b: Blob, secret: string, context: [string, string][]): string | null {
+	try {
+		return aead.open(secret, b.nonce, b.sealed, b.head + canonical(context))
+	} catch (e: CryptoError) {
+		return null
+	}
+}
+
+export function mac(algorithm: string, secret: string, message: string): string throws Fault {
+	try {
+		return if (algorithm == "HMAC_SHA_512") hmacSha512(secret, message) else hmacSha256(secret, message)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", `A key's material does not MAC: ${e.what}`)
+	}
+}
+
+/// The encryption context as the tag covers it: its pairs by key, each part after its length.
+function canonical(context: [string, string][]): string {
+	const pairs = context.slice(0, context.length)
+	sortBy(pairs, (a, b) => a[0] < b[0])
+	return pairs.map(p => `${p[0].length}:${p[0]}${p[1].length}:${p[1]}`).join("")
+}
+
+/// s after a byte of its length, which is less than 256.
+function sized(s: string): string { return fromBytes([s.length as u8]) + s }
