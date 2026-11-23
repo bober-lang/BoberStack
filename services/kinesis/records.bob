@@ -1,0 +1,56 @@
+//! Kinesis's state in an account's regional tree. Records are by the stream's name, NUL, the shard's id, NUL and the
+//! sequence number, whose fixed width makes byte order the shard's order.
+
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+
+export class Stream {
+	name = ""
+	/// In ns, as are all times here.
+	created: i64 = 0
+	mode = "PROVISIONED"
+	/// In hours.
+	retention = 24
+	maxRecordKiB = 1024
+	shards: Shard[] = []
+	/// What the last sequence number given counts: each record put, shard opened and shard closed takes the next.
+	counter: i64 = 0
+	tags: [string, string][] = []
+	encryption = "NONE"
+	keyId: string | null = null
+	policy: string | null = null
+	metrics: api.MetricsName[] = []
+}
+
+export class Shard {
+	index = 0
+	parent: string | null = null
+	adjacent: string | null = null
+	/// Its hash keys, in decimal.
+	start = ""
+	end = ""
+	/// The sequence number it opened at, below its records', and the one it closed at, null while open.
+	first = ""
+	last: string | null = null
+	opened: i64 = 0
+	closed: i64 | null = null
+}
+
+export class Record {
+	/// In base64.
+	data = ""
+	key = ""
+	arrived: i64 = 0
+	encrypted = false
+}
+
+export class Consumer {
+	name = ""
+	created: i64 = 0
+	tags: [string, string][] = []
+	policy: string | null = null
+}
+
+export function streams(s: Store): Table[Stream] { return new Table[Stream](s, "kinesis/streams") }
+export function records(s: Store): Table[Record] { return new Table[Record](s, "kinesis/records") }
+export function consumers(s: Store): Table[Consumer] { return new Table[Consumer](s, "kinesis/consumers") }

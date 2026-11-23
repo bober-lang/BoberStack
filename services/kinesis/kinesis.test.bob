@@ -1,0 +1,241 @@
+import { sign } from "../../core/auth/sigv4"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import * as protocol from "../../core/protocol/json"
+import * as api from "./api"
+import { largest } from "./hash"
+import { Handler } from "./kinesis"
+import { indexOf } from "std/algo"
+import * as json from "std/encoding/json"
+import { Decodable } from "std/types"
+import { Request, Response } from "std/http"
+
+const arn = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+
+/// What DescribeStream answers and these tests read: AWS answers no metrics as an empty list, which its model forbids.
+class Described {
+	StreamDescription = new Description()
+}
+
+class Description {
+	StreamStatus = ""
+	RetentionPeriodHours = 0
+	Shards: api.Shard[] = []
+	HasMoreShards = false
+}
+
+/// What PutRecords answers and these tests read: AWS answers a FailedRecordCount of 0, which its model forbids.
+class Put {
+	FailedRecordCount = -1
+	Records: api.PutRecordsResultEntry[] = []
+}
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string, key = "test"): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `Kinesis_20131202.${op}`)
+	sign(req, body, "kinesis", "us-east-1", key, "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function ok[T extends Decodable](g: Gateway, op: string, body: string): T {
+	const res = call(g, op, body)
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+function done(g: Gateway, op: string, body: string) { assert call(g, op, body).status == 200 }
+
+function fails(g: Gateway, op: string, body: string, code: string, why: string = "", key = "test"): bool {
+	const res = call(g, op, body, key)
+	const b = res.body.whole ?? ""
+	return res.status == 400 && indexOf(b, `"__type":"${code}"`) >= 0 && indexOf(b, why) >= 0
+}
+
+function read(g: Gateway, it: string, limit = 100): api.GetRecordsOutput {
+	return ok[api.GetRecordsOutput](g, "GetRecords", `{"ShardIterator": "${it}", "Limit": ${limit}}`)
+}
+
+function iterator(g: Gateway, shard: string, kind: string, extra: string = ""): string {
+	const body = `{"StreamName": "s", "ShardId": "${shard}", "ShardIteratorType": "${kind}"${extra}}`
+	return ok[api.GetShardIteratorOutput](g, "GetShardIterator", body).ShardIterator!
+}
+
+test "a stream's shards divide the hash keys" {
+	const g = gateway()
+	done(g, "CreateStream", `{"StreamName": "s", "ShardCount": 2}`)
+	assert fails(g, "CreateStream", `{"StreamName": "s", "ShardCount": 2}`, "ResourceInUseException",
+		"Stream s under account 000000000000 already exists.")
+	const d = ok[Described](g, "DescribeStream", `{"StreamARN": "${arn}"}`).StreamDescription
+	assert d.StreamStatus == "ACTIVE" && d.RetentionPeriodHours == 24 && d.Shards.length == 2 && !d.HasMoreShards
+	assert d.Shards[0].ShardId == "shardId-000000000000" && d.Shards[1].HashKeyRange.EndingHashKey == largest
+	assert d.Shards[1].HashKeyRange.StartingHashKey == "170141183460469231731687303715884105728"
+	assert d.Shards[0].SequenceNumberRange.StartingSequenceNumber.length == 56
+	const l = ok[api.ListStreamsOutput](g, "ListStreams", "{}")
+	assert l.StreamNames == ["s"] && !l.HasMoreStreams && l.StreamSummaries![0].StreamARN == arn
+	assert fails(g, "DescribeStreamSummary", "{}", "InvalidArgumentException",
+		"Stream arn and stream name can't be empty at the same time")
+	assert fails(g, "DescribeStream", `{"StreamName": "t"}`, "ResourceNotFoundException",
+		"Stream t under account 000000000000 not found.")
+	assert fails(g, "DescribeStream", `{"StreamName": "a b"}`, "ValidationException",
+		"Value 'a b' at 'streamName' failed to satisfy constraint")
+	done(g, "CreateStream", `{"StreamName": "d", "StreamModeDetails": {"StreamMode": "ON_DEMAND"}}`)
+	const sum = call(g, "DescribeStreamSummary", `{"StreamName": "d"}`).body.whole ?? ""
+	assert indexOf(sum, `"OpenShardCount":4`) > 0 && indexOf(sum, `"StreamMode":"ON_DEMAND"`) > 0
+	done(g, "DeleteStream", `{"StreamName": "d"}`)
+	assert ok[api.ListStreamsOutput](g, "ListStreams", "{}").StreamNames == ["s"]
+}
+
+test "records in order per shard, by partition key or explicit hash key" {
+	const g = gateway()
+	done(g, "CreateStream", `{"StreamName": "s", "ShardCount": 2}`)
+	const low = ok[api.PutRecordOutput](g, "PutRecord",
+		`{"StreamName": "s", "Data": "YQ==", "PartitionKey": "p", "ExplicitHashKey": "0"}`)
+	assert low.ShardId == "shardId-000000000000"
+	const high = ok[api.PutRecordOutput](g, "PutRecord",
+		`{"StreamName": "s", "Data": "Yg==", "PartitionKey": "p", "ExplicitHashKey": "${largest}"}`)
+	assert high.ShardId == "shardId-000000000001" && high.SequenceNumber > low.SequenceNumber
+	const batch = ok[Put](g, "PutRecords",
+		`{"StreamName": "s", "Records": [{"Data": "Yw==", "PartitionKey": "x", "ExplicitHashKey": "1"}, {"Data": "ZA==", "PartitionKey": "y", "ExplicitHashKey": "2"}]}`)
+	assert batch.FailedRecordCount == 0 && batch.Records.length == 2
+	const it = iterator(g, "shardId-000000000000", "TRIM_HORIZON")
+	const r = read(g, it)
+	assert r.Records.map(x => x.Data) == ["a", "c", "d"] && r.MillisBehindLatest == 0
+	assert r.Records[0].PartitionKey == "p" && r.Records[0].ApproximateArrivalTimestamp != null
+	assert read(g, r.NextShardIterator!).Records.length == 0
+	assert read(g, it, 1).Records.map(x => x.Data) == ["a"]
+	const after = iterator(g, "shardId-000000000000", "AFTER_SEQUENCE_NUMBER",
+		`, "StartingSequenceNumber": "${low.SequenceNumber}"`)
+	assert read(g, after).Records.map(x => x.Data) == ["c", "d"]
+	const at = iterator(g, "shardId-000000000000", "AT_SEQUENCE_NUMBER",
+		`, "StartingSequenceNumber": "${low.SequenceNumber}"`)
+	assert read(g, at).Records.map(x => x.Data) == ["a", "c", "d"]
+	const latest = iterator(g, "shardId-000000000000", "LATEST")
+	assert read(g, latest).Records.length == 0
+	ok[api.PutRecordOutput](g, "PutRecord",
+		`{"StreamName": "s", "Data": "ZQ==", "PartitionKey": "p", "ExplicitHashKey": "3"}`)
+	assert read(g, latest).Records.map(x => x.Data) == ["e"]
+	assert fails(g, "GetShardIterator",
+		`{"StreamName": "s", "ShardId": "shardId-000000000000", "ShardIteratorType": "AT_SEQUENCE_NUMBER", "StartingSequenceNumber": "${high.SequenceNumber}"}`,
+		"InvalidArgumentException", "It encodes shardId-000000000001")
+	assert fails(g, "GetRecords", `{"ShardIterator": "x"}`, "InvalidArgumentException", "Invalid ShardIterator.")
+	assert fails(g, "PutRecord", `{"StreamName": "s", "Data": "YQ==", "PartitionKey": "p", "ExplicitHashKey": "abc"}`,
+		"ValidationException", "Value 'abc' at 'explicitHashKey'")
+	assert fails(g, "PutRecord",
+		`{"StreamName": "s", "Data": "YQ==", "PartitionKey": "p", "ExplicitHashKey": "340282366920938463463374607431768211456"}`,
+		"InvalidArgumentException", "Invalid ExplicitHashKey.")
+	assert fails(g, "GetShardIterator",
+		`{"StreamName": "s", "ShardId": "shardId-000000000009", "ShardIteratorType": "LATEST"}`,
+		"ResourceNotFoundException", "Shard shardId-000000000009 in stream s under account 000000000000 does not exist")
+}
+
+test "splitting and merging, read across" {
+	const g = gateway()
+	done(g, "CreateStream", `{"StreamName": "s", "ShardCount": 1}`)
+	ok[api.PutRecordOutput](g, "PutRecord", `{"StreamName": "s", "Data": "YQ==", "PartitionKey": "p"}`)
+	const it = iterator(g, "shardId-000000000000", "TRIM_HORIZON")
+	done(g, "SplitShard", `{"StreamName": "s", "ShardToSplit": "shardId-000000000000", "NewStartingHashKey": "100"}`)
+	assert fails(g, "SplitShard",
+		`{"StreamName": "s", "ShardToSplit": "shardId-000000000000", "NewStartingHashKey": "5"}`,
+		"ResourceInUseException", "has already been merged or split")
+	const r = read(g, it)
+	assert r.Records.map(x => x.Data) == ["a"] && r.NextShardIterator == null
+	assert r.ChildShards!.map(c => c.ShardId) == ["shardId-000000000001", "shardId-000000000002"]
+	assert r.ChildShards![0].HashKeyRange.EndingHashKey == "99"
+		&& r.ChildShards![0].ParentShards == ["shardId-000000000000"]
+	const shards = ok[api.ListShardsOutput](g, "ListShards", `{"StreamName": "s"}`).Shards!
+	assert shards.length == 3 && shards[0].SequenceNumberRange.EndingSequenceNumber != null
+	assert shards[2].ParentShardId == "shardId-000000000000"
+	const open = ok[api.ListShardsOutput](g, "ListShards", `{"StreamName": "s", "ShardFilter": {"Type": "AT_LATEST"}}`)
+	assert open.Shards!.map(h => h.ShardId) == ["shardId-000000000001", "shardId-000000000002"]
+	const paged = ok[api.ListShardsOutput](g, "ListShards", `{"StreamName": "s", "MaxResults": 2}`)
+	assert paged.Shards!.length == 2 && paged.NextToken != null
+	assert fails(g, "ListShards", `{"StreamName": "s", "NextToken": "${paged.NextToken!}"}`, "InvalidArgumentException",
+		"NextToken and StreamName cannot be provided together.")
+	const rest = ok[api.ListShardsOutput](g, "ListShards", `{"NextToken": "${paged.NextToken!}"}`)
+	assert rest.Shards!.map(h => h.ShardId) == ["shardId-000000000002"] && rest.NextToken == null
+	assert fails(g, "MergeShards",
+		`{"StreamName": "s", "ShardToMerge": "shardId-000000000001", "AdjacentShardToMerge": "shardId-000000000001"}`,
+		"InvalidArgumentException", "are not an adjacent pair")
+	done(g, "MergeShards",
+		`{"StreamName": "s", "ShardToMerge": "shardId-000000000002", "AdjacentShardToMerge": "shardId-000000000001"}`)
+	const merged = ok[api.ListShardsOutput](g, "ListShards",
+		`{"StreamName": "s", "ShardFilter": {"Type": "AT_LATEST"}}`)
+	const m = merged.Shards![0]
+	assert m.ShardId == "shardId-000000000003" && m.ParentShardId == "shardId-000000000002"
+	assert m.AdjacentParentShardId == "shardId-000000000001" && m.HashKeyRange.StartingHashKey == "0"
+	assert m.HashKeyRange.EndingHashKey == largest
+}
+
+test "retention, tags, encryption, consumers and policies" {
+	const g = gateway()
+	done(g, "CreateStream", `{"StreamName": "s", "ShardCount": 1, "Tags": {"a": "1"}}`)
+	assert fails(g, "IncreaseStreamRetentionPeriod", `{"StreamName": "s", "RetentionPeriodHours": 8761}`,
+		"InvalidArgumentException", "Maximum allowed retention period is 8760 hours.")
+	done(g, "IncreaseStreamRetentionPeriod", `{"StreamName": "s", "RetentionPeriodHours": 48}`)
+	assert fails(g, "DecreaseStreamRetentionPeriod", `{"StreamName": "s", "RetentionPeriodHours": 72}`,
+		"InvalidArgumentException", "can not be longer than existing retention period (48 hours)")
+	done(g, "AddTagsToStream", `{"StreamName": "s", "Tags": {"b": "2"}}`)
+	done(g, "RemoveTagsFromStream", `{"StreamName": "s", "TagKeys": ["a"]}`)
+	const tags = ok[api.ListTagsForResourceOutput](g, "ListTagsForResource", `{"ResourceARN": "${arn}"}`).Tags!
+	assert tags.map(t => t.Key) == ["b"]
+	done(g, "StartStreamEncryption", `{"StreamName": "s", "EncryptionType": "KMS", "KeyId": "alias/k"}`)
+	const put = ok[api.PutRecordOutput](g, "PutRecord", `{"StreamName": "s", "Data": "YQ==", "PartitionKey": "p"}`)
+	assert put.EncryptionType == "KMS"
+	const c = ok[api.RegisterStreamConsumerOutput](g, "RegisterStreamConsumer",
+		`{"StreamARN": "${arn}", "ConsumerName": "c"}`).Consumer
+	assert c.ConsumerStatus == "ACTIVE" && indexOf(c.ConsumerARN, `${arn}/consumer/c:`) == 0
+	assert fails(g, "RegisterStreamConsumer", `{"StreamARN": "${arn}", "ConsumerName": "c"}`, "ResourceInUseException")
+	assert fails(g, "DescribeStreamConsumer", "{}", "InvalidArgumentException",
+		"Both streamARN and consumer name must be provided if consumerARN is not provided.")
+	const d = ok[api.DescribeStreamConsumerOutput](g, "DescribeStreamConsumer", `{"ConsumerARN": "${c.ConsumerARN}"}`)
+	assert d.ConsumerDescription.StreamARN == arn
+	assert ok[api.ListStreamConsumersOutput](g, "ListStreamConsumers", `{"StreamARN": "${arn}"}`).Consumers!.length == 1
+	assert fails(g, "DeleteStream", `{"StreamName": "s"}`, "ResourceInUseException")
+	const it = iterator(g, "shardId-000000000000", "TRIM_HORIZON")
+	assert fails(g, "GetRecords", `{"ShardIterator": "${it}"}`, "AccessDeniedException", "", "111111111111")
+	const policy = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "111111111111"}, "Action": "kinesis:GetRecords", "Resource": "${arn}"}]}`
+	done(g, "PutResourcePolicy", `{"ResourceARN": "${arn}", "Policy": ${json.quoted(policy)}}`)
+	assert ok[api.GetResourcePolicyOutput](g, "GetResourcePolicy", `{"ResourceARN": "${arn}"}`).Policy == policy
+	const res = call(g, "GetRecords", `{"ShardIterator": "${it}"}`, "111111111111")
+	assert res.status == 200
+	done(g, "DeleteResourcePolicy", `{"ResourceARN": "${arn}"}`)
+	assert fails(g, "GetRecords", `{"ShardIterator": "${it}"}`, "AccessDeniedException", "", "111111111111")
+	done(g, "DeleteStream", `{"StreamName": "s", "EnforceConsumerDeletion": true}`)
+	assert fails(g, "GetRecords", `{"ShardIterator": "${it}"}`, "ResourceNotFoundException")
+}
+
+// Through the handler: the codec rejects every ScalingType, the one value of its enum too.
+test "uniform scaling" {
+	const c = new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "r")
+	const h = new Handler()
+	h.createStream(c, { ...new api.CreateStreamInput(), StreamName: "s", ShardCount: 3 })
+	const scale = (n: i32) => h.updateShardCount(c,
+		{ ...new api.UpdateShardCountInput(), StreamName: "s", TargetShardCount: n })
+	const u = scale(2)
+	assert u.CurrentShardCount == 3 && u.TargetShardCount == 2
+	const open = h.listShards(c,
+		{ ...new api.ListShardsInput(), StreamName: "s",
+		ShardFilter: { ...new api.ShardFilter(), Type: "AT_LATEST" } }).Shards!
+	assert open.map(x => x.ShardId) == ["shardId-000000000003", "shardId-000000000004"]
+	assert open[0].ParentShardId == "shardId-000000000000" && open[0].AdjacentParentShardId == "shardId-000000000001"
+	assert open[1].ParentShardId == "shardId-000000000001" && open[1].AdjacentParentShardId == "shardId-000000000002"
+	assert open[1].HashKeyRange.EndingHashKey == largest
+	assert scale(5) throws api.invalidArgumentException("UpdateShardCount failed for stream s under account "
+		+ "000000000000: the target shard count 5 must be between half and double the current open shard count 2.")
+	for (const [_, t] of c.opened) {
+		t.close()
+	}
+}
