@@ -1,0 +1,152 @@
+//! BoberStack whole: every service behind one gateway, as main serves it and tests of several services build it.
+
+import { Gateway } from "./core/gateway"
+import * as query from "./core/protocol/query"
+import * as restjson from "./core/protocol/restjson"
+import * as restxml from "./core/protocol/restxml"
+import * as acmApi from "./services/acm/api"
+import * as acm from "./services/acm/acm"
+import * as cloudformationApi from "./services/cloudformation/api"
+import * as cloudformation from "./services/cloudformation/cloudformation"
+import * as cloudwatchApi from "./services/cloudwatch/api"
+import * as cloudwatch from "./services/cloudwatch/cloudwatch"
+import * as dynamodbApi from "./services/dynamodb/api"
+import * as dynamodb from "./services/dynamodb/dynamodb"
+import * as streamsApi from "./services/dynamodbstreams/api"
+import * as streams from "./services/dynamodbstreams/dynamodbstreams"
+import * as eventsApi from "./services/events/api"
+import * as events from "./services/events/events"
+import * as firehoseApi from "./services/firehose/api"
+import * as firehose from "./services/firehose/firehose"
+import * as iamApi from "./services/iam/api"
+import { Catalog } from "./services/iam/catalog"
+import * as iam from "./services/iam/iam"
+import { identify } from "./services/iam/identities"
+import * as kinesisApi from "./services/kinesis/api"
+import * as kinesis from "./services/kinesis/kinesis"
+import * as kmsApi from "./services/kms/api"
+import * as kms from "./services/kms/kms"
+import * as lambdaApi from "./services/lambda/api"
+import * as lambda from "./services/lambda/lambda"
+import * as logsApi from "./services/logs/api"
+import * as logs from "./services/logs/logs"
+import * as s3Api from "./services/s3/api"
+import * as s3 from "./services/s3/s3"
+import * as route53Api from "./services/route53/api"
+import * as route53 from "./services/route53/route53"
+import * as secretsmanagerApi from "./services/secretsmanager/api"
+import * as secretsmanager from "./services/secretsmanager/secretsmanager"
+import * as sesApi from "./services/ses/api"
+import * as ses from "./services/ses/ses"
+import * as sesv2Api from "./services/ses/v2/api"
+import * as schedulerApi from "./services/scheduler/api"
+import * as scheduler from "./services/scheduler/scheduler"
+import * as snsApi from "./services/sns/api"
+import * as sns from "./services/sns/sns"
+import * as sqsApi from "./services/sqs/api"
+import * as sqs from "./services/sqs/sqs"
+import * as ssmApi from "./services/ssm/api"
+import * as sfnApi from "./services/stepfunctions/api"
+import * as stepfunctions from "./services/stepfunctions/stepfunctions"
+import * as ssm from "./services/ssm/ssm"
+import * as stsApi from "./services/sts/api"
+import * as sts from "./services/sts/sts"
+import { startsWith } from "std/algo"
+
+/// A gateway to every service by signing name, catalog the policies AWS manages; services that deliver to others call
+/// them directly.
+export function stack(catalog: Catalog): Gateway {
+	const g = new Gateway()
+	g.identify = identify(catalog)
+	const i = new iam.Handler(catalog)
+	const s = new sts.Handler()
+	const q = new sqs.Handler()
+	const d = new dynamodb.Handler()
+	const n = new sns.Handler(q)
+	const e = new events.Handler(q, n)
+	const m = new secretsmanager.Handler()
+	const p = new ssm.Handler()
+	const l = new logs.Handler()
+	const k = new kms.Handler()
+	const o = new s3.Handler()
+	o.sqs = q
+	o.sns = n
+	o.events = e
+	const r = new kinesis.Handler()
+	const f = new stepfunctions.Handler(q, n, d, e)
+	const z = new route53.Handler()
+	l.kinesis = r
+	e.kinesis = r
+	e.logs = l
+	d.kinesis = r
+	const h = new firehose.Handler()
+	h.s3 = o
+	l.firehose = h
+	e.firehose = h
+	n.firehose = h
+	f.kinesis = r
+	e.states = f
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
+	g.faults.set(iamApi.signingName, (f, id, _) => query.error(f, id, iamApi.ns))
+	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	g.faults.set(stsApi.signingName, (f, id, _) => query.error(f, id, stsApi.ns))
+	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
+	// DynamoDB Streams signs as DynamoDB does, its operations named apart by X-Amz-Target.
+	const t = new streams.Handler()
+	g.services.set(dynamodbApi.signingName, (caller, req) => {
+		const streamed = startsWith(req.headers.get("x-amz-target") ?? "", "DynamoDBStreams_")
+		return if (streamed) streamsApi.handle(t, caller, req) else dynamodbApi.handle(d, caller, req)
+	})
+	g.services.set(snsApi.signingName, (caller, req) => snsApi.handle(n, caller, req))
+	g.services.set(eventsApi.signingName, (caller, req) => eventsApi.handle(e, caller, req))
+	g.services.set(secretsmanagerApi.signingName, (caller, req) => secretsmanagerApi.handle(m, caller, req))
+	g.services.set(ssmApi.signingName, (caller, req) => ssmApi.handle(p, caller, req))
+	g.services.set(logsApi.signingName, (caller, req) => logsApi.handle(l, caller, req))
+	g.services.set(kmsApi.signingName, (caller, req) => kmsApi.handle(k, caller, req))
+	g.services.set(kinesisApi.signingName, (caller, req) => kinesisApi.handle(r, caller, req))
+	g.services.set(firehoseApi.signingName, (caller, req) => firehoseApi.handle(h, caller, req))
+	const a = new lambda.Handler()
+	a.s3 = o
+	a.sqs = q
+	a.kinesis = r
+	a.streams = t
+	f.lambda = a
+	f.s3 = o
+	g.services.set(lambdaApi.signingName, (caller, req) => lambdaApi.handle(a, caller, req))
+	g.faults.set(lambdaApi.signingName, (why, id, _) => restjson.error(lambdaApi.service, why, id))
+	g.services.set(sfnApi.signingName, (caller, req) => sfnApi.handle(f, caller, req))
+	// CloudWatch serves awsQuery and, named by X-Amz-Target, awsJson.
+	const w = new cloudwatch.Handler(n)
+	l.cloudwatch = w
+	g.services.set(cloudwatchApi.signingName, (caller, req) => {
+		const json = req.headers.has("x-amz-target")
+		return if (json) cloudwatchApi.handleJson(w, caller, req) else cloudwatchApi.handle(w, caller, req)
+	})
+	g.services.set(s3Api.signingName, (caller, req) => s3.serve(o, caller, req))
+	g.faults.set(s3Api.signingName, (f, id, _) => restxml.error(s3Api.service, f, id))
+	g.services.set(route53Api.signingName, (caller, req) => route53.serve(z, caller, req))
+	// SES serves its classic API by awsQuery and v2, under /v2/, by restJson1.
+	const v = new ses.Handler()
+	const v2 = new ses.V2()
+	v.sns = n
+	v2.sns = n
+	g.services.set(sesApi.signingName, (caller, req) => {
+		const json = startsWith(req.url.path, "/v2/")
+		return if (json) sesv2Api.handle(v2, caller, ses.routed(req)) else sesApi.handle(v, caller, req)
+	})
+	g.faults.set(sesApi.signingName, (f, id, req) => {
+		const json = req != null && startsWith(req!.url.path, "/v2/")
+		return if (json) restjson.error(sesv2Api.service, f, id) else query.error(f, id, sesApi.ns)
+	})
+	g.faults.set(route53Api.signingName, (f, id, _) => route53.error(f, id))
+	const c = new acm.Handler()
+	g.services.set(acmApi.signingName, (caller, req) => acmApi.handle(c, caller, req))
+	const x = new scheduler.Handler()
+	const y = new cloudformation.Handler(q, n, o, l, i, d, p, a, k, r, m, e, f, w, h, x)
+	g.services.set(cloudformationApi.signingName, (caller, req) => cloudformationApi.handle(y, caller, req))
+	g.faults.set(cloudformationApi.signingName, (f, id, _) => query.error(f, id, cloudformationApi.ns))
+	g.services.set(schedulerApi.signingName, (caller, req) => schedulerApi.handle(x, caller, req))
+	g.faults.set(schedulerApi.signingName, (f, id, _) => restjson.error(schedulerApi.service, f, id))
+	g.anonymous = s3Api.signingName
+	return g
+}

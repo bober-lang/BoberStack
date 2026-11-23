@@ -1,0 +1,156 @@
+import { sign } from "./core/auth/sigv4"
+import { Gateway } from "./core/gateway"
+import { live } from "./core/state/store"
+import { Catalog } from "./services/iam/catalog"
+import { stack } from "./stack"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+
+function internal(g: Gateway, method: string, path: string): Response {
+	return g.handle(new Request(method, `http://localhost:4566${path}`))
+}
+
+function signed(g: Gateway, service: string, method: string, path: string, body = "", op = "",
+	account = "000000000000"): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	if (op != "") {
+		req.headers.set("content-type", "application/x-amz-json-1.0")
+		req.headers.set("x-amz-target", `AmazonSQS.${op}`)
+	}
+	const key = if (account == "000000000000") "test" else account
+	sign(req, body, service, "us-east-1", key, "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function createQueue(g: Gateway, name: string, account = "000000000000"): i32 {
+	return signed(g, "sqs", "POST", "/", `{"QueueName":"${name}"}`, "CreateQueue", account).status
+}
+
+function queues(g: Gateway, account = "000000000000"): string {
+	return signed(g, "sqs", "POST", "/", "{}", "ListQueues", account).body.whole ?? ""
+}
+
+function has(res: Response, s: string): bool { return indexOf(res.body.whole ?? "", s) >= 0 }
+
+/// The body of res, closed as a server closes it once sent.
+function read(res: Response): string {
+	const s = res.body.text(1 << 20)
+	res.body.close()
+	return s
+}
+
+/// An object's bytes, of s repeated past what S3 keeps inline, so that they are a blob.
+function big(s: string): string {
+	let b = s
+	while (b.length <= 65536) {
+		b += b
+	}
+	return b
+}
+
+test "health and info answer as LocalStack's, unsigned, of every service there" {
+	const g = stack(new Catalog(""))
+	for (const p of ["/_localstack/health", "/_boberstack/health"]) {
+		const res = internal(g, "GET", p)
+		assert res.status == 200 && res.headers.get("content-type") == "application/json"
+		assert has(res, `{"services": {"acm": "running", "cloudformation": "running", `)
+		assert has(res,
+			`"cloudwatch": "running", "dynamodb": "running", "dynamodbstreams": "running", "events": "running", `
+			+ `"firehose": "running", `)
+		assert has(res, `"s3": "running"`) && has(res, `"ses": "running"`) && has(res, `"sts": "running"`)
+		assert has(res, `"lambda": "running"`)
+		assert has(res, `"scheduler": "running"`)
+		assert has(res, `"edition": "community", "version": "`)
+	}
+	assert internal(g, "HEAD", "/_localstack/health").status == 200
+	assert has(internal(g, "GET", "/_localstack/info"), `"uptime": 0`)
+	assert has(internal(g, "GET", "/_localstack/init/ready"), `{"completed": true, "scripts": []}`)
+	assert has(internal(g, "GET", "/_localstack/init"), `"READY": true, "SHUTDOWN": false`)
+	assert internal(g, "GET", "/_localstack/init/later").status == 404
+	assert internal(g, "GET", "/_localstack/nothing").status == 404
+	assert internal(g, "POST", "/_localstack/health").status == 405
+	g.close()
+}
+
+test "a reset drops every tree and blob" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert createQueue(g, "q") == 200 && createQueue(g, "r", "111111111111") == 200
+	assert signed(g, "s3", "PUT", "/bkt").status == 200
+	assert signed(g, "s3", "PUT", "/bkt/k", big("an object")).status == 200
+	assert live()[2] > before[2]
+	for (const p of ["/_localstack/state/reset", "/_boberstack/state/reset"]) {
+		assert internal(g, "POST", p).status == 200
+		assert live() == before
+	}
+	assert !has(signed(g, "sqs", "POST", "/", "{}", "ListQueues"), "/q")
+	assert signed(g, "s3", "GET", "/bkt/k").status == 404
+	assert internal(g, "GET", "/_localstack/state/reset").status == 405
+	g.close()
+	assert live() == before
+}
+
+test "a snapshot restored brings back what was deleted and drops what was made since, of every account" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert createQueue(g, "q") == 200 && createQueue(g, "r", "111111111111") == 200
+	assert signed(g, "s3", "PUT", "/bkt").status == 200
+	assert signed(g, "s3", "PUT", "/bkt/k", big("kept")).status == 200
+	assert live()[2] > before[2]
+	let res = internal(g, "PUT", "/_boberstack/snapshots/seed")
+	assert res.status == 200 && has(res, `"name":"seed"`) && has(res, `"trees":`)
+	const blobs = live()[2]
+	// Deleted since: the queue of the other account and the object, whose blob the snapshot holds.
+	assert signed(g, "sqs", "POST", "/", `{"QueueUrl":"http://localhost:4566/111111111111/r"}`, "DeleteQueue",
+		"111111111111").status == 200
+	assert signed(g, "s3", "DELETE", "/bkt/k").status == 204
+	assert live()[2] == blobs
+	assert createQueue(g, "later") == 200
+	assert signed(g, "s3", "PUT", "/new").status == 200
+	for (const _ of [1, 2]) {
+		assert internal(g, "POST", "/_boberstack/snapshots/seed/restore").status == 200
+		assert indexOf(queues(g), `/000000000000/q"`) >= 0 && indexOf(queues(g), "/later") < 0
+		assert indexOf(queues(g, "111111111111"), "/111111111111/r") >= 0
+		assert read(signed(g, "s3", "GET", "/bkt/k")) == big("kept")
+		assert signed(g, "s3", "HEAD", "/new").status == 404
+		assert createQueue(g, "again") == 200
+	}
+	res = internal(g, "GET", "/_boberstack/snapshots")
+	assert res.status == 200 && has(res, `{"snapshots":[{"name":"seed","taken":"`)
+	assert internal(g, "POST", "/_boberstack/snapshots/none/restore").status == 404
+	assert internal(g, "PUT", "/_boberstack/snapshots/a%20b").status == 400
+	g.close()
+	assert live() == before
+}
+
+test "a blob lives while a snapshot holds it, and is freed with the last" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert signed(g, "s3", "PUT", "/bkt").status == 200
+	assert signed(g, "s3", "PUT", "/bkt/k", big("bytes")).status == 200
+	const held = live()[2]
+	assert internal(g, "PUT", "/_boberstack/snapshots/one").status == 200
+	assert internal(g, "PUT", "/_boberstack/snapshots/two").status == 200
+	assert internal(g, "POST", "/_boberstack/state/reset").status == 200
+	assert live()[2] == held && live()[1] > before[1]
+	assert internal(g, "DELETE", "/_boberstack/snapshots/one").status == 204
+	assert live()[2] == held
+	assert internal(g, "DELETE", "/_boberstack/snapshots/two").status == 204
+	assert live() == before
+	assert internal(g, "DELETE", "/_boberstack/snapshots/two").status == 404
+	g.close()
+}
+
+test "a snapshot is the state as of when it was taken, whatever is written after" {
+	const g = stack(new Catalog(""))
+	assert createQueue(g, "q") == 200
+	assert internal(g, "PUT", "/_boberstack/snapshots/s").status == 200
+	assert signed(g, "sqs", "POST", "/", `{"QueueUrl":"http://localhost:4566/000000000000/q","MessageBody":"m"}`,
+		"SendMessage").status == 200
+	// A request that fails commits nothing, to the state or the snapshot.
+	assert createQueue(g, "bad name!") == 400
+	assert internal(g, "POST", "/_boberstack/snapshots/s/restore").status == 200
+	const got = signed(g, "sqs", "POST", "/", `{"QueueUrl":"http://localhost:4566/000000000000/q"}`, "ReceiveMessage")
+	assert got.status == 200 && !has(got, `"Body"`)
+	g.close()
+}

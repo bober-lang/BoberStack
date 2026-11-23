@@ -1,0 +1,1927 @@
+import { sign } from "./core/auth/sigv4"
+import { text } from "./core/client.test"
+import { Fault } from "./core/fault"
+import { Gateway } from "./core/gateway"
+import * as protocol from "./core/protocol/json"
+import { Catalog } from "./services/iam/catalog"
+import * as sqsApi from "./services/sqs/api"
+import { stack } from "./stack"
+import { indexOf, startsWith } from "std/algo"
+import { gunzip } from "std/compress/gzip"
+import { md5, sha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { Keys } from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { ParseError } from "std/string"
+import { millisecond } from "std/time"
+import { escape } from "std/url"
+
+const account = "000000000000"
+const other = "111111111111"
+
+/// Who signs a request; an unknown key is its account's root.
+class Key {
+	id = "test"
+	secret = "test"
+	token = ""
+}
+
+function root(): Key { return new Key() }
+function otherRoot(): Key { return rootOf(other) }
+
+function rootOf(of: string): Key {
+	const k = new Key()
+	if (of != account) {
+		k.id = of
+	}
+	return k
+}
+
+/// A notification as SNS delivers it to a queue.
+class Envelope {
+	Type = ""
+	MessageId = ""
+	SequenceNumber: string | null = null
+	TopicArn = ""
+	Subject: string | null = null
+	Message = ""
+	Timestamp = ""
+	SignatureVersion: string | null = null
+	Signature: string | null = null
+	SigningCertURL: string | null = null
+	UnsubscribeURL = ""
+	MessageAttributes: Keys | null = null
+}
+
+/// A subscription's confirmation as SNS sends it to a queue.
+class Confirmation {
+	Type = ""
+	MessageId = ""
+	Token = ""
+	TopicArn = ""
+	Message = ""
+	SubscribeURL = ""
+	Timestamp = ""
+	SignatureVersion = ""
+	Signature = ""
+	SigningCertURL = ""
+}
+
+function query(g: Gateway, service: string, params: [string, string][], k: Key = root()): Response {
+	const version = switch (service) {
+		case "iam": "2010-05-08"
+		case "sts": "2011-06-15"
+		case "cloudformation": "2010-05-15"
+		case "monitoring": "2010-08-01"
+		default: "2010-03-31"
+	}
+	const body = `Version=${version}`
+		+ params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+function call(g: Gateway, service: string, op: string, body: string, k: Key = root()): Response {
+	const [target, version] = switch (service) {
+		case "sqs": ["AmazonSQS", "1.0"]
+		case "dynamodb": ["DynamoDB_20120810", "1.0"]
+		case "states": ["AWSStepFunctions", "1.0"]
+		default: ["AWSEvents", "1.1"]
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", `application/x-amz-json-${version}`)
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	const body = res.body.whole ?? ""
+	if (res.status != status) {
+		return false
+	}
+	if (indexOf(body, "<Code>") >= 0) {
+		return text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+	}
+	return indexOf(body, code) >= 0 && indexOf(body, message) >= 0
+}
+
+function policy(statements: string[]): string {
+	return `{"Version":"2012-10-17","Statement":[${statements.join(",")}]}`
+}
+
+function statement(effect: string, actions: string, resource: string, principal = "", condition = ""): string {
+	return `{"Effect":"${effect}"${if (principal == "") "" else `,"Principal":${principal}`},"Action":${actions},`
+		+ `"Resource":"${resource}"${if (condition == "") "" else `,"Condition":${condition}`}}`
+}
+
+function user(g: Gateway, name: string, document = "", k: Key = root()): Key {
+	assert query(g, "iam", [["Action", "CreateUser"], ["UserName", name]], k).status == 200
+	if (document != "") {
+		assert query(g, "iam",
+			[["Action", "PutUserPolicy"], ["UserName", name], ["PolicyName", "p"], ["PolicyDocument", document]],
+			k).status == 200
+	}
+	const res = query(g, "iam", [["Action", "CreateAccessKey"], ["UserName", name]], k)
+	return { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")! }
+}
+
+function queueArn(name: string, of = account): string { return `arn:aws:sqs:us-east-1:${of}:${name}` }
+function queueUrl(name: string, of = account): string { return `http://localhost:4566/${of}/${name}` }
+function topicArn(name: string, of = account): string { return `arn:aws:sns:us-east-1:${of}:${name}` }
+
+function queue(g: Gateway, name: string, document = "", attributes = "", k: Key = root()) {
+	const members: string[] = []
+	if (attributes != "") {
+		members.push(attributes)
+	}
+	if (document != "") {
+		members.push(`"Policy":${json.quoted(document)}`)
+	}
+	const res = call(g, "sqs", "CreateQueue", `{"QueueName":"${name}","Attributes":{${members.join(",")}}}`, k)
+	assert res.status == 200
+}
+
+function sendable(name: string, principal: string, source: string): string {
+	return policy([statement("Allow", `"sqs:SendMessage"`, queueArn(name), `{"Service":"${principal}"}`,
+		`{"ArnEquals":{"aws:SourceArn":"${source}"}}`)])
+}
+
+function received(g: Gateway, name: string, of = account): sqsApi.Message[] {
+	const res = call(g, "sqs", "ReceiveMessage",
+		`{"QueueUrl":"${queueUrl(name, of)}","MaxNumberOfMessages":10,"MessageSystemAttributeNames":["All"],"MessageAttributeNames":["All"]}`,
+		rootOf(of))
+	assert res.status == 200
+	try {
+		return protocol.decode[sqsApi.ReceiveMessageResult](res.body.whole ?? "").Messages ?? []
+	} catch (f: Fault) {
+		assert false
+		return []
+	}
+}
+
+function bodies(g: Gateway, name: string, of = account): string[] {
+	return received(g, name, of).map(m => m.Body ?? "")
+}
+
+function envelope(body: string): Envelope { return json.decode[Envelope](body) }
+
+function topic(g: Gateway, name: string, document = "", attributes: [string, string][] = []) {
+	const params: [string, string][] = [["Action", "CreateTopic"], ["Name", name]]
+	const all = attributes.slice(0, attributes.length)
+	if (document != "") {
+		all.push(["Policy", document])
+	}
+	for (let i = 0; i < all.length; i++) {
+		params.push([`Attributes.entry.${i + 1}.key`, all[i][0]])
+		params.push([`Attributes.entry.${i + 1}.value`, all[i][1]])
+	}
+	assert query(g, "sns", params).status == 200
+}
+
+function subscribe(g: Gateway, t: string, q: string, attributes: [string, string][] = [], k: Key = root()): string {
+	const params: [string, string][] = [["Action", "Subscribe"], ["TopicArn", t], ["Protocol", "sqs"], ["Endpoint", q]]
+	for (let i = 0; i < attributes.length; i++) {
+		params.push([`Attributes.entry.${i + 1}.key`, attributes[i][0]])
+		params.push([`Attributes.entry.${i + 1}.value`, attributes[i][1]])
+	}
+	const res = query(g, "sns", params, k)
+	assert res.status == 200
+	return text(res, "SubscriptionArn")!
+}
+
+function publish(g: Gateway, t: string, message: string, c = "", k: Key = root()): Response {
+	const params: [string, string][] = [["Action", "Publish"], ["TopicArn", t], ["Message", message]]
+	if (c != "") {
+		params.push(["MessageAttributes.entry.1.Name", "c"])
+		params.push(["MessageAttributes.entry.1.Value.DataType", "String"])
+		params.push(["MessageAttributes.entry.1.Value.StringValue", c])
+	}
+	return query(g, "sns", params, k)
+}
+
+function system(m: sqsApi.Message, name: string): string | null {
+	const found = (m.Attributes ?? []).find(a => a[0] == name)
+	return if (found == null) null else found[1]
+}
+
+function gateway(): Gateway { return stack(new Catalog("")) }
+
+test "SNS delivers to a queue only as the queue's policy allows SNS on behalf of the topic" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t")
+	queue(g, "open", sendable("open", "sns.amazonaws.com", t))
+	queue(g, "closed")
+	queue(g, "elsewhere", sendable("elsewhere", "sns.amazonaws.com", topicArn("another")))
+	queue(g, "raw", sendable("raw", "sns.amazonaws.com", t))
+	queue(g, "red", sendable("red", "sns.amazonaws.com", t))
+	for (const q of ["open", "closed", "elsewhere"]) {
+		subscribe(g, t, queueArn(q))
+	}
+	subscribe(g, t, queueArn("raw"), [["RawMessageDelivery", "true"]])
+	subscribe(g, t, queueArn("red"), [["FilterPolicy", `{"c":["red"]}`]])
+	assert publish(g, t, "hello", "blue").status == 200
+	const [m] = received(g, "open")
+	const e = envelope(m.Body!)
+	assert e.Type == "Notification" && e.TopicArn == t && e.Message == "hello" && e.MessageAttributes != null
+	assert system(m, "SenderId") == "AIDAIT2UOQQY3AUEKVGXU"
+	assert bodies(g, "closed") == [] && bodies(g, "elsewhere") == [] && bodies(g, "red") == []
+	const [raw] = received(g, "raw")
+	assert raw.Body == "hello" && raw.MessageAttributes?.[0][1].StringValue == "blue"
+	assert publish(g, t, "again", "red").status == 200
+	assert bodies(g, "red").map(b => envelope(b).Message) == ["again"]
+	g.close()
+}
+
+test "SNS: a subscription's dead-letter queue takes what its queue refuses, under its own policy" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t")
+	queue(g, "closed")
+	queue(g, "dlq", sendable("dlq", "sns.amazonaws.com", t))
+	subscribe(g, t, queueArn("closed"), [["RedrivePolicy", `{"deadLetterTargetArn":"${queueArn("dlq")}"}`]])
+	assert publish(g, t, "lost").status == 200
+	assert bodies(g, "closed") == [] && bodies(g, "dlq").map(b => envelope(b).Message) == ["lost"]
+	g.close()
+}
+
+test "SNS: a FIFO topic delivers to a FIFO queue in its group" {
+	const g = gateway()
+	const t = topicArn("t.fifo")
+	topic(g, "t.fifo", "", [["FifoTopic", "true"], ["ContentBasedDeduplication", "true"]])
+	queue(g, "q.fifo", sendable("q.fifo", "sns.amazonaws.com", t), `"FifoQueue":"true"`)
+	subscribe(g, t, queueArn("q.fifo"))
+	assert query(g, "sns", [["Action", "Publish"], ["TopicArn", t], ["Message", "m"], ["MessageGroupId", "g1"]]).status
+		== 200
+	const [m] = received(g, "q.fifo")
+	assert envelope(m.Body!).Message == "m" && system(m, "MessageGroupId") == "g1"
+	g.close()
+}
+
+test "SNS: a queue of another account is subscribed pending, and sent the confirmation" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t", policy([statement("Allow", `"sns:Subscribe"`, t, `{"AWS":"arn:aws:iam::111111111111:root"}`)]))
+	queue(g, "theirs",
+		policy([statement("Allow", `"sqs:SendMessage"`, queueArn("theirs", other), `{"Service":"sns.amazonaws.com"}`,
+		`{"ArnEquals":{"aws:SourceArn":"${t}"}}`)]), "", otherRoot())
+	assert subscribe(g, t, queueArn("theirs", other)) == "pending confirmation"
+	assert publish(g, t, "early").status == 200
+	const [c] = bodies(g, "theirs", other)
+	const e = json.decode[Confirmation](c)
+	assert e.Type == "SubscriptionConfirmation" && e.TopicArn == t && indexOf(e.SubscribeURL, e.Token) > 0
+	const res = query(g, "sns", [["Action", "ConfirmSubscription"], ["TopicArn", t], ["Token", e.Token]], otherRoot())
+	assert res.status == 200
+	assert publish(g, t, "now").status == 200
+	assert bodies(g, "theirs", other).map(b => envelope(b).Message) == ["now"]
+	// The queue's owner subscribing it itself, as the topic's policy allows, is confirmed at once.
+	queue(g, "mine", "", "", otherRoot())
+	assert subscribe(g, t, queueArn("mine", other), [], otherRoot()) != "pending confirmation"
+	g.close()
+}
+
+test "EventBridge delivers to a queue only as its policy allows the rule: input, InputPath, InputTransformer" {
+	const g = gateway()
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	queue(g, "whole", sendable("whole", "events.amazonaws.com", rule))
+	queue(g, "path", sendable("path", "events.amazonaws.com", rule))
+	queue(g, "shaped", sendable("shaped", "events.amazonaws.com", rule))
+	queue(g, "closed")
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	queue(g, "q.fifo", sendable("q.fifo", "events.amazonaws.com", rule), `"FifoQueue":"true"`)
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	const targets = [`{"Id":"1","Arn":"${queueArn("whole")}"}`,
+		`{"Id":"2","Arn":"${queueArn("path")}","InputPath":"$.detail"}`,
+		`{"Id":"3","Arn":"${queueArn("shaped")}","InputTransformer":{"InputPathsMap":{"k":"$.detail.k"},`
+		+ `"InputTemplate":"\\"got <k>\\""}}`,
+		`{"Id":"4","Arn":"${queueArn("closed")}","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}`,
+		`{"Id":"5","Arn":"${queueArn("q.fifo")}","SqsParameters":{"MessageGroupId":"g1"}}`]
+	assert call(g, "events", "PutTargets", `{"Rule":"r","Targets":[${targets.join(",")}]}`).status == 200
+	const res = call(g, "events", "PutEvents",
+		`{"Entries":[{"Source":"app","DetailType":"t","Detail":"{\\"k\\":\\"v\\"}"}]}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"FailedEntryCount":0`) >= 0
+	const [whole] = bodies(g, "whole")
+	assert indexOf(whole, `"source":"app"`) >= 0 && indexOf(whole, `"detail":{"k":"v"}`) >= 0
+	assert bodies(g, "path") == [`{"k":"v"}`]
+	assert bodies(g, "shaped") == [`"got v"`]
+	assert bodies(g, "closed") == [] && bodies(g, "dlq") == [whole]
+	const [f] = received(g, "q.fifo")
+	assert f.Body == whole && system(f, "MessageGroupId") == "g1"
+	g.close()
+}
+
+test "EventBridge to SNS to SQS, as the topic's policy allows EventBridge; and bus to bus" {
+	const g = gateway()
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	const t = topicArn("t")
+	const closed = topicArn("closed")
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, `{"Service":"events.amazonaws.com"}`)]))
+	topic(g, "closed")
+	queue(g, "q", sendable("q", "sns.amazonaws.com", t))
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	subscribe(g, t, queueArn("q"))
+	subscribe(g, closed, queueArn("q"))
+	assert call(g, "events", "CreateEventBus", `{"Name":"b"}`).status == 200
+	const open = policy([statement("Allow", `"events:PutEvents"`, "arn:aws:events:us-east-1:000000000000:event-bus/b",
+		`{"Service":"events.amazonaws.com"}`)])
+	assert call(g, "events", "PutPermission", `{"EventBusName":"b","Policy":${json.quoted(open)}}`).status == 200
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"1","Arn":"${t}"},`
+		+ `{"Id":"2","Arn":"${closed}","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}},`
+		+ `{"Id":"3","Arn":"arn:aws:events:us-east-1:000000000000:event-bus/b"}]}`).status == 200
+	const onB = "arn:aws:events:us-east-1:000000000000:rule/b/r"
+	queue(g, "fromB", sendable("fromB", "events.amazonaws.com", onB))
+	assert call(g, "events", "PutRule",
+		`{"Name":"r","EventBusName":"b","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","EventBusName":"b","Targets":[{"Id":"1",` + `"Arn":"${queueArn("fromB")}"}]}`).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	const [n] = bodies(g, "q")
+	assert envelope(n).TopicArn == t && indexOf(envelope(n).Message, `"source":"app"`) >= 0
+	assert bodies(g, "dlq").length == 1 && bodies(g, "fromB").length == 1
+	g.close()
+}
+
+test "a user with no policy is denied by each service, as each words it" {
+	const g = gateway()
+	const k = user(g, "bob")
+	const who = "User: arn:aws:iam::000000000000:user/bob is not authorized to perform:"
+	queue(g, "q")
+	topic(g, "t")
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k",`
+		+ `"AttributeType":"S"}],"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status
+		== 200
+	let res = call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k)
+	assert fails(res, 403, "AccessDenied",
+		`${who} sqs:sendmessage on resource: ${queueArn("q")} because no `
+		+ "identity-based policy allows the sqs:sendmessage action. Go to https://us-east-1.console.aws.amazon.com/iam/"
+		+ "home?region=us-east-1#/authorization-details/")
+	res = publish(g, topicArn("t"), "x", "", k)
+	assert fails(res, 403, "AuthorizationError",
+		`${who} SNS:Publish on resource: ${topicArn("t")} because no `
+		+ "identity-based policy allows the SNS:Publish action")
+	res = call(g, "dynamodb", "GetItem", `{"TableName":"tab","Key":{"k":{"S":"a"}}}`, k)
+	assert fails(res, 400, "AccessDeniedException",
+		`${who} dynamodb:GetItem on resource: `
+		+ "arn:aws:dynamodb:us-east-1:000000000000:table/tab because no identity-based policy allows the "
+		+ "dynamodb:GetItem action")
+	res = call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`, k)
+	assert fails(res, 400, "AccessDeniedException",
+		`${who} events:PutEvents on resource: `
+		+ "arn:aws:events:us-east-1:000000000000:event-bus/default because no identity-based policy allows the "
+		+ "events:PutEvents action")
+	// Listings name what AWS names.
+	assert fails(call(g, "dynamodb", "ListTables", "{}", k), 400, "AccessDeniedException",
+		"on resource: arn:aws:dynamodb:us-east-1:000000000000:table/*")
+	assert fails(call(g, "events", "ListRules", "{}", k), 400, "AccessDeniedException",
+		"on resource: arn:aws:events:us-east-1:000000000000:rule/*")
+	// A queue that does not exist is said so first.
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("none")}","MessageBody":"x"}`, k), 400,
+		"QueueDoesNotExist")
+	g.close()
+}
+
+test "an identity-based policy for one queue, table, topic and bus allows there only" {
+	const g = gateway()
+	const k = user(g, "bob",
+		policy([statement("Allow", `"sqs:*"`, queueArn("mine")), statement("Allow", `"sns:Publish"`, topicArn("mine")),
+		statement("Allow", `["dynamodb:PutItem","dynamodb:GetItem"]`,
+		"arn:aws:dynamodb:us-east-1:000000000000:table/mine"),
+		statement("Allow", `"dynamodb:Query"`, "arn:aws:dynamodb:us-east-1:000000000000:table/mine/index/*"),
+		statement("Allow", `"events:PutEvents"`, "arn:aws:events:us-east-1:000000000000:event-bus/mine")]))
+	for (const n of ["mine", "theirs"]) {
+		queue(g, n)
+		topic(g, n)
+		assert call(g, "dynamodb", "CreateTable",
+			`{"TableName":"${n}","AttributeDefinitions":[{"AttributeName":"k",`
+			+ `"AttributeType":"S"},{"AttributeName":"x","AttributeType":"S"}],"KeySchema":[{"AttributeName":"k",`
+			+ `"KeyType":"HASH"}],"GlobalSecondaryIndexes":[{"IndexName":"byx","KeySchema":[{"AttributeName":"x",`
+			+ `"KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}],"BillingMode":"PAY_PER_REQUEST"}`).status
+			== 200
+		assert call(g, "events", "CreateEventBus", `{"Name":"${n}"}`).status == 200
+	}
+	assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("mine")}","MessageBody":"x"}`, k).status == 200
+	assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("theirs")}","MessageBody":"x"}`, k).status == 403
+	assert publish(g, topicArn("mine"), "x", "", k).status == 200
+	assert publish(g, topicArn("theirs"), "x", "", k).status == 403
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"mine","Item":{"k":{"S":"a"},"x":{"S":"b"}}}`, k).status == 200
+	assert call(g, "dynamodb", "GetItem", `{"TableName":"mine","Key":{"k":{"S":"a"}}}`, k).status == 200
+	assert call(g, "dynamodb", "GetItem", `{"TableName":"theirs","Key":{"k":{"S":"a"}}}`, k).status == 400
+	// A query of an index is authorized on the index alone.
+	assert call(g, "dynamodb", "Query",
+		`{"TableName":"mine","IndexName":"byx","KeyConditionExpression":"x = :x",`
+		+ `"ExpressionAttributeValues":{":x":{"S":"b"}}}`, k).status == 200
+	assert call(g, "dynamodb", "Query",
+		`{"TableName":"mine","KeyConditionExpression":"k = :k",` + `"ExpressionAttributeValues":{":k":{"S":"a"}}}`,
+		k).status == 400
+	const entry = (bus: string) => `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}","EventBusName":"${bus}"}]}`
+	assert call(g, "events", "PutEvents", entry("mine"), k).status == 200
+	assert call(g, "events", "PutEvents", entry("theirs"), k).status == 400
+	g.close()
+}
+
+test "a resource policy without a Principal is refused when set, as each service refuses it, and leaves what was there" {
+	const g = gateway()
+	const bad = policy([statement("Allow", `"*"`, "*")])
+	const quoted = json.quoted(bad)
+	queue(g, "q")
+	assert fails(call(g, "sqs", "CreateQueue", `{"QueueName":"p","Attributes":{"Policy":${quoted}}}`), 400,
+		"InvalidAttributeValue", "Invalid value for the parameter Policy.")
+	assert fails(call(g, "sqs", "SetQueueAttributes",
+		`{"QueueUrl":"${queueUrl("q")}","Attributes":{"Policy":${quoted}}}`), 400, "InvalidAttributeValue",
+		"Invalid value for the parameter Policy.")
+	const got = call(g, "sqs", "GetQueueAttributes", `{"QueueUrl":"${queueUrl("q")}","AttributeNames":["All"]}`)
+	assert got.status == 200 && indexOf(got.body.whole ?? "", "Principal") < 0
+	topic(g, "t")
+	assert fails(query(g, "sns",
+		[["Action", "SetTopicAttributes"], ["TopicArn", topicArn("t")], ["AttributeName", "Policy"],
+		["AttributeValue", bad]]), 400, "InvalidParameter", "Invalid parameter: Policy")
+	assert query(g, "sns", [["Action", "GetTopicAttributes"], ["TopicArn", topicArn("t")]]).status == 200
+	assert fails(call(g, "events", "PutPermission", `{"Policy":${quoted}}`), 400, "ValidationException",
+		"Parameter Policy is not valid.")
+	assert call(g, "events", "DescribeEventBus", "{}").status == 200
+	assert fails(json11Of(g, "logs", "PutResourcePolicy", `{"policyName":"p","policyDocument":${quoted}}`), 400,
+		"InvalidParameterException", "Error occurred while parsing accessPolicy.")
+	const res = json11Of(g, "logs", "DescribeResourcePolicies", "{}")
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"policyName":"p"`) < 0
+	g.close()
+}
+
+test "a queue's or topic's policy alone allows a user or role session of its account; another account's only with its own" {
+	const g = gateway()
+	const t = topicArn("t")
+	const q = queueArn("q")
+	const named = `{"AWS":["arn:aws:iam::000000000000:user/bob","arn:aws:iam::000000000000:role/r",`
+		+ `"arn:aws:iam::111111111111:user/eve","arn:aws:iam::111111111111:user/mallory"]}`
+	queue(g, "q", policy([statement("Allow", `"sqs:SendMessage"`, q, named)]))
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, named)]))
+	const bob = user(g, "bob", policy([statement("Allow", `"sts:AssumeRole"`, "*")]))
+	const trust = policy([`{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},`
+		+ `"Action":"sts:AssumeRole"}`])
+	assert query(g, "iam", [["Action", "CreateRole"], ["RoleName", "r"], ["AssumeRolePolicyDocument", trust]]).status
+		== 200
+	let res = query(g, "sts",
+		[["Action", "AssumeRole"], ["RoleArn", "arn:aws:iam::000000000000:role/r"], ["RoleSessionName", "session"]],
+		bob)
+	assert res.status == 200
+	const session = { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")!,
+		token: text(res, "SessionToken")! }
+	const eve = user(g, "eve", policy([statement("Allow", `["sqs:SendMessage","sns:Publish"]`, "*")]), otherRoot())
+	const mallory = user(g, "mallory", "", otherRoot())
+	for (const k of [bob, session, eve]) {
+		assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k).status == 200
+		assert publish(g, t, "x", "", k).status == 200
+	}
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, mallory), 403,
+		"AccessDenied")
+	assert fails(publish(g, t, "x", "", mallory), 403, "AuthorizationError")
+	// Of another account, a queue or topic is found without making that account's state.
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName":"q","QueueOwnerAWSAccountId":"222222222222"}`).status == 400
+	assert publish(g, topicArn("t", "222222222222"), "x").status == 403
+	assert g.trees.get("222222222222/us-east-1") == null
+	g.close()
+}
+
+test "an explicit deny in a resource policy binds the owner's users" {
+	const g = gateway()
+	const k = user(g, "bob", policy([statement("Allow", `["sqs:*","sns:*"]`, "*")]))
+	const deny = `{"AWS":"arn:aws:iam::000000000000:user/bob"}`
+	queue(g, "q", policy([statement("Deny", `"sqs:SendMessage"`, queueArn("q"), deny)]))
+	topic(g, "t", policy([statement("Deny", `"sns:Publish"`, topicArn("t"), deny)]))
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k), 403,
+		"AccessDenied",
+		"User: arn:aws:iam::000000000000:user/bob is not authorized to perform: sqs:sendmessage on "
+		+ `resource: ${queueArn("q")} with an explicit deny in a resource-based policy. Go to https://us-east-1.console.`
+		+ "aws.amazon.com/iam/home?region=us-east-1#/authorization-details/")
+	assert fails(publish(g, topicArn("t"), "x", "", k), 403, "AuthorizationError")
+	assert call(g, "sqs", "ReceiveMessage", `{"QueueUrl":"${queueUrl("q")}"}`, k).status == 200
+	g.close()
+}
+
+test "condition keys: sns:Protocol and sns:Endpoint, dynamodb:LeadingKeys and dynamodb:Attributes, events:source" {
+	const g = gateway()
+	const k = user(g, "bob",
+		policy([statement("Allow", `"sns:Subscribe"`, "*", "",
+		`{"StringEquals":{"sns:Protocol":"sqs","sns:Endpoint":"${queueArn("q")}"}}`),
+		statement("Allow", `["dynamodb:GetItem","dynamodb:PutItem"]`, "*", "",
+		`{"ForAllValues:StringEquals":{"dynamodb:LeadingKeys":["bob"],"dynamodb:Attributes":["k","v"]}}`),
+		statement("Allow", `"events:PutEvents"`, "*", "", `{"StringEquals":{"events:source":"app"}}`)]))
+	topic(g, "t")
+	queue(g, "q")
+	queue(g, "other")
+	subscribe(g, topicArn("t"), queueArn("q"), [], k)
+	const res = query(g, "sns",
+		[["Action", "Subscribe"], ["TopicArn", topicArn("t")], ["Protocol", "sqs"], ["Endpoint", queueArn("other")]], k)
+	assert fails(res, 403, "AuthorizationError")
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k",`
+		+ `"AttributeType":"S"}],"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status
+		== 200
+	const put = (key: string, attribute: string) => call(g, "dynamodb", "PutItem",
+		`{"TableName":"tab","Item":{"k":{"S":"${key}"},"${attribute}":{"S":"x"}}}`, k)
+	assert put("bob", "v").status == 200
+	assert put("eve", "v").status == 400
+	assert put("bob", "secret").status == 400
+	const entry = (source: string) => `{"Entries":[{"Source":"${source}","DetailType":"t","Detail":"{}"}]}`
+	assert call(g, "events", "PutEvents", entry("app"), k).status == 200
+	assert call(g, "events", "PutEvents", entry("other"), k).status == 400
+	g.close()
+}
+
+function s3(g: Gateway, method: string, path: string, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	sign(req, body, "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function notifying(q: string, events: string[], prefix: string, suffix: string): string {
+	return `<NotificationConfiguration><QueueConfiguration><Id>c</Id><Queue>${q}</Queue>`
+		+ events.map(e => `<Event>${e}</Event>`).join("") + "<Filter><S3Key>"
+		+ `<FilterRule><Name>prefix</Name><Value>${prefix}</Value></FilterRule>`
+		+ `<FilterRule><Name>suffix</Name><Value>${suffix}</Value></FilterRule>`
+		+ "</S3Key></Filter></QueueConfiguration></NotificationConfiguration>"
+}
+
+test "S3 notifies a queue of the objects made and removed under its filter, as the queue's policy lets it" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	queue(g, "open", sendable("open", "s3.amazonaws.com", "arn:aws:s3:::bkt"))
+	queue(g, "closed")
+	const events = ["s3:ObjectCreated:*", "s3:ObjectRemoved:Delete"]
+	let res = s3(g, "PUT", "/bkt?notification", notifying(queueArn("closed"), events, "in/", ".txt"))
+	assert fails(res, 400, "InvalidArgument", "Unable to validate the following destination configurations")
+	assert indexOf(res.body.whole ?? "", "Permissions on the destination queue do not allow S3") > 0
+	res = s3(g, "PUT", "/bkt?notification", notifying(queueArn("none"), events, "in/", ".txt"))
+	assert indexOf(res.body.whole ?? "", "The destination queue does not exist") > 0
+	assert s3(g, "PUT", "/bkt?notification", notifying(queueArn("open"), events, "in/", ".txt")).status == 200
+	const test = bodies(g, "open")
+	assert test.length == 1 && indexOf(test[0], `"Event":"s3:TestEvent"`) > 0
+	assert s3(g, "PUT", "/bkt/in/a%20b.txt", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/out/a.txt", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/in/a.bin", "ab").status == 200
+	assert s3(g, "DELETE", "/bkt/in/a%20b.txt").status == 204
+	const got = bodies(g, "open")
+	assert got.length == 2
+	assert indexOf(got[0], `"eventVersion":"2.1"`) > 0 && indexOf(got[0], `"eventName":"ObjectCreated:Put"`) > 0
+	assert indexOf(got[0], `"key":"in/a+b.txt","size":2,"eTag":"187ef4436122d1cc2f40dc2b92f0eba0"`) > 0
+	assert indexOf(got[0], `"arn":"arn:aws:s3:::bkt"`) > 0 && indexOf(got[0], `"configurationId":"c"`) > 0
+	assert indexOf(got[1], `"eventName":"ObjectRemoved:Delete"`) > 0 && indexOf(got[1], `"key":"in/a+b.txt"`) > 0
+	const n = s3(g, "GET", "/bkt?notification")
+	assert indexOf(n.body.whole ?? "", "<Queue>arn:aws:sqs:us-east-1:000000000000:open</Queue>") > 0
+	g.close()
+}
+
+test "S3 answers a CORS preflight by its bucket's rules, and names them on an answer to an origin" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert s3(g, "PUT", "/bkt/k", "k").status == 200
+	const preflight = (origin: string, method: string) => {
+		const req = new Request("OPTIONS", "http://localhost:4566/bkt/k", "")
+		req.headers.set("origin", origin)
+		req.headers.set("access-control-request-method", method)
+		return g.handle(req)
+	}
+	assert fails(preflight("https://a.example", "GET"), 403, "AccessForbidden",
+		"CORSResponse: CORS is not enabled for this bucket.")
+	const rules = "<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>"
+		+ "<AllowedOrigin>https://*.example</AllowedOrigin><MaxAgeSeconds>60</MaxAgeSeconds></CORSRule></CORSConfiguration>"
+	assert s3(g, "PUT", "/bkt?cors", rules).status == 200
+	const ok = preflight("https://a.example", "GET")
+	assert ok.status == 200 && ok.headers.get("access-control-allow-origin") == "https://a.example"
+	assert ok.headers.get("access-control-max-age") == "60"
+	assert preflight("https://a.example", "PUT").status == 403
+	assert preflight("https://a.other", "GET").status == 403
+	const req = new Request("GET", "http://localhost:4566/bkt/k", "")
+	req.headers.set("origin", "https://a.example")
+	sign(req, "", "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	const res = g.handle(req)
+	assert res.status == 200 && res.headers.get("access-control-allow-methods") == "GET"
+	g.close()
+}
+
+function json11(g: Gateway, service: string, op: string, body: string, k: Key = root()): Response {
+	const target = switch (service) {
+		case "kms": "TrentService"
+		case "secretsmanager": "secretsmanager"
+		default: "AmazonSSM"
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+function member(res: Response, name: string): string {
+	const body = res.body.whole ?? ""
+	const at = indexOf(body, `"${name}":"`)
+	if (at < 0) {
+		return ""
+	}
+	const from = at + name.length + 4
+	return body.slice(from, indexOf(body, "\"", from))
+}
+
+function kmsKey(g: Gateway, document = ""): string {
+	const body = if (document == "") "{}"
+		else `{"Policy":${json.quoted(document)},"BypassPolicyLockoutSafetyCheck":true}`
+	const res = json11(g, "kms", "CreateKey", body)
+	assert res.status == 200
+	return member(res, "KeyId")
+}
+
+test "a key policy that does not give the account access refuses its users and root, whatever their policies" {
+	const g = gateway()
+	const bob = user(g, "bob", policy([statement("Allow", `"kms:*"`, "*")]))
+	const alice = user(g, "alice")
+	const carol = user(g, "carol")
+	const only = kmsKey(g,
+		policy([statement("Allow", `"kms:*"`, "*", `{"AWS":"arn:aws:iam::000000000000:user/alice"}`)]))
+	const plain = `{"KeyId":"${only}","Plaintext":"eA=="}`
+	assert fails(json11(g, "kms", "Encrypt", plain, bob), 400, "AccessDeniedException",
+		"because no resource-based policy allows the kms:Encrypt action")
+	assert fails(json11(g, "kms", "DescribeKey", `{"KeyId":"${only}"}`), 400, "AccessDeniedException")
+	assert json11(g, "kms", "Encrypt", plain, alice).status == 200
+	const open = kmsKey(g)
+	assert json11(g, "kms", "Encrypt", `{"KeyId":"${open}","Plaintext":"eA=="}`, bob).status == 200
+	assert fails(json11(g, "kms", "Encrypt", `{"KeyId":"${open}","Plaintext":"eA=="}`, carol), 400,
+		"AccessDeniedException", "because no identity-based policy allows the kms:Encrypt action")
+	g.close()
+}
+
+test "AWS managed keys: predefined, made on first use, used only through their service" {
+	const g = gateway()
+	let res = json11(g, "kms", "ListAliases", "{}")
+	assert indexOf(res.body.whole ?? "",
+		`{"AliasName":"alias/aws/ssm","AliasArn":"arn:aws:kms:us-east-1:000000000000:alias/aws/ssm"}`) >= 0
+	res = json11(g, "kms", "DescribeKey", `{"KeyId":"alias/aws/ssm"}`)
+	assert res.status == 200 && member(res, "KeyManager") == "AWS"
+	const id = member(res, "KeyId")
+	assert member(json11(g, "kms", "DescribeKey", `{"KeyId":"alias/aws/ssm"}`), "KeyId") == id
+	assert member(json11(g, "kms", "ListAliases", `{"KeyId":"${id}"}`), "AliasName") == "alias/aws/ssm"
+	assert indexOf(json11(g, "kms", "GetKeyRotationStatus", `{"KeyId":"${id}"}`).body.whole ?? "",
+		`"KeyRotationEnabled":true`) >= 0
+	for (const op of ["DisableKey", "ScheduleKeyDeletion", "EnableKeyRotation"]) {
+		assert fails(json11(g, "kms", op, `{"KeyId":"${id}"}`), 400, "AccessDeniedException")
+	}
+	assert fails(json11(g, "kms", "Encrypt", `{"KeyId":"alias/aws/ssm","Plaintext":"eA=="}`), 400,
+		"AccessDeniedException")
+	assert fails(json11(g, "kms", "DeleteAlias", `{"AliasName":"alias/aws/ssm"}`), 400, "AccessDeniedException")
+	g.close()
+}
+
+test "Secrets Manager encrypts under the secret's key, decrypting as the caller" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const other = kmsKey(g)
+	const writer = user(g, "writer", policy([statement("Allow", `["secretsmanager:*","kms:*"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"secretsmanager:GetSecretValue"`, "*")]))
+	assert json11(g, "secretsmanager", "CreateSecret", `{"Name":"mine","KmsKeyId":"${key}","SecretString":"s1"}`,
+		writer).status == 200
+	assert json11(g, "secretsmanager", "CreateSecret", `{"Name":"plain","SecretString":"s0"}`, writer).status == 200
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), "SecretString") == "s1"
+	assert fails(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, reader), 400,
+		"AccessDeniedException", "Access to KMS is not allowed")
+	// The AWS managed key lets any principal of the account that may read the secret decrypt it.
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"plain"}`, reader), "SecretString") == "s0"
+	assert fails(json11(g, "secretsmanager", "CreateSecret",
+		`{"Name":"none","KmsKeyId":"alias/none","SecretString":"x"}`, writer), 400, "EncryptionFailure")
+	// UpdateSecret re-encrypts the current versions under the new key.
+	assert json11(g, "secretsmanager", "UpdateSecret", `{"SecretId":"mine","KmsKeyId":"${other}"}`, writer).status
+		== 200
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert member(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), "SecretString") == "s1"
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${other}"}`).status == 200
+	assert fails(json11(g, "secretsmanager", "GetSecretValue", `{"SecretId":"mine"}`, writer), 400, "DecryptionFailure")
+	assert fails(json11(g, "secretsmanager", "PutSecretValue", `{"SecretId":"mine","SecretString":"s2"}`, writer), 400,
+		"EncryptionFailure")
+	g.close()
+}
+
+test "SSM encrypts a SecureString under its key, decrypting it only WithDecryption, as the caller" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const writer = user(g, "writer", policy([statement("Allow", `["ssm:*","kms:*"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"ssm:GetParameter"`, "*")]))
+	assert json11(g, "ssm", "PutParameter", `{"Name":"/mine","Type":"SecureString","KeyId":"${key}","Value":"v1"}`,
+		writer).status == 200
+	assert json11(g, "ssm", "PutParameter", `{"Name":"/plain","Type":"SecureString","Value":"v0"}`, writer).status
+		== 200
+	const sealed = member(json11(g, "ssm", "GetParameter", `{"Name":"/mine"}`, reader), "Value")
+	assert sealed != "" && sealed != "v1"
+	assert member(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, writer), "Value") == "v1"
+	assert fails(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, reader), 400,
+		"AccessDeniedException", "kms:Decrypt")
+	assert member(json11(g, "ssm", "GetParameter", `{"Name":"/plain","WithDecryption":true}`, reader), "Value") == "v0"
+	assert fails(json11(g, "ssm", "PutParameter",
+		`{"Name":"/x","Type":"SecureString","KeyId":"alias/none","Value":"v"}`, writer), 400, "InvalidKeyId",
+		"Alias arn:aws:kms:us-east-1:000000000000:alias/none is not found.")
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(json11(g, "ssm", "GetParameter", `{"Name":"/mine","WithDecryption":true}`, writer), 400,
+		"InvalidKeyId", "DisabledException")
+	g.close()
+}
+
+function lambdaGet(g: Gateway, path: string, k: Key = root()): Response { return lambdaCall(g, "GET", path, "", k) }
+
+function lambdaCall(g: Gateway, method: string, path: string, body: string, k: Key = root()): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	if (body != "") {
+		req.headers.set("content-type", "application/json")
+	}
+	sign(req, body, "lambda", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "Lambda routes and authenticates a request, and answers NotImplemented in restJson1's error form" {
+	const g = gateway()
+	let res = lambdaGet(g, "/2020-04-22/code-signing-configs")
+	assert res.status == 501 && res.headers.get("x-amzn-errortype") == "NotImplemented"
+	assert res.headers.get("content-type") == "application/json"
+	assert res.body.whole == `{"message":"The operation ListCodeSigningConfigs is not implemented"}`
+	const forged = user(g, "bob")
+	forged.secret = "wrong"
+	res = lambdaGet(g, "/2015-03-31/functions", forged)
+	assert res.status == 403 && res.headers.get("x-amzn-errortype") == "SignatureDoesNotMatch"
+	g.close()
+}
+
+function refused(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && res.headers.get("x-amzn-errortype") == code
+		&& (message == "" || indexOf(res.body.whole ?? "", `essage":"${message}"`) >= 0)
+}
+
+test "Lambda: a function of a role Lambda may assume, its versions, aliases, policy and mappings; Invoke runs nothing" {
+	const g = gateway()
+	role(g, "other", "states.amazonaws.com")
+	role(g, "fn", "lambda.amazonaws.com")
+	const zip = base64.encode("PK\x03\x04 not really")
+	const create = (r: string) => lambdaCall(g, "POST", "/2015-03-31/functions",
+		`{"FunctionName":"f","Runtime":"python3.12","Handler":"h.h","Role":"arn:aws:iam::${account}:role/${r}",`
+		+ `"Code":{"ZipFile":"${zip}"}}`)
+	assert refused(create("other"), 400, "InvalidParameterValueException",
+		"The role defined for the function cannot be assumed by Lambda.")
+	assert refused(create("none"), 400, "InvalidParameterValueException")
+	let res = create("fn")
+	assert res.status == 201 && member(res, "State") == "Active" && member(res, "Version") == "$LATEST"
+	assert member(res, "CodeSha256") == base64.encode(sha256("PK\x03\x04 not really"))
+	assert refused(create("fn"), 409, "ResourceConflictException", "Function already exist: f")
+	assert refused(lambdaGet(g, "/2015-03-31/functions/g"), 404, "ResourceNotFoundException",
+		`Function not found: arn:aws:lambda:us-east-1:${account}:function:g`)
+	assert member(lambdaGet(g,
+		`/2015-03-31/functions/${escape(`arn:aws:lambda:us-east-1:${account}:function:f`)}/configuration`), "Handler")
+		== "h.h"
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}")
+	assert res.status == 201 && member(res, "Version") == "1"
+	assert member(lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}"), "Version") == "1"
+	const located = member(lambdaGet(g, "/2015-03-31/functions/f?Qualifier=1"), "Location")
+	assert located == `http://localhost:4566/_boberstack/lambda/${account}/us-east-1/versions/f/0000000001`
+	res = g.handle(new Request("GET", located, ""))
+	assert res.status == 200 && res.body.whole == "PK\x03\x04 not really"
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"live","FunctionVersion":"1"}`).status
+		== 201
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"x","FunctionVersion":"7"}`), 404,
+		"ResourceNotFoundException")
+	assert member(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), "Version") == "1"
+	const provisioning = "/2019-09-30/functions/f/provisioned-concurrency?Qualifier="
+	assert refused(lambdaCall(g, "PUT", `${provisioning}$LATEST`, `{"ProvisionedConcurrentExecutions":2}`), 400,
+		"InvalidParameterValueException")
+	assert member(lambdaCall(g, "PUT", `${provisioning}live`, `{"ProvisionedConcurrentExecutions":2}`), "Status")
+		== "READY"
+	assert refused(lambdaGet(g, `${provisioning}1`), 404, "ProvisionedConcurrencyConfigNotFoundException")
+	assert refused(lambdaGet(g, "/2019-09-25/functions/f/event-invoke-config"), 404, "ResourceNotFoundException",
+		`The function arn:aws:lambda:us-east-1:${account}:function:f:$LATEST doesn't have an EventInvokeConfig`)
+	assert lambdaCall(g, "PUT", "/2019-09-25/functions/f/event-invoke-config?Qualifier=live",
+		`{"MaximumRetryAttempts":1,"DestinationConfig":{"OnFailure":{"Destination":"arn:aws:sqs:us-east-1:${account}:q"}}}`).status
+		== 200
+	assert indexOf(lambdaGet(g, "/2019-09-25/functions/f/event-invoke-config/list").body.whole ?? "",
+		`"Destination":"arn:aws:sqs:us-east-1:${account}:q"`) > 0
+	assert member(lambdaGet(g, "/2024-08-31/functions/f/recursion-config"), "RecursiveLoop") == "Terminate"
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"s3","Action":"lambda:InvokeFunction","Principal":"s3.amazonaws.com","SourceAccount":"${account}"}`)
+	assert res.status == 201
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"s3","Action":"lambda:InvokeFunction","Principal":"sns.amazonaws.com"}`), 409,
+		"ResourceConflictException")
+	assert indexOf(lambdaGet(g, "/2015-03-31/functions/f/policy").body.whole ?? "",
+		`\\"Service\\":\\"s3.amazonaws.com\\"`) > 0
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", `{"a":1}`)
+	assert res.status == 200 && res.headers.get("x-amz-function-error") == "Unhandled"
+	assert indexOf(res.body.whole ?? "", `"errorType":"NotImplemented"`) > 0
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/g/invocations", "{}"), 404, "ResourceNotFoundException")
+	const bob = user(g, "bob")
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob), 403,
+		"AccessDeniedException")
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"bob","Action":"lambda:InvokeFunction","Principal":"arn:aws:iam::${account}:user/bob"}`).status
+		== 201
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob).status == 200
+	const mapped = `{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped), 400,
+		"InvalidParameterValueException",
+		"Error occurred while ReceiveMessage. SQS Error Code: QueueDoesNotExist. SQS Error Message: The specified queue does not exist.")
+	queue(g, "q")
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped), 400,
+		"InvalidParameterValueException",
+		"The provided execution role does not have permissions to call ReceiveMessage on SQS")
+	assert query(g, "iam",
+		[["Action", "PutRolePolicy"], ["RoleName", "fn"], ["PolicyName", "p"],
+		["PolicyDocument", policy([statement("Allow", `"sqs:*"`, "*")])]]).status == 200
+	res = lambdaCall(g, "POST", "/2015-03-31/event-source-mappings", mapped)
+	assert res.status == 202 && member(res, "State") == "Creating"
+	const id = member(res, "UUID")
+	assert member(lambdaGet(g, `/2015-03-31/event-source-mappings/${id}`), "State") == "Enabled"
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings",
+		`{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`), 409,
+		"ResourceConflictException")
+	assert lambdaCall(g, "DELETE", `/2015-03-31/event-source-mappings/${id}`, "").status == 202
+	res = lambdaCall(g, "POST", "/2021-10-31/functions/f/url", `{"AuthType":"NONE"}`)
+	assert res.status == 201 && indexOf(member(res, "FunctionUrl"), ".lambda-url.us-east-1.on.aws/") == 40
+	assert lambdaCall(g, "DELETE", "/2015-03-31/functions/f", "").status == 204
+	assert refused(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), 404, "ResourceNotFoundException")
+	g.close()
+}
+
+test "Lambda: a layer's versions, served where GetLayerVersion locates them, and a function of one" {
+	const g = gateway()
+	role(g, "fn", "lambda.amazonaws.com")
+	const published = `{"Content":{"ZipFile":"${base64.encode("layer")}"},"CompatibleRuntimes":["python3.12"]}`
+	assert member(lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published), "LayerVersionArn")
+		== `arn:aws:lambda:us-east-1:${account}:layer:l:1`
+	assert lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published).status == 201
+	assert lambdaCall(g, "DELETE", "/2018-10-31/layers/l/versions/2", "").status == 204
+	const layer = `arn:aws:lambda:us-east-1:${account}:layer:l:1`
+	let res = lambdaGet(g, `/2018-10-31/layers?find=LayerVersion&Arn=${escape(layer)}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"CodeSize":5`) > 0
+	assert g.handle(new Request("GET", member(res, "Location"), "")).body.whole == "layer"
+	assert refused(lambdaGet(g, "/2018-10-31/layers/l/versions/2"), 404, "ResourceNotFoundException",
+		"The resource you requested does not exist.")
+	assert indexOf(lambdaCall(g, "POST", "/2018-10-31/layers/l/versions", published).body.whole ?? "", `"Version":3`)
+		> 0
+	assert indexOf(lambdaGet(g, "/2018-10-31/layers?CompatibleRuntime=python3.12").body.whole ?? "", `"Version":3`) > 0
+	assert lambdaCall(g, "POST", "/2018-10-31/layers/l/versions/1/policy",
+		`{"StatementId":"all","Action":"lambda:GetLayerVersion","Principal":"*"}`).status == 201
+	res = lambdaGet(g, "/2018-10-31/layers/l/versions/1/policy")
+	assert indexOf(res.body.whole ?? "", `\\"Principal\\":\\"*\\"`) > 0
+	const create = (l: string) => lambdaCall(g, "POST", "/2015-03-31/functions",
+		`{"FunctionName":"f","Runtime":"python3.12","Handler":"h.h","Role":"arn:aws:iam::${account}:role/fn",`
+		+ `"Code":{"ZipFile":"${base64.encode("code")}"},"Layers":["${l}"]}`)
+	assert refused(create(`${layer}0`), 400, "InvalidParameterValueException",
+		`Layer version ${layer}0 does not exist.`)
+	res = create(layer)
+	assert res.status == 201 && indexOf(res.body.whole ?? "", `"CodeSize":5`) > 0
+	g.close()
+}
+
+function s3as(g: Gateway, method: string, path: string, headers: [string, string][], k: Key, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	for (const [n, v] of headers) {
+		req.headers.set(n, v)
+	}
+	sign(req, body, "s3", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "S3 encrypts under a KMS key as the writer may generate a data key and the reader decrypt it" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const arn = `arn:aws:kms:us-east-1:000000000000:key/${key}`
+	const writer = user(g, "writer", policy([statement("Allow", `["s3:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"s3:*"`, "*")]))
+	assert s3(g, "PUT", "/bkt").status == 200
+	const kms: [string,
+		string][] = [["x-amz-server-side-encryption", "aws:kms"], ["x-amz-server-side-encryption-aws-kms-key-id", key]]
+	let res = s3as(g, "PUT", "/bkt/a", kms, writer, "ab")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption") == "aws:kms"
+	assert res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	res = s3as(g, "PUT", "/bkt/b", kms, reader, "ab")
+	assert fails(res, 403, "AccessDenied")
+		&& startsWith(text(res, "Message") ?? "",
+		`User: arn:aws:iam::000000000000:user/reader is not authorized to perform: kms:GenerateDataKey on resource: ${arn} `
+		+ "because no identity-based policy allows the kms:GenerateDataKey action. Go to")
+	assert fails(s3as(g, "GET", "/bkt/a", [], reader), 403, "AccessDenied")
+	res = s3as(g, "HEAD", "/bkt/a", [], reader)
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	assert s3(g, "GET", "/bkt/a").body.whole == "ab"
+	assert fails(s3as(g, "PUT", "/bkt/b",
+		[["x-amz-server-side-encryption", "aws:kms"], ["x-amz-server-side-encryption-aws-kms-key-id", "alias/none"]],
+		writer, "ab"), 400, "KMS.NotFoundException")
+	assert fails(s3as(g, "PUT", "/bkt/b", [["x-amz-server-side-encryption", "AES257"]], writer, "ab"), 400,
+		"InvalidArgument", "The encryption method specified is not supported")
+	assert fails(s3as(g, "PUT", "/bkt/b", [["x-amz-server-side-encryption-aws-kms-key-id", key]], writer, "ab"), 400,
+		"InvalidArgument")
+	// The AWS managed key lets any principal of the account use it through S3.
+	res = s3as(g, "PUT", "/bkt/m", [["x-amz-server-side-encryption", "aws:kms"]], reader, "m")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") != arn
+	assert s3as(g, "GET", "/bkt/m", [], reader).body.whole == "m"
+	// A bucket's default rule encrypts what is written without asking.
+	const rule = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+		+ `<SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>${key}</KMSMasterKeyID>`
+		+ "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule>"
+		+ "</ServerSideEncryptionConfiguration>"
+	assert s3(g, "PUT", "/bkt?encryption", rule).status == 200
+	res = s3as(g, "PUT", "/bkt/d", [], writer, "d")
+	assert res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	assert res.headers.get("x-amz-server-side-encryption-bucket-key-enabled") == "true"
+	assert s3as(g, "PUT", "/bkt/c", [["x-amz-copy-source", "/bkt/a"]], writer).status == 200
+	assert fails(s3as(g, "PUT", "/bkt/e", [["x-amz-copy-source", "/bkt/a"]], reader), 403, "AccessDenied")
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(s3(g, "GET", "/bkt/a"), 400, "KMS.DisabledException")
+	g.close()
+}
+
+test "S3 refuses a customer's key (SSE-C) unless the bucket allows it, then reads only with that key" {
+	const g = gateway()
+	assert s3(g, "PUT", "/bkt").status == 200
+	const mine: [string, string][] = [["x-amz-server-side-encryption-customer-algorithm", "AES256"],
+		["x-amz-server-side-encryption-customer-key", "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="],
+		["x-amz-server-side-encryption-customer-key-MD5", "mT2HRsMGJ5IX5C+0rreZ8Q=="]]
+	const theirs: [string, string][] = [["x-amz-server-side-encryption-customer-algorithm", "AES256"],
+		["x-amz-server-side-encryption-customer-key", "ampqampqampqampqampqampqampqampqampqampqamo="],
+		["x-amz-server-side-encryption-customer-key-MD5", "i6qJOqb8EmJKrlLOjo18Fg=="]]
+	assert fails(s3as(g, "PUT", "/bkt/a", mine, root(), "ab"), 403, "AccessDenied",
+		"User: arn:aws:iam::000000000000:root is not authorized to perform: s3:PutObject on resource: "
+		+ "\"arn:aws:s3:::bkt/a\" because this bucket has blocked upload requests that specify Server Side Encryption "
+		+ "with Customer provided keys (SSE-C). Please specify a different server-side encryption type.")
+	const rule = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+		+ "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+		+ "<BlockedEncryptionTypes><EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>"
+		+ "</ServerSideEncryptionConfiguration>"
+	assert s3(g, "PUT", "/bkt?encryption", rule).status == 200
+	let res = s3as(g, "PUT", "/bkt/a", mine, root(), "ab")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption") == null
+	assert res.headers.get("x-amz-server-side-encryption-customer-key-MD5") == "mT2HRsMGJ5IX5C+0rreZ8Q=="
+	assert fails(s3(g, "GET", "/bkt/a"), 400, "InvalidRequest",
+		"The object was stored using a form of Server Side Encryption. The correct parameters must be provided to "
+		+ "retrieve the object.")
+	assert fails(s3as(g, "GET", "/bkt/a", theirs, root()), 403, "AccessDenied")
+	assert s3as(g, "GET", "/bkt/a", mine, root()).body.whole == "ab"
+	assert s3(g, "PUT", "/bkt/p", "p").status == 200
+	assert fails(s3as(g, "GET", "/bkt/p", mine, root()), 400, "InvalidRequest",
+		"The encryption parameters are not applicable to this object.")
+	const wrong: [string, string][] = [mine[0], mine[1], theirs[2]]
+	assert fails(s3as(g, "PUT", "/bkt/b", wrong, root(), "ab"), 400, "InvalidArgument",
+		"The calculated MD5 hash of the key did not match the hash that was provided.")
+	g.close()
+}
+
+test "SQS: a queue under a KMS key takes a sender's message as it may generate a data key, gives it as it may decrypt" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const sender = user(g, "sender", policy([statement("Allow", `["sqs:*","kms:GenerateDataKey"]`, "*")]))
+	const both = user(g, "both", policy([statement("Allow", `["sqs:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const bare = user(g, "bare", policy([statement("Allow", `"sqs:*"`, "*")]))
+	assert fails(call(g, "sqs", "CreateQueue",
+		`{"QueueName":"x","Attributes":{"KmsMasterKeyId":"${key}","SqsManagedSseEnabled":"true"}}`), 400,
+		"InvalidAttributeName")
+	queue(g, "q", "", `"KmsMasterKeyId":"${key}"`)
+	const res = call(g, "sqs", "GetQueueAttributes", `{"QueueUrl":"${queueUrl("q")}","AttributeNames":["All"]}`)
+	const body = res.body.whole ?? ""
+	assert indexOf(body, `"SqsManagedSseEnabled":"false"`) > 0
+	assert indexOf(body, `"KmsDataKeyReusePeriodSeconds":"300"`) > 0
+	const send = `{"QueueUrl":"${queueUrl("q")}","MessageBody":"m"}`
+	assert fails(call(g, "sqs", "SendMessage", send, bare), 400, "KmsAccessDenied", "kms:GenerateDataKey")
+	assert call(g, "sqs", "SendMessage", send, sender).status == 200
+	const receive = `{"QueueUrl":"${queueUrl("q")}"}`
+	assert fails(call(g, "sqs", "ReceiveMessage", receive, sender), 400, "KmsAccessDenied", "kms:Decrypt")
+	assert indexOf(call(g, "sqs", "ReceiveMessage", receive, both).body.whole ?? "", `"Body":"m"`) > 0
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(call(g, "sqs", "SendMessage", send, both), 400, "KmsDisabled")
+	// SNS delivers only as the key's policy lets SNS use it, which the AWS managed key's does not.
+	const t = topicArn("t")
+	topic(g, "t")
+	const open = kmsKey(g,
+		policy([statement("Allow", `"kms:*"`, "*", `{"AWS":"arn:aws:iam::000000000000:root"}`),
+		statement("Allow", `["kms:GenerateDataKey","kms:Decrypt"]`, "*", `{"Service":"sns.amazonaws.com"}`)]))
+	queue(g, "open", sendable("open", "sns.amazonaws.com", t), `"KmsMasterKeyId":"${open}"`)
+	queue(g, "closed", sendable("closed", "sns.amazonaws.com", t), `"KmsMasterKeyId":"alias/aws/sqs"`)
+	subscribe(g, t, queueArn("open"))
+	subscribe(g, t, queueArn("closed"))
+	assert publish(g, t, "hello").status == 200
+	assert bodies(g, "open").length == 1 && bodies(g, "closed") == []
+	g.close()
+}
+
+test "SNS: a publish to a topic under a KMS key needs kms:GenerateDataKey and kms:Decrypt of the publisher" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const half = user(g, "half", policy([statement("Allow", `["sns:*","kms:GenerateDataKey"]`, "*")]))
+	const both = user(g, "both", policy([statement("Allow", `["sns:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const t = topicArn("t")
+	topic(g, "t", "", [["KmsMasterKeyId", key]])
+	const denied = publish(g, t, "m", "", half)
+	assert fails(denied, 400, "KMSAccessDenied") && indexOf(text(denied, "Message") ?? "", "kms:Decrypt") > 0
+	assert publish(g, t, "m", "", both).status == 200
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(publish(g, t, "m", "", both), 400, "KMSDisabled")
+	topic(g, "gone", "", [["KmsMasterKeyId", "alias/none"]])
+	assert fails(publish(g, topicArn("gone"), "m", "", both), 400, "KMSNotFound")
+	g.close()
+}
+
+function table(g: Gateway, name: string, sse: string): Response {
+	return call(g, "dynamodb", "CreateTable",
+		`{"TableName":"${name}","AttributeDefinitions":[{"AttributeName":"k","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"${sse}}`)
+}
+
+test "DynamoDB: a table under a KMS key describes it; under a key AWS owns, nothing" {
+	const g = gateway()
+	const key = kmsKey(g)
+	let res = table(g, "owned", "")
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "SSEDescription") < 0
+	res = table(g, "mine", `,"SSESpecification":{"Enabled":true,"SSEType":"KMS","KMSMasterKeyId":"${key}"}`)
+	assert res.status == 200 && indexOf(member(res, "KMSMasterKeyArn"), `:key/${key}`) > 0
+	res = table(g, "managed", `,"SSESpecification":{"Enabled":true}`)
+	assert res.status == 200 && indexOf(member(res, "KMSMasterKeyArn"), ":key/") > 0
+	assert fails(table(g, "none", `,"SSESpecification":{"Enabled":true,"KMSMasterKeyId":"alias/none"}`), 400,
+		"ValidationException")
+	res = call(g, "dynamodb", "UpdateTable", `{"TableName":"mine","SSESpecification":{"Enabled":false}}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "SSEDescription") < 0
+	g.close()
+}
+
+function deleteObjects(g: Gateway, bucket: string, keys: string[]): Response {
+	const body = "<Delete>" + keys.map(k => `<Object><Key>${k}</Key></Object>`).join("") + "</Delete>"
+	const req = new Request("POST", `http://localhost:4566/${bucket}?delete`, body)
+	req.headers.set("content-md5", base64.encode(md5(body)))
+	sign(req, body, "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "S3 puts its object events on the default bus, without a policy; DeleteObjects notifies each key, a topic too" {
+	const g = gateway()
+	const t = topicArn("t")
+	queue(g, "q", sendable("q", "events.amazonaws.com", "arn:aws:events:us-east-1:000000000000:rule/s3"))
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, `{"Service":"s3.amazonaws.com"}`)]))
+	queue(g, "fromT", sendable("fromT", "sns.amazonaws.com", t))
+	subscribe(g, t, queueArn("fromT"))
+	assert call(g, "events", "PutRule", `{"Name":"s3","EventPattern":"{\\"source\\":[\\"aws.s3\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets", `{"Rule":"s3","Targets":[{"Id":"1","Arn":"${queueArn("q")}"}]}`).status
+		== 200
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert s3(g, "PUT", "/bkt?notification",
+		`<NotificationConfiguration><TopicConfiguration><Id>c</Id>`
+		+ `<Topic>${t}</Topic><Event>s3:ObjectRemoved:*</Event></TopicConfiguration>`
+		+ "<EventBridgeConfiguration></EventBridgeConfiguration></NotificationConfiguration>").status == 200
+	assert indexOf(envelope(bodies(g, "fromT")[0]).Message, `"Event":"s3:TestEvent"`) > 0
+	assert s3(g, "PUT", "/bkt/a", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/b", "b").status == 200
+	assert deleteObjects(g, "bkt", ["a", "b"]).status == 200
+	const got = bodies(g, "q")
+	assert got.length == 4
+	assert indexOf(got[0], `"detail-type":"Object Created","source":"aws.s3","account":"000000000000"`) > 0
+	assert indexOf(got[0],
+		`"resources":["arn:aws:s3:::bkt"],"detail":{"version":"0","bucket":{"name":"bkt"},`
+		+ `"object":{"key":"a","size":2,"etag":"187ef4436122d1cc2f40dc2b92f0eba0","sequencer":`) > 0
+	assert indexOf(got[0], `"requester":"000000000000","source-ip-address":"127.0.0.1","reason":"PutObject"}`) > 0
+	assert indexOf(got[2], `"detail-type":"Object Deleted"`) > 0 && indexOf(got[3], `"object":{"key":"b",`) > 0
+	assert indexOf(got[3], `"reason":"DeleteObject","deletion-type":"Permanently Deleted"}`) > 0
+	const removed = bodies(g, "fromT")
+	assert removed.length == 2 && envelope(removed[0]).Subject == "Amazon S3 Notification"
+	assert indexOf(envelope(removed[1]).Message, `"eventName":"ObjectRemoved:Delete"`) > 0
+	assert indexOf(envelope(removed[1]).Message, `"key":"b"`) > 0
+	g.close()
+}
+
+function json11Of(g: Gateway, service: string, op: string, body: string): Response {
+	const target = switch (service) {
+		case "kinesis": "Kinesis_20131202"
+		case "firehose": "Firehose_20150804"
+		case "states": "AWSStepFunctions"
+		default: "Logs_20140328"
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type",
+		if (service == "states") "application/x-amz-json-1.0" else "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function role(g: Gateway, name: string, service: string, document = "") {
+	const trust = policy([`{"Effect":"Allow","Principal":{"Service":"${service}"},"Action":"sts:AssumeRole"}`])
+	assert query(g, "iam", [["Action", "CreateRole"], ["RoleName", name], ["AssumeRolePolicyDocument", trust]]).status
+		== 200
+	if (document != "") {
+		assert query(g, "iam",
+			[["Action", "PutRolePolicy"], ["RoleName", name], ["PolicyName", "p"], ["PolicyDocument", document]]).status
+			== 200
+	}
+}
+
+function streamed(g: Gateway, name: string): string[] {
+	const it = member(json11Of(g, "kinesis", "GetShardIterator",
+		`{"StreamName":"${name}","ShardId":"shardId-000000000000","ShardIteratorType":"TRIM_HORIZON"}`),
+		"ShardIterator")
+	const body = json11Of(g, "kinesis", "GetRecords", `{"ShardIterator":"${it}"}`).body.whole ?? ""
+	const out: string[] = []
+	let at = indexOf(body, `"Data":"`)
+	while (at >= 0) {
+		const from = at + 8
+		const to = indexOf(body, "\"", from)
+		try {
+			out.push(base64.decode(body.slice(from, to)))
+		} catch (e: ParseError) {
+			assert false
+		}
+		at = indexOf(body, `"Data":"`, to)
+	}
+	return out
+}
+
+test "a subscription filter tries its Kinesis stream as its role, then puts matching events there gzipped" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	role(g, "toKinesis", "logs.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	role(g, "none", "logs.amazonaws.com")
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	const filter = (role: string) => {
+		const r = if (role == "") "" else `,"roleArn":"arn:aws:iam::000000000000:role/${role}"`
+		return json11Of(g, "logs", "PutSubscriptionFilter",
+			`{"logGroupName":"/g","filterName":"f","filterPattern":"ERROR","destinationArn":"${stream}"${r}}`)
+	}
+	assert fails(filter(""), 400, "InvalidParameterException",
+		"destinationArn for vendor kinesis cannot be used without roleArn")
+	assert fails(filter("none"), 400, "InvalidParameterException",
+		"Could not deliver test message to specified Kinesis stream. Check if the given Kinesis stream is in ACTIVE state.")
+	assert filter("toKinesis").status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":`
+		+ `[{"timestamp":${t},"message":"ERROR one"},{"timestamp":${t},"message":"fine"}]}`).status == 200
+	const got = streamed(g, "s")
+	assert got.length == 2
+	try {
+		assert indexOf(gunzip(got[0]), `"messageType":"CONTROL_MESSAGE"`) >= 0
+		const data = gunzip(got[1])
+		assert indexOf(data,
+			`{"messageType":"DATA_MESSAGE","owner":"000000000000","logGroup":"/g","logStream":"l",`
+			+ `"subscriptionFilters":["f"],"logEvents":[{"id":"`) == 0
+		assert indexOf(data, `"timestamp":${t},"message":"ERROR one"}]}`) > 0 && indexOf(data, "fine") < 0
+	} catch (e: ParseError) {
+		assert false
+	}
+	g.close()
+}
+
+test "a role is passed only as the caller may pass it, and acted as only as it trusts the service" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	role(g, "toKinesis", "logs.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	role(g, "elsewhere", "events.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	const filter = (role: string, k: Key) => {
+		const body = `{"logGroupName":"/g","filterName":"f","filterPattern":"","destinationArn":"${stream}",`
+			+ `"roleArn":"arn:aws:iam::000000000000:role/${role}"}`
+		const req = new Request("POST", "http://localhost:4566/", body)
+		req.headers.set("content-type", "application/x-amz-json-1.1")
+		req.headers.set("x-amz-target", "Logs_20140328.PutSubscriptionFilter")
+		sign(req, body, "logs", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+		return g.handle(req)
+	}
+	assert fails(filter("elsewhere", root()), 400, "InvalidParameterException",
+		"Could not deliver test message to specified Kinesis stream.")
+	const k = user(g, "u", policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*")]))
+	assert fails(filter("toKinesis", k), 400, "AccessDeniedException",
+		"User: arn:aws:iam::000000000000:user/u is not authorized to perform: iam:PassRole on resource: "
+		+ "arn:aws:iam::000000000000:role/toKinesis")
+	assert query(g, "iam",
+		[["Action", "PutUserPolicy"], ["UserName", "u"], ["PolicyName", "p"],
+		["PolicyDocument",
+		policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*"),
+		statement("Allow", `"iam:PassRole"`, "*", "",
+		`{"StringEquals":{"iam:PassedToService":"events.amazonaws.com"}}`)])]]).status == 200
+	assert fails(filter("toKinesis", k), 400, "AccessDeniedException", "iam:PassRole")
+	assert query(g, "iam",
+		[["Action", "PutUserPolicy"], ["UserName", "u"], ["PolicyName", "p"],
+		["PolicyDocument",
+		policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*"),
+		statement("Allow", `"iam:PassRole"`, "*", "",
+		`{"StringEquals":{"iam:PassedToService":"logs.amazonaws.com"}}`)])]]).status == 200
+	assert filter("toKinesis", k).status == 200
+	g.close()
+}
+
+test "EventBridge targets: a Kinesis stream and a bus as the target's role, a log group as the account's policy allows" {
+	const g = gateway()
+	role(g, "put", "events.amazonaws.com",
+		policy([statement("Allow", `["kinesis:PutRecord","events:PutEvents"]`, "*")]))
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/events/g"}`).status == 200
+	const logged = policy([statement("Allow", `["logs:CreateLogStream","logs:PutLogEvents"]`,
+		"arn:aws:logs:us-east-1:000000000000:log-group:/events/g:*",
+		`{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]}`)])
+	assert json11Of(g, "logs", "PutResourcePolicy", `{"policyName":"p","policyDocument":${json.quoted(logged)}}`).status
+		== 200
+	for (const b of ["b2", "b3"]) {
+		assert call(g, "events", "CreateEventBus", `{"Name":"${b}"}`).status == 200
+		queue(g, b, sendable(b, "events.amazonaws.com", `arn:aws:events:us-east-1:000000000000:rule/${b}/r`))
+		assert call(g, "events", "PutRule",
+			`{"Name":"r","EventBusName":"${b}","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+		assert call(g, "events", "PutTargets",
+			`{"Rule":"r","EventBusName":"${b}","Targets":[{"Id":"1","Arn":"${queueArn(b)}"}]}`).status == 200
+	}
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	assert fails(call(g, "events", "PutTargets", `{"Rule":"r","Targets":[{"Id":"k","Arn":"${stream}"}]}`), 400,
+		"ValidationException", "Parameter(s) RoleArn must be specified for target: k.")
+	const put = "arn:aws:iam::000000000000:role/put"
+	const bus = "arn:aws:events:us-east-1:000000000000:event-bus/"
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[`
+		+ `{"Id":"k","Arn":"${stream}","RoleArn":"${put}","KinesisParameters":{"PartitionKeyPath":"$.detail.k"}},`
+		+ `{"Id":"l","Arn":"arn:aws:logs:us-east-1:000000000000:log-group:/events/g","InputPath":"$.detail"},`
+		+ `{"Id":"b2","Arn":"${bus}b2","RoleArn":"${put}"},{"Id":"b3","Arn":"${bus}b3"}]}`).status == 200
+	assert call(g, "events", "PutEvents",
+		`{"Entries":[{"Source":"app","DetailType":"t","Detail":"{\\"k\\":\\"v\\"}"}]}`).status == 200
+	const [record] = streamed(g, "s")
+	assert indexOf(record, `"source":"app"`) > 0 && indexOf(record, `"detail":{"k":"v"}`) > 0
+	const name = member(json11Of(g, "logs", "DescribeLogStreams", `{"logGroupName":"/events/g"}`), "logStreamName")
+	assert indexOf(record, `"id":"${name}"`) > 0
+	const events = json11Of(g, "logs", "GetLogEvents", `{"logGroupName":"/events/g","logStreamName":"${name}"}`)
+	assert indexOf(events.body.whole ?? "", `"message":"{\\"k\\":\\"v\\"}"`) > 0
+	assert bodies(g, "b2").length == 1 && bodies(g, "b3").length == 0
+	g.close()
+}
+
+test "EventBridge targets: a bus of another account as its policy allows, a state machine as a role that trusts EventBridge" {
+	const g = gateway()
+	const far = `arn:aws:events:us-east-1:${other}:event-bus/far`
+	assert call(g, "events", "CreateEventBus", `{"Name":"far"}`, otherRoot()).status == 200
+	queue(g, "far",
+		policy([statement("Allow", `"sqs:SendMessage"`, queueArn("far", other), `{"Service":"events.amazonaws.com"}`,
+		`{"ArnEquals":{"aws:SourceArn":"arn:aws:events:us-east-1:${other}:rule/far/r"}}`)]), "", otherRoot())
+	assert call(g, "events", "PutRule", `{"Name":"r","EventBusName":"far","EventPattern":"{\\"source\\":[\\"app\\"]}"}`,
+		otherRoot()).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","EventBusName":"far","Targets":[{"Id":"q","Arn":"${queueArn("far", other)}"}]}`,
+		otherRoot()).status == 200
+	role(g, "put", "events.amazonaws.com", policy([statement("Allow", `"events:PutEvents"`, "*")]))
+	role(g, "machine", "states.amazonaws.com")
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	const sm = json11Of(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"arn:aws:iam::000000000000:role/machine",`
+		+ `"definition":"{\\"StartAt\\":\\"P\\",\\"States\\":{\\"P\\":{\\"Type\\":\\"Pass\\",\\"End\\":true}}}"}`)
+	assert sm.status == 200
+	const machine = member(sm, "stateMachineArn")
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[`
+		+ `{"Id":"b","Arn":"${far}","RoleArn":"arn:aws:iam::000000000000:role/put","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}},`
+		+ `{"Id":"s","Arn":"${machine}","RoleArn":"arn:aws:iam::000000000000:role/machine",`
+		+ `"DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}]}`).status == 200
+	const put = `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`
+	assert call(g, "events", "PutEvents", put).status == 200
+	// Not yet allowed by the far bus's policy.
+	assert bodies(g, "far", other).length == 0
+	// Each refused delivery reaches the dead-letter queue with what refused it, the role's session's or the bus's.
+	const dead = received(g, "dlq").map(m => m.MessageAttributes ?? [])
+	assert dead.length == 2
+	for (const attributes of dead) {
+		assert attributes.map(a => a[0]).join(",") == "ERROR_CODE,ERROR_MESSAGE,RULE_ARN,TARGET_ARN"
+		assert attributes[0][1].StringValue == "AccessDenied" && attributes[2][1].StringValue == rule
+	}
+	const targets = dead.map(attributes => attributes[3][1].StringValue ?? "")
+	assert targets.some(t => t == machine) && targets.some(t => t == far)
+	assert json11Of(g, "states", "ListExecutions", `{"stateMachineArn":"${machine}"}`).body.whole == `{"executions":[]}`
+	assert call(g, "events", "PutPermission",
+		`{"EventBusName":"far","Action":"events:PutEvents","Principal":"${account}","StatementId":"s"}`,
+		otherRoot()).status == 200
+	assert call(g, "events", "PutEvents", put).status == 200
+	const again = received(g, "dlq").map(m => m.MessageAttributes ?? [])
+	assert again.length == 1 && again[0][3][1].StringValue == machine
+	const [got] = bodies(g, "far", other)
+	assert indexOf(got, `"account":"${account}"`) > 0
+	g.close()
+}
+
+test "DynamoDB puts each item write's change record on its Kinesis streaming destination within the write" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status == 200
+	assert fails(call(g, "dynamodb", "EnableKinesisStreamingDestination",
+		`{"TableName":"tab","StreamArn":"${stream}x"}`), 400, "ValidationException")
+	let res = call(g, "dynamodb", "EnableKinesisStreamingDestination", `{"TableName":"tab","StreamArn":"${stream}"}`)
+	assert res.status == 200 && member(res, "DestinationStatus") == "ENABLING"
+	res = call(g, "dynamodb", "DescribeKinesisStreamingDestination", `{"TableName":"tab"}`)
+	assert member(res, "DestinationStatus") == "ACTIVE" && member(res, "StreamArn") == stream
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"a"},"v":{"N":"1"}}}`).status == 200
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"a"},"v":{"N":"1"}}}`).status == 200
+	assert call(g, "dynamodb", "DeleteItem", `{"TableName":"tab","Key":{"k":{"S":"a"}}}`).status == 200
+	assert call(g, "dynamodb", "DisableKinesisStreamingDestination",
+		`{"TableName":"tab","StreamArn":"${stream}"}`).status == 200
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"b"}}}`).status == 200
+	const got = streamed(g, "s")
+	assert got.length == 2
+	assert indexOf(got[0], `{"awsRegion":"us-east-1","dynamodb":{"ApproximateCreationDateTime":`) == 0
+	assert indexOf(got[0], `"Keys":{"k":{"S":"a"}},"NewImage":{"k":{"S":"a"},"v":{"N":"1"}},"SizeBytes":`) > 0
+	assert indexOf(got[0], `"ApproximateCreationDateTimePrecision":"MILLISECOND"},"eventID":"`) > 0
+	assert indexOf(got[0],
+		`"eventName":"INSERT","userIdentity":null,"recordFormat":"application/json",`
+		+ `"tableName":"tab","eventSource":"aws:dynamodb"}`) > 0
+	assert indexOf(got[1], `"Keys":{"k":{"S":"a"}},"OldImage":{"k":{"S":"a"},"v":{"N":"1"}}`) > 0
+	assert indexOf(got[1], `"eventName":"REMOVE"`) > 0
+	g.close()
+}
+
+function objects(g: Gateway, b: string): [string, string][] {
+	const body = s3(g, "GET", `/${b}?list-type=2`).body.whole ?? ""
+	const out: [string, string][] = []
+	let at = indexOf(body, "<Key>")
+	while (at >= 0) {
+		const to = indexOf(body, "</Key>", at)
+		const key = body.slice(at + 5, to)
+		out.push([key, s3(g, "GET", `/${b}/${key}`).body.whole ?? ""])
+		at = indexOf(body, "<Key>", to)
+	}
+	return out
+}
+
+test "Firehose writes each put as one S3 object as its role, from Logs, EventBridge and SNS too" {
+	const g = gateway()
+	assert s3(g, "PUT", "/bkt").status == 200
+	role(g, "write", "firehose.amazonaws.com", policy([statement("Allow", `"s3:PutObject"`, "arn:aws:s3:::bkt/*")]))
+	role(g, "none", "firehose.amazonaws.com")
+	for (const [name, r] of [["s", "write"], ["d", "none"]]) {
+		assert json11Of(g, "firehose", "CreateDeliveryStream",
+			`{"DeliveryStreamName":"${name}","ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::bkt",`
+			+ `"RoleARN":"arn:aws:iam::000000000000:role/${r}","Prefix":"in/"}}`).status == 200
+	}
+	assert json11Of(g, "firehose", "PutRecord", `{"DeliveryStreamName":"d","Record":{"Data":"YWI="}}`).status == 200
+	assert objects(g, "bkt").length == 0
+	const res = json11Of(g, "firehose", "PutRecordBatch",
+		`{"DeliveryStreamName":"s","Records":[{"Data":"YWI="},{"Data":"Y2Q="}]}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"FailedPutCount":0`) >= 0
+	let got = objects(g, "bkt")
+	assert got.length == 1 && startsWith(got[0][0], "in/") && indexOf(got[0][0], "/s-1-") == 16 && got[0][1] == "abcd"
+	const stream = "arn:aws:firehose:us-east-1:000000000000:deliverystream/s"
+	role(g, "toFirehose", "logs.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	assert json11Of(g, "logs", "PutSubscriptionFilter",
+		`{"logGroupName":"/g","filterName":"f","filterPattern":"","destinationArn":"${stream}",`
+		+ `"roleArn":"arn:aws:iam::000000000000:role/toFirehose"}`).status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":[{"timestamp":${t},"message":"one"}]}`).status == 200
+	got = objects(g, "bkt")
+	assert got.length == 3
+	let control = false
+	for (const [_, body] of got) {
+		try {
+			control = control
+				|| indexOf(gunzip(body), "CWL CONTROL MESSAGE: Checking health of destination Firehose.") > 0
+		} catch (e: ParseError) {}
+	}
+	assert control
+	role(g, "put", "events.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert fails(call(g, "events", "PutTargets", `{"Rule":"r","Targets":[{"Id":"f","Arn":"${stream}"}]}`), 400,
+		"ValidationException", "Parameter(s) RoleArn must be specified for target: f.")
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"f","Arn":"${stream}",`
+		+ `"RoleArn":"arn:aws:iam::000000000000:role/put"}]}`).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	role(g, "sns", "sns.amazonaws.com", policy([statement("Allow", `"firehose:PutRecord"`, stream)]))
+	topic(g, "t")
+	assert query(g, "sns",
+		[["Action", "Subscribe"], ["TopicArn", topicArn("t")], ["Protocol", "firehose"], ["Endpoint", stream],
+		["Attributes.entry.1.key", "SubscriptionRoleArn"],
+		["Attributes.entry.1.value", "arn:aws:iam::000000000000:role/sns"]]).status == 200
+	assert publish(g, topicArn("t"), "hello").status == 200
+	got = objects(g, "bkt")
+	assert got.length == 5
+	assert got.some(o => indexOf(o[1], `"source":"app"`) > 0)
+	assert got.some(o => indexOf(o[1], `"Type":"Notification"`) > 0 && indexOf(o[1], `"Message":"hello"`) > 0)
+	g.close()
+}
+
+test "EventBridge, SNS and Step Functions take a role only as the caller may pass it, and act only as it trusts them" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	const firehose = "arn:aws:firehose:us-east-1:000000000000:deliverystream/d"
+	const can = policy([statement("Allow", `["kinesis:PutRecord","firehose:PutRecord"]`, "*")])
+	role(g, "elsewhere", "logs.amazonaws.com", can)
+	role(g, "write", "firehose.amazonaws.com", policy([statement("Allow", `"s3:PutObject"`, "*")]))
+	const elsewhere = "arn:aws:iam::000000000000:role/elsewhere"
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "firehose", "CreateDeliveryStream",
+		`{"DeliveryStreamName":"d","ExtendedS3DestinationConfiguration":{"BucketARN":"arn:aws:s3:::bkt",`
+		+ `"RoleARN":"arn:aws:iam::000000000000:role/write"}}`).status == 200
+	const k = user(g, "u", policy([statement("Allow", `["events:*","sns:*","states:*"]`, "*")]))
+	// No iam:PassRole: each service refuses as it words it.
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", "arn:aws:events:us-east-1:000000000000:rule/r"))
+	const target = `{"Rule":"r","Targets":[{"Id":"k","Arn":"${stream}","RoleArn":"${elsewhere}",`
+		+ `"DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}]}`
+	assert fails(call(g, "events", "PutTargets", target, k), 400, "AccessDeniedException",
+		`is not authorized to perform: iam:PassRole on resource: ${elsewhere}`)
+	topic(g, "t")
+	const subscription: [string, string][] = [["Action", "Subscribe"], ["TopicArn", topicArn("t")],
+		["Protocol", "firehose"], ["Endpoint", firehose], ["Attributes.entry.1.key", "SubscriptionRoleArn"],
+		["Attributes.entry.1.value", elsewhere]]
+	assert fails(query(g, "sns", subscription, k), 403, "AuthorizationError")
+	const d = `{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}}`
+	assert fails(call(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"${elsewhere}","definition":${json.quoted(d)}}`, k), 400, "AccessDeniedException",
+		"iam:PassRole")
+	// Passed by the root, a role that does not trust the service: the event goes to the dead-letter queue, the
+	// notification nowhere, and the machine is not made.
+	assert call(g, "events", "PutTargets", target).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	assert streamed(g, "s").length == 0
+	const [dead] = bodies(g, "dlq")
+	assert indexOf(dead, `"source":"app"`) >= 0
+	assert query(g, "sns", subscription).status == 200
+	assert publish(g, topicArn("t"), "hello").status == 200
+	assert objects(g, "bkt").length == 0
+	assert fails(call(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"${elsewhere}","definition":${json.quoted(d)}}`), 400, "AccessDeniedException",
+		"Neither the global service principal states.amazonaws.com, nor the regional one is authorized to assume the "
+		+ "provided role.")
+	g.close()
+}
+
+test "CloudFormation makes a stack's queue, topic and output, and deletes them in reverse" {
+	const g = gateway()
+	const template = `{"Parameters": {"Suffix": {"Type": "String", "Default": "x"}}, "Resources": {`
+		+ `"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": {"Fn::Sub": "q-\${Suffix}"}}},`
+		+ `"T": {"Type": "AWS::SNS::Topic", "Properties": {"DisplayName": {"Fn::GetAtt": ["Q", "QueueName"]}}},`
+		+ `"H": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "T"}},`
+		+ `"Outputs": {"Arn": {"Value": {"Fn::GetAtt": "Q.Arn"}, "Export": {"Name": "qarn"}}}}`
+	let res = query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "s1"], ["TemplateBody", template], ["Tags.member.1.Key", "team"],
+		["Tags.member.1.Value", "a"]])
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "<StackId>arn:aws:cloudformation:us-east-1:") >= 0
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName": "q-x"}`).status == 200
+	res = call(g, "sqs", "ListQueueTags",
+		`{"QueueUrl": "http://sqs.us-east-1.localhost.localstack.cloud:4566/${account}/q-x"}`)
+	assert indexOf(res.body.whole ?? "", `"team":"a"`) >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", `<OutputValue>${queueArn("q-x")}</OutputValue>`) >= 0
+	res = query(g, "cloudformation", [["Action", "ListExports"]])
+	assert indexOf(res.body.whole ?? "", "<Name>qarn</Name>") >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeStackEvents"], ["StackName", "s1"]])
+	assert indexOf(res.body.whole ?? "", "Resource creation Initiated") >= 0
+	res = query(g, "cloudformation", [["Action", "UpdateStack"], ["StackName", "s1"], ["TemplateBody", template]])
+	assert fails(res, 400, "ValidationError", "No updates are to be performed.")
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "s1"]]).status == 200
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName": "q-x"}`).status == 400
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s1"]])
+	assert fails(res, 400, "ValidationError", "Stack with id s1 does not exist")
+}
+
+test "CloudFormation rolls a stack back from a type it does not know, and refuses a cycle" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue"}, "X": {"Type": "AWS::Nope::Thing", "DependsOn": "Q"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "s2"], ["TemplateBody", template]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s2"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>ROLLBACK_COMPLETE</StackStatus>") >= 0
+	res = call(g, "sqs", "ListQueues", "{}")
+	assert indexOf(res.body.whole ?? "", "s2-Q-") < 0
+	const cycle = `{"Resources": {"A": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "B"},`
+		+ `"B": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "A"}}}`
+	res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateBody", cycle]])
+	assert fails(res, 400, "ValidationError", "Circular dependency between resources: [A, B]")
+}
+
+test "CloudFormation makes a stack of a YAML template, and GetTemplate gives the YAML back as written" {
+	const g = gateway()
+	const template = "AWSTemplateFormatVersion: 2010-09-09\nDescription: yaml\n# kept\nParameters:\n  P:\n"
+		+ "    Type: String\n    Default: x\nConditions:\n  C: !Equals [!Ref P, x]\nResources:\n  H:\n"
+		+ "    Type: AWS::CloudFormation::WaitConditionHandle\nOutputs:\n  O1:\n    Value: !If [C, matched, unmatched]\n"
+		+ "  O2:\n    Value: !Join ['-', [!Ref P, 1.50, !Sub \"\${AWS::Region}\"]]\n"
+	let res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateBody", template]])
+	assert text(res, "Description") == "yaml" && text(res, "DefaultValue") == "x"
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "y1"], ["TemplateBody", template]]).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "y1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	// as CloudFormation answered on 2026-11-23: 1.50 as 1.5, and the body as sent at both stages
+	assert indexOf(res.body.whole ?? "", "<OutputValue>matched</OutputValue>") >= 0
+	assert indexOf(res.body.whole ?? "", "<OutputValue>x-1.5-us-east-1</OutputValue>") >= 0
+	res = query(g, "cloudformation", [["Action", "GetTemplate"], ["StackName", "y1"], ["TemplateStage", "Processed"]])
+	assert text(res, "TemplateBody") == template
+	g.close()
+}
+
+test "CloudFormation has no transforms: a template that names one fails as AWS's does of an unknown macro" {
+	// as CloudFormation answered on 2026-11-23
+	const g = gateway()
+	const plain = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}`
+	const template = `{"Transform": ["Zed", "AWS::LanguageExtensions", "Zed"], "Resources": {"R": {`
+		+ `"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": []}}}}}`
+	const expand: [string, string] = ["Capabilities.member.1", "CAPABILITY_AUTO_EXPAND"]
+	let res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateBody", template]])
+	assert indexOf(res.body.whole ?? "", "<member>CAPABILITY_AUTO_EXPAND</member>") >= 0
+	assert indexOf(res.body.whole ?? "", "CAPABILITY_IAM") < 0 && indexOf(res.body.whole ?? "", "Reason") < 0
+	res = query(g, "cloudformation", [["Action", "GetTemplateSummary"], ["TemplateBody", template]])
+	assert indexOf(res.body.whole ?? "", "<member>000000000000::Zed</member><member>AWS::LanguageExtensions</member>")
+		>= 0
+	assert indexOf(res.body.whole ?? "", "ResourceTypes") < 0 && indexOf(res.body.whole ?? "", "CAPABILITY") < 0
+	res = query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "t1"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_IAM"]])
+	assert fails(res, 400, "InsufficientCapabilitiesException", "Requires capabilities : [CAPABILITY_AUTO_EXPAND]")
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "t1"], ["TemplateBody", template], expand]).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "t1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>ROLLBACK_COMPLETE</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeStackEvents"], ["StackName", "t1"]])
+	assert indexOf(res.body.whole ?? "",
+		"<ResourceStatusReason>No transform named 000000000000::Zed found.. Rollback requested by user.<") >= 0
+	assert indexOf(res.body.whole ?? "", "<ResourceStatusReason>No transform named 000000000000::Zed found.<") >= 0
+	assert query(g, "iam", [["Action", "ListRoles"]]).status == 200
+	assert indexOf(query(g, "iam", [["Action", "ListRoles"]]).body.whole ?? "", "<RoleName>") < 0
+	assert query(g, "cloudformation", [["Action", "CreateStack"], ["StackName", "t2"], ["TemplateBody", plain]]).status
+		== 200
+	res = query(g, "cloudformation", [["Action", "UpdateStack"], ["StackName", "t2"], ["TemplateBody", template]])
+	assert fails(res, 400, "InsufficientCapabilitiesException", "Requires capabilities : [CAPABILITY_AUTO_EXPAND]")
+	assert query(g, "cloudformation",
+		[["Action", "UpdateStack"], ["StackName", "t2"], ["TemplateBody", template], expand]).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "t2"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "GetTemplate"], ["StackName", "t2"]])
+	assert text(res, "TemplateBody") == plain
+	res = query(g, "cloudformation", [["Action", "DescribeStackEvents"], ["StackName", "t2"]])
+	assert indexOf(res.body.whole ?? "", "<ResourceStatus>UPDATE_ROLLBACK_IN_PROGRESS</ResourceStatus>") >= 0
+	// A change set needs no capability to fail.
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "t2"], ["ChangeSetName", "c"], ["TemplateBody", template]]).status
+		== 200
+	res = query(g, "cloudformation", [["Action", "DescribeChangeSet"], ["StackName", "t2"], ["ChangeSetName", "c"]])
+	assert text(res, "Status") == "FAILED" && text(res, "ExecutionStatus") == "UNAVAILABLE"
+	assert text(res, "StatusReason") == "No transform named 000000000000::Zed found."
+	g.close()
+}
+
+test "a metric filter puts its matches' values to CloudWatch within PutLogEvents, and an alarm on them moves" {
+	const g = gateway()
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	assert json11Of(g, "logs", "PutMetricFilter",
+		`{"logGroupName":"/g","filterName":"f","filterPattern":"{ $.ms > 0 }",`
+		+ `"metricTransformations":[{"metricName":"ms","metricNamespace":"app","metricValue":"$.ms",`
+		+ `"dimensions":{"svc":"$.svc"},"unit":"Milliseconds"}]}`).status == 200
+	assert json11Of(g, "logs", "PutMetricFilter",
+		`{"logGroupName":"/g","filterName":"e","filterPattern":"ERROR",`
+		+ `"metricTransformations":[{"metricName":"errors","metricNamespace":"app","metricValue":"1",`
+		+ `"defaultValue":0}]}`).status == 200
+	assert query(g, "monitoring",
+		[["Action", "PutMetricAlarm"], ["AlarmName", "slow"], ["Namespace", "app"], ["MetricName", "ms"],
+		["Dimensions.member.1.Name", "svc"], ["Dimensions.member.1.Value", "web"], ["Statistic", "Maximum"],
+		["Period", "60"], ["EvaluationPeriods", "1"], ["Threshold", "500"],
+		["ComparisonOperator", "GreaterThanThreshold"]]).status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":[`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":900,\\"svc\\":\\"web\\"}"},`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":\\"slow\\",\\"svc\\":\\"web\\"}"},`
+		+ `{"timestamp":${t},"message":"{\\"ms\\":5}"}]}`).status == 200
+	const alarm = query(g, "monitoring", [["Action", "DescribeAlarms"], ["AlarmNames.member.1", "slow"]])
+	assert text(alarm, "StateValue") == "ALARM"
+	const stats = (name: string, dims: [string, string][]) => {
+		const params: [string, string][] = [["Action", "GetMetricStatistics"], ["Namespace", "app"],
+			["MetricName", name], ["StartTime", "2015-06-26T13:00:00Z"], ["EndTime", "2015-06-26T15:00:00Z"],
+			["Period", "3600"], ["Statistics.member.1", "SampleCount"], ["Statistics.member.2", "Sum"]]
+		for (let i = 0; i < dims.length; i++) {
+			params.push([`Dimensions.member.${i + 1}.Name`, dims[i][0]])
+			params.push([`Dimensions.member.${i + 1}.Value`, dims[i][1]])
+		}
+		const r = query(g, "monitoring", params)
+		return `${text(r, "SampleCount")}/${text(r, "Sum")}/${text(r, "Unit")}`
+	}
+	assert stats("ms", [["svc", "web"]]) == "1.0/900.0/Milliseconds"
+	assert stats("errors", []) == "1.0/0.0/None"
+	g.close()
+}
+
+test "CloudFormation change sets: CREATE under review, executed; an empty one FAILED; a role, table and parameter" {
+	const g = gateway()
+	const handle = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"], ["ChangeSetType", "CREATE"],
+		["TemplateBody", handle]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>REVIEW_IN_PROGRESS</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"]])
+	assert indexOf(res.body.whole ?? "", "<Status>CREATE_COMPLETE</Status>") >= 0
+	assert indexOf(res.body.whole ?? "", "<Action>Add</Action>") >= 0
+	assert query(g, "cloudformation",
+		[["Action", "ExecuteChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"]]).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "ListChangeSets"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<ChangeSetName>") < 0
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "b"], ["TemplateBody", handle]]).status
+		== 200
+	res = query(g, "cloudformation", [["Action", "DescribeChangeSet"], ["StackName", "c1"], ["ChangeSetName", "b"]])
+	assert indexOf(res.body.whole ?? "", "<Status>FAILED</Status>") >= 0
+	assert indexOf(res.body.whole ?? "", "contain changes. Submit different information to create a change set.") >= 0
+	const template = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"},`
+		+ `"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "sqs.amazonaws.com"}, "Action": "sts:AssumeRole"}]},`
+		+ `"Policies": [{"PolicyName": "p", "PolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}}]}},`
+		+ `"T": {"Type": "AWS::DynamoDB::Table", "Properties": {"TableName": "tab","BillingMode": "PAY_PER_REQUEST",`
+		+ `"AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}],`
+		+ `"KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}]}},`
+		+ `"P": {"Type": "AWS::SSM::Parameter", "Properties": {"Name": "/p", "Type": "String",`
+		+ `"Value": {"Fn::GetAtt": ["R", "Arn"]}}}}}`
+	res = query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"], ["TemplateBody", template]])
+	assert fails(res, 400, "InsufficientCapabilitiesException", "Requires capabilities : [CAPABILITY_IAM]")
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+	assert query(g, "cloudformation",
+		[["Action", "ExecuteChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"]]).status == 200
+	assert call(g, "dynamodb", "DescribeTable", `{"TableName": "tab"}`).status == 200
+	res = json11(g, "ssm", "GetParameter", `{"Name": "/p"}`)
+	assert indexOf(res.body.whole ?? "", ":role/c1-R-") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "c1"]]).status == 200
+	assert call(g, "dynamodb", "DescribeTable", `{"TableName": "tab"}`).status == 400
+	assert json11(g, "ssm", "GetParameter", `{"Name": "/p"}`).status == 400
+}
+
+test "CloudFormation makes a function of inline code zipped as index.py, its version, alias, permission and URL" {
+	const g = gateway()
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {`
+		+ `"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"F": {"Type": "AWS::Lambda::Function", "Properties": {"Runtime": "python3.12", "Handler": "index.handler",`
+		+ `"Role": {"Fn::GetAtt": ["R", "Arn"]}, "Code": {"ZipFile": "def handler(e, c):\\n  return 1\\n"},`
+		+ `"Tags": [{"Key": "team", "Value": "a"}]}},`
+		+ `"V": {"Type": "AWS::Lambda::Version", "Properties": {"FunctionName": {"Ref": "F"}}},`
+		+ `"A": {"Type": "AWS::Lambda::Alias", "Properties": {"FunctionName": {"Ref": "F"}, "Name": "live",`
+		+ `"FunctionVersion": {"Fn::GetAtt": ["V", "Version"]}}},`
+		+ `"P": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": {"Ref": "A"},`
+		+ `"Action": "lambda:InvokeFunction", "Principal": "sns.amazonaws.com"}},`
+		+ `"U": {"Type": "AWS::Lambda::Url", "Properties": {"TargetFunctionArn": {"Fn::GetAtt": ["F", "Arn"]},`
+		+ `"AuthType": "NONE"}}},`
+		+ `"Outputs": {"Url": {"Value": {"Fn::GetAtt": ["U", "FunctionUrl"]}}, "Alias": {"Value": {"Ref": "A"}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "fn"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "fn"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", ":live</OutputValue>") >= 0
+	res = query(g, "cloudformation",
+		[["Action", "DescribeStackResource"], ["StackName", "fn"], ["LogicalResourceId", "F"]])
+	const w = res.body.whole ?? ""
+	const name = w.slice(indexOf(w, "<PhysicalResourceId>") + 20, indexOf(w, "</PhysicalResourceId>"))
+	assert startsWith(name, "fn-F-")
+	res = g.handle(new Request("GET", member(lambdaGet(g, `/2015-03-31/functions/${name}?Qualifier=1`), "Location"),
+		""))
+	const zip = res.body.whole ?? ""
+	assert startsWith(zip, "PK\x03\x04") && indexOf(zip, "index.pydef handler(e, c):\n  return 1\n") >= 0
+	assert indexOf(lambdaGet(g, `/2015-03-31/functions/${name}/policy?Qualifier=live`).body.whole ?? "",
+		"sns.amazonaws.com") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "fn"]]).status == 200
+	assert lambdaGet(g, `/2015-03-31/functions/${name}`).status == 404
+}
+
+test "CloudFormation makes policies, a user, a key, alias, stream, log stream, secret, rule and state machine" {
+	const g = gateway()
+	const allow = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}`
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {`
+		+ `"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "sqs.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"M": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}, "Roles": [{"Ref": "R"}]}},`
+		+ `"I": {"Type": "AWS::IAM::Policy", "Properties": {"PolicyName": "inline", "PolicyDocument": ${allow},`
+		+ `"Roles": [{"Ref": "R"}], "Users": [{"Ref": "U"}]}}, "U": {"Type": "AWS::IAM::User"}, "K": {"Type": "AWS::KMS::Key"},`
+		+ `"SR": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "states.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": {"StateMachineName": "sm",`
+		+ `"RoleArn": {"Fn::GetAtt": ["SR", "Arn"]}, "DefinitionString": "{\\"StartAt\\": \\"P\\", \\"States\\": {`
+		+ `\\"P\\": {\\"Type\\": \\"Pass\\", \\"Result\\": \\"\${greeting}\\", \\"End\\": true}}}",`
+		+ `"DefinitionSubstitutions": {"greeting": "hi"}}},`
+		+ `"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "rq"}},`
+		+ `"E": {"Type": "AWS::Events::Rule", "Properties": {"Name": "e", "EventPattern": {"source": ["cf"]},`
+		+ `"Targets": [{"Id": "q", "Arn": {"Fn::GetAtt": ["Q", "Arn"]}}]}},`
+		+ `"W": {"Type": "AWS::CloudWatch::Alarm", "Properties": {"AlarmName": "w", "Namespace": "N", "MetricName": "m",`
+		+ `"Statistic": "Sum", "Period": "60", "EvaluationPeriods": 1, "Threshold": "2", "ComparisonOperator": "GreaterThanThreshold"}},`
+		+ `"B": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": "fhb"}},`
+		+ `"FR": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "firehose.amazonaws.com"}, "Action": "sts:AssumeRole"}]}}},`
+		+ `"FH": {"Type": "AWS::KinesisFirehose::DeliveryStream", "Properties": {"DeliveryStreamName": "fh",`
+		+ `"S3DestinationConfiguration": {"BucketARN": {"Fn::GetAtt": ["B", "Arn"]}, "RoleARN": {"Fn::GetAtt": ["FR", "Arn"]},`
+		+ `"BufferingHints": {"IntervalInSeconds": "60", "SizeInMBs": 1}}}},`
+		+ `"A": {"Type": "AWS::KMS::Alias", "Properties": {"AliasName": "alias/cf", "TargetKeyId": {"Ref": "K"}}},`
+		+ `"S": {"Type": "AWS::Kinesis::Stream", "Properties": {"ShardCount": 1}},`
+		+ `"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": "g"}},`
+		+ `"L": {"Type": "AWS::Logs::LogStream", "Properties": {"LogGroupName": {"Ref": "G"}, "LogStreamName": "l"}},`
+		+ `"X": {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": "x", "GenerateSecretString": {`
+		+ `"SecretStringTemplate": "{\\"user\\": \\"a\\"}", "GenerateStringKey": "password", "PasswordLength": 12,`
+		+ `"ExcludePunctuation": true}}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "more"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_NAMED_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "more"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = json11(g, "secretsmanager", "GetSecretValue", `{"SecretId": "x"}`)
+	assert indexOf(res.body.whole ?? "", `\\"user\\":\\"a\\",\\"password\\":\\"`) >= 0
+	assert json11(g, "kms", "DescribeKey", `{"KeyId": "alias/cf"}`).status == 200
+	res = call(g, "events", "ListTargetsByRule", `{"Rule": "e"}`)
+	assert indexOf(res.body.whole ?? "", queueArn("rq")) >= 0
+	res = call(g, "states", "DescribeStateMachine",
+		`{"stateMachineArn": "arn:aws:states:us-east-1:${account}:stateMachine:sm"}`)
+	assert indexOf(res.body.whole ?? "", `\\"Result\\": \\"hi\\"`) >= 0
+	res = query(g, "monitoring", [["Action", "DescribeAlarms"], ["AlarmNames.member.1", "w"]])
+	assert indexOf(res.body.whole ?? "", "<Period>60</Period>") >= 0
+	assert json11Of(g, "firehose", "DescribeDeliveryStream", `{"DeliveryStreamName": "fh"}`).status == 200
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "more"]]).status == 200
+	assert json11Of(g, "firehose", "DescribeDeliveryStream", `{"DeliveryStreamName": "fh"}`).status == 400
+	assert call(g, "events", "DescribeRule", `{"Name": "e"}`).status == 400
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "more"]])
+	assert fails(res, 400, "ValidationError", "Stack with id more does not exist")
+	assert json11(g, "kms", "DescribeKey", `{"KeyId": "alias/cf"}`).status == 404
+}
+
+test "Step Functions: a DISTRIBUTED map reads a CSV in a bucket as the role may, and writes its results there" {
+	const g = gateway()
+	assert s3(g, "PUT", "/rows").status == 200
+	assert s3(g, "PUT", "/rows/in.csv", "id,name\n1,a\n2,b\n").status == 200
+	role(g, "reader", "states.amazonaws.com", policy([statement("Allow", `"s3:GetObject"`, "arn:aws:s3:::rows/*")]))
+	const definition = `{"StartAt":"M","States":{"M":{"Type":"Map","End":true,`
+		+ `"ItemReader":{"Resource":"arn:aws:states:::s3:getObject","ReaderConfig":{"InputType":"CSV",`
+		+ `"CSVHeaderLocation":"FIRST_ROW"},"Parameters":{"Bucket":"rows","Key":"in.csv"}},`
+		+ `"ResultWriter":{"Resource":"arn:aws:states:::s3:putObject","Parameters":{"Bucket":"rows","Prefix":"out"}},`
+		+ `"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED","ExecutionType":"STANDARD"},"StartAt":"P",`
+		+ `"States":{"P":{"Type":"Pass","End":true}}}}}}`
+	const sm = json11Of(g, "states", "CreateStateMachine",
+		`{"name":"d","roleArn":"arn:aws:iam::000000000000:role/reader","definition":${json.quoted(definition)}}`)
+	assert sm.status == 200
+	const machine = member(sm, "stateMachineArn")
+	// The role may read the object but not write the results.
+	assert json11Of(g, "states", "StartExecution", `{"stateMachineArn":"${machine}","name":"e"}`).status == 200
+	let x = json11Of(g, "states", "DescribeExecution",
+		`{"executionArn":"arn:aws:states:us-east-1:000000000000:execution:d:e"}`).body.whole ?? ""
+	assert indexOf(x, `"status":"FAILED"`) >= 0 && indexOf(x, `"error":"S3.AccessDeniedException"`) >= 0
+	assert query(g, "iam",
+		[["Action", "PutRolePolicy"], ["RoleName", "reader"], ["PolicyName", "w"],
+		["PolicyDocument", policy([statement("Allow", `"s3:PutObject"`, "arn:aws:s3:::rows/out/*")])]]).status == 200
+	assert json11Of(g, "states", "StartExecution", `{"stateMachineArn":"${machine}","name":"f"}`).status == 200
+	const f = "arn:aws:states:us-east-1:000000000000:execution:d:f"
+	x = json11Of(g, "states", "DescribeExecution", `{"executionArn":"${f}"}`).body.whole ?? ""
+	assert indexOf(x, `"status":"SUCCEEDED"`) >= 0
+	const run = member(json11Of(g, "states", "ListMapRuns", `{"executionArn":"${f}"}`), "mapRunArn")
+	const prefix = "arn:aws:states:us-east-1:000000000000:mapRun:d/M:"
+	assert startsWith(run, prefix)
+	const id = run.slice(prefix.length, run.length)
+	const described = json11Of(g, "states", "DescribeMapRun", `{"mapRunArn":"${run}"}`).body.whole ?? ""
+	assert indexOf(described, `"succeeded":2`) >= 0 && indexOf(described, `"resultsWritten":2`) >= 0
+	const manifest = s3(g, "GET", `/rows/out/${id}/manifest.json`)
+	assert manifest.status == 200 && indexOf(manifest.body.whole ?? "", `"MapRunArn":"${run}"`) >= 0
+	const results = s3(g, "GET", `/rows/out/${id}/SUCCEEDED_0.json`).body.whole ?? ""
+	assert indexOf(results, `"Output":"{\\"id\\":\\"1\\",\\"name\\":\\"a\\"}"`) >= 0
+	// The run's children are kept: listed by the run, and described as executions of it.
+	const children = json11Of(g, "states", "ListExecutions", `{"mapRunArn":"${run}"}`)
+	const child = member(children, "executionArn")
+	assert startsWith(child, "arn:aws:states:us-east-1:000000000000:execution:d/M:")
+	x = json11Of(g, "states", "DescribeExecution", `{"executionArn":"${child}"}`).body.whole ?? ""
+	assert indexOf(x, `"status":"SUCCEEDED"`) >= 0 && indexOf(x, `"mapRunArn":"${run}"`) >= 0
+	x = json11Of(g, "states", "GetExecutionHistory", `{"executionArn":"${child}"}`).body.whole ?? ""
+	assert indexOf(x, `"type":"ExecutionSucceeded"`) >= 0
+}
+
+test "CloudFormation reads a TemplateURL of S3 as the caller, path-style or virtual-hosted, and refuses another" {
+	const g = gateway()
+	assert s3(g, "PUT", "/tpl").status == 200
+	assert s3(g, "PUT", "/tpl/a%20b.json",
+		`{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}`).status == 200
+	for (const url of ["http://localhost:4566/tpl/a%20b.json", "https://tpl.s3.amazonaws.com/a%20b.json",
+		"https://s3.us-east-1.amazonaws.com/tpl/a%20b.json", "https://tpl.s3.us-east-1.amazonaws.com/a%20b.json"]) {
+		assert query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateURL", url]]).status == 200
+	}
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "u"],
+		["TemplateURL", "https://tpl.s3.amazonaws.com/a%20b.json"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "u"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateURL", "https://example.com/t.json"]])
+	assert fails(res, 400, "ValidationError", "TemplateURL must be a supported URL.")
+	res = query(g, "cloudformation",
+		[["Action", "ValidateTemplate"], ["TemplateURL", "https://tpl.s3.amazonaws.com/no"]])
+	assert fails(res, 400, "ValidationError", "TemplateURL must reference a valid S3 object to which you have access.")
+}
+
+test "CloudFormation pages ListStacks and DescribeStacks by 100, and refuses a NextToken it did not give" {
+	const g = gateway()
+	const template = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}`
+	for (let i = 0; i < 101; i++) {
+		assert query(g, "cloudformation",
+			[["Action", "CreateStack"], ["StackName", `p${i}`], ["TemplateBody", template]]).status == 200
+	}
+	for (const action of ["ListStacks", "DescribeStacks"]) {
+		let res = query(g, "cloudformation", [["Action", action]])
+		const token = text(res, "NextToken")
+		assert token != null
+		res = query(g, "cloudformation", [["Action", action], ["NextToken", token!]])
+		assert indexOf(res.body.whole ?? "", "<StackName>") >= 0
+		assert indexOf(res.body.whole ?? "", "<NextToken>") < 0
+		res = query(g, "cloudformation", [["Action", action], ["NextToken", "x"]])
+		assert fails(res, 400, "ValidationError", "Invalid NextToken")
+	}
+}
+
+test "CloudFormation makes a group with policies, a user in it, policies of it, an instance profile, and deletes them" {
+	const g = gateway()
+	const allow = `{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}`
+	const template = `{"Resources": {"R": {"Type": "AWS::IAM::Role", "Properties": {"RoleName": "pr",`
+		+ `"AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",`
+		+ `"Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}}},`
+		+ `"P": {"Type": "AWS::IAM::InstanceProfile", "Properties": {"InstanceProfileName": "ip", "Path": "/a/",`
+		+ `"Roles": [{"Ref": "R"}]}},`
+		+ `"G": {"Type": "AWS::IAM::Group", "Properties": {"GroupName": "gr", "Policies": [{"PolicyName": "own",`
+		+ `"PolicyDocument": ${allow}}], "ManagedPolicyArns": [{"Ref": "M"}]}},`
+		+ `"M": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}}},`
+		+ `"N": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {"PolicyDocument": ${allow}, "Groups": [{"Ref": "G"}]}},`
+		+ `"I": {"Type": "AWS::IAM::Policy", "Properties": {"PolicyName": "in", "PolicyDocument": ${allow},`
+		+ `"Groups": [{"Ref": "G"}]}},`
+		+ `"U": {"Type": "AWS::IAM::User", "Properties": {"UserName": "gu", "Groups": [{"Ref": "G"}]}}},`
+		+ `"Outputs": {"G": {"Value": {"Fn::GetAtt": ["G", "Arn"]}}, "P": {"Value": {"Fn::GetAtt": ["P", "Arn"]}}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "grp"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_NAMED_IAM"]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "grp"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", ":group/gr</OutputValue>") >= 0
+	assert indexOf(res.body.whole ?? "", ":instance-profile/a/ip</OutputValue>") >= 0
+	res = query(g, "iam", [["Action", "GetInstanceProfile"], ["InstanceProfileName", "ip"]])
+	assert indexOf(res.body.whole ?? "", "<RoleName>pr</RoleName>") >= 0
+	res = query(g, "iam", [["Action", "GetGroup"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "<UserName>gu</UserName>") >= 0
+	res = query(g, "iam", [["Action", "ListGroupPolicies"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "<member>own</member>") >= 0
+	assert indexOf(res.body.whole ?? "", "<member>in</member>") >= 0
+	res = query(g, "iam", [["Action", "ListAttachedGroupPolicies"], ["GroupName", "gr"]])
+	assert indexOf(res.body.whole ?? "", "grp-M-") >= 0
+	assert indexOf(res.body.whole ?? "", "grp-N-") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "grp"]]).status == 200
+	assert query(g, "iam", [["Action", "GetGroup"], ["GroupName", "gr"]]).status == 404
+	assert query(g, "iam", [["Action", "GetInstanceProfile"], ["InstanceProfileName", "ip"]]).status == 404
+	assert query(g, "iam", [["Action", "GetRole"], ["RoleName", "pr"]]).status == 404
+}
+
+test "CloudFormation tags a stack's resources aws:cloudformation:stack-name, stack-id and logical-id, but a KMS key" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": "tq"}},`
+		+ `"T": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": "tt"}}, "K": {"Type": "AWS::KMS::Key"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "tags"], ["TemplateBody", template]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "tags"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = call(g, "sqs", "ListQueueTags",
+		`{"QueueUrl": "http://sqs.us-east-1.localhost.localstack.cloud:4566/${account}/tq"}`)
+	const body = res.body.whole ?? ""
+	assert indexOf(body, `"aws:cloudformation:stack-name":"tags"`) >= 0
+	assert indexOf(body, `"aws:cloudformation:logical-id":"Q"`) >= 0
+	assert indexOf(body, `"aws:cloudformation:stack-id":"arn:aws:cloudformation:us-east-1:${account}:stack/tags/`) >= 0
+	res = query(g, "sns", [["Action", "ListTagsForResource"], ["ResourceArn", `arn:aws:sns:us-east-1:${account}:tt`]])
+	assert indexOf(res.body.whole ?? "", "<Value>T</Value>") >= 0
+}
+
+test "CloudFormation makes a schedule group and a schedule in it, and deletes them" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue"},`
+		+ `"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "scheduler.amazonaws.com"},`
+		+ `"Action": "sts:AssumeRole"}]}}},`
+		+ `"G": {"Type": "AWS::Scheduler::ScheduleGroup", "Properties": {"Name": "sg"}},`
+		+ `"S": {"Type": "AWS::Scheduler::Schedule", "Properties": {"Name": "s", "GroupName": {"Ref": "G"},`
+		+ `"ScheduleExpression": "rate(1 hour)", "FlexibleTimeWindow": {"Mode": "FLEXIBLE",`
+		+ `"MaximumWindowInMinutes": "5"}, "Target": {"Arn": {"Fn::GetAtt": ["Q", "Arn"]},`
+		+ `"RoleArn": {"Fn::GetAtt": ["R", "Arn"]}, "RetryPolicy": {"MaximumRetryAttempts": 2}}}}},`
+		+ `"Outputs": {"S": {"Value": {"Fn::GetAtt": ["S", "Arn"]}}, "G": {"Value": {"Fn::GetAtt": ["G", "Arn"]}}}}`
+	for (const _ of [1, 2]) {
+		assert query(g, "cloudformation",
+			[["Action", "CreateStack"], ["StackName", "sch"], ["TemplateBody", template],
+			["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+		const res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "sch"]])
+		assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+		assert indexOf(res.body.whole ?? "", ":schedule/sg/s</OutputValue>") >= 0
+		assert indexOf(res.body.whole ?? "", ":schedule-group/sg</OutputValue>") >= 0
+		assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "sch"]]).status == 200
+	}
+}
