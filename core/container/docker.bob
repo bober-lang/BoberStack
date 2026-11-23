@@ -4,7 +4,7 @@
 
 import { Arch, ContainerError, Containers, Spec } from "./container"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
-import { EncodeError, Name, OmitEmpty, Rest, Unknown, decode, encode } from "std/encoding/json"
+import { EncodeError, Mapping, Name, OmitEmpty, Rest, Unknown, decode, encode } from "std/encoding/json"
 import { Buffered, Framed, head, readHead } from "std/http/h1"
 import { readAll } from "std/io"
 import { Conn, dial } from "std/net"
@@ -21,14 +21,14 @@ export class DockerContainers implements Containers {
 	/// Where the daemon listens, as net.dial takes it.
 	daemon = located()
 
-	pull(image: string) throws ContainerError {
+	pull(image: string, arch: Arch) throws ContainerError {
 		const [repo, tag] = reference(image)
 		const found = this.send("GET", `/images/${escape(named(repo, tag), "path")}/json`)
 		if (found.status == 404) {
 			found.close()
-			this.fetch(repo, tag, null)
-		} else {
-			found.ok()
+			this.fetch(repo, tag, platformOf(arch))
+		} else if (parse[Inspected](found.ok()).architecture != architecture(arch)) {
+			this.fetch(repo, tag, platformOf(arch))
 		}
 	}
 
@@ -77,17 +77,33 @@ export class DockerContainers implements Containers {
 
 	wait(id: string): i32 throws ContainerError {
 		const r = this.send("POST", `/containers/${escape(id, "component")}/wait`, "", true)
-		return parse[Exited](r.ok()).statusCode as i32
+		const exited = parse[Exited](r.ok())
+		// As when the daemon lost the container while waiting on it.
+		if (exited.error != null && exited.error!.message != "") {
+			throw new ContainerError("Failed", exited.error!.message)
+		}
+		return exited.statusCode as i32
 	}
 
 	stop(id: string) throws ContainerError {
 		const q = query([["force", "1"], ["v", "1"]])
 		const r = this.send("DELETE", `/containers/${escape(id, "component")}?${q}`)
-		if (r.status == 404) {
+		// 409 for a removal already under way.
+		if (r.status == 404 || r.status == 409) {
 			r.close()
 		} else {
 			r.ok()
 		}
+	}
+
+	list(label: [string, string]): string[] throws ContainerError {
+		const filters = `{"label":[${json(`${label[0]}=${label[1]}`)}]}`
+		const ids: string[] = []
+		for (const c of parse[Created[]](this.send("GET",
+			`/containers/json?${query([["all", "1"], ["filters", filters]])}`).ok())) {
+			ids.push(c.id)
+		}
+		return ids
 	}
 
 	/// The daemon's response to a request of target under api; with no timeout if long, as a wait's is.
@@ -266,7 +282,13 @@ function reference(ref: string): [string, string] {
 }
 
 function named(repo: string, tag: string): string { return repo + (if (indexOf(tag, ":") < 0) ":" else "@") + tag }
-function platformOf(a: Arch): string { return if (a == "x86_64") "linux/amd64" else "linux/arm64" }
+function platformOf(a: Arch): string { return "linux/" + architecture(a) }
+function architecture(a: Arch): string { return if (a == "x86_64") "amd64" else "arm64" }
+
+class Inspected {
+	architecture: string @Name["Architecture"] = ""
+	rest: Unknown[] @Rest = []
+}
 
 class Progress {
 	error = ""
@@ -279,6 +301,7 @@ class Create {
 	entrypoint: string[] @Name["Entrypoint"] @OmitEmpty = []
 	cmd: string[] @Name["Cmd"] @OmitEmpty = []
 	env: string[] @Name["Env"] = []
+	labels: [string, string][] @Name["Labels"] @Mapping @OmitEmpty = []
 	hostConfig: HostConfig @Name["HostConfig"] = new HostConfig()
 }
 
@@ -308,6 +331,7 @@ function create(spec: Spec, image: string): Create {
 	for (const [k, v] of spec.env) {
 		c.env.push(`${k}=${v}`)
 	}
+	c.labels = spec.labels
 	const mb = if (spec.memoryMb < leastMb) leastMb else spec.memoryMb
 	c.hostConfig.memory = (mb as i64) << 20
 	c.hostConfig.memorySwap = c.hostConfig.memory
@@ -328,6 +352,12 @@ class Created {
 
 class Exited {
 	statusCode: i64 @Name["StatusCode"] = 0
+	error: WaitError | null @Name["Error"] = null
+	rest: Unknown[] @Rest = []
+}
+
+class WaitError {
+	message: string @Name["Message"] = ""
 	rest: Unknown[] @Rest = []
 }
 

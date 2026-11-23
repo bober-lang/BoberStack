@@ -19,6 +19,8 @@ export class Spec {
 	mounts: Mount[] = []
 	memoryMb = 128
 	arch: Arch = "x86_64"
+	/// Names and values the container is found by later, as by list after a crash.
+	labels: [string, string][] = []
 }
 
 /// NotFound for a container or image there is not; Unavailable when nothing that runs containers answers.
@@ -35,8 +37,8 @@ export class ContainerError {
 }
 
 export interface Containers {
-	/// Makes image available here; nothing if it is.
-	pull(image: string) throws ContainerError
+	/// Makes image available here for arch; nothing if it is.
+	pull(image: string, arch: Arch) throws ContainerError
 	/// Creates and starts a container of spec, pulling its image if it is not here: its id.
 	start(spec: Spec): string throws ContainerError
 	/// The address a container reaches this machine at, for a server listening on all of its addresses.
@@ -45,6 +47,8 @@ export interface Containers {
 	output(id: string): string throws ContainerError
 	/// Parks until the container's program has exited: its status.
 	wait(id: string): i32 throws ContainerError
-	/// Stops and removes the container; nothing if it is gone.
+	/// Stops and removes the container; nothing if it is gone or going.
 	stop(id: string) throws ContainerError
+	/// The containers, running or not, that bear the label.
+	list(label: [string, string]): string[] throws ContainerError
 }

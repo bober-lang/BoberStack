@@ -24,11 +24,11 @@ const leastMb = 200
 
 /// The daemon's containers.
 export class AppleContainers implements Containers {
-	pull(image: string) throws ContainerError {
+	pull(image: string, arch: Arch) throws ContainerError {
 		const ref = normalized(image)
 		const found = listed(ref)
-		if (found == null || content(found!.descriptor.digest) == null) {
-			fetch(ref, null)
+		if (found == null || manifestOf(found!, platformOf(arch)) == null) {
+			fetch(ref, platformOf(arch))
 		}
 	}
 
@@ -42,6 +42,7 @@ export class AppleContainers implements Containers {
 		config.rosetta = spec.arch == "x86_64" && arch == "arm64"
 		config.resources.memoryInBytes = ((if (spec.memoryMb < leastMb) leastMb else spec.memoryMb) as u64) << 20
 		config.initProcess = process(spec, settings)
+		config.labels = spec.labels
 		for (const m of spec.mounts) {
 			const fs = new Filesystem()
 			fs.source = m.host
@@ -83,8 +84,7 @@ export class AppleContainers implements Containers {
 			return new Message("containerLogs").string("id", id).send(api, "logs")[0]
 		} catch (e: ContainerError) {
 			// The daemon's logs turns notFound into internalError.
-			const filters = `{"ids":[${quoted(id)}],"labels":{}}`
-			if (new Message("containerList").data("listFilters", filters).send(api, "containers")[0] == "[]") {
+			if (containers(`{"ids":[${quoted(id)}],"labels":{}}`).length == 0) {
 				throw new ContainerError("NotFound", e.message)
 			}
 			throw e
@@ -106,6 +106,29 @@ export class AppleContainers implements Containers {
 			}
 		}
 	}
+
+	list(label: [string, string]): string[] throws ContainerError {
+		const ids: string[] = []
+		for (const c of containers(`{"ids":[],"labels":{${quoted(label[0])}:${quoted(label[1])}}}`)) {
+			ids.push(c.configuration.id)
+		}
+		return ids
+	}
+}
+
+/// The daemon's containers that filters, a ContainerListFilters, picks.
+function containers(filters: string): Snapshot[] throws ContainerError {
+	return parse[Snapshot[]](new Message("containerList").data("listFilters", filters).send(api, "containers")[0])
+}
+
+class Snapshot {
+	configuration = new Identified()
+	rest: Unknown[] @Rest = []
+}
+
+class Identified {
+	id = ""
+	rest: Unknown[] @Rest = []
 }
 
 /// A request to one of the daemon's services, to send once.
@@ -399,6 +422,7 @@ class Config {
 	initProcess = new Process()
 	platform = new Platform()
 	resources = new Resources()
+	labels: [string, string][] @Mapping = []
 }
 
 class Filesystem {

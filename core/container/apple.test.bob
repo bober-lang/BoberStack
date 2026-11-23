@@ -16,8 +16,10 @@ test "normalized names a registry and a tag" {
 
 /// Runs spec to its end: its status and output, the container removed even if an assert would trap.
 function run(c: AppleContainers, spec: Spec): [i32, string] throws ContainerError {
+	spec.labels = [["boberstack.test", "apple"]]
 	const id = c.start(spec)
 	try {
+		assert c.list(["boberstack.test", "apple"]) == [id]
 		return [c.wait(id), c.output(id)]
 	} finally {
 		c.stop(id)
@@ -37,7 +39,7 @@ test "containers of either arch read a mount and see their env" {
 		return
 	}
 	assert indexOf(host, ".") > 0
-	c.pull(image)
+	c.pull(image, "arm64")
 	const dir = makeTempDir("container")
 	writeFile(`${dir}/hello.txt`, "hello from a mount")
 	const m = new Mount()
