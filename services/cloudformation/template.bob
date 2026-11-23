@@ -1,0 +1,437 @@
+//! A CloudFormation template of JSON, and its intrinsic functions evaluated against a stack's parameters, conditions
+//! and the resources made so far. YAML is not read.
+
+import { arr, boolean, Json, JsonError, parse, str, write } from "../stepfunctions/value"
+import * as base64 from "std/encoding/base64"
+import { indexOf, sort, startsWith } from "std/algo"
+import { ParseError, parseInt, split, trim } from "std/string"
+
+/// A template that does not validate, as AWS words it.
+export class TemplateError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+/// A template's sections.
+export class Template {
+	description: string | null = null
+	parameters: [string, Json][] = []
+	mappings = new Json()
+	conditions: [string, Json][] = []
+	resources: [string, Json][] = []
+	outputs: [string, Json][] = []
+}
+
+/// The template of body, which must be JSON, with the checks ValidateTemplate makes.
+export function read(body: string): Template throws TemplateError {
+	if (!startsWith(trim(body), "{")) {
+		throw new TemplateError("Template format error: YAML templates are not supported")
+	}
+	let v = new Json()
+	try {
+		v = parse(body)
+	} catch (e: JsonError) {
+		throw new TemplateError("Template format error: JSON not well-formed.")
+	}
+	const t = new Template()
+	t.description = v.str("Description")
+	t.parameters = v.get("Parameters")?.keys ?? []
+	t.mappings = v.get("Mappings") ?? new Json()
+	t.conditions = v.get("Conditions")?.keys ?? []
+	t.resources = v.get("Resources")?.keys ?? []
+	t.outputs = v.get("Outputs")?.keys ?? []
+	if (t.resources.length == 0) {
+		throw new TemplateError("Template format error: At least one Resources member must be defined.")
+	}
+	const names: string[] = []
+	for (const [p, _] of t.parameters) {
+		names.push(p)
+	}
+	for (const [r, _] of t.resources) {
+		names.push(r)
+	}
+	const unresolved: string[] = []
+	for (const [r, d] of t.resources) {
+		if (d.str("Type") == null) {
+			throw new TemplateError(`Template format error: [/Resources/${r}] Every Resources object must contain a Type member.`)
+		}
+		for (const n of references(d)) {
+			if (!has(names, n) && !startsWith(n, "AWS::") && !has(unresolved, n)) {
+				unresolved.push(n)
+			}
+		}
+	}
+	if (unresolved.length > 0) {
+		throw new TemplateError(`Template format error: Unresolved resource dependencies [${unresolved.join(", ")}] in the Resources block of the template`)
+	}
+	return t
+}
+
+/// The resources and parameters d refers to by Ref, Fn::GetAtt, Fn::Sub and DependsOn.
+export function references(d: Json): string[] {
+	const out: string[] = []
+	collect(d, out)
+	const on = d.get("DependsOn")
+	if (on != null) {
+		if (on.kind == "string") {
+			out.push(on.text)
+		}
+		for (const x of on.items) {
+			out.push(x.text)
+		}
+	}
+	return out
+}
+
+function collect(v: Json, out: string[]): void {
+	if (v.kind == "array") {
+		for (const x of v.items) {
+			collect(x, out)
+		}
+		return
+	}
+	if (v.kind != "object") {
+		return
+	}
+	if (v.keys.length == 1) {
+		const [k, a] = v.keys[0]
+		if (k == "Ref" && a.kind == "string") {
+			out.push(a.text)
+			return
+		}
+		if (k == "Fn::GetAtt") {
+			const target = if (a.kind == "string") split(a.text, ".")[0]
+				else if (a.items.length > 0) a.items[0].text
+				else ""
+			out.push(target)
+			return
+		}
+		if (k == "Fn::Sub") {
+			const s = if (a.kind == "string") a.text else if (a.items.length > 0) a.items[0].text else ""
+			const own: string[] = []
+			if (a.kind == "array" && a.items.length > 1) {
+				for (const [n, x] of a.items[1].keys) {
+					own.push(n)
+					collect(x, out)
+				}
+			}
+			for (const n of placeholders(s)) {
+				const name = split(n, ".")[0]
+				if (!has(own, name)) {
+					out.push(name)
+				}
+			}
+			return
+		}
+	}
+	for (const [_, x] of v.keys) {
+		collect(x, out)
+	}
+}
+
+/// The names in ${…} of a Fn::Sub string, but ${!…}.
+function placeholders(s: string): string[] {
+	const out: string[] = []
+	let i = 0
+	while (i < s.length - 1) {
+		if (at(s, i) == "$" && at(s, i + 1) == "{") {
+			const end = indexOf(s, "}", i)
+			if (end < 0) {
+				break
+			}
+			if (at(s, i + 2) != "!") {
+				out.push(s.slice(i + 2, end))
+			}
+			i = end + 1
+		} else {
+			i++
+		}
+	}
+	return out
+}
+
+/// The resources in the order they are made, each after those it refers to; refuses a cycle as AWS words it.
+export function ordered(t: Template): string[] throws TemplateError {
+	const done: string[] = []
+	let left: string[] = []
+	for (const [r, _] of t.resources) {
+		left.push(r)
+	}
+	while (left.length > 0) {
+		const next: string[] = []
+		for (const r of left) {
+			let ready = true
+			for (const n of references(resource(t, r)!)) {
+				if (n != r && resource(t, n) != null && !has(done, n)) {
+					ready = false
+				}
+			}
+			if (ready) {
+				done.push(r)
+			} else {
+				next.push(r)
+			}
+		}
+		if (next.length == left.length) {
+			sort(next)
+			throw new TemplateError(`Circular dependency between resources: [${next.join(", ")}]`)
+		}
+		left = next
+	}
+	return done
+}
+
+/// The definition of the resource r, null if none.
+export function resource(t: Template, r: string): Json | null {
+	for (const [n, d] of t.resources) {
+		if (n == r) {
+			return d
+		}
+	}
+	return null
+}
+
+/// What a value's evaluation finds wrong, as AWS words it.
+export class EvalError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+/// What the intrinsic functions see: the values of Ref of parameters, pseudo parameters and resources made, their
+/// attributes, the conditions, the mappings and the exports.
+export class Scope {
+	refs: [string, string][] = []
+	attributes: [string, string][] = []
+	conditions: [string, bool][] = []
+	mappings = new Json()
+	exports: [string, string][] = []
+	region = ""
+	/// The exports Fn::ImportValue has read.
+	imported: string[] = []
+	/// A parameter's list value, by name, as CommaDelimitedList gives.
+	lists: [string, string[]][] = []
+}
+
+function lookup(xs: [string, string][], k: string): string | null {
+	for (const [n, v] of xs) {
+		if (n == k) {
+			return v
+		}
+	}
+	return null
+}
+
+/// Whether v is {"Ref": "AWS::NoValue"}, which drops the property it is the value of.
+export function noValue(v: Json): bool {
+	return v.kind == "object" && v.keys.length == 1 && v.keys[0][0] == "Ref" && v.keys[0][1].text == "AWS::NoValue"
+}
+
+/// v with its intrinsic functions evaluated.
+export function evaluate(v: Json, s: Scope): Json throws EvalError {
+	if (v.kind == "array") {
+		const items: Json[] = []
+		for (const x of v.items) {
+			if (!noValue(x)) {
+				items.push(evaluate(x, s))
+			}
+		}
+		return arr(items)
+	}
+	if (v.kind != "object") {
+		return v
+	}
+	if (v.keys.length == 1
+		&& (v.keys[0][0] == "Ref" || startsWith(v.keys[0][0], "Fn::") || v.keys[0][0] == "Condition")) {
+		return intrinsic(v.keys[0][0], v.keys[0][1], s)
+	}
+	const out = new Json()
+	out.kind = "object"
+	for (const [k, x] of v.keys) {
+		if (!noValue(x)) {
+			out.keys.push([k, evaluate(x, s)])
+		}
+	}
+	return out
+}
+
+/// The text of a scalar value; a number's literal.
+export function text(v: Json): string { return if (v.kind == "object" || v.kind == "array") write(v) else v.text }
+
+function intrinsic(f: string, a: Json, s: Scope): Json throws EvalError {
+	if (f == "Ref") {
+		for (const [n, l] of s.lists) {
+			if (n == a.text) {
+				const items: Json[] = []
+				for (const x of l) {
+					items.push(str(x))
+				}
+				return arr(items)
+			}
+		}
+		const r = lookup(s.refs, a.text)
+		if (r == null) {
+			throw new EvalError(`Unresolved resource dependencies [${a.text}] in the Resources block of the template`)
+		}
+		return str(r!)
+	}
+	if (f == "Condition") {
+		return boolean(condition(a.text, s))
+	}
+	if (f == "Fn::GetAtt") {
+		const parts = if (a.kind == "string") split(a.text, ".") else [text(a.items[0]), text(evaluate(a.items[1], s))]
+		const name = `${parts[0]}.${parts.slice(1, parts.length).join(".")}`
+		const r = lookup(s.attributes, name)
+		if (r == null) {
+			throw new EvalError(`Template error: resource ${parts[0]} does not support attribute type ${parts[1]} in Fn::GetAtt`)
+		}
+		return str(r!)
+	}
+	if (f == "Fn::Join") {
+		const parts: string[] = []
+		for (const x of evaluate(a.items[1], s).items) {
+			parts.push(text(x))
+		}
+		return str(parts.join(text(a.items[0])))
+	}
+	if (f == "Fn::Sub") {
+		return str(sub(a, s))
+	}
+	if (f == "Fn::Select") {
+		const list = evaluate(a.items[1], s)
+		let i = 0
+		try {
+			i = parseInt(text(evaluate(a.items[0], s))) as i32
+		} catch (e: ParseError) {
+			throw new EvalError("Template error: Fn::Select requires a list argument with two elements: an integer index and a list")
+		}
+		if (i < 0 || i >= list.items.length) {
+			throw new EvalError("Template error: Fn::Select cannot select nonexistent value at index " + `${i}`)
+		}
+		return list.items[i]
+	}
+	if (f == "Fn::Split") {
+		const items: Json[] = []
+		for (const x of split(text(evaluate(a.items[1], s)), text(a.items[0]))) {
+			items.push(str(x))
+		}
+		return arr(items)
+	}
+	if (f == "Fn::If") {
+		return evaluate(if (condition(a.items[0].text, s)) a.items[1] else a.items[2], s)
+	}
+	if (f == "Fn::Equals") {
+		return boolean(text(evaluate(a.items[0], s)) == text(evaluate(a.items[1], s)))
+	}
+	if (f == "Fn::Not") {
+		return boolean(evaluate(a.items[0], s).text != "true")
+	}
+	if (f == "Fn::And" || f == "Fn::Or") {
+		let and = true
+		let or = false
+		for (const x of a.items) {
+			const b = evaluate(x, s).text == "true"
+			and = and && b
+			or = or || b
+		}
+		return boolean(if (f == "Fn::And") and else or)
+	}
+	if (f == "Fn::FindInMap") {
+		const m = s.mappings.get(text(evaluate(a.items[0], s)))
+		const top = m?.get(text(evaluate(a.items[1], s)))
+		const v = top?.get(text(evaluate(a.items[2], s)))
+		if (v == null) {
+			throw new EvalError(`Template error: Unable to get mapping for ${text(a.items[0])}::${text(evaluate(a.items[1], s))}::${text(evaluate(a.items[2], s))}`)
+		}
+		return v!
+	}
+	if (f == "Fn::ImportValue") {
+		const name = text(evaluate(a, s))
+		const v = lookup(s.exports, name)
+		if (v == null) {
+			throw new EvalError(`No export named ${name} found.`)
+		}
+		if (!has(s.imported, name)) {
+			s.imported.push(name)
+		}
+		return str(v!)
+	}
+	if (f == "Fn::Base64") {
+		return str(base64.encode(text(evaluate(a, s))))
+	}
+	if (f == "Fn::GetAZs") {
+		return arr([str(`${s.region}a`), str(`${s.region}b`), str(`${s.region}c`)])
+	}
+	throw new EvalError(`Template format error: Unrecognized intrinsic function: ${f}`)
+}
+
+/// The value of the condition named c.
+export function condition(c: string, s: Scope): bool throws EvalError {
+	for (const [n, b] of s.conditions) {
+		if (n == c) {
+			return b
+		}
+	}
+	throw new EvalError(`Template format error: Unresolved dependencies [${c}]. Cannot reference resources in the Conditions block of the template`)
+}
+
+function sub(a: Json, s: Scope): string throws EvalError {
+	const body = if (a.kind == "string") a.text else a.items[0].text
+	const own: [string, string][] = []
+	if (a.kind == "array" && a.items.length > 1) {
+		for (const [n, x] of a.items[1].keys) {
+			own.push([n, text(evaluate(x, s))])
+		}
+	}
+	let out = ""
+	let i = 0
+	while (i < body.length) {
+		if (at(body, i) == "$" && at(body, i + 1) == "{") {
+			const end = indexOf(body, "}", i)
+			if (end < 0) {
+				out = out + body.slice(i, body.length)
+				break
+			}
+			const name = body.slice(i + 2, end)
+			if (startsWith(name, "!")) {
+				out = out + "${" + name.slice(1, name.length) + "}"
+			} else {
+				const mine = lookup(own, name)
+				if (mine != null) {
+					out = out + mine!
+				} else if (indexOf(name, ".") >= 0) {
+					const r = lookup(s.attributes, name)
+					if (r == null) {
+						throw new EvalError(`Template error: unresolved attribute ${name} in Fn::Sub`)
+					}
+					out = out + r!
+				} else {
+					const r = lookup(s.refs, name)
+					if (r == null) {
+						throw new EvalError(`Unresolved resource dependencies [${name}] in the Resources block of the template`)
+					}
+					out = out + r!
+				}
+			}
+			i = end + 1
+		} else {
+			out = out + at(body, i)
+			i++
+		}
+	}
+	return out
+}
+
+/// Whether xs holds x.
+export function has(xs: string[], x: string): bool {
+	for (const y of xs) {
+		if (y == x) {
+			return true
+		}
+	}
+	return false
+}
+
+/// The character of s at i, "" past its end.
+function at(s: string, i: i32): string { return if (i < s.length) s.slice(i, i + 1) else "" }

@@ -1,0 +1,48 @@
+import { evaluate, EvalError, ordered, read, Scope, TemplateError, text } from "./template"
+import { parse } from "../stepfunctions/value"
+
+/// The text of the value v evaluates to in s.
+function value(v: string, s: Scope): string { return text(evaluate(parse(v), s)) }
+
+test "intrinsic functions: Ref, Fn::Sub, Fn::Join, Fn::Select, Fn::Split, Fn::If, Fn::FindInMap, Fn::Base64" {
+	const s = new Scope()
+	s.refs = [["Env", "prod"], ["AWS::Region", "us-east-1"], ["Q", "url"]]
+	s.attributes = [["Q.Arn", "arn:q"]]
+	s.conditions = [["IsProd", true]]
+	s.mappings = parse(`{"M": {"prod": {"Size": "5"}}}`)
+	assert value(`{"Fn::Sub": "\${Env}-\${Q.Arn}-\${!Literal}"}`, s) == "prod-arn:q-\${Literal}"
+	assert value(`{"Fn::Sub": ["\${A}/\${AWS::Region}", {"A": {"Ref": "Env"}}]}`, s) == "prod/us-east-1"
+	assert value(`{"Fn::Join": ["-", ["a", {"Ref": "Env"}, {"Fn::GetAtt": ["Q", "Arn"]}]]}`, s) == "a-prod-arn:q"
+	assert value(`{"Fn::Select": ["1", {"Fn::Split": [",", "a,b,c"]}]}`, s) == "b"
+	assert value(`{"Fn::If": ["IsProd", "yes", "no"]}`, s) == "yes"
+	assert value(`{"Fn::FindInMap": ["M", {"Ref": "Env"}, "Size"]}`, s) == "5"
+	assert value(`{"Fn::Base64": "hi"}`, s) == "aGk="
+	assert value(`{"Fn::Equals": [{"Ref": "Env"}, "prod"]}`, s) == "true"
+	assert value(`{"Fn::And": [{"Condition": "IsProd"}, {"Fn::Not": [{"Fn::Equals": ["a", "b"]}]}]}`, s) == "true"
+	assert value(`{"P": {"Ref": "AWS::NoValue"}, "Q": [1, {"Ref": "AWS::NoValue"}]}`, s) == `{"Q":[1]}`
+	try {
+		value(`{"Fn::ImportValue": "none"}`, s)
+		assert false
+	} catch (e: EvalError) {
+		assert e.message == "No export named none found."
+	}
+}
+
+test "a template's resources are ordered by references and DependsOn; a missing reference and no resources refused" {
+	const t = read(`{"Resources": {"A": {"Type": "T", "Properties": {"X": {"Fn::GetAtt": "B.Arn"}}},`
+		+ `"B": {"Type": "T", "DependsOn": ["C"]}, "C": {"Type": "T", "Properties": {"Y": {"Fn::Sub": "\${AWS::Region}"}}}}}`)
+	assert ordered(t).join(",") == "C,B,A"
+	try {
+		read(`{"Resources": {"A": {"Type": "T", "Properties": {"X": {"Ref": "Nope"}}}}}`)
+		assert false
+	} catch (e: TemplateError) {
+		assert e.message
+			== "Template format error: Unresolved resource dependencies [Nope] in the Resources block of the template"
+	}
+	try {
+		read(`{"Parameters": {}}`)
+		assert false
+	} catch (e: TemplateError) {
+		assert e.message == "Template format error: At least one Resources member must be defined."
+	}
+}

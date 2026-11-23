@@ -73,6 +73,7 @@ function query(g: Gateway, service: string, params: [string, string][], k: Key =
 	const version = switch (service) {
 		case "iam": "2010-05-08"
 		case "sts": "2011-06-15"
+		case "cloudformation": "2010-05-15"
 		default: "2010-03-31"
 	}
 	const body = `Version=${version}`
@@ -1221,4 +1222,44 @@ test "Firehose writes each put as one S3 object as its role, from Logs, EventBri
 	assert got.some(o => indexOf(o[1], `"source":"app"`) > 0)
 	assert got.some(o => indexOf(o[1], `"Type":"Notification"`) > 0 && indexOf(o[1], `"Message":"hello"`) > 0)
 	g.close()
+}
+
+test "CloudFormation makes a stack's queue, topic and output, and deletes them in reverse" {
+	const g = gateway()
+	const template = `{"Parameters": {"Suffix": {"Type": "String", "Default": "x"}}, "Resources": {`
+		+ `"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": {"Fn::Sub": "q-\${Suffix}"}}},`
+		+ `"T": {"Type": "AWS::SNS::Topic", "Properties": {"DisplayName": {"Fn::GetAtt": ["Q", "QueueName"]}}},`
+		+ `"H": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "T"}},`
+		+ `"Outputs": {"Arn": {"Value": {"Fn::GetAtt": "Q.Arn"}, "Export": {"Name": "qarn"}}}}`
+	let res = query(g, "cloudformation", [["Action", "CreateStack"], ["StackName", "s1"], ["TemplateBody", template]])
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "<StackId>arn:aws:cloudformation:us-east-1:") >= 0
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName": "q-x"}`).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	assert indexOf(res.body.whole ?? "", `<OutputValue>${queueArn("q-x")}</OutputValue>`) >= 0
+	res = query(g, "cloudformation", [["Action", "ListExports"]])
+	assert indexOf(res.body.whole ?? "", "<Name>qarn</Name>") >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeStackEvents"], ["StackName", "s1"]])
+	assert indexOf(res.body.whole ?? "", "Resource creation Initiated") >= 0
+	res = query(g, "cloudformation", [["Action", "UpdateStack"], ["StackName", "s1"], ["TemplateBody", template]])
+	assert fails(res, 400, "ValidationError", "No updates are to be performed.")
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "s1"]]).status == 200
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName": "q-x"}`).status == 400
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s1"]])
+	assert fails(res, 400, "ValidationError", "Stack with id s1 does not exist")
+}
+
+test "CloudFormation rolls a stack back from a type it does not know, and refuses a cycle" {
+	const g = gateway()
+	const template = `{"Resources": {"Q": {"Type": "AWS::SQS::Queue"}, "X": {"Type": "AWS::Nope::Thing", "DependsOn": "Q"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateStack"], ["StackName", "s2"], ["TemplateBody", template]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "s2"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>ROLLBACK_COMPLETE</StackStatus>") >= 0
+	res = call(g, "sqs", "ListQueues", "{}")
+	assert indexOf(res.body.whole ?? "", "s2-Q-") < 0
+	const cycle = `{"Resources": {"A": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "B"},`
+		+ `"B": {"Type": "AWS::CloudFormation::WaitConditionHandle", "DependsOn": "A"}}}`
+	res = query(g, "cloudformation", [["Action", "ValidateTemplate"], ["TemplateBody", cycle]])
+	assert fails(res, 400, "ValidationError", "Circular dependency between resources: [A, B]")
 }

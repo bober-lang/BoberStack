@@ -1,0 +1,1115 @@
+//! AWS CloudFormation: stacks of JSON templates, made of resources of the services BoberStack has. BoberStack has no
+//! timers and runs nothing between requests, so a stack is created, updated or deleted inside its request, to its end
+//! state, as CREATE_COMPLETE or ROLLBACK_COMPLETE, with the events AWS writes on the way: CREATE_IN_PROGRESS, then
+//! CREATE_IN_PROGRESS with "Resource creation Initiated", then CREATE_COMPLETE of each resource, and the stack's own.
+//! Each resource is made by a direct call of its service's handler, as a session of the stack's RoleARN if it has one,
+//! else as the caller, so that IAM decides as on AWS. Where AWS differs:
+//!
+//! - Templates are JSON only: YAML, TemplateURL, transforms and change sets are refused or not implemented.
+//! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SNS::Topic,
+//!   AWS::S3::Bucket and AWS::Logs::LogGroup; any other fails its resource, CREATE_FAILED, and the stack rolls back.
+//!   Their properties are those of each service's create call; tags are not propagated.
+//! - Resources are made one after another, so a failure fails only its resource: none is "Resource creation
+//!   cancelled".
+//! - UpdateStack replaces a resource whose properties change, as if each property required replacement; one that
+//!   fails fails the request, so nothing it did is kept, where AWS rolls the update back to UPDATE_ROLLBACK_COMPLETE.
+//!   UPDATE_COMPLETE_CLEANUP_IN_PROGRESS, which the model's ResourceStatus lacks, is not recorded.
+//! - Fn::GetAZs gives the region's a, b and c; a failed resource's reason is the handler's message quoted as AWS quotes
+//!   a resource handler's, without its RequestToken and HandlerErrorCode.
+//! - Nothing is paged: each list is answered whole.
+
+import * as api from "./api"
+
+import { condition, evaluate, EvalError, has, ordered, read, resource, Scope, Template, TemplateError,
+	text } from "./template"
+
+import * as logsApi from "../logs/api"
+import * as s3Api from "../s3/api"
+import * as snsApi from "../sns/api"
+import * as sqsApi from "../sqs/api"
+import { Json, str, write } from "../stepfunctions/value"
+import { Fault } from "../../core/fault"
+import { Caller, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import { startsWith } from "std/algo"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import { EncodeError } from "std/encoding/json"
+import { lower, split } from "std/string"
+import { rfc3339 } from "std/time"
+
+/// Who CloudFormation is to the roles it assumes.
+const principal = "cloudformation.amazonaws.com"
+
+/// A resource of a stack.
+export class Made {
+	logical = ""
+	kind = ""
+	physical = ""
+	status: api.ResourceStatus = "CREATE_COMPLETE"
+	reason: string | null = null
+	at: i64 = 0
+	/// Its Ref value and attributes, as GetAtt names them.
+	ref = ""
+	attributes: [string, string][] = []
+	/// Its properties evaluated, as JSON, which an update compares.
+	properties = ""
+	retain = false
+}
+
+/// An event of a stack or one of its resources.
+export class Event {
+	id = ""
+	logical = ""
+	physical = ""
+	kind = ""
+	status: api.ResourceStatus = "CREATE_IN_PROGRESS"
+	reason: string | null = null
+	at: i64 = 0
+}
+
+/// A stack's output.
+export class Out {
+	key = ""
+	value = ""
+	description: string | null = null
+	export: string | null = null
+}
+
+/// A stack, kept by its id after it is deleted.
+export class Stack {
+	id = ""
+	name = ""
+	status: api.StackStatus = "CREATE_IN_PROGRESS"
+	reason: string | null = null
+	description: string | null = null
+	body = ""
+	parameters: [string, string][] = []
+	hidden: string[] = []
+	outputs: Out[] = []
+	resources: Made[] = []
+	events: Event[] = []
+	imports: string[] = []
+	created: i64 = 0
+	updated: i64 | null = null
+	deleted: i64 | null = null
+	capabilities: api.Capability[] = []
+	tags: [string, string][] = []
+	role: string | null = null
+	disableRollback = false
+}
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	/// The services whose resources stacks make.
+	sqs: sqsApi.SQS
+	sns: snsApi.SNS
+	s3: s3Api.S3
+	logs: logsApi.CloudWatchLogs
+
+	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Api.S3, logs: logsApi.CloudWatchLogs) {
+		this.sqs = sqs
+		this.sns = sns
+		this.s3 = s3
+		this.logs = logs
+	}
+
+	validateTemplate(caller: Caller, input: api.ValidateTemplateInput): api.ValidateTemplateOutput throws Fault {
+		const t = template(input.TemplateBody, input.TemplateURL)
+		const out = new api.ValidateTemplateOutput()
+		out.Description = t.description
+		const ps: api.TemplateParameter[] = []
+		for (const [k, d] of t.parameters) {
+			const p = new api.TemplateParameter()
+			p.ParameterKey = k
+			p.DefaultValue = if (d.get("Default") == null) null else text(d.get("Default")!)
+			p.NoEcho = d.get("NoEcho")?.text == "true"
+			p.Description = d.str("Description")
+			ps.push(p)
+		}
+		out.Parameters = ps
+		const iam = iamTypes(t)
+		if (iam.length > 0) {
+			out.Capabilities = [if (named(t)) "CAPABILITY_NAMED_IAM" else "CAPABILITY_IAM"]
+			out.CapabilitiesReason = `The following resource(s) require capabilities: [${iam.join(", ")}]`
+		}
+		return out
+	}
+
+	createStack(caller: Caller, input: api.CreateStackInput): api.CreateStackOutput throws Fault {
+		const db = table(caller)
+		if (live(db, input.StackName) != null) {
+			throw api.alreadyExistsException(`Stack [${input.StackName}] already exists`)
+		}
+		const body = input.TemplateBody
+		const t = template(body, input.TemplateURL)
+		capable(t, input.Capabilities ?? [])
+		const s = new Stack()
+		s.id = `arn:aws:cloudformation:${caller.region}:${caller.account}:stack/${input.StackName}/${uuid()}`
+		s.name = input.StackName
+		s.body = body!
+		s.description = t.description
+		s.created = now()
+		s.capabilities = input.Capabilities ?? []
+		s.role = input.RoleARN
+		s.disableRollback = input.DisableRollback ?? false
+		for (const tag of input.Tags ?? []) {
+			s.tags.push([tag.Key, tag.Value])
+		}
+		parameters(s, t, input.Parameters ?? [], [])
+		const order = sequence(t)
+		const onFailure = input.OnFailure ?? (if (s.disableRollback) "DO_NOTHING" else "ROLLBACK")
+		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS", "User Initiated")
+		const failed = this.build(caller, s, t, order, db, [])
+		if (failed == null) {
+			s.status = "CREATE_COMPLETE"
+			event(s, s.name, s.id, "AWS::CloudFormation::Stack", "CREATE_COMPLETE", null)
+		} else if (onFailure == "DO_NOTHING") {
+			s.status = "CREATE_FAILED"
+			s.reason = failed
+			event(s, s.name, s.id, "AWS::CloudFormation::Stack", "CREATE_FAILED", failed)
+		} else {
+			s.status = "ROLLBACK_IN_PROGRESS"
+			const why = `${failed}. Rollback requested by user.`
+			event(s, s.name, s.id, "AWS::CloudFormation::Stack", "ROLLBACK_IN_PROGRESS", why)
+			this.tear(caller, s, false)
+			s.outputs = []
+			if (onFailure == "DELETE") {
+				s.status = "DELETE_COMPLETE"
+				s.deleted = now()
+				event(s, s.name, s.id, "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null)
+			} else {
+				s.status = "ROLLBACK_COMPLETE"
+				event(s, s.name, s.id, "AWS::CloudFormation::Stack", "ROLLBACK_COMPLETE", null)
+			}
+		}
+		save(db, s)
+		const out = new api.CreateStackOutput()
+		out.StackId = s.id
+		return out
+	}
+
+	updateStack(caller: Caller, input: api.UpdateStackInput): api.UpdateStackOutput throws Fault {
+		const db = table(caller)
+		const s = found(db, input.StackName)
+		if (s.status != "CREATE_COMPLETE" && s.status != "UPDATE_COMPLETE" && s.status != "UPDATE_ROLLBACK_COMPLETE") {
+			throw validation(`Stack:${s.id} is in ${s.status} state and can not be updated.`)
+		}
+		const body = if (input.UsePreviousTemplate ?? false) s.body else input.TemplateBody
+		const t = template(body, input.TemplateURL)
+		capable(t, input.Capabilities ?? s.capabilities)
+		const before = s.parameters
+		const was = s.resources
+		const oldBody = s.body
+		s.body = body!
+		s.description = t.description
+		parameters(s, t, input.Parameters ?? [], before)
+		const order = sequence(t)
+		if (oldBody == s.body && same(before, s.parameters)) {
+			s.body = oldBody
+			s.parameters = before
+			throw validation("No updates are to be performed.")
+		}
+		s.status = "UPDATE_IN_PROGRESS"
+		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS", "User Initiated")
+		s.resources = []
+		const failed = this.build(caller, s, t, order, db, was)
+		if (failed != null) {
+			throw validation(failed!)
+		}
+		for (let i = was.length - 1; i >= 0; i--) {
+			const r = was[i]
+			const now = kept(s, r.logical)
+			if (now == null || now.physical != r.physical) {
+				this.remove(caller, s, r)
+			}
+		}
+		s.status = "UPDATE_COMPLETE"
+		s.updated = now()
+		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "UPDATE_COMPLETE", null)
+		save(db, s)
+		const out = new api.UpdateStackOutput()
+		out.StackId = s.id
+		return out
+	}
+
+	deleteStack(caller: Caller, input: api.DeleteStackInput): Unit throws Fault {
+		const db = table(caller)
+		const s = stack(db, input.StackName)
+		if (s == null || s.status == "DELETE_COMPLETE") {
+			return new Unit()
+		}
+		for (const o of s.outputs) {
+			if (o.export != null) {
+				for (const [_, other] of db.scan()) {
+					if (other.status != "DELETE_COMPLETE" && has(other.imports, o.export!)) {
+						throw validation(`Export ${o.export!} cannot be deleted as it is in use by ${other.name}`)
+					}
+				}
+			}
+		}
+		for (const r of s.resources) {
+			r.retain = r.retain || has(input.RetainResources ?? [], r.logical)
+		}
+		s.status = "DELETE_IN_PROGRESS"
+		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", "User Initiated")
+		this.tear(caller, s, true)
+		s.status = "DELETE_COMPLETE"
+		s.deleted = now()
+		s.outputs = []
+		s.imports = []
+		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null)
+		save(db, s)
+		return new Unit()
+	}
+
+	describeStacks(caller: Caller, input: api.DescribeStacksInput): api.DescribeStacksOutput throws Fault {
+		const db = table(caller)
+		const out = new api.DescribeStacksOutput()
+		const stacks: api.Stack[] = []
+		if (input.StackName != null) {
+			stacks.push(described(found(db, input.StackName!)))
+		} else {
+			for (const [_, s] of db.scan()) {
+				if (s.status != "DELETE_COMPLETE") {
+					stacks.push(described(s))
+				}
+			}
+		}
+		out.Stacks = stacks
+		return out
+	}
+
+	listStacks(caller: Caller, input: api.ListStacksInput): api.ListStacksOutput throws Fault {
+		const out = new api.ListStacksOutput()
+		const filter = input.StackStatusFilter ?? []
+		const sums: api.StackSummary[] = []
+		for (const [_, s] of table(caller).scan()) {
+			if (filter.length == 0 || filter.includes(s.status)) {
+				const m = new api.StackSummary()
+				m.StackId = s.id
+				m.StackName = s.name
+				m.TemplateDescription = s.description
+				m.CreationTime = s.created
+				m.LastUpdatedTime = s.updated
+				m.DeletionTime = s.deleted
+				m.StackStatus = s.status
+				m.StackStatusReason = s.reason
+				sums.push(m)
+			}
+		}
+		out.StackSummaries = sums
+		return out
+	}
+
+	describeStackEvents(caller: Caller,
+		input: api.DescribeStackEventsInput): api.DescribeStackEventsOutput throws Fault {
+		const s = found(table(caller), input.StackName)
+		const out = new api.DescribeStackEventsOutput()
+		const events: api.StackEvent[] = []
+		for (let i = s.events.length - 1; i >= 0; i--) {
+			const e = s.events[i]
+			const m = new api.StackEvent()
+			m.StackId = s.id
+			m.EventId = e.id
+			m.StackName = s.name
+			m.LogicalResourceId = e.logical
+			m.PhysicalResourceId = e.physical
+			m.ResourceType = e.kind
+			m.Timestamp = e.at
+			m.ResourceStatus = e.status
+			m.ResourceStatusReason = e.reason
+			events.push(m)
+		}
+		out.StackEvents = events
+		return out
+	}
+
+	describeStackResources(caller: Caller,
+		input: api.DescribeStackResourcesInput): api.DescribeStackResourcesOutput throws Fault {
+		if (input.StackName == null && input.PhysicalResourceId == null) {
+			throw validation("Either StackName or PhysicalResourceId must be specified.")
+		}
+		const db = table(caller)
+		let s: Stack | null = null
+		if (input.StackName != null) {
+			s = found(db, input.StackName!)
+		} else {
+			for (const [_, x] of db.scan()) {
+				for (const r of x.resources) {
+					if (r.physical == input.PhysicalResourceId && x.status != "DELETE_COMPLETE") {
+						s = x
+					}
+				}
+			}
+			if (s == null) {
+				throw validation(`Stack for ${input.PhysicalResourceId!} does not exist`)
+			}
+		}
+		const out = new api.DescribeStackResourcesOutput()
+		const rs: api.StackResource[] = []
+		for (const r of s!.resources) {
+			if (input.LogicalResourceId == null || input.LogicalResourceId == r.logical) {
+				const m = new api.StackResource()
+				m.StackName = s!.name
+				m.StackId = s!.id
+				m.LogicalResourceId = r.logical
+				m.PhysicalResourceId = r.physical
+				m.ResourceType = r.kind
+				m.Timestamp = r.at
+				m.ResourceStatus = r.status
+				m.ResourceStatusReason = r.reason
+				rs.push(m)
+			}
+		}
+		out.StackResources = rs
+		return out
+	}
+
+	describeStackResource(caller: Caller,
+		input: api.DescribeStackResourceInput): api.DescribeStackResourceOutput throws Fault {
+		const s = found(table(caller), input.StackName)
+		const r = kept(s, input.LogicalResourceId)
+		if (r == null) {
+			throw validation(`Resource ${input.LogicalResourceId} does not exist for stack ${input.StackName}`)
+		}
+		const m = new api.StackResourceDetail()
+		m.StackName = s.name
+		m.StackId = s.id
+		m.LogicalResourceId = r!.logical
+		m.PhysicalResourceId = r!.physical
+		m.ResourceType = r!.kind
+		m.LastUpdatedTimestamp = r!.at
+		m.ResourceStatus = r!.status
+		m.ResourceStatusReason = r!.reason
+		m.Metadata = "{}"
+		const out = new api.DescribeStackResourceOutput()
+		out.StackResourceDetail = m
+		return out
+	}
+
+	listStackResources(caller: Caller, input: api.ListStackResourcesInput): api.ListStackResourcesOutput throws Fault {
+		const s = found(table(caller), input.StackName)
+		const out = new api.ListStackResourcesOutput()
+		const rs: api.StackResourceSummary[] = []
+		for (const r of s.resources) {
+			const m = new api.StackResourceSummary()
+			m.LogicalResourceId = r.logical
+			m.PhysicalResourceId = r.physical
+			m.ResourceType = r.kind
+			m.LastUpdatedTimestamp = r.at
+			m.ResourceStatus = r.status
+			m.ResourceStatusReason = r.reason
+			rs.push(m)
+		}
+		out.StackResourceSummaries = rs
+		return out
+	}
+
+	getTemplate(caller: Caller, input: api.GetTemplateInput): api.GetTemplateOutput throws Fault {
+		if (input.StackName == null) {
+			throw validation("Either StackName or ChangeSetName must be specified.")
+		}
+		const s = found(table(caller), input.StackName!)
+		const out = new api.GetTemplateOutput()
+		out.TemplateBody = s.body
+		out.StagesAvailable = ["Original", "Processed"]
+		return out
+	}
+
+	getTemplateSummary(caller: Caller, input: api.GetTemplateSummaryInput): api.GetTemplateSummaryOutput throws Fault {
+		const body = if (input.StackName != null) found(table(caller), input.StackName!).body else input.TemplateBody
+		const t = template(body, input.TemplateURL)
+		const out = new api.GetTemplateSummaryOutput()
+		out.Description = t.description
+		const ps: api.ParameterDeclaration[] = []
+		for (const [k, d] of t.parameters) {
+			const p = new api.ParameterDeclaration()
+			p.ParameterKey = k
+			p.DefaultValue = if (d.get("Default") == null) null else text(d.get("Default")!)
+			p.ParameterType = d.str("Type")
+			p.NoEcho = d.get("NoEcho")?.text == "true"
+			p.Description = d.str("Description")
+			p.ParameterConstraints = new api.ParameterConstraints()
+			ps.push(p)
+		}
+		out.Parameters = ps
+		const types: string[] = []
+		for (const [_, d] of t.resources) {
+			if (!has(types, d.str("Type")!)) {
+				types.push(d.str("Type")!)
+			}
+		}
+		out.ResourceTypes = types
+		out.Version = "2010-09-09"
+		const iam = iamTypes(t)
+		if (iam.length > 0) {
+			out.Capabilities = [if (named(t)) "CAPABILITY_NAMED_IAM" else "CAPABILITY_IAM"]
+			out.CapabilitiesReason = `The following resource(s) require capabilities: [${iam.join(", ")}]`
+		}
+		out.DeclaredTransforms = []
+		return out
+	}
+
+	listExports(caller: Caller, input: api.ListExportsInput): api.ListExportsOutput throws Fault {
+		const out = new api.ListExportsOutput()
+		const xs: api.Export[] = []
+		for (const [name, value, id] of exported(table(caller))) {
+			const e = new api.Export()
+			e.ExportingStackId = id
+			e.Name = name
+			e.Value = value
+			xs.push(e)
+		}
+		out.Exports = xs
+		return out
+	}
+
+	listImports(caller: Caller, input: api.ListImportsInput): api.ListImportsOutput throws Fault {
+		const names: string[] = []
+		for (const [_, s] of table(caller).scan()) {
+			if (s.status != "DELETE_COMPLETE" && has(s.imports, input.ExportName)) {
+				names.push(s.name)
+			}
+		}
+		if (names.length == 0) {
+			throw validation(`Export '${input.ExportName}' is not imported by any stack.`)
+		}
+		const out = new api.ListImportsOutput()
+		out.Imports = names
+		return out
+	}
+
+	/// Makes t's resources of s in order, keeping those of was whose properties are the same, and its outputs; the
+	/// reason it failed for, null if it did not.
+	private build(caller: Caller, s: Stack, t: Template, order: string[], db: Table[Stack],
+		was: Made[]): string | null throws Fault {
+		const scope = this.scope(caller, s, t, db)
+		for (const logical of order) {
+			const d = resource(t, logical)!
+			const c = d.str("Condition")
+			try {
+				if (c != null && !condition(c!, scope)) {
+					continue
+				}
+			} catch (e: EvalError) {
+				return e.message
+			}
+			const kind = d.str("Type")!
+			let props = new Json()
+			props.kind = "object"
+			try {
+				props = evaluate(d.get("Properties") ?? props, scope)
+			} catch (e: EvalError) {
+				return e.message
+			}
+			let prior: Made | null = null
+			for (const r of was) {
+				if (r.logical == logical && r.kind == kind && r.properties == write(props)) {
+					prior = r
+				}
+			}
+			if (prior != null) {
+				s.resources.push(prior!)
+				bind(scope, prior!)
+				continue
+			}
+			const r = new Made()
+			r.logical = logical
+			r.kind = kind
+			r.properties = write(props)
+			r.retain = d.str("DeletionPolicy") == "Retain"
+			let replacing = false
+			for (const x of was) {
+				replacing = replacing || x.logical == logical
+			}
+			const status: api.ResourceStatus = if (replacing) "UPDATE_IN_PROGRESS" else "CREATE_IN_PROGRESS"
+			event(s, logical, "", kind, status,
+				if (replacing) "Requested update requires the creation of a new physical resource; hence creating one."
+				else null)
+			try {
+				this.make(this.acting(caller, s), s, r, props)
+			} catch (f: Fault) {
+				const why = `Resource handler returned message: "${f.message}"`
+				r.status = if (status == "UPDATE_IN_PROGRESS") "UPDATE_FAILED" else "CREATE_FAILED"
+				r.reason = why
+				r.at = now()
+				event(s, logical, "", kind, r.status, why)
+				s.resources.push(r)
+				return `The following resource(s) failed to ${if (status == "UPDATE_IN_PROGRESS") "update" else "create"}: [${logical}]`
+			}
+			r.at = now()
+			r.status = if (status == "UPDATE_IN_PROGRESS") "UPDATE_COMPLETE" else "CREATE_COMPLETE"
+			event(s, logical, r.physical, kind, status, "Resource creation Initiated")
+			event(s, logical, r.physical, kind, r.status, null)
+			s.resources.push(r)
+			bind(scope, r)
+		}
+		const outs: Out[] = []
+		const names: string[] = []
+		for (const [_, other] of db.scan()) {
+			for (const o of other.outputs) {
+				if (o.export != null && other.id != s.id) {
+					names.push(o.export!)
+				}
+			}
+		}
+		try {
+			for (const [k, d] of t.outputs) {
+				const c = d.str("Condition")
+				if (c != null && !condition(c!, scope)) {
+					continue
+				}
+				const o = new Out()
+				o.key = k
+				o.value = text(evaluate(d.get("Value") ?? str(""), scope))
+				o.description = d.str("Description")
+				const e = d.get("Export")?.get("Name")
+				if (e != null) {
+					o.export = text(evaluate(e!, scope))
+					if (has(names, o.export!)) {
+						return `Export with name ${o.export!} is already exported by stack ${exporter(db, o.export!)}`
+					}
+				}
+				outs.push(o)
+			}
+		} catch (e: EvalError) {
+			return e.message
+		}
+		s.outputs = outs
+		s.imports = scope.imported
+		return null
+	}
+
+	/// What the intrinsic functions of s see.
+	private scope(caller: Caller, s: Stack, t: Template, db: Table[Stack]): Scope throws Fault {
+		const scope = new Scope()
+		scope.region = caller.region
+		scope.mappings = t.mappings
+		for (const [k, v] of s.parameters) {
+			const d = parameter(t, k)
+			if (d != null && startsWith(d!.str("Type") ?? "", "List<") || d?.str("Type") == "CommaDelimitedList") {
+				scope.lists.push([k, split(v, ",")])
+			}
+			scope.refs.push([k, v])
+		}
+		scope.refs.push(["AWS::Region", caller.region])
+		scope.refs.push(["AWS::AccountId", caller.account])
+		scope.refs.push(["AWS::StackName", s.name])
+		scope.refs.push(["AWS::StackId", s.id])
+		scope.refs.push(["AWS::Partition", "aws"])
+		scope.refs.push(["AWS::URLSuffix", "amazonaws.com"])
+		for (const [name, value, _] of exported(db)) {
+			scope.exports.push([name, value])
+		}
+		for (const [k, d] of t.conditions) {
+			try {
+				scope.conditions.push([k, evaluate(d, scope).text == "true"])
+			} catch (e: EvalError) {
+				throw validation(`Template format error: ${e.message}`)
+			}
+		}
+		return scope
+	}
+
+	/// Makes r of its properties as c, setting its physical id, Ref value and attributes.
+	private make(c: Caller, s: Stack, r: Made, p: Json) throws Fault {
+		if (r.kind == "AWS::CloudFormation::WaitConditionHandle") {
+			r.physical = `https://cloudformation-waitcondition-${c.region}.s3.amazonaws.com/${encode(s.id)}/${r.logical}`
+			r.ref = r.physical
+			return
+		}
+		if (r.kind == "AWS::SQS::Queue") {
+			const fifo = p.get("FifoQueue")?.text == "true"
+			const name = p.str("QueueName")
+				?? `${physical(s, r, 80 - (if (fifo) 5 else 0), false)}${if (fifo) ".fifo" else ""}`
+			const q = new sqsApi.CreateQueueRequest()
+			q.QueueName = name
+			const attrs: [sqsApi.QueueAttributeName, string][] = []
+			for (const [k, v] of p.keys) {
+				const a = queueAttribute(k)
+				if (a != null) {
+					attrs.push([a!, text(v)])
+				}
+			}
+			q.Attributes = attrs
+			c.actions = ["sqs:CreateQueue"]
+			const url = this.sqs.createQueue(c, q).QueueUrl ?? ""
+			const arn = `arn:aws:sqs:${c.region}:${c.account}:${name}`
+			r.physical = url
+			r.ref = url
+			r.attributes = [["Arn", arn], ["QueueName", name], ["QueueUrl", url]]
+			return
+		}
+		if (r.kind == "AWS::SNS::Topic") {
+			const fifo = p.get("FifoTopic")?.text == "true"
+			const name = p.str("TopicName")
+				?? `${physical(s, r, 256 - (if (fifo) 5 else 0), false)}${if (fifo) ".fifo" else ""}`
+			const q = new snsApi.CreateTopicInput()
+			q.Name = name
+			const attrs: [string, string][] = []
+			for (const k of ["DisplayName", "FifoTopic", "ContentBasedDeduplication", "KmsMasterKeyId"]) {
+				if (p.get(k) != null) {
+					attrs.push([k, text(p.get(k)!)])
+				}
+			}
+			q.Attributes = attrs
+			c.actions = ["sns:CreateTopic"]
+			const arn = this.sns.createTopic(c, q).TopicArn ?? ""
+			r.physical = arn
+			r.ref = arn
+			r.attributes = [["TopicArn", arn], ["TopicName", name]]
+			return
+		}
+		if (r.kind == "AWS::S3::Bucket") {
+			const name = p.str("BucketName") ?? physical(s, r, 63, true)
+			const q = new s3Api.CreateBucketRequest()
+			q.Bucket = name
+			c.actions = ["s3:CreateBucket"]
+			this.s3.createBucket(c, q)
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", `arn:aws:s3:::${name}`], ["DomainName", `${name}.s3.amazonaws.com`],
+				["RegionalDomainName", `${name}.s3.${c.region}.amazonaws.com`],
+				["WebsiteURL", `http://${name}.s3-website-${c.region}.amazonaws.com`]]
+			return
+		}
+		if (r.kind == "AWS::Logs::LogGroup") {
+			const name = p.str("LogGroupName") ?? physical(s, r, 512, false)
+			const q = new logsApi.CreateLogGroupRequest()
+			q.logGroupName = name
+			c.actions = ["logs:CreateLogGroup"]
+			this.logs.createLogGroup(c, q)
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", `arn:aws:logs:${c.region}:${c.account}:log-group:${name}:*`]]
+			return
+		}
+		throw new Fault(400, "ValidationError", `Unrecognized resource types: [${r.kind}]`)
+	}
+
+	/// Deletes r as the stack's session, but one retained or deleted; one that failed to be made has nothing to delete.
+	private remove(caller: Caller, s: Stack, r: Made) throws Fault {
+		if (r.status == "DELETE_COMPLETE" || r.status == "DELETE_SKIPPED") {
+			return
+		}
+		r.at = now()
+		if (r.retain) {
+			r.status = "DELETE_SKIPPED"
+			event(s, r.logical, r.physical, r.kind, "DELETE_SKIPPED", null)
+			return
+		}
+		r.status = "DELETE_COMPLETE"
+		if (r.physical == "") {
+			event(s, r.logical, "", r.kind, "DELETE_COMPLETE", null)
+			return
+		}
+		event(s, r.logical, r.physical, r.kind, "DELETE_IN_PROGRESS", null)
+		const c = this.acting(caller, s)
+		try {
+			if (r.kind == "AWS::SQS::Queue") {
+				const q = new sqsApi.DeleteQueueRequest()
+				q.QueueUrl = r.physical
+				c.actions = ["sqs:DeleteQueue"]
+				this.sqs.deleteQueue(c, q)
+			} else if (r.kind == "AWS::SNS::Topic") {
+				const q = new snsApi.DeleteTopicInput()
+				q.TopicArn = r.physical
+				c.actions = ["sns:DeleteTopic"]
+				this.sns.deleteTopic(c, q)
+			} else if (r.kind == "AWS::S3::Bucket") {
+				const q = new s3Api.DeleteBucketRequest()
+				q.Bucket = r.physical
+				c.actions = ["s3:DeleteBucket"]
+				this.s3.deleteBucket(c, q)
+			} else if (r.kind == "AWS::Logs::LogGroup") {
+				const q = new logsApi.DeleteLogGroupRequest()
+				q.logGroupName = r.physical
+				c.actions = ["logs:DeleteLogGroup"]
+				this.logs.deleteLogGroup(c, q)
+			}
+		} catch (f: Fault) {
+			if (f.code != "AWS.SimpleQueueService.NonExistentQueue" && f.code != "NotFound" && f.code != "NoSuchBucket"
+				&& f.code != "ResourceNotFoundException") {
+				throw f
+			}
+		}
+		event(s, r.logical, r.physical, r.kind, "DELETE_COMPLETE", null)
+	}
+
+	/// Deletes s's resources in the reverse of their order, which it keeps as deleted; on a rollback, the retained ones
+	/// as well.
+	private tear(caller: Caller, s: Stack, deleting: bool) throws Fault {
+		for (let i = s.resources.length - 1; i >= 0; i--) {
+			const r = s.resources[i]
+			if (!deleting) {
+				r.retain = false
+			}
+			this.remove(caller, s, r)
+		}
+	}
+
+	/// Who makes and deletes s's resources: a session of its role, else the caller.
+	private acting(caller: Caller, s: Stack): Caller {
+		const c = caller.internal(principal, s.id, [])
+		c.source = ""
+		if (s.role != null) {
+			const role = split(s.role!, "/")
+			c.arn = `arn:aws:sts::${caller.account}:assumed-role/${role[role.length - 1]}/AWSCloudFormation`
+			c.userId = `${role[role.length - 1]}:AWSCloudFormation`
+		} else {
+			c.arn = caller.arn
+			c.userId = caller.userId
+			c.credential = caller.credential
+		}
+		return c
+	}
+}
+
+function table(caller: Caller): Table[Stack] throws Fault {
+	return new Table[Stack](caller.regional(), "cloudformation/stacks")
+}
+
+function save(db: Table[Stack], s: Stack) throws Fault {
+	try {
+		db.put(s.id, s)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `The stack does not encode: ${e}`)
+	}
+}
+
+/// The stack not deleted of name.
+function live(db: Table[Stack], name: string): Stack | null {
+	for (const [_, s] of db.scan()) {
+		if (s.name == name && s.status != "DELETE_COMPLETE") {
+			return s
+		}
+	}
+	return null
+}
+
+/// The stack of name, not deleted, or of its id, deleted or not.
+function stack(db: Table[Stack], name: string): Stack | null {
+	return if (startsWith(name, "arn:")) db.get(name) else live(db, name)
+}
+
+/// As stack, refusing one there is not as AWS does.
+function found(db: Table[Stack], name: string): Stack throws Fault {
+	const s = stack(db, name)
+	if (s == null) {
+		throw validation(`Stack with id ${name} does not exist`)
+	}
+	return s!
+}
+
+function validation(message: string): Fault { return new Fault(400, "ValidationError", message) }
+
+/// The template of body, refusing a TemplateURL and the lack of both as AWS does.
+function template(body: string | null, url: string | null): Template throws Fault {
+	if (body == null && url == null) {
+		throw validation("Either Template URL or Template Body must be specified.")
+	}
+	if (body == null) {
+		throw validation("TemplateURL is not supported; give the template as TemplateBody")
+	}
+	try {
+		const t = read(body!)
+		ordered(t)
+		return t
+	} catch (e: TemplateError) {
+		throw validation(e.message)
+	}
+}
+
+/// The resources in their order, refusing a cycle.
+function sequence(t: Template): string[] throws Fault {
+	try {
+		return ordered(t)
+	} catch (e: TemplateError) {
+		throw validation(e.message)
+	}
+}
+
+/// The IAM resource types of t, each once.
+function iamTypes(t: Template): string[] {
+	const out: string[] = []
+	for (const [_, d] of t.resources) {
+		const k = d.str("Type")!
+		if (startsWith(k, "AWS::IAM::") && !has(out, k)) {
+			out.push(k)
+		}
+	}
+	return out
+}
+
+/// Whether an IAM resource of t names itself, which takes CAPABILITY_NAMED_IAM.
+function named(t: Template): bool {
+	for (const [_, d] of t.resources) {
+		const p = d.get("Properties")
+		if (startsWith(d.str("Type")!, "AWS::IAM::") && p != null
+			&& (p.get("RoleName") != null || p.get("UserName") != null || p.get("GroupName") != null
+			|| p.get("ManagedPolicyName") != null)) {
+			return true
+		}
+	}
+	return false
+}
+
+/// Refuses t without the capabilities its IAM resources take, as AWS does.
+function capable(t: Template, given: api.Capability[]) throws Fault {
+	if (iamTypes(t).length == 0) {
+		return
+	}
+	const need: api.Capability = if (named(t)) "CAPABILITY_NAMED_IAM" else "CAPABILITY_IAM"
+	if (!given.includes(need) && !(need == "CAPABILITY_IAM" && given.includes("CAPABILITY_NAMED_IAM"))) {
+		throw api.insufficientCapabilitiesException(`Requires capabilities : [${need}]`)
+	}
+}
+
+/// The declaration of the parameter k of t.
+function parameter(t: Template, k: string): Json | null {
+	for (const [n, d] of t.parameters) {
+		if (n == k) {
+			return d
+		}
+	}
+	return null
+}
+
+/// Sets s's parameters from given, before's where one uses its previous value, and the defaults, as AWS checks them.
+function parameters(s: Stack, t: Template, given: api.Parameter[], before: [string, string][]) throws Fault {
+	const unknown: string[] = []
+	for (const p of given) {
+		if (parameter(t, p.ParameterKey ?? "") == null) {
+			unknown.push(p.ParameterKey ?? "")
+		}
+	}
+	if (unknown.length > 0) {
+		throw validation(`Parameters: [${unknown.join(", ")}] do not exist in the template`)
+	}
+	const values: [string, string][] = []
+	const missing: string[] = []
+	s.hidden = []
+	for (const [k, d] of t.parameters) {
+		let v: string | null = if (d.get("Default") == null) null else text(d.get("Default")!)
+		for (const p of given) {
+			if (p.ParameterKey == k) {
+				if (p.UsePreviousValue ?? false) {
+					for (const [n, x] of before) {
+						if (n == k) {
+							v = x
+						}
+					}
+				} else {
+					v = p.ParameterValue
+				}
+			}
+		}
+		if (v == null) {
+			missing.push(k)
+			continue
+		}
+		const allowed = d.get("AllowedValues")
+		if (allowed != null) {
+			let ok = false
+			for (const a of allowed.items) {
+				ok = ok || text(a) == v
+			}
+			if (!ok) {
+				throw validation(`Parameter '${k}' must be one of AllowedValues`)
+			}
+		}
+		if (d.get("NoEcho")?.text == "true") {
+			s.hidden.push(k)
+		}
+		values.push([k, v!])
+	}
+	if (missing.length > 0) {
+		throw validation(`Parameters: [${missing.join(", ")}] must have values`)
+	}
+	s.parameters = values
+}
+
+function same(a: [string, string][], b: [string, string][]): bool {
+	if (a.length != b.length) {
+		return false
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i][0] != b[i][0] || a[i][1] != b[i][1]) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The resource logical of s, null if it has none.
+function kept(s: Stack, logical: string): Made | null {
+	for (const r of s.resources) {
+		if (r.logical == logical) {
+			return r
+		}
+	}
+	return null
+}
+
+/// Lets the intrinsic functions see r.
+function bind(scope: Scope, r: Made) {
+	scope.refs.push([r.logical, r.ref])
+	for (const [k, v] of r.attributes) {
+		scope.attributes.push([`${r.logical}.${k}`, v])
+	}
+}
+
+/// Records an event of s.
+function event(s: Stack, logical: string, physical: string, kind: string, status: api.ResourceStatus,
+	reason: string | null) throws Fault {
+	const e = new Event()
+	e.at = now()
+	e.id = if (kind == "AWS::CloudFormation::Stack") uuid() else `${logical}-${status}-${rfc3339(e.at)}`
+	e.logical = logical
+	e.physical = physical
+	e.kind = kind
+	e.status = status
+	e.reason = reason
+	s.events.push(e)
+}
+
+/// The exports of the stacks not deleted: each name, value and stack id.
+function exported(db: Table[Stack]): [string, string, string][] {
+	const out: [string, string, string][] = []
+	for (const [_, s] of db.scan()) {
+		if (s.status != "DELETE_COMPLETE") {
+			for (const o of s.outputs) {
+				if (o.export != null) {
+					out.push([o.export!, o.value, s.id])
+				}
+			}
+		}
+	}
+	return out
+}
+
+/// The name of the stack exporting name.
+function exporter(db: Table[Stack], name: string): string {
+	for (const [_, s] of db.scan()) {
+		for (const o of s.outputs) {
+			if (o.export == name && s.status != "DELETE_COMPLETE") {
+				return s.name
+			}
+		}
+	}
+	return ""
+}
+
+/// s as DescribeStacks gives it.
+function described(s: Stack): api.Stack {
+	const m = new api.Stack()
+	m.StackId = s.id
+	m.StackName = s.name
+	m.Description = s.description
+	const ps: api.Parameter[] = []
+	for (const [k, v] of s.parameters) {
+		const p = new api.Parameter()
+		p.ParameterKey = k
+		p.ParameterValue = if (has(s.hidden, k)) "****" else v
+		ps.push(p)
+	}
+	m.Parameters = ps
+	m.CreationTime = s.created
+	m.LastUpdatedTime = s.updated
+	m.DeletionTime = s.deleted
+	m.StackStatus = s.status
+	m.StackStatusReason = s.reason
+	m.DisableRollback = s.disableRollback
+	m.NotificationARNs = []
+	m.Capabilities = s.capabilities
+	const outs: api.Output[] = []
+	for (const o of s.outputs) {
+		const x = new api.Output()
+		x.OutputKey = o.key
+		x.OutputValue = o.value
+		x.Description = o.description
+		x.ExportName = o.export
+		outs.push(x)
+	}
+	m.Outputs = outs
+	m.RoleARN = s.role
+	const tags: api.Tag[] = []
+	for (const [k, v] of s.tags) {
+		const t = new api.Tag()
+		t.Key = k
+		t.Value = v
+		tags.push(t)
+	}
+	m.Tags = tags
+	m.EnableTerminationProtection = false
+	const drift = new api.StackDriftInformation()
+	drift.StackDriftStatus = "NOT_CHECKED"
+	m.DriftInformation = drift
+	return m
+}
+
+/// The SQS attribute of a queue's property k, null if it has none.
+function queueAttribute(k: string): sqsApi.QueueAttributeName | null {
+	const names: sqsApi.QueueAttributeName[] = ["DelaySeconds", "MaximumMessageSize", "MessageRetentionPeriod",
+		"ReceiveMessageWaitTimeSeconds", "VisibilityTimeout", "FifoQueue", "ContentBasedDeduplication",
+		"KmsMasterKeyId", "KmsDataKeyReusePeriodSeconds", "SqsManagedSseEnabled", "RedrivePolicy", "DeduplicationScope",
+		"FifoThroughputLimit"]
+	for (const n of names) {
+		if (n == k) {
+			return n
+		}
+	}
+	return null
+}
+
+/// A name as AWS makes one of a resource that names none: the stack's, the logical id's and 12 random characters,
+/// the first two cut to fit max; in lower case for a bucket.
+function physical(s: Stack, r: Made, max: i32, lowered: bool): string throws Fault {
+	const tail = suffix(lowered)
+	let head = `${s.name}-${r.logical}`
+	if (head.length + 13 > max) {
+		head = head.slice(0, max - 13)
+	}
+	const name = `${head}-${tail}`
+	return if (lowered) lower(name) else name
+}
+
+/// 12 random letters and digits, the letters in lower case if lowered.
+function suffix(lowered: bool): string throws Fault {
+	const lowers = "abcdefghijklmnopqrstuvwxyz0123456789"
+	const chars = if (lowered) lowers else `ABCDEFGHIJKLMNOPQRSTUVWXYZ${lowers}`
+	let out = ""
+	const r = random(12)
+	for (let k = 0; k < r.length; k++) {
+		const i = (r[k] as i32) % chars.length
+		out = out + chars.slice(i, i + 1)
+	}
+	return out
+}
+
+function random(n: i32): string throws Fault {
+	try {
+		return bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+}
+
+/// A random UUID.
+function uuid(): string throws Fault {
+	const h = hex.encode(random(16))
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+/// s with its colons and slashes escaped, as a URL's path holds a stack's ARN.
+function encode(s: string): string {
+	let out = ""
+	for (let i = 0; i < s.length; i++) {
+		const ch = s.slice(i, i + 1)
+		out = out + (if (ch == ":") "%3A" else if (ch == "/") "%2F" else if (ch == "|") "%7C" else ch)
+	}
+	return out
+}
