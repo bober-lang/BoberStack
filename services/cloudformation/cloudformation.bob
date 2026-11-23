@@ -3,12 +3,20 @@
 //! state, as CREATE_COMPLETE or ROLLBACK_COMPLETE, with the events AWS writes on the way: CREATE_IN_PROGRESS, then
 //! CREATE_IN_PROGRESS with "Resource creation Initiated", then CREATE_COMPLETE of each resource, and the stack's own.
 //! Each resource is made by a direct call of its service's handler, as a session of the stack's RoleARN if it has one,
-//! else as the caller, so that IAM decides as on AWS. Where AWS differs:
+//! else as the caller, so that IAM decides as on AWS. A RoleARN must be one the caller may pass to CloudFormation and
+//! that trusts it. A change set is CREATE_COMPLETE, or FAILED, at once; one of type CREATE leaves a new stack
+//! REVIEW_IN_PROGRESS until it is executed, and executing one deletes the stack's others, as AWS does. Where AWS
+//! differs:
 //!
-//! - Templates are JSON only: YAML, TemplateURL, transforms and change sets are refused or not implemented.
-//! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SNS::Topic,
-//!   AWS::S3::Bucket and AWS::Logs::LogGroup; any other fails its resource, CREATE_FAILED, and the stack rolls back.
-//!   Their properties are those of each service's create call; tags are not propagated.
+//! - Templates are JSON only: YAML, TemplateURL, transforms and change sets of type IMPORT are refused.
+//! - The resource types are AWS::CloudFormation::WaitConditionHandle, AWS::SQS::Queue, AWS::SQS::QueuePolicy,
+//!   AWS::SNS::Topic, AWS::SNS::Subscription, AWS::S3::Bucket, AWS::Logs::LogGroup, AWS::DynamoDB::Table,
+//!   AWS::IAM::Role (with Policies and ManagedPolicyArns) and AWS::SSM::Parameter; any other, AWS::Lambda::Function
+//!   among them, fails its resource, CREATE_FAILED, and the stack rolls back. Their properties are those of each
+//!   service's create call; tags are not propagated.
+//! - A change set's Modify is of a resource whose definition changes or refers to a parameter whose value changes,
+//!   always with Replacement True and no Details; the stack's REVIEW_IN_PROGRESS event, which the model's
+//!   ResourceStatus lacks, is not recorded.
 //! - Resources are made one after another, so a failure fails only its resource: none is "Resource creation
 //!   cancelled".
 //! - UpdateStack replaces a resource whose properties change, as if each property required replacement; one that
@@ -20,14 +28,19 @@
 
 import * as api from "./api"
 
-import { condition, evaluate, EvalError, has, ordered, read, resource, Scope, Template, TemplateError,
+import { condition, evaluate, EvalError, has, ordered, read, references, resource, Scope, Template, TemplateError,
 	text } from "./template"
 
+import * as dynamodbApi from "../dynamodb/api"
+import * as iamApi from "../iam/api"
 import * as logsApi from "../logs/api"
 import * as s3Api from "../s3/api"
 import * as snsApi from "../sns/api"
+import * as ssmApi from "../ssm/api"
 import * as sqsApi from "../sqs/api"
-import { Json, str, write } from "../stepfunctions/value"
+import { actAs, passRole } from "../sts/sts"
+import { boolean, Json, str, write } from "../stepfunctions/value"
+import * as json from "../../core/protocol/json"
 import { Fault } from "../../core/fault"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
@@ -55,6 +68,8 @@ export class Made {
 	/// Its properties evaluated, as JSON, which an update compares.
 	properties = ""
 	retain = false
+	/// What deleting it undoes besides, by kind: a role's "inline" and "managed" policies, a policy's "queue"s.
+	parts: [string, string][] = []
 }
 
 /// An event of a stack or one of its resources.
@@ -97,6 +112,36 @@ export class Stack {
 	tags: [string, string][] = []
 	role: string | null = null
 	disableRollback = false
+	/// Its change sets not executed, and the one it was last made or updated by.
+	changeSets: Planned[] = []
+	changeSet: string | null = null
+}
+
+/// A change set: what CreateStack or UpdateStack would be given, and the changes it would make.
+export class Planned {
+	id = ""
+	name = ""
+	kind: api.ChangeSetType = "UPDATE"
+	description: string | null = null
+	body = ""
+	parameters: api.Parameter[] = []
+	capabilities: api.Capability[] = []
+	tags: api.Tag[] = []
+	role: string | null = null
+	status: api.ChangeSetStatus = "CREATE_COMPLETE"
+	execution: api.ExecutionStatus = "AVAILABLE"
+	reason: string | null = null
+	created: i64 = 0
+	changes: Changed[] = []
+}
+
+/// A change of a resource in a change set.
+export class Changed {
+	action: api.ChangeAction = "Add"
+	logical = ""
+	physical: string | null = null
+	kind = ""
+	replacement: api.Replacement | null = null
 }
 
 /// The service, of the operations implemented.
@@ -108,12 +153,19 @@ export class Handler {
 	sns: snsApi.SNS
 	s3: s3Api.S3
 	logs: logsApi.CloudWatchLogs
+	iam: iamApi.IAM
+	dynamodb: dynamodbApi.DynamoDB
+	ssm: ssmApi.SSM
 
-	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Api.S3, logs: logsApi.CloudWatchLogs) {
+	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, s3: s3Api.S3, logs: logsApi.CloudWatchLogs, iam: iamApi.IAM,
+		dynamodb: dynamodbApi.DynamoDB, ssm: ssmApi.SSM) {
 		this.sqs = sqs
 		this.sns = sns
 		this.s3 = s3
 		this.logs = logs
+		this.iam = iam
+		this.dynamodb = dynamodb
+		this.ssm = ssm
 	}
 
 	validateTemplate(caller: Caller, input: api.ValidateTemplateInput): api.ValidateTemplateOutput throws Fault {
@@ -143,13 +195,22 @@ export class Handler {
 		if (live(db, input.StackName) != null) {
 			throw api.alreadyExistsException(`Stack [${input.StackName}] already exists`)
 		}
+		const s = new Stack()
+		s.id = stackId(caller, input.StackName)
+		s.name = input.StackName
+		return this.create(caller, db, s, input)
+	}
+
+	/// Makes the stack s, new or under review, of input.
+	private create(caller: Caller, db: Table[Stack], s: Stack,
+		c: api.CreateStackInput): api.CreateStackOutput throws Fault {
+		const input = c
 		const body = input.TemplateBody
 		const t = template(body, input.TemplateURL)
 		capable(t, input.Capabilities ?? [])
-		const s = new Stack()
-		s.id = `arn:aws:cloudformation:${caller.region}:${caller.account}:stack/${input.StackName}/${uuid()}`
-		s.name = input.StackName
+		usable(caller, input.RoleARN, s.id)
 		s.body = body!
+		s.reason = null
 		s.description = t.description
 		s.created = now()
 		s.capabilities = input.Capabilities ?? []
@@ -200,10 +261,19 @@ export class Handler {
 		const body = if (input.UsePreviousTemplate ?? false) s.body else input.TemplateBody
 		const t = template(body, input.TemplateURL)
 		capable(t, input.Capabilities ?? s.capabilities)
+		usable(caller, input.RoleARN, s.id)
+		s.role = input.RoleARN ?? s.role
+		if (input.Tags != null) {
+			s.tags = []
+			for (const tag of input.Tags!) {
+				s.tags.push([tag.Key, tag.Value])
+			}
+		}
 		const before = s.parameters
 		const was = s.resources
 		const oldBody = s.body
 		s.body = body!
+		s.reason = null
 		s.description = t.description
 		parameters(s, t, input.Parameters ?? [], before)
 		const order = sequence(t)
@@ -250,9 +320,12 @@ export class Handler {
 				}
 			}
 		}
+		usable(caller, input.RoleARN, s.id)
+		s.role = input.RoleARN ?? s.role
 		for (const r of s.resources) {
 			r.retain = r.retain || has(input.RetainResources ?? [], r.logical)
 		}
+		s.changeSets = []
 		s.status = "DELETE_IN_PROGRESS"
 		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", "User Initiated")
 		this.tear(caller, s, true)
@@ -263,6 +336,175 @@ export class Handler {
 		event(s, s.name, s.id, "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null)
 		save(db, s)
 		return new Unit()
+	}
+
+	createChangeSet(caller: Caller, input: api.CreateChangeSetInput): api.CreateChangeSetOutput throws Fault {
+		const db = table(caller)
+		const kind = input.ChangeSetType ?? "UPDATE"
+		if (kind == "IMPORT") {
+			throw validation("ChangeSetType IMPORT is not supported")
+		}
+		let s = live(db, input.StackName)
+		if (kind == "CREATE") {
+			if (s != null && s!.status != "REVIEW_IN_PROGRESS") {
+				throw validation(`Stack [${input.StackName}] already exists and cannot be created again with the changeSet [${input.ChangeSetName}].`)
+			}
+		} else if (s == null || s!.status == "REVIEW_IN_PROGRESS") {
+			throw validation(`Stack [${input.StackName}] does not exist`)
+		}
+		if (s != null) {
+			for (const p of s!.changeSets) {
+				if (p.name == input.ChangeSetName) {
+					throw api.alreadyExistsException(`ChangeSet [${input.ChangeSetName}] already exists`)
+				}
+			}
+		}
+		const body = if (input.UsePreviousTemplate ?? false) s?.body else input.TemplateBody
+		const t = template(body, input.TemplateURL)
+		capable(t, input.Capabilities ?? [])
+		if (s == null) {
+			const n = new Stack()
+			n.id = stackId(caller, input.StackName)
+			n.name = input.StackName
+			n.status = "REVIEW_IN_PROGRESS"
+			n.reason = "User Initiated"
+			n.created = now()
+			s = n
+		}
+		usable(caller, input.RoleARN, s!.id)
+		const p = new Planned()
+		p.id = `arn:aws:cloudformation:${caller.region}:${caller.account}:changeSet/${input.ChangeSetName}/${uuid()}`
+		p.name = input.ChangeSetName
+		p.kind = kind
+		p.description = input.Description
+		p.body = body!
+		p.parameters = input.Parameters ?? []
+		p.capabilities = input.Capabilities ?? []
+		p.tags = input.Tags ?? []
+		p.role = input.RoleARN
+		p.created = now()
+		const trial = new Stack()
+		parameters(trial, t, p.parameters, s!.parameters)
+		p.changes = changes(s!, t, trial.parameters)
+		if (kind == "UPDATE" && p.changes.length == 0 && p.body == s!.body && same(trial.parameters, s!.parameters)) {
+			p.status = "FAILED"
+			p.execution = "UNAVAILABLE"
+			p.reason = "The submitted information didn't contain changes. Submit different information to create a change set."
+		}
+		s!.changeSets.push(p)
+		save(db, s!)
+		const out = new api.CreateChangeSetOutput()
+		out.Id = p.id
+		out.StackId = s!.id
+		return out
+	}
+
+	describeChangeSet(caller: Caller, input: api.DescribeChangeSetInput): api.DescribeChangeSetOutput throws Fault {
+		const [s, p] = planned(table(caller), input.ChangeSetName, input.StackName)
+		const out = new api.DescribeChangeSetOutput()
+		out.ChangeSetName = p.name
+		out.ChangeSetId = p.id
+		out.StackId = s.id
+		out.StackName = s.name
+		out.Description = p.description
+		out.Parameters = p.parameters
+		out.CreationTime = p.created
+		out.ExecutionStatus = p.execution
+		out.Status = p.status
+		out.StatusReason = p.reason
+		out.NotificationARNs = []
+		out.RollbackConfiguration = new api.RollbackConfiguration()
+		out.Capabilities = p.capabilities
+		out.Tags = if (p.tags.length == 0) null else p.tags
+		const cs: api.Change[] = []
+		for (const c of p.changes) {
+			const r = new api.ResourceChange()
+			r.Action = c.action
+			r.LogicalResourceId = c.logical
+			r.PhysicalResourceId = c.physical
+			r.ResourceType = c.kind
+			r.Replacement = c.replacement
+			r.Scope = if (c.action == "Modify") ["Properties"] else []
+			r.Details = []
+			const m = new api.Change()
+			m.Type = "Resource"
+			m.ResourceChange = r
+			cs.push(m)
+		}
+		out.Changes = cs
+		out.IncludeNestedStacks = false
+		return out
+	}
+
+	listChangeSets(caller: Caller, input: api.ListChangeSetsInput): api.ListChangeSetsOutput throws Fault {
+		const s = found(table(caller), input.StackName)
+		const out = new api.ListChangeSetsOutput()
+		const sums: api.ChangeSetSummary[] = []
+		for (const p of s.changeSets) {
+			const m = new api.ChangeSetSummary()
+			m.StackId = s.id
+			m.StackName = s.name
+			m.ChangeSetId = p.id
+			m.ChangeSetName = p.name
+			m.ExecutionStatus = p.execution
+			m.Status = p.status
+			m.StatusReason = p.reason
+			m.CreationTime = p.created
+			m.Description = p.description
+			m.IncludeNestedStacks = false
+			sums.push(m)
+		}
+		out.Summaries = sums
+		return out
+	}
+
+	executeChangeSet(caller: Caller, input: api.ExecuteChangeSetInput): api.ExecuteChangeSetOutput throws Fault {
+		const db = table(caller)
+		const [s, p] = planned(db, input.ChangeSetName, input.StackName)
+		if (p.execution != "AVAILABLE") {
+			throw api.invalidChangeSetStatusException(`ChangeSet [${p.id}] cannot be executed in its current execution status of [${p.execution}]`)
+		}
+		if (p.kind == "CREATE") {
+			const c = new api.CreateStackInput()
+			c.StackName = s.name
+			c.TemplateBody = p.body
+			c.Parameters = p.parameters
+			c.Capabilities = p.capabilities
+			c.Tags = p.tags
+			c.RoleARN = p.role
+			c.DisableRollback = input.DisableRollback
+			s.changeSets = []
+			s.changeSet = p.id
+			this.create(caller, db, s, c)
+		} else {
+			const u = new api.UpdateStackInput()
+			u.StackName = s.id
+			u.TemplateBody = p.body
+			u.Parameters = p.parameters
+			u.Capabilities = p.capabilities
+			u.Tags = if (p.tags.length == 0) null else p.tags
+			u.RoleARN = p.role
+			this.updateStack(caller, u)
+			const done = found(db, s.id)
+			done.changeSets = []
+			done.changeSet = p.id
+			save(db, done)
+		}
+		return new api.ExecuteChangeSetOutput()
+	}
+
+	deleteChangeSet(caller: Caller, input: api.DeleteChangeSetInput): api.DeleteChangeSetOutput throws Fault {
+		const db = table(caller)
+		const [s, p] = planned(db, input.ChangeSetName, input.StackName)
+		const left: Planned[] = []
+		for (const x of s.changeSets) {
+			if (x.id != p.id) {
+				left.push(x)
+			}
+		}
+		s.changeSets = left
+		save(db, s)
+		return new api.DeleteChangeSetOutput()
 	}
 
 	describeStacks(caller: Caller, input: api.DescribeStacksInput): api.DescribeStacksOutput throws Fault {
@@ -687,6 +929,102 @@ export class Handler {
 			r.attributes = [["Arn", `arn:aws:logs:${c.region}:${c.account}:log-group:${name}:*`]]
 			return
 		}
+		if (r.kind == "AWS::DynamoDB::Table") {
+			const name = p.str("TableName") ?? physical(s, r, 255, false)
+			p.set("TableName", str(name))
+			const streams = p.get("StreamSpecification")
+			if (streams != null) {
+				streams!.set("StreamEnabled", boolean(true))
+			}
+			c.actions = ["dynamodb:CreateTable"]
+			const d = this.dynamodb.createTable(c, json.decode[dynamodbApi.CreateTableInput](write(p))).TableDescription
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", d?.TableArn ?? `arn:aws:dynamodb:${c.region}:${c.account}:table/${name}`]]
+			if (d?.LatestStreamArn != null) {
+				r.attributes.push(["StreamArn", d!.LatestStreamArn!])
+			}
+			return
+		}
+		if (r.kind == "AWS::IAM::Role") {
+			const name = p.str("RoleName") ?? physical(s, r, 64, false)
+			const q = new iamApi.CreateRoleRequest()
+			q.RoleName = name
+			q.Path = p.str("Path")
+			q.Description = p.str("Description")
+			q.AssumeRolePolicyDocument = document(p.get("AssumeRolePolicyDocument"))
+			c.actions = ["iam:CreateRole"]
+			const role = this.iam.createRole(c, q).Role
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Arn", role.Arn], ["RoleId", role.RoleId]]
+			for (const x of p.get("Policies")?.items ?? []) {
+				const i = new iamApi.PutRolePolicyRequest()
+				i.RoleName = name
+				i.PolicyName = x.str("PolicyName") ?? ""
+				i.PolicyDocument = document(x.get("PolicyDocument"))
+				c.actions = ["iam:PutRolePolicy"]
+				this.iam.putRolePolicy(c, i)
+				r.parts.push(["inline", i.PolicyName])
+			}
+			for (const x of p.get("ManagedPolicyArns")?.items ?? []) {
+				const a = new iamApi.AttachRolePolicyRequest()
+				a.RoleName = name
+				a.PolicyArn = x.text
+				c.actions = ["iam:AttachRolePolicy"]
+				this.iam.attachRolePolicy(c, a)
+				r.parts.push(["managed", x.text])
+			}
+			return
+		}
+		if (r.kind == "AWS::SSM::Parameter") {
+			const name = p.str("Name") ?? `CFN-${r.logical}-${suffix(false)}`
+			const q = new ssmApi.PutParameterRequest()
+			q.Name = name
+			q.Value = p.str("Value") ?? ""
+			q.Type = if (p.str("Type") == "StringList") "StringList" else "String"
+			q.Description = p.str("Description")
+			q.AllowedPattern = p.str("AllowedPattern")
+			c.actions = ["ssm:PutParameter"]
+			this.ssm.putParameter(c, q)
+			r.physical = name
+			r.ref = name
+			r.attributes = [["Type", p.str("Type") ?? "String"], ["Value", q.Value]]
+			return
+		}
+		if (r.kind == "AWS::SNS::Subscription") {
+			const q = new snsApi.SubscribeInput()
+			q.TopicArn = p.str("TopicArn") ?? ""
+			q.Protocol = p.str("Protocol") ?? ""
+			q.Endpoint = p.str("Endpoint")
+			q.ReturnSubscriptionArn = true
+			const attrs: [string, string][] = []
+			for (const k of ["RawMessageDelivery", "FilterPolicy", "FilterPolicyScope", "RedrivePolicy"]) {
+				if (p.get(k) != null) {
+					attrs.push([k, text(p.get(k)!)])
+				}
+			}
+			q.Attributes = attrs
+			c.actions = ["sns:Subscribe"]
+			const arn = this.sns.subscribe(c, q).SubscriptionArn ?? ""
+			r.physical = arn
+			r.ref = arn
+			r.attributes = [["Arn", arn]]
+			return
+		}
+		if (r.kind == "AWS::SQS::QueuePolicy") {
+			for (const u of p.get("Queues")?.items ?? []) {
+				const q = new sqsApi.SetQueueAttributesRequest()
+				q.QueueUrl = u.text
+				q.Attributes = [["Policy", document(p.get("PolicyDocument"))]]
+				c.actions = ["sqs:SetQueueAttributes"]
+				this.sqs.setQueueAttributes(c, q)
+				r.parts.push(["queue", u.text])
+			}
+			r.physical = physical(s, r, 256, false)
+			r.ref = r.physical
+			return
+		}
 		throw new Fault(400, "ValidationError", `Unrecognized resource types: [${r.kind}]`)
 	}
 
@@ -729,10 +1067,53 @@ export class Handler {
 				q.logGroupName = r.physical
 				c.actions = ["logs:DeleteLogGroup"]
 				this.logs.deleteLogGroup(c, q)
+			} else if (r.kind == "AWS::DynamoDB::Table") {
+				const q = new dynamodbApi.DeleteTableInput()
+				q.TableName = r.physical
+				c.actions = ["dynamodb:DeleteTable"]
+				this.dynamodb.deleteTable(c, q)
+			} else if (r.kind == "AWS::IAM::Role") {
+				for (const [part, name] of r.parts) {
+					if (part == "inline") {
+						const q = new iamApi.DeleteRolePolicyRequest()
+						q.RoleName = r.physical
+						q.PolicyName = name
+						c.actions = ["iam:DeleteRolePolicy"]
+						this.iam.deleteRolePolicy(c, q)
+					} else {
+						const q = new iamApi.DetachRolePolicyRequest()
+						q.RoleName = r.physical
+						q.PolicyArn = name
+						c.actions = ["iam:DetachRolePolicy"]
+						this.iam.detachRolePolicy(c, q)
+					}
+				}
+				const q = new iamApi.DeleteRoleRequest()
+				q.RoleName = r.physical
+				c.actions = ["iam:DeleteRole"]
+				this.iam.deleteRole(c, q)
+			} else if (r.kind == "AWS::SSM::Parameter") {
+				const q = new ssmApi.DeleteParameterRequest()
+				q.Name = r.physical
+				c.actions = ["ssm:DeleteParameter"]
+				this.ssm.deleteParameter(c, q)
+			} else if (r.kind == "AWS::SNS::Subscription") {
+				const q = new snsApi.UnsubscribeInput()
+				q.SubscriptionArn = r.physical
+				c.actions = ["sns:Unsubscribe"]
+				this.sns.unsubscribe(c, q)
+			} else if (r.kind == "AWS::SQS::QueuePolicy") {
+				for (const [_, url] of r.parts) {
+					const q = new sqsApi.SetQueueAttributesRequest()
+					q.QueueUrl = url
+					q.Attributes = [["Policy", ""]]
+					c.actions = ["sqs:SetQueueAttributes"]
+					this.sqs.setQueueAttributes(c, q)
+				}
 			}
 		} catch (f: Fault) {
 			if (f.code != "AWS.SimpleQueueService.NonExistentQueue" && f.code != "NotFound" && f.code != "NoSuchBucket"
-				&& f.code != "ResourceNotFoundException") {
+				&& f.code != "ResourceNotFoundException" && f.code != "NoSuchEntity" && f.code != "ParameterNotFound") {
 				throw f
 			}
 		}
@@ -752,19 +1133,109 @@ export class Handler {
 	}
 
 	/// Who makes and deletes s's resources: a session of its role, else the caller.
-	private acting(caller: Caller, s: Stack): Caller {
+	private acting(caller: Caller, s: Stack): Caller throws Fault {
+		if (s.role != null) {
+			return assumed(caller, s.role!, s.id)
+		}
 		const c = caller.internal(principal, s.id, [])
 		c.source = ""
-		if (s.role != null) {
-			const role = split(s.role!, "/")
-			c.arn = `arn:aws:sts::${caller.account}:assumed-role/${role[role.length - 1]}/AWSCloudFormation`
-			c.userId = `${role[role.length - 1]}:AWSCloudFormation`
-		} else {
-			c.arn = caller.arn
-			c.userId = caller.userId
-			c.credential = caller.credential
-		}
+		c.arn = caller.arn
+		c.userId = caller.userId
+		c.credential = caller.credential
 		return c
+	}
+}
+
+/// The session of role for the stack of id, refusing a role that is not there or does not trust CloudFormation as AWS
+/// does.
+function assumed(caller: Caller, role: string, id: string): Caller throws Fault {
+	const c = actAs(caller, principal, role, id, [], "AWSCloudFormation")
+	if (c == null) {
+		throw validation(`Role ${role} is invalid or cannot be assumed`)
+	}
+	return c!
+}
+
+/// A policy document of a template, an object or its JSON text, as JSON text.
+function document(v: Json | null): string {
+	return if (v == null) "" else if (v!.kind == "string") v!.text else write(v!)
+}
+
+/// The ARN of a new stack of name.
+function stackId(caller: Caller, name: string): string throws Fault {
+	return `arn:aws:cloudformation:${caller.region}:${caller.account}:stack/${name}/${uuid()}`
+}
+
+/// The change set of name, or of its ARN, of the stack of stack, or of any if null, refused as AWS does if none.
+function planned(db: Table[Stack], name: string, stack: string | null): [Stack, Planned] throws Fault {
+	for (const [_, s] of db.scan()) {
+		if (s.status != "DELETE_COMPLETE" && (stack == null || s.name == stack || s.id == stack)) {
+			for (const p of s.changeSets) {
+				if (p.id == name || p.name == name && stack != null) {
+					return [s, p]
+				}
+			}
+		}
+	}
+	throw api.changeSetNotFoundException(`ChangeSet [${name}] does not exist`)
+}
+
+/// The changes of s's resources that the template t of parameters would make: Add, Remove, and Modify, by
+/// replacement, of a resource whose definition changes or refers to a parameter whose value changes.
+function changes(s: Stack, t: Template, parameters: [string, string][]): Changed[] throws Fault {
+	const out: Changed[] = []
+	const changed: string[] = []
+	for (const [k, v] of parameters) {
+		let was: string | null = null
+		for (const [n, x] of s.parameters) {
+			if (n == k) {
+				was = x
+			}
+		}
+		if (was != v) {
+			changed.push(k)
+		}
+	}
+	const old = if (s.body == "") null else template(s.body, null)
+	for (const [logical, d] of t.resources) {
+		const c = new Changed()
+		c.logical = logical
+		c.kind = d.str("Type")!
+		const before = if (old == null) null else resource(old!, logical)
+		const r = kept(s, logical)
+		if (before == null || r == null) {
+			out.push(c)
+			continue
+		}
+		let differs = write(before!) != write(d)
+		for (const n of references(d)) {
+			differs = differs || has(changed, n)
+		}
+		if (differs) {
+			c.action = "Modify"
+			c.physical = r!.physical
+			c.replacement = "True"
+			out.push(c)
+		}
+	}
+	for (const r of s.resources) {
+		if (resource(t, r.logical) == null && r.status != "DELETE_COMPLETE") {
+			const c = new Changed()
+			c.action = "Remove"
+			c.logical = r.logical
+			c.physical = r.physical
+			c.kind = r.kind
+			out.push(c)
+		}
+	}
+	return out
+}
+
+/// Refuses role unless the caller may pass it to CloudFormation and CloudFormation may assume it.
+function usable(caller: Caller, role: string | null, id: string) throws Fault {
+	if (role != null) {
+		passRole(caller, role!, principal)
+		assumed(caller, role!, id)
 	}
 }
 
@@ -1036,6 +1507,7 @@ function described(s: Stack): api.Stack {
 	}
 	m.Outputs = outs
 	m.RoleARN = s.role
+	m.ChangeSetId = s.changeSet
 	const tags: api.Tag[] = []
 	for (const [k, v] of s.tags) {
 		const t = new api.Tag()

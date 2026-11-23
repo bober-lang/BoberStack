@@ -1428,3 +1428,52 @@ test "a metric filter puts its matches' values to CloudWatch within PutLogEvents
 	assert stats("errors", []) == "1.0/0.0/None"
 	g.close()
 }
+
+test "CloudFormation change sets: CREATE under review, executed; an empty one FAILED; a role, table and parameter" {
+	const g = gateway()
+	const handle = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"}}}`
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"], ["ChangeSetType", "CREATE"],
+		["TemplateBody", handle]]).status == 200
+	let res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>REVIEW_IN_PROGRESS</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "DescribeChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"]])
+	assert indexOf(res.body.whole ?? "", "<Status>CREATE_COMPLETE</Status>") >= 0
+	assert indexOf(res.body.whole ?? "", "<Action>Add</Action>") >= 0
+	assert query(g, "cloudformation",
+		[["Action", "ExecuteChangeSet"], ["StackName", "c1"], ["ChangeSetName", "a"]]).status == 200
+	res = query(g, "cloudformation", [["Action", "DescribeStacks"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<StackStatus>CREATE_COMPLETE</StackStatus>") >= 0
+	res = query(g, "cloudformation", [["Action", "ListChangeSets"], ["StackName", "c1"]])
+	assert indexOf(res.body.whole ?? "", "<ChangeSetName>") < 0
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "b"], ["TemplateBody", handle]]).status
+		== 200
+	res = query(g, "cloudformation", [["Action", "DescribeChangeSet"], ["StackName", "c1"], ["ChangeSetName", "b"]])
+	assert indexOf(res.body.whole ?? "", "<Status>FAILED</Status>") >= 0
+	assert indexOf(res.body.whole ?? "", "contain changes. Submit different information to create a change set.") >= 0
+	const template = `{"Resources": {"H": {"Type": "AWS::CloudFormation::WaitConditionHandle"},`
+		+ `"R": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Principal": {"Service": "sqs.amazonaws.com"}, "Action": "sts:AssumeRole"}]},`
+		+ `"Policies": [{"PolicyName": "p", "PolicyDocument": {"Version": "2012-10-17",`
+		+ `"Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}}]}},`
+		+ `"T": {"Type": "AWS::DynamoDB::Table", "Properties": {"TableName": "tab","BillingMode": "PAY_PER_REQUEST",`
+		+ `"AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}],`
+		+ `"KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}]}},`
+		+ `"P": {"Type": "AWS::SSM::Parameter", "Properties": {"Name": "/p", "Type": "String",`
+		+ `"Value": {"Fn::GetAtt": ["R", "Arn"]}}}}}`
+	res = query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"], ["TemplateBody", template]])
+	assert fails(res, 400, "InsufficientCapabilitiesException", "Requires capabilities : [CAPABILITY_IAM]")
+	assert query(g, "cloudformation",
+		[["Action", "CreateChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"], ["TemplateBody", template],
+		["Capabilities.member.1", "CAPABILITY_IAM"]]).status == 200
+	assert query(g, "cloudformation",
+		[["Action", "ExecuteChangeSet"], ["StackName", "c1"], ["ChangeSetName", "c"]]).status == 200
+	assert call(g, "dynamodb", "DescribeTable", `{"TableName": "tab"}`).status == 200
+	res = json11(g, "ssm", "GetParameter", `{"Name": "/p"}`)
+	assert indexOf(res.body.whole ?? "", ":role/c1-R-") >= 0
+	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "c1"]]).status == 200
+	assert call(g, "dynamodb", "DescribeTable", `{"TableName": "tab"}`).status == 400
+	assert json11(g, "ssm", "GetParameter", `{"Name": "/p"}`).status == 400
+}
