@@ -152,7 +152,7 @@ test "user and role tags: set by key whatever its case, at most 50" {
 	assert call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust], ...tags(2)]).status == 200
 	assert call(g, "TagRole", [["RoleName", "r"], ["Tags.member.1.Key", "k1"], ["Tags.member.1.Value", "x"]]).status
 		== 200
-	assert texts(call(g, "ListRoleTags", [["RoleName", "r"]]), "Value") == ["v0", "x"]
+	assert texts(call(g, "ListRoleTags", [["RoleName", "r"]]), "Value") == ["x", "v0"]
 	assert call(g, "UntagRole", [["RoleName", "r"], ["TagKeys.member.1", "K1"]]).status == 200
 	assert texts(call(g, "GetRole", [["RoleName", "r"]]), "Key") == ["k0"]
 	assert fails(call(g, "ListRoleTags", [["RoleName", "x"]]), 404, "NoSuchEntity")
@@ -308,7 +308,7 @@ test "managed policies and their versions" {
 		[["PolicyName", "p"], ["Path", "/team/"], ["PolicyDocument", allow], ["Description", "s3"]])
 	assert res.status == 200 && text(res, "Arn") == arn && text(res, "DefaultVersionId") == "v1"
 	assert text(res, "AttachmentCount") == "0" && text(res, "IsAttachable") == "true"
-		&& text(res, "Description") == "s3"
+		&& text(res, "Description") == null
 	assert text(res, "PolicyId")!.slice(0, 4) == "ANPA"
 	assert fails(call(g, "CreatePolicy", [["PolicyName", "P"], ["PolicyDocument", allow]]), 409, "EntityAlreadyExists",
 		"A policy called P already exists. Duplicate names are not allowed.")
@@ -328,7 +328,7 @@ test "managed policies and their versions" {
 	assert fails(call(g, "CreatePolicyVersion", [["PolicyArn", arn], ["PolicyDocument", allow]]), 409, "LimitExceeded")
 	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "DefaultVersionId") == "v3"
 	res = call(g, "ListPolicyVersions", [["PolicyArn", arn]])
-	assert texts(res, "VersionId") == ["v1", "v2", "v3", "v4", "v5"] && texts(res, "Document") == []
+	assert texts(res, "VersionId") == ["v5", "v4", "v3", "v2", "v1"] && texts(res, "Document") == []
 	assert texts(res, "IsDefaultVersion") == ["false", "false", "true", "false", "false"]
 	res = call(g, "GetPolicyVersion", [["PolicyArn", arn], ["VersionId", "v2"]])
 	assert text(res, "Document") == escape(doc(2), "component") && text(res, "IsDefaultVersion") == "false"
@@ -347,11 +347,11 @@ test "managed policies and their versions" {
 	assert text(call(g, "CreatePolicyVersion", [["PolicyArn", arn], ["PolicyDocument", allow]]), "VersionId") == "v6"
 	call(g, "CreatePolicy", [["PolicyName", "other"], ["PolicyDocument", allow]])
 	res = call(g, "ListPolicies", [["Scope", "Local"]])
-	assert texts(res, "PolicyName") == ["other", "p"] && texts(res, "DefaultVersionId") == ["v1", "v5"]
+	assert texts(res, "PolicyName") == ["p", "other"] && texts(res, "DefaultVersionId") == ["v5", "v1"]
 	assert texts(res, "Description") == []
 	assert texts(call(g, "ListPolicies", [["Scope", "Local"], ["PathPrefix", "/team/"]]), "PolicyName") == ["p"]
 	assert texts(call(g, "ListPolicies", [["Scope", "AWS"]]), "PolicyName")
-		== ["APIGatewayServiceRolePolicy", "ReadOnlyAccess", "ViewOnlyAccess"]
+		== ["ReadOnlyAccess", "ViewOnlyAccess", "APIGatewayServiceRolePolicy"]
 	assert texts(call(g, "ListPolicies", [["OnlyAttached", "true"]]), "PolicyName") == []
 	assert fails(call(g, "ListPolicies", [["Scope", "Mine"]]), 400, "ValidationError")
 	assert fails(call(g, "DeletePolicy", [["PolicyArn", arn]]), 409, "DeleteConflict")
@@ -492,14 +492,14 @@ test "AWS managed policies: read from the catalog, changed by no one" {
 	assert text(call(g, "GetPolicyVersion", [["PolicyArn", ro], ["VersionId", "v3"]]), "IsDefaultVersion") == "true"
 	assert fails(call(g, "GetPolicyVersion", [["PolicyArn", ro], ["VersionId", "v4"]]), 404, "NoSuchEntity",
 		`Policy ${ro} version v4 does not exist or is not attachable.`)
-	const denied = (action: string) => `User: arn:aws:iam::000000000000:root is not authorized to perform: iam:${action} on resource: policy ${ro}`
+	const denied = (what: string) => `Cannot ${what} outside your own account.`
 	assert fails(call(g, "CreatePolicyVersion", [["PolicyArn", ro], ["PolicyDocument", allow]]), 403, "AccessDenied",
-		denied("CreatePolicyVersion"))
-	assert fails(call(g, "DeletePolicy", [["PolicyArn", ro]]), 403, "AccessDenied", denied("DeletePolicy"))
+		denied("create versions for policies"))
+	assert fails(call(g, "DeletePolicy", [["PolicyArn", ro]]), 403, "AccessDenied", denied("delete policies"))
 	assert fails(call(g, "DeletePolicyVersion", [["PolicyArn", ro], ["VersionId", "v1"]]), 403, "AccessDenied",
-		denied("DeletePolicyVersion"))
+		denied("delete policy versions for policies"))
 	assert fails(call(g, "SetDefaultPolicyVersion", [["PolicyArn", ro], ["VersionId", "v1"]]), 403, "AccessDenied",
-		denied("SetDefaultPolicyVersion"))
+		denied("update policies"))
 	assert text(call(g, "GetPolicy", [["PolicyArn", ro]]), "DefaultVersionId") == "v3"
 	g.close()
 }
@@ -509,10 +509,11 @@ test "listing the account's policies and AWS's" {
 	for (const name of ["ReadOnlyAccess", "b", "z"]) {
 		call(g, "CreatePolicy", [["PolicyName", name], ["PolicyDocument", allow]])
 	}
-	const all = ["APIGatewayServiceRolePolicy", "b", "ReadOnlyAccess", "ReadOnlyAccess", "ViewOnlyAccess", "z"]
+	// The account's in the order made, then AWS's by date.
+	const all = ["ReadOnlyAccess", "b", "z", "ReadOnlyAccess", "ViewOnlyAccess", "APIGatewayServiceRolePolicy"]
 	let res = call(g, "ListPolicies")
 	assert texts(res, "PolicyName") == all && text(res, "IsTruncated") == "false" && texts(res, "Description") == []
-	assert texts(res, "Arn")[2] == "arn:aws:iam::000000000000:policy/ReadOnlyAccess"
+	assert texts(res, "Arn")[0] == "arn:aws:iam::000000000000:policy/ReadOnlyAccess"
 		&& texts(res, "Arn")[3] == "arn:aws:iam::aws:policy/ReadOnlyAccess"
 	for (const n of 1 ... 6) {
 		const listed: string[] = []
@@ -532,7 +533,7 @@ test "listing the account's policies and AWS's" {
 	}
 	assert texts(call(g, "ListPolicies", [["Scope", "AWS"], ["PathPrefix", "/job-function/"]]), "PolicyName")
 		== ["ViewOnlyAccess"]
-	assert texts(call(g, "ListPolicies", [["Scope", "Local"]]), "PolicyName") == ["b", "ReadOnlyAccess", "z"]
+	assert texts(call(g, "ListPolicies", [["Scope", "Local"]]), "PolicyName") == ["ReadOnlyAccess", "b", "z"]
 	assert texts(call(g, "ListPolicies", [["PolicyUsageFilter", "PermissionsBoundary"]]), "PolicyName") == []
 	call(g, "CreateRole", [["RoleName", "r"], ["AssumeRolePolicyDocument", trust]])
 	call(g, "AttachRolePolicy",
@@ -558,7 +559,7 @@ test "attaching AWS managed policies, counted in each account" {
 	assert call(g, "AttachUserPolicy", [["UserName", "bob"], ["PolicyArn", mine]]).status == 200
 	assert call(g, "AttachRolePolicy", [["RoleName", "r"], ["PolicyArn", ro]]).status == 200
 	let res = call(g, "ListAttachedUserPolicies", [["UserName", "bob"]])
-	assert texts(res, "PolicyArn") == [mine, ro] && texts(res, "PolicyName") == ["ReadOnlyAccess", "ReadOnlyAccess"]
+	assert texts(res, "PolicyArn") == [ro, mine] && texts(res, "PolicyName") == ["ReadOnlyAccess", "ReadOnlyAccess"]
 	assert text(call(g, "GetPolicy", [["PolicyArn", ro]]), "AttachmentCount") == "2"
 	assert text(call(g, "GetPolicy", [["PolicyArn", mine]]), "AttachmentCount") == "1"
 	assert text(call(g, "GetPolicy", [["PolicyArn", ro]], "111122223333"), "AttachmentCount") == "0"
@@ -580,7 +581,7 @@ test "attaching AWS managed policies, counted in each account" {
 		"NoSuchEntity", "Policy arn:aws:iam::aws:policy/Nope does not exist or is not attachable.")
 	assert fails(call(g, "AttachRolePolicy",
 		[["RoleName", "r"], ["PolicyArn", "arn:aws:iam::aws:policy/aws-service-role/APIGatewayServiceRolePolicy"]]),
-		400, "PolicyNotAttachable", "Cannot attach a Service Role Policy to a Customer Role.")
+		400, "PolicyNotAttachable", "Cannot attach AWS reserved policy to an IAM role.")
 	assert call(g, "UpdateUser", [["UserName", "bob"], ["NewUserName", "rob"]]).status == 200
 	assert texts(call(g, "ListEntitiesForPolicy", [["PolicyArn", ro]]), "UserName") == ["rob"]
 	assert call(g, "DetachUserPolicy", [["UserName", "rob"], ["PolicyArn", ro]]).status == 200

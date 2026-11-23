@@ -4,7 +4,7 @@
 //! document is copied out of the text when it is read.
 
 import { arn, key, Policy, Version, within } from "./records"
-import { lastIndexOf, partitionPoint } from "std/algo"
+import { lastIndexOf, partitionPoint, sortBy } from "std/algo"
 import { decode } from "std/encoding/json"
 import { ParseError } from "std/string"
 import { parseRfc3339 } from "std/time"
@@ -40,6 +40,8 @@ class Entry {
 
 export class Catalog {
 	private entries: Entry[] = []
+	/// The indices of the policies by their dates of creation, those of one date by their keys.
+	private order: i32[] = []
 
 	/// Of the text of n bytes at the address at, which shall never change nor be freed.
 	constructor(at: u64, n: u64) throws ParseError {
@@ -77,10 +79,19 @@ export class Catalog {
 			}
 			this.entries.push(e)
 		}
+		for (let i = 0; i < this.entries.length; i++) {
+			this.order.push(i)
+		}
+		const es = this.entries
+		sortBy(this.order,
+			(i,
+			j) => es[i].policy.created < es[j].policy.created || es[i].policy.created == es[j].policy.created && i < j)
 	}
 
 	/// The number of policies.
 	size(): i32 { return this.entries.length }
+	/// The indices of the policies in the order AWS lists them, as far as their dates tell it.
+	dated(): i32[] { return this.order }
 
 	/// The index of the policy of the ARN a, -1 if there is none.
 	find(a: string): i32 {

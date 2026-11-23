@@ -5,6 +5,7 @@ import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
 import { EncodeError } from "std/encoding/json"
 import { lower } from "std/string"
+import { second } from "std/time"
 import { Decodable } from "std/types"
 
 export class User {
@@ -12,6 +13,9 @@ export class User {
 	path = "/"
 	id = ""
 	created: i64 = 0
+	/// The ARN of its permissions boundary, "" if none.
+	boundary = ""
+	/// In the order added, the latest first.
 	tags: [string, string][] = []
 }
 
@@ -25,6 +29,7 @@ export class Role {
 	description: string | null = null
 	/// In seconds.
 	maxSession: i32 = 3600
+	boundary = ""
 	tags: [string, string][] = []
 }
 
@@ -39,8 +44,11 @@ export class Policy {
 	/// The version that is the default, and the number of the next.
 	defaultVersion = "v1"
 	next = 2
-	/// The users and roles it is attached to.
+	/// The users and roles it is attached to, and those it bounds.
 	attachments = 0
+	bounds = 0
+	/// Its place in the order of creation.
+	serial: i64 = 0
 	tags: [string, string][] = []
 }
 
@@ -58,6 +66,8 @@ export class AccessKey {
 	id = ""
 	status = "Active"
 	created: i64 = 0
+	/// Its place in the order of creation.
+	serial: i64 = 0
 }
 
 /// A managed policy attached to a user or role.
@@ -65,6 +75,13 @@ export class Attachment {
 	name = ""
 	path = ""
 	arn = ""
+	/// Its place in the order of attachment.
+	serial: i64 = 0
+}
+
+/// The last serial number given.
+export class Serial {
+	n: i64 = 0
 }
 
 /// A policy embedded in a user or role.
@@ -90,6 +107,8 @@ export class Tables {
 	roleAttached: Table[Attachment]
 	userInline: Table[Inline]
 	roleInline: Table[Inline]
+	/// By "".
+	serial: Table[Serial]
 
 	constructor(s: Store) {
 		this.users = new Table[User](s, "iam/users")
@@ -102,6 +121,15 @@ export class Tables {
 		this.roleAttached = new Table[Attachment](s, "iam/role-attached")
 		this.userInline = new Table[Inline](s, "iam/user-inline")
 		this.roleInline = new Table[Inline](s, "iam/role-inline")
+		this.serial = new Table[Serial](s, "iam/serial")
+	}
+
+	/// The next serial number, of the order in which records are made.
+	next(): i64 throws Fault {
+		const s = this.serial.get("") ?? new Serial()
+		s.n++
+		save(this.serial, "", s)
+		return s.n
 	}
 }
 
@@ -115,6 +143,12 @@ export function number(n: i32): string { return `${10000000000 + (n as i64)}`.sl
 /// The ARN of an IAM resource of a kind, as user, in account; IAM's have no region.
 export function arn(account: string, kind: string, path: string, name: string): string {
 	return `arn:aws:iam::${account}:${kind}${path}${name}`
+}
+
+/// The time now, to the second, as IAM's dates are.
+export function stamp(): i64 {
+	const t = now()
+	return t - t % second
 }
 
 /// Puts v at k in t; a record holds no float, the one thing JSON cannot encode.

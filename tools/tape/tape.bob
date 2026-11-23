@@ -39,10 +39,9 @@
 //! A replay compares the status, the headers in `headers`, and the body as a tree: of XML elements, or JSON members
 //! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
 //! does not. A captured value is expected where AWS's was, as is a volatile member, of the same form: its runs of
-//! letters, digits and +/= the same in number, between the same other characters, but for a date's fraction of a
-//! second, which BoberStack's have unless it is 0 and AWS's never do; and the random id of an authorization that
-//! IAM's denials link to is not compared. A step with `differs`, the reason
-//! BoberStack answers otherwise, is expected to differ, until it no longer does.
+//! letters, digits and +/= the same in number, between the same other characters; and the random id of an
+//! authorization that IAM's denials link to is not compared. A step with `differs`, the reason BoberStack answers
+//! otherwise, is expected to differ, until it no longer does.
 
 import * as client from "../../core/client"
 import { Gateway } from "../../core/gateway"
@@ -430,7 +429,7 @@ function compare(e: Tree, a: Tree, path: string, volatile: string[], values: [st
 	const at = if (path == "") "body" else path
 	const want = fill(e.text, values, false)
 	if (volatile.includes(e.name) && e.leaf && a.leaf) {
-		if (whole(form(want)) != whole(form(a.text))) {
+		if (form(want) != form(a.text)) {
 			out.push(`${at}: expected the form of ${show(want)}, got ${show(a.text)}`)
 		}
 		return
@@ -491,9 +490,6 @@ export function form(v: string): string {
 	}
 	return fromBytes(out)
 }
-
-/// The form f of a date without its fraction of a second, which BoberStack's have when not 0 and AWS's do not.
-function whole(f: string): string { return replace(f, ":x.x", ":x") }
 
 /// Whether c is a letter, digit or +/=.
 function formed(c: u8): bool {

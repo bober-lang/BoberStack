@@ -5,7 +5,7 @@ import { Credential, credentials, id, secret } from "../../core/auth/credentials
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
 import { Caller, Context } from "../../core/service"
-import { arn, key, save, Tables } from "../iam/records"
+import { arn, key, save, stamp, Tables } from "../iam/records"
 
 import { AssumedRoleUser, AssumeRoleRequest, AssumeRoleResponse, Credentials, FederatedUser, GetCallerIdentityRequest,
 	GetCallerIdentityResponse, GetFederationTokenRequest, GetFederationTokenResponse, GetSessionTokenRequest,
@@ -69,6 +69,10 @@ export class Handler {
 		r.AssumedRoleUser = u
 		const c = issued(account, u.Arn, u.AssumedRoleId, seconds, "role", input.Policy, input.PolicyArns, tags)
 		r.Credentials = issue(caller, c)
+		const [size, used] = sized(c)
+		r.SessionTokenSize = size
+		r.SessionTokenUtilization = used
+		r.PackedPolicySize = used
 		return r
 	}
 
@@ -92,6 +96,10 @@ export class Handler {
 			input.Policy, input.PolicyArns, tags)
 		c.issuer = caller.arn
 		r.Credentials = issue(caller, c)
+		const [size, used] = sized(c)
+		r.SessionTokenSize = size
+		r.SessionTokenUtilization = used
+		r.PackedPolicySize = used
 		return r
 	}
 
@@ -108,6 +116,9 @@ export class Handler {
 		const r = new GetSessionTokenResponse()
 		const c = issued(caller.account, caller.arn, caller.userId, seconds, if (root) "" else "user", null, null, [])
 		r.Credentials = issue(caller, c)
+		const [size, used] = sized(c)
+		r.SessionTokenSize = size
+		r.SessionTokenUtilization = used
 		return r
 	}
 }
@@ -135,12 +146,19 @@ function issued(account: string, identity: string, userId: string, seconds: i32,
 	c.arn = identity
 	c.userId = userId
 	c.token = secret(356)
-	c.expiry = now() + (seconds as i64) * second
+	c.expiry = stamp() + (seconds as i64) * second
 	c.session = session
 	c.policy = policy ?? ""
 	c.policyArns = (policyArns ?? []).map(p => p.arn ?? "")
 	c.tags = tags.map(t => [t.Key, t.Value])
 	return c
+}
+
+/// The size of c's session token, and the percentage that is of the most a token may be, 4096 bytes; which AWS also
+/// answers as the size of the session's packed policies.
+function sized(c: Credential): [i32, i32] {
+	const n = c.token.length as i32
+	return [n, n * 100 / 4096]
 }
 
 /// The credentials that c is, saved under a new access key id, issued for caller.

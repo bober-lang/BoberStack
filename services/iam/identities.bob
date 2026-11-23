@@ -13,9 +13,9 @@ import { ParseError, parseInt, split } from "std/string"
 /// How IAM sees a caller, the AWS managed policies of catalog.
 export function identify(catalog: Catalog): Identify { return caller => identity(catalog, caller) }
 
-/// The caller as policies see it, and the policies that apply to it: a user's own, or those of the user a federated
-/// user's session was issued to; a role session's role's; and the session's session policies, of which a federated
-/// user without any has none that allow.
+/// The caller as policies see it, and the policies that apply to it: a user's own and its permissions boundary, or
+/// those of the user a federated user's session was issued to; a role session's role's; and the session's session
+/// policies, of which a federated user without any has none that allow.
 function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Policies] throws Fault {
 	const a = caller.arn
 	const p = new auth.Principal()
@@ -35,6 +35,7 @@ function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Polic
 			p.role = arn(caller.account, "role", r.path, r.name)
 			p.tags = r.tags
 			ps.identity = policies(catalog, db, caller.account, db.roleInline, db.roleAttached, key(r.name))
+			ps.boundary = boundary(catalog, db, caller.account, r.boundary)
 		}
 	} else {
 		p.kind = if (indexOf(a, ":federated-user/") >= 0) "federated-user" else "user"
@@ -43,6 +44,7 @@ function identity(catalog: Catalog, caller: Caller): [auth.Principal, auth.Polic
 		if (u != null) {
 			p.tags = u.tags
 			ps.identity = policies(catalog, db, caller.account, db.userInline, db.userAttached, key(u.name))
+			ps.boundary = boundary(catalog, db, caller.account, u.boundary)
 		}
 	}
 	if (c != null) {
@@ -79,6 +81,15 @@ function policies(catalog: Catalog, db: Tables, account: string, inline: Table[I
 		}
 	}
 	return out
+}
+
+/// The permissions boundary of ARN a, of account, none if "", one that allows nothing if it is no longer there.
+function boundary(catalog: Catalog, db: Tables, account: string, a: string): auth.Policy | null throws Fault {
+	if (a == "") {
+		return null
+	}
+	const d = managed(catalog, db, account, a)
+	return if (d == null) new auth.Policy() else parsed(d!, a)
 }
 
 /// The document of the default version of the managed policy of ARN a, AWS's or account's, whose tables are db; null

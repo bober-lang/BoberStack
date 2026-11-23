@@ -12,11 +12,11 @@ import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { Catalog } from "./catalog"
 
-import { AccessKey, arn, Attachment, Inline, key, number, Policy, Role, save, Tables, User, Version,
+import { AccessKey, arn, Attachment, Inline, key, number, Policy, Role, save, stamp, Tables, User, Version,
 	within } from "./records"
 
-import { endsWith, indexOf, lastIndexOf, merge, startsWith } from "std/algo"
-import { isAlphanumeric, isGraphic } from "std/ascii"
+import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isGraphic } from "std/ascii"
 import { HashMap } from "std/collections/hashmap"
 import * as base64 from "std/encoding/base64"
 import { lower, ParseError, parseInt } from "std/string"
@@ -44,8 +44,11 @@ export class Handler {
 		u.name = input.UserName
 		u.path = path(input.Path, "path")
 		u.id = id("AIDA", 17)
-		u.created = now()
+		u.created = stamp()
 		u.tags = tagged([], input.Tags ?? [], "User")
+		if (input.PermissionsBoundary != null) {
+			u.boundary = bound(caller, db, this.catalog, "", input.PermissionsBoundary!)
+		}
 		save(db.users, k, u)
 		const r = new api.CreateUserResponse()
 		r.User = userOf(caller.account, u, true)
@@ -114,11 +117,13 @@ export class Handler {
 		if (db.userInline.scan(null, 1, within(k, "")).length > 0) {
 			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
 		}
+		bound(caller, db, this.catalog, db.users.get(k)!.boundary, "")
 		db.users.delete(k)
 		return new Unit()
 	}
 
 	tagUser(caller: Caller, input: api.TagUserRequest): Unit throws Fault {
+		keys(input.Tags)
 		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = user(db, input.UserName)
@@ -158,7 +163,8 @@ export class Handler {
 		const a = new AccessKey()
 		a.user = u.name
 		a.id = id("AKIA", 16)
-		a.created = now()
+		a.created = stamp()
+		a.serial = db.next()
 		save(db.keys, within(k, a.id), a)
 		const c = new Credential()
 		c.secret = secret()
@@ -179,7 +185,9 @@ export class Handler {
 		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
 		const u = owner(caller, db, input.UserName)
-		const [keys, next] = page(db.keys, within(key(u.name), ""), input.Marker, input.MaxItems, a => true)
+		const all = db.keys.scan(null, 2147483647, within(key(u.name), "")).map(e => e[1])
+		sortBy(all, (a, b) => a.serial > b.serial)
+		const [keys, next] = part(all, input.Marker, input.MaxItems)
 		const r = new api.ListAccessKeysResponse()
 		r.AccessKeyMetadata = keys.map(a => {
 			const m = new api.AccessKeyMetadata()
@@ -234,14 +242,21 @@ export class Handler {
 		r.name = input.RoleName
 		r.path = path(input.Path, "path")
 		r.id = id("AROA", 17)
-		r.created = now()
+		r.created = stamp()
 		r.trust = document(input.AssumeRolePolicyDocument, "trust")
 		r.description = input.Description
 		r.maxSession = input.MaxSessionDuration ?? 3600
 		r.tags = tagged([], input.Tags ?? [], "Role")
+		if (input.PermissionsBoundary != null) {
+			r.boundary = bound(caller, db, this.catalog, "", input.PermissionsBoundary!)
+		}
 		save(db.roles, k, r)
 		const out = new api.CreateRoleResponse()
 		out.Role = roleOf(caller.account, r, true)
+		// Which IAM does not answer on creation.
+		out.Role.Description = null
+		out.Role.MaxSessionDuration = null
+		out.Role.MaxSigninSessionDuration = null
 		return out
 	}
 
@@ -284,11 +299,13 @@ export class Handler {
 		if (db.roleInline.scan(null, 1, within(k, "")).length > 0) {
 			throw api.deleteConflictException("Cannot delete entity, must delete policies first.")
 		}
+		bound(caller, db, this.catalog, db.roles.get(k)!.boundary, "")
 		db.roles.delete(k)
 		return new Unit()
 	}
 
 	tagRole(caller: Caller, input: api.TagRoleRequest): Unit throws Fault {
+		keys(input.Tags)
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
 		const r = role(db, input.RoleName)
@@ -317,6 +334,42 @@ export class Handler {
 		return r
 	}
 
+	putUserPermissionsBoundary(caller: Caller, input: api.PutUserPermissionsBoundaryRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.boundary = bound(caller, db, this.catalog, u.boundary, input.PermissionsBoundary)
+		save(db.users, key(u.name), u)
+		return new Unit()
+	}
+
+	deleteUserPermissionsBoundary(caller: Caller, input: api.DeleteUserPermissionsBoundaryRequest): Unit throws Fault {
+		onUser(caller, input.UserName)
+		const db = new Tables(caller.store())
+		const u = user(db, input.UserName)
+		u.boundary = bound(caller, db, this.catalog, u.boundary, "")
+		save(db.users, key(u.name), u)
+		return new Unit()
+	}
+
+	putRolePermissionsBoundary(caller: Caller, input: api.PutRolePermissionsBoundaryRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.boundary = bound(caller, db, this.catalog, r.boundary, input.PermissionsBoundary)
+		save(db.roles, key(r.name), r)
+		return new Unit()
+	}
+
+	deleteRolePermissionsBoundary(caller: Caller, input: api.DeleteRolePermissionsBoundaryRequest): Unit throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		r.boundary = bound(caller, db, this.catalog, r.boundary, "")
+		save(db.roles, key(r.name), r)
+		return new Unit()
+	}
+
 	createPolicy(caller: Caller, input: api.CreatePolicyRequest): api.CreatePolicyResponse throws Fault {
 		tagging(caller, input.Tags)
 		caller.allow(arn(caller.account, "policy", input.Path ?? "/", input.PolicyName))
@@ -330,8 +383,9 @@ export class Handler {
 		p.name = input.PolicyName
 		p.path = path(input.Path, "path")
 		p.id = id("ANPA", 17)
-		p.created = now()
+		p.created = stamp()
 		p.updated = p.created
+		p.serial = db.next()
 		p.description = input.Description
 		p.tags = tagged([], input.Tags ?? [], "Policy")
 		const v = new Version()
@@ -342,6 +396,7 @@ export class Handler {
 		save(db.versions, within(k, number(1)), v)
 		const r = new api.CreatePolicyResponse()
 		r.Policy = policyOf(caller.account, p, true)
+		r.Policy.Description = null // which IAM does not answer on creation
 		return r
 	}
 
@@ -351,61 +406,65 @@ export class Handler {
 		const a = input.PolicyArn
 		const p = managed(caller, db, this.catalog, a)
 		if (aws(a)) {
-			p.attachments = uses(db).get(a) ?? 0
+			const [attached, bounding] = uses(db)
+			p.attachments = attached.get(a) ?? 0
+			p.bounds = bounding.get(a) ?? 0
 		}
 		const r = new api.GetPolicyResponse()
 		r.Policy = policyOf(if (aws(a)) "aws" else caller.account, p, true)
 		return r
 	}
 
-	/// The account's policies and AWS's, of each name the account's first.
+	/// The account's policies in the order they were made, then AWS's in the order of their dates, as AWS made them.
 	listPolicies(caller: Caller, input: api.ListPoliciesRequest): api.ListPoliciesResponse throws Fault {
 		caller.allow(arn(caller.account, "policy", "/", ""))
 		const db = new Tables(caller.store())
 		const prefix = input.PathPrefix ?? "/"
 		const scope = input.Scope ?? "All"
-		// There are no permissions boundaries.
-		const none = input.PolicyUsageFilter == "PermissionsBoundary"
 		const attached = input.OnlyAttached
-		const n = input.MaxItems ?? 100
-		const after = cursor(input.Marker)
-		const listed: [string, api.Policy][] = []
-		if (!none && scope != "AWS") {
-			for (const [k, p] of take(db.policies, "", after, n + 1,
-				p => startsWith(p.path, prefix) && (!attached || p.attachments > 0))) {
-				listed.push([within(k, caller.account), policyOf(caller.account, p, false)])
+		const boundaries = input.PolicyUsageFilter == "PermissionsBoundary"
+		const keep = (p: Policy) => startsWith(p.path, prefix) && (!attached || p.attachments > 0)
+			&& (!boundaries || p.bounds > 0)
+		const listed: [string, Policy][] = [] // the account and the policy
+		if (scope != "AWS") {
+			const local = db.policies.scan(null, 2147483647).map(e => e[1]).filter(keep)
+			sortBy(local, (a, b) => a.serial < b.serial)
+			for (const p of local) {
+				listed.push([caller.account, p])
 			}
 		}
-		const local = listed.length
-		const counts = uses(db)
-		for (let i = this.catalog.after(after
-			?? ""); !none && scope != "Local" && i < this.catalog.size() && listed.length - local <= n; i++) {
-			const p = this.catalog.policy(i)
-			p.attachments = counts.get(arn("aws", "policy", p.path, p.name)) ?? 0
-			if (startsWith(p.path, prefix) && (!attached || p.attachments > 0)) {
-				listed.push([within(key(p.name), "aws"), policyOf("aws", p, false)])
+		if (scope != "Local") {
+			const [counts, bounding] = uses(db)
+			for (const i of this.catalog.dated()) {
+				const p = this.catalog.policy(i)
+				const a = arn("aws", "policy", p.path, p.name)
+				p.attachments = counts.get(a) ?? 0
+				p.bounds = bounding.get(a) ?? 0
+				if (keep(p)) {
+					listed.push(["aws", p])
+				}
 			}
 		}
-		merge(listed, local, (x, y) => x[0] < y[0])
+		const [found, next] = part(listed, input.Marker, input.MaxItems)
 		const r = new api.ListPoliciesResponse()
-		r.Policies = listed.slice(0, if (listed.length < n) listed.length else n).map(e => e[1])
-		r.IsTruncated = listed.length > n
-		r.Marker = if (listed.length > n) base64.encode(listed[n - 1][0]) else null
+		r.Policies = found.map(e => policyOf(e[0], e[1], false))
+		r.IsTruncated = next != null
+		r.Marker = next
 		return r
 	}
 
 	deletePolicy(caller: Caller, input: api.DeletePolicyRequest): Unit throws Fault {
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
-		const p = owned(caller, db, input.PolicyArn, "DeletePolicy")
+		const p = owned(caller, db, input.PolicyArn, "delete policies")
 		const k = key(p.name)
-		if (p.attachments > 0) {
-			throw api.deleteConflictException("Cannot delete a policy attached to entities.")
-		}
 		const versions = db.versions.scan(null, 2, within(k, ""))
 		if (versions.length > 1) {
 			throw api.deleteConflictException("This policy has more than one version. Before you delete a policy, you "
 				+ "must delete the policy's versions. The default version is deleted with the policy.")
+		}
+		if (p.attachments > 0 || p.bounds > 0) {
+			throw api.deleteConflictException("Cannot delete a policy attached to entities.")
 		}
 		db.versions.delete(versions[0][0])
 		db.policies.delete(k)
@@ -416,16 +475,17 @@ export class Handler {
 		input: api.CreatePolicyVersionRequest): api.CreatePolicyVersionResponse throws Fault {
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
-		const p = owned(caller, db, input.PolicyArn, "CreatePolicyVersion")
+		const p = owned(caller, db, input.PolicyArn, "create versions for policies")
 		const k = key(p.name)
+		const d = document(input.PolicyDocument, "identity")
 		if (db.versions.scan(null, 5, within(k, "")).length == 5) {
 			throw api.limitExceededException("A managed policy can have up to 5 versions. Before you create a new "
 				+ "version, you must delete an existing version.")
 		}
 		const v = new Version()
 		v.id = `v${p.next}`
-		v.document = document(input.PolicyDocument, "identity")
-		v.created = now()
+		v.document = d
+		v.created = stamp()
 		save(db.versions, within(k, number(p.next)), v)
 		p.next++
 		p.updated = v.created
@@ -439,6 +499,7 @@ export class Handler {
 	}
 
 	getPolicyVersion(caller: Caller, input: api.GetPolicyVersionRequest): api.GetPolicyVersionResponse throws Fault {
+		versionId(input.VersionId)
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
@@ -457,16 +518,21 @@ export class Handler {
 		return r
 	}
 
-	/// The account's policy's versions in their order, AWS's as AWS lists them, the latest first.
+	/// A policy's versions, the latest first.
 	listPolicyVersions(caller: Caller,
 		input: api.ListPolicyVersionsRequest): api.ListPolicyVersionsResponse throws Fault {
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
 		const a = input.PolicyArn
 		const p = managed(caller, db, this.catalog, a)
-		const [versions, next] = if (aws(a)) part(this.catalog.versions(this.catalog.find(a)), input.Marker,
-			input.MaxItems)
-			else page(db.versions, within(key(p.name), ""), input.Marker, input.MaxItems, v => true)
+		let all = if (aws(a)) this.catalog.versions(this.catalog.find(a)) else []
+		if (!aws(a)) {
+			const made = db.versions.scan(null, 5, within(key(p.name), ""))
+			for (let i = made.length - 1; i >= 0; i--) {
+				all.push(made[i][1])
+			}
+		}
+		const [versions, next] = part(all, input.Marker, input.MaxItems)
 		const r = new api.ListPolicyVersionsResponse()
 		r.Versions = versions.map(v => versionOf(p, v, false))
 		r.IsTruncated = next != null
@@ -475,9 +541,11 @@ export class Handler {
 	}
 
 	deletePolicyVersion(caller: Caller, input: api.DeletePolicyVersionRequest): Unit throws Fault {
+		versionId(input.VersionId)
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
-		const p = owned(caller, db, input.PolicyArn, "DeletePolicyVersion")
+		const p = owned(caller, db, input.PolicyArn, "delete policy versions for policies",
+			`version ${input.VersionId} does not exist or is not attachable.`)
 		const [k, v] = version(db, p, input.PolicyArn, input.VersionId)
 		if (v.id == p.defaultVersion) {
 			throw api.deleteConflictException("Cannot delete the default version of a policy.")
@@ -487,19 +555,52 @@ export class Handler {
 	}
 
 	setDefaultPolicyVersion(caller: Caller, input: api.SetDefaultPolicyVersionRequest): Unit throws Fault {
+		versionId(input.VersionId)
 		onPolicy(caller, input.PolicyArn)
 		const db = new Tables(caller.store())
-		const p = owned(caller, db, input.PolicyArn, "SetDefaultPolicyVersion")
+		const p = owned(caller, db, input.PolicyArn, "update policies")
 		p.defaultVersion = version(db, p, input.PolicyArn, input.VersionId)[1].id
-		p.updated = now()
+		p.updated = stamp()
 		save(db.policies, key(p.name), p)
 		return new Unit()
+	}
+
+	tagPolicy(caller: Caller, input: api.TagPolicyRequest): Unit throws Fault {
+		keys(input.Tags)
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = taggable(caller, db, input.PolicyArn)
+		p.tags = tagged(p.tags, input.Tags, "Policy")
+		save(db.policies, key(p.name), p)
+		return new Unit()
+	}
+
+	untagPolicy(caller: Caller, input: api.UntagPolicyRequest): Unit throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const p = taggable(caller, db, input.PolicyArn)
+		p.tags = p.tags.filter(t => !input.TagKeys.some(k => lower(k) == lower(t[0])))
+		save(db.policies, key(p.name), p)
+		return new Unit()
+	}
+
+	/// None of AWS's.
+	listPolicyTags(caller: Caller, input: api.ListPolicyTagsRequest): api.ListPolicyTagsResponse throws Fault {
+		onPolicy(caller, input.PolicyArn)
+		const db = new Tables(caller.store())
+		const a = input.PolicyArn
+		const [tags, next] = tagPage(managed(caller, db, this.catalog, a).tags, input.Marker, input.MaxItems)
+		const r = new api.ListPolicyTagsResponse()
+		r.Tags = tags
+		r.IsTruncated = next != null
+		r.Marker = next
+		return r
 	}
 
 	attachUserPolicy(caller: Caller, input: api.AttachUserPolicyRequest): Unit throws Fault {
 		onUser(caller, input.UserName)
 		const db = new Tables(caller.store())
-		attach(caller, db, this.catalog, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn, "User")
+		attach(caller, db, this.catalog, db.userAttached, key(user(db, input.UserName).name), input.PolicyArn, "user")
 		return new Unit()
 	}
 
@@ -526,7 +627,7 @@ export class Handler {
 	attachRolePolicy(caller: Caller, input: api.AttachRolePolicyRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())
-		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "Role")
+		attach(caller, db, this.catalog, db.roleAttached, key(role(db, input.RoleName).name), input.PolicyArn, "role")
 		return new Unit()
 	}
 
@@ -550,7 +651,7 @@ export class Handler {
 		return r
 	}
 
-	/// The users, then the roles, a managed policy is attached to, each in the order of their names.
+	/// The users, then the roles, a managed policy is attached to, or that it bounds, each in the order of their names.
 	listEntitiesForPolicy(caller: Caller,
 		input: api.ListEntitiesForPolicyRequest): api.ListEntitiesForPolicyResponse throws Fault {
 		onPolicy(caller, input.PolicyArn)
@@ -559,18 +660,24 @@ export class Handler {
 		managed(caller, db, this.catalog, a)
 		const prefix = input.PathPrefix ?? "/"
 		const f = input.EntityFilter
-		// There are no groups, nor permissions boundaries.
-		const none = input.PolicyUsageFilter == "PermissionsBoundary"
+		// There are no groups.
+		const boundaries = input.PolicyUsageFilter == "PermissionsBoundary"
 		const entities: [bool, string, string][] = [] // whether a user's, the name and the id
-		for (const [k, at] of if (none || f != null && f != "User") [] else db.userAttached.scan(null, 2147483647)) {
-			const u = if (at.arn == a) db.users.get(k.slice(0, indexOf(k, "\x00"))) else null
-			if (u != null && startsWith(u.path, prefix)) {
+		const users = if (f != null && f != "User") []
+			else if (boundaries) db.users.scan(null, 2147483647).filter(e => e[1].boundary == a).map(e => e[1])
+			else db.userAttached.scan(null,
+			2147483647).filter(e => e[1].arn == a).map(e => db.users.get(e[0].slice(0, indexOf(e[0], "\x00")))!)
+		for (const u of users) {
+			if (startsWith(u.path, prefix)) {
 				entities.push([true, u.name, u.id])
 			}
 		}
-		for (const [k, at] of if (none || f != null && f != "Role") [] else db.roleAttached.scan(null, 2147483647)) {
-			const x = if (at.arn == a) db.roles.get(k.slice(0, indexOf(k, "\x00"))) else null
-			if (x != null && startsWith(x.path, prefix)) {
+		const roles = if (f != null && f != "Role") []
+			else if (boundaries) db.roles.scan(null, 2147483647).filter(e => e[1].boundary == a).map(e => e[1])
+			else db.roleAttached.scan(null,
+			2147483647).filter(e => e[1].arn == a).map(e => db.roles.get(e[0].slice(0, indexOf(e[0], "\x00")))!)
+		for (const x of roles) {
+			if (startsWith(x.path, prefix)) {
 				entities.push([false, x.name, x.id])
 			}
 		}
@@ -716,7 +823,7 @@ function owner(caller: Caller, db: Tables, name: string | null): User throws Fau
 		if (found != null) {
 			return found
 		}
-		const r = { ...new User(), path: "", id: caller.account, created: now() }
+		const r = { ...new User(), path: "", id: caller.account, created: stamp() }
 		save(db.root, "", r)
 		return r
 	}
@@ -760,27 +867,63 @@ function managed(caller: Caller, db: Tables, catalog: Catalog, a: string,
 	return catalog.policy(i)
 }
 
-/// The managed policy of the caller's account that a names, for the action, which is denied on AWS's.
-function owned(caller: Caller, db: Tables, a: string, action: string): Policy throws Fault {
+/// The managed policy of the caller's account that a names, to do what is denied on AWS's, as "delete policies"; if
+/// there is none, missing says so, after its ARN.
+function owned(caller: Caller, db: Tables, a: string, what: string, missing = "was not found."): Policy throws Fault {
 	if (aws(a)) {
-		throw new Fault(403, "AccessDenied",
-			`User: ${caller.arn} is not authorized to perform: iam:${action} on resource: policy ${a}`)
+		throw new Fault(403, "AccessDenied", `Cannot ${what} outside your own account.`)
+	}
+	return policy(caller, db, a, missing)
+}
+
+/// The managed policy of the caller's account that a names, to be tagged; AWS's take none.
+function taggable(caller: Caller, db: Tables, a: string): Policy throws Fault {
+	if (aws(a)) {
+		throw api.invalidInputException("Tags not supported for policies in this domain")
 	}
 	return policy(caller, db, a)
+}
+
+/// The ARN a of the permissions boundary to set in place of the one of ARN was, "" for none, of the caller's account's
+/// or AWS's, whose count of those it bounds it keeps.
+function bound(caller: Caller, db: Tables, catalog: Catalog, was: string, a: string): string throws Fault {
+	if (a != "") {
+		managed(caller, db, catalog, a, "does not exist or is not attachable.")
+	}
+	if (was != a) {
+		count(db, was, -1)
+		count(db, a, 1)
+	}
+	return a
+}
+
+/// Adds by to the number of those the account's managed policy of ARN a bounds, if a is one.
+function count(db: Tables, a: string, by: i32) throws Fault {
+	const p = if (a == "" || aws(a)) null else db.policies.get(key(a.slice(lastIndexOf(a, "/") + 1, a.length)))
+	if (p != null) {
+		p.bounds += by
+		save(db.policies, key(p.name), p)
+	}
 }
 
 /// Whether a is the ARN of one of AWS's managed policies, of the account aws.
 function aws(a: string): bool { return startsWith(a, "arn:aws:iam::aws:") }
 
-/// The number of users and roles each managed policy is attached to, by its ARN.
-function uses(db: Tables): HashMap[string, i32] {
+/// The number of users and roles each managed policy is attached to, and the number it bounds, by its ARN.
+function uses(db: Tables): [HashMap[string, i32], HashMap[string, i32]] {
 	const n = new HashMap[string, i32]()
 	for (const t of [db.userAttached, db.roleAttached]) {
 		for (const [_, at] of t.scan(null, 2147483647)) {
 			n.set(at.arn, (n.get(at.arn) ?? 0) + 1)
 		}
 	}
-	return n
+	const b = new HashMap[string, i32]()
+	const boundaries = db.users.scan(null, 2147483647).map(e => e[1].boundary)
+	boundaries.append(db.roles.scan(null, 2147483647).map(e => e[1].boundary))
+	for (const x of boundaries) {
+		b.set(x, (b.get(x) ?? 0) + 1)
+	}
+	return [n, b]
 }
 
 /// The key and version of p, of the ARN a, whose id is v.
@@ -795,6 +938,21 @@ function version(db: Tables, p: Policy, a: string, v: string): [string, Version]
 		throw unknownVersion(a, v)
 	}
 	return [k, found]
+}
+
+/// v, if it is a version id.
+function versionId(v: string): string throws Fault {
+	let digits = 1
+	while (digits < v.length && isDigit(v[digits])) {
+		digits++
+	}
+	const rest = v.slice(digits, v.length)
+	if (!startsWith(v, "v") || digits == 1 || v[1] == 48
+		|| rest != "" && (rest[0] != 46 || !rest.slice(1, rest.length).every(c => isAlphanumeric(c) || c == 45))) {
+		throw new Violations(api.validation).fault(v, "versionId",
+			"Member must satisfy regular expression pattern: v[1-9][0-9]*(\\.[A-Za-z0-9-]*)?")
+	}
+	return v
 }
 
 /// The fault of the version v, of the policy of ARN a, that does not exist.
@@ -812,12 +970,12 @@ function accessKey(db: Tables, k: string, id: string): AccessKey throws Fault {
 }
 
 /// Attaches the policy of ARN a to the user or role, as kind names it, of key owner, whose attachments are in t, unless
-/// it is already; a service role's policy of AWS's only AWS attaches, to the role it makes.
+/// it is already; a service role's policy of AWS's is reserved to the roles AWS makes.
 function attach(caller: Caller, db: Tables, catalog: Catalog, t: Table[Attachment], owner: string, a: string,
 	kind: string) throws Fault {
 	const p = managed(caller, db, catalog, a, "does not exist or is not attachable.")
 	if (aws(a) && startsWith(p.path, "/aws-service-role/")) {
-		throw api.policyNotAttachableException(`Cannot attach a Service Role Policy to a Customer ${kind}.`)
+		throw api.policyNotAttachableException(`Cannot attach AWS reserved policy to an IAM ${kind}.`)
 	}
 	const k = within(owner, placed(caller, a))
 	if (t.get(k) == null) {
@@ -825,6 +983,7 @@ function attach(caller: Caller, db: Tables, catalog: Catalog, t: Table[Attachmen
 		at.name = p.name
 		at.path = p.path
 		at.arn = a
+		at.serial = db.next()
 		save(t, k, at)
 		if (!aws(a)) {
 			p.attachments++
@@ -854,10 +1013,14 @@ function placed(caller: Caller, a: string): string {
 	return within(key(a.slice(lastIndexOf(a, "/") + 1, a.length)), if (aws(a)) "aws" else caller.account)
 }
 
-/// A page of the policies attached to the user or role of key owner, of t, whose paths start with prefix.
+/// A page of the policies attached to the user or role of key owner, of t, whose paths start with prefix, in the order
+/// attached.
 function attached(t: Table[Attachment], owner: string, prefix: string | null, marker: string | null,
 	max: i32 | null): [api.AttachedPolicy[], string | null] throws Fault {
-	const [policies, next] = page(t, within(owner, ""), marker, max, a => startsWith(a.path, prefix ?? "/"))
+	const all = t.scan(null, 2147483647,
+		within(owner, "")).map(e => e[1]).filter(a => startsWith(a.path, prefix ?? "/"))
+	sortBy(all, (a, b) => a.serial < b.serial)
+	const [policies, next] = part(all, marker, max)
 	return [policies.map(a => ({ ...new api.AttachedPolicy(), PolicyName: a.name, PolicyArn: a.arn })), next]
 }
 
@@ -892,19 +1055,31 @@ function move[V extends Decodable](t: Table[V], from: string, to: string, edit: 
 function page[V extends Decodable](t: Table[V], prefix: string, marker: string | null, max: i32 | null,
 	keep: (v: V) => bool): [V[], string | null] throws Fault {
 	const n = max ?? 100
-	const got = take(t, prefix, cursor(marker), n + 1, keep)
+	const got = take(t, prefix, cursor(marker, prefix), n + 1, keep)
 	return [got.slice(0, if (got.length < n) got.length else n).map(e => e[1]),
 		if (got.length > n) base64.encode(got[n - 1][0]) else null]
 }
 
-/// The key after which the page that marker names starts, null for the first.
-function cursor(marker: string | null): string | null throws Fault {
-	try {
-		return if (marker == null) null else base64.decode(marker)
-	} catch (e: ParseError) {
-		throw api.invalidInputException("Invalid Marker.")
+/// The key after which the page that marker names starts, null for the first; a key of a table, its names', starts
+/// with prefix.
+function cursor(marker: string | null, prefix: string): string | null throws Fault {
+	if (marker == null) {
+		return null
 	}
+	let k = ""
+	try {
+		k = base64.decode(marker!)
+	} catch (e: ParseError) {
+		throw invalidMarker()
+	}
+	if (!startsWith(k, prefix) || !k.every(c => c == 0 || isGraphic(c))) {
+		throw invalidMarker()
+	}
+	return k
 }
+
+/// The fault of a marker that names no page.
+function invalidMarker(): Fault { return new Fault(400, api.validation.code, "Invalid Marker.") }
 
 /// Up to n records of t, with their keys, whose keys start with prefix and come after after, those that keep takes.
 function take[V extends Decodable](t: Table[V], prefix: string, after: string | null, n: i32,
@@ -935,10 +1110,10 @@ function part[T](items: T[], marker: string | null, max: i32 | null): [T[], stri
 	try {
 		from = if (marker == null) 0 else parseInt(marker)
 	} catch (e: ParseError) {
-		throw api.invalidInputException("Invalid Marker.")
+		throw invalidMarker()
 	}
 	if (from < 0 || from > items.length) {
-		throw api.invalidInputException("Invalid Marker.")
+		throw invalidMarker()
 	}
 	const to = if (from + n < items.length) from + n else items.length
 	return [items.slice(from, to), if (to < items.length) `${to}` else null]
@@ -951,7 +1126,8 @@ function tagPage(tags: [string, string][], marker: string | null,
 	return [page.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] })), next]
 }
 
-/// tags with given set over them by key, whatever its case, of a resource of a kind, as User; at most 50.
+/// tags with given set over them by key, whatever its case, of a resource of a kind, as User, in the order IAM lists
+/// them: a policy's as added, a user's or role's the latest first; at most 50.
 function tagged(tags: [string, string][], given: api.Tag[], kind: string): [string, string][] throws Fault {
 	for (let i = 0; i < given.length; i++) {
 		for (let j = 0; j < i; j++) {
@@ -960,12 +1136,35 @@ function tagged(tags: [string, string][], given: api.Tag[], kind: string): [stri
 			}
 		}
 	}
-	const out = tags.filter(t => !given.some(g => lower(g.Key) == lower(t[0])))
-	out.append(given.map(g => [g.Key, g.Value]))
+	const kept = tags.filter(t => !given.some(g => lower(g.Key) == lower(t[0])))
+	const out: [string, string][] = if (kind == "Policy") kept else []
+	for (const g of given) {
+		out.push([g.Key, g.Value])
+	}
+	if (kind != "Policy") {
+		out.append(kept)
+	}
 	if (out.length > 50) {
 		throw api.limitExceededException(`Cannot exceed quota for TagsPer${kind}: 50`)
 	}
 	return out
+}
+
+/// Throws unless the key of each of tags is one: of a letter, digit, space or _.:/=+-@ or more, as IAM checks them.
+function keys(tags: api.Tag[] | null) throws Fault {
+	const v = new Violations(api.validation)
+	const given = tags ?? []
+	for (let i = 0; i < given.length; i++) {
+		const k = given[i].Key
+		const at = `tags.${i + 1}.member.key`
+		if (k.length == 0) {
+			v.note(k, at, "Member must have length greater than or equal to 1")
+		}
+		if (!k.every(c => c >= 128 || isAlphanumeric(c) || indexOf(" _.:/=+-@", chr(c)) >= 0) || k.length == 0) {
+			v.note(k, at, "Member must satisfy regular expression pattern: [\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]+")
+		}
+	}
+	v.check()
 }
 
 /// name, of the member m, if it is a name of at most max characters of IAM's: as IAM checks one, its characters
@@ -1017,8 +1216,16 @@ function userOf(account: string, u: User, full: bool): api.User {
 	w.UserId = u.id
 	w.Arn = identity(account, u)
 	w.CreateDate = u.created
+	w.PermissionsBoundary = if (full) boundaryOf(u.boundary) else null
 	w.Tags = if (full) tagsOf(u.tags) else null
 	return w
+}
+
+/// The permissions boundary of ARN a as IAM gives it, none if "".
+function boundaryOf(a: string): api.AttachedPermissionsBoundary | null {
+	return if (a == "") null
+		else ({ ...new api.AttachedPermissionsBoundary(), PermissionsBoundaryType: "PermissionsBoundaryPolicy",
+		PermissionsBoundaryArn: a })
 }
 
 /// The ARN of u of account: the root's if u is.
@@ -1037,6 +1244,8 @@ function roleOf(account: string, r: Role, full: bool): api.Role {
 	w.AssumeRolePolicyDocument = escape(r.trust, "component")
 	w.Description = r.description
 	w.MaxSessionDuration = r.maxSession
+	w.MaxSigninSessionDuration = r.maxSession
+	w.PermissionsBoundary = if (full) boundaryOf(r.boundary) else null
 	w.Tags = if (full) tagsOf(r.tags) else null
 	return w
 }
@@ -1050,7 +1259,7 @@ function policyOf(account: string, p: Policy, full: bool): api.Policy {
 	w.Path = p.path
 	w.DefaultVersionId = p.defaultVersion
 	w.AttachmentCount = p.attachments
-	w.PermissionsBoundaryUsageCount = 0
+	w.PermissionsBoundaryUsageCount = p.bounds
 	w.IsAttachable = true
 	w.Description = if (full) p.description else null
 	w.CreateDate = p.created
