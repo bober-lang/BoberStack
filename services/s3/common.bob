@@ -1,0 +1,140 @@
+//! What ./s3 and ./config share: finding a bucket a caller may act on, S3's errors, and a bucket policy's validation.
+
+import { Fault } from "../../core/fault"
+import { parse, Policy } from "../../core/auth/policy"
+import { Caller, Context } from "../../core/service"
+import { key, Tables as Iam } from "../iam/records"
+import * as api from "./api"
+import { Bucket, places, Tables } from "./records"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { CryptoError } from "std/crypto/error"
+import { sha256 } from "std/crypto/hash"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import { lower, ParseError, replace, split, trim } from "std/string"
+
+export class Found {
+	db: Tables
+	bucket: Bucket
+
+	constructor(db: Tables, bucket: Bucket) {
+		this.db = db
+		this.bucket = bucket
+	}
+}
+
+/// The bucket named name, once the caller is allowed its actions on resource, the bucket's ARN if null; a bucket of
+/// an account other than expected is denied.
+export function found(caller: Caller, name: string, expected: string | null, resource: string | null = null,
+	context: Context = []): Found throws Fault {
+	const g = caller.existing("")
+	const p = if (g == null) null else places(g!).get(name)
+	if (p == null) {
+		throw noSuchBucket(name)
+	}
+	const db = new Tables(caller.tree(`${p.account}/${p.region}`))
+	const b = db.buckets.get(name)!
+	authorize(caller, b, resource ?? arn(name), context)
+	if (expected != null && expected! != b.owner) {
+		throw new Fault(403, "AccessDenied", "Access Denied")
+	}
+	return new Found(db, b)
+}
+
+/// Throws S3's access denied unless the caller may perform its actions on resource, with the reason only to a caller
+/// of b's account.
+export function authorize(caller: Caller, b: Bucket, resource: string, context: Context = []) throws Fault {
+	try {
+		caller.allow(resource, b.policy, context, `"${resource}"`, b.owner)
+	} catch (f: Fault) {
+		if (f.code == "AccessDenied" && caller.account != b.owner) {
+			throw new Fault(403, "AccessDenied", "Access Denied")
+		}
+		throw f
+	}
+}
+
+export function arn(bucket: string, key: string | null = null): string {
+	return if (key == null) `arn:aws:s3:::${bucket}` else `arn:aws:s3:::${bucket}/${key!}`
+}
+
+export function member(n: string, s: string): string {
+	return `<${n}>${replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")}</${n}>`
+}
+
+export function noSuchBucket(name: string): Fault {
+	return new Fault(404, "NoSuchBucket", "The specified bucket does not exist", true, member("BucketName", name))
+}
+
+export function noSuchKey(key: string): Fault {
+	return new Fault(404, "NoSuchKey", "The specified key does not exist.", true, member("Key", key))
+}
+
+/// The owner as S3 names one: by a canonical id, made of the account.
+export function owner(account: string): api.Owner throws Fault {
+	try {
+		return { ...new api.Owner(), ID: hex.encode(sha256(`canonical ${account}`)) }
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalError", e.what)
+	}
+}
+
+/// The policy document of the bucket f, once valid as S3 checks it: JSON of an object, a policy of a principal, of
+/// S3's actions, on the bucket or its objects, its principals of IAM users and roles there.
+export function bucketPolicy(caller: Caller, f: Found, document: string): Policy throws Fault {
+	if (!startsWith(trim(document), "{")) {
+		throw malformed("Policies must be valid JSON and the first byte must be '{'")
+	}
+	try {
+		json.decode[json.Keys](document)
+	} catch (e: ParseError) {
+		throw malformed("This policy contains invalid Json")
+	}
+	let p: Policy | null = null
+	try {
+		p = parse(document, "resource")
+	} catch (e: Fault) {
+		throw malformed(e.message)
+	}
+	const bucket = arn(f.bucket.name)
+	for (const s of p!.statements) {
+		for (const a of s.actions) {
+			if (a != "*" && !startsWith(lower(a), "s3:")) {
+				// as the document spells it, which parsing lowers
+				const at = indexOf(lower(document), `"${a}"`) + 1
+				throw malformed("Policy has invalid action", if (at > 0) document.slice(at, at + a.length) else a)
+			}
+		}
+		for (const r of s.resources ?? []) {
+			if (r != bucket && !startsWith(r, `${bucket}/`)) {
+				throw malformed("Policy has invalid resource", r)
+			}
+		}
+		for (const [t, a] of s.principals) {
+			if (t == "AWS" && !exists(caller, f.bucket.owner, a)) {
+				throw malformed("Invalid principal in policy", `"AWS" : "${a}"`)
+			}
+		}
+	}
+	return p!
+}
+
+/// Whether the principal a is there: an IAM user or role of the account given that its ARN names, as any other.
+function exists(caller: Caller, account: string, a: string): bool throws Fault {
+	const parts = split(a, ":")
+	if (parts.length != 6 || parts[2] != "iam") {
+		return true
+	}
+	const resource = parts[5]
+	const kind = resource.slice(0, if (indexOf(resource, "/") < 0) 0 else indexOf(resource, "/"))
+	if (parts[4] != account || kind != "user" && kind != "role" || indexOf(resource, "*") >= 0) {
+		return true
+	}
+	const db = new Iam(caller.tree(account))
+	const name = key(resource.slice(lastIndexOf(resource, "/") + 1, resource.length))
+	return if (kind == "user") db.users.get(name) != null else db.roles.get(name) != null
+}
+
+function malformed(message: string, detail: string | null = null): Fault {
+	return new Fault(400, "MalformedPolicy", message, true, if (detail == null) "" else member("Detail", detail!))
+}

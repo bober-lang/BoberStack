@@ -1,0 +1,191 @@
+//! S3's state. The global tree maps a bucket's name to where it is; its owner's regional tree holds the bucket, the
+//! versions of its objects, each key's current one, and its multipart uploads with their parts. A body under 64 KiB is
+//! held in the tree under a key of its own; a larger one is a blob that its record holds.
+
+import { Fault } from "../../core/fault"
+import { Blob, Store, Table } from "../../core/state/store"
+import { Body } from "std/http"
+import { Decodable } from "std/types"
+
+export const inline = 65536
+
+export class Place {
+	account = ""
+	region = ""
+	created: i64 = 0
+}
+
+export class Bucket {
+	name = ""
+	owner = ""
+	region = ""
+	created: i64 = 0
+	/// "" if never set, else Enabled or Suspended.
+	versioning = ""
+	/// The order of the next version written, which sorts a key's versions newest first.
+	next: i64 = 0
+	policy: string | null = null
+	tags: [string, string][] | null = null
+	locked = false
+}
+
+export class Version {
+	key = ""
+	/// "null" for one written while the bucket was not versioned, or suspended.
+	id = "null"
+	order: i64 = 0
+	marker = false
+	/// Quoted, as S3 answers it.
+	etag = ""
+	size: i64 = 0
+	modified: i64 = 0
+	owner = ""
+	type = "binary/octet-stream"
+	cacheControl: string | null = null
+	disposition: string | null = null
+	encoding: string | null = null
+	language: string | null = null
+	expires: string | null = null
+	redirect: string | null = null
+	metadata: [string, string][] = []
+	tags: [string, string][] = []
+	algorithm = ""
+	checksum = ""
+	parts = 0
+	sizes: i64[] = []
+	/// Its server-side encryption: AES256, aws:kms or aws:kms:dsse, "" for a customer's key (SSE-C).
+	sse = "AES256"
+	/// Of SSE-KMS, the key's ARN, the encryption context given, in base64, whether by a bucket key, and the data key
+	/// its key sealed, in base64.
+	kmsKey: string | null = null
+	context: string | null = null
+	bucketKey = false
+	dataKey = ""
+	/// Of SSE-C, the MD5 of the customer's key, in base64.
+	customerKey: string | null = null
+	/// Its Object Lock retention, GOVERNANCE or COMPLIANCE, null for none, until when, and its legal hold, ON or OFF,
+	/// null if never put.
+	mode: string | null = null
+	until: i64 = 0
+	hold: string | null = null
+}
+
+export class Upload {
+	id = ""
+	key = ""
+	initiated: i64 = 0
+	owner = ""
+	initiator = ""
+	object = new Version()
+	order: i64 = 0
+	/// "" while it goes on, else completed or aborted: S3 answers completing or aborting it again.
+	state = ""
+}
+
+export class Part {
+	number = 0
+	etag = ""
+	size: i64 = 0
+	modified: i64 = 0
+	/// The MD5 of its bytes, of which a multipart ETag is the MD5.
+	md5 = ""
+	algorithm = ""
+	checksum = ""
+}
+
+export class Tables {
+	store: Store
+	buckets: Table[Bucket]
+	/// By bucket/key, the current version of each key that has one, not a delete marker.
+	objects: Table[Version]
+	/// By version(), every version.
+	versions: Table[Version]
+	/// By bucket/key, a NUL and the upload's order in twelve digits.
+	uploads: Table[Upload]
+	/// By the upload id, a NUL and the part number in five digits.
+	parts: Table[Part]
+
+	constructor(store: Store) {
+		this.store = store
+		this.buckets = new Table[Bucket](store, "s3/buckets")
+		this.objects = new Table[Version](store, "s3/objects")
+		this.versions = new Table[Version](store, "s3/versions")
+		this.uploads = new Table[Upload](store, "s3/uploads")
+		this.parts = new Table[Part](store, "s3/parts")
+	}
+}
+
+export function places(global: Store): Table[Place] { return new Table[Place](global, "s3/places") }
+export function path(bucket: string, key: string): string { return `${bucket}/${key}` }
+
+/// The key of the version of the order given, which sorts after the versions written after it.
+export function version(bucket: string, key: string, order: i64): string {
+	const n = `${9223372036854775807 - order}`
+	return `${path(bucket, key)}\x00${"0000000000000000000".slice(n.length, 19)}${n}`
+}
+
+export function part(upload: string, n: i32): string { return `${upload}\x00${`${100000 + n}`.slice(1, 6)}` }
+function held(table: string, k: string): string { return `s3/bodies\x00${table}\x00${k}` }
+
+export function save[V extends Decodable](db: Tables, t: Table[V], name: string, k: string, v: V,
+	body: string) throws Fault {
+	if (body.length < inline) {
+		db.store.put(held(name, k), body)
+		t.put(k, v)
+		return
+	}
+	t.put(k, v, Blob.of(body))
+}
+
+/// Puts v under k of t, named name, with the body held under from of the table named of, shared, not copied.
+export function share[V extends Decodable](db: Tables, of: string, from: string, t: Table[V], name: string, k: string,
+	v: V) throws Fault {
+	const b = db.store.blob(`${of}\x00${from}`)
+	if (b == null) {
+		db.store.put(held(name, k), db.store.get(held(of, from)) ?? "")
+		t.put(k, v)
+		return
+	}
+	t.put(k, v, b)
+}
+
+export function drop[V extends Decodable](db: Tables, t: Table[V], name: string, k: string) throws Fault {
+	t.delete(k)
+	db.store.delete(held(name, k))
+}
+
+export function read(db: Tables, name: string, k: string, at: i64 = 0, n: i64 = 9223372036854775807): string {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b == null) {
+		const s = db.store.get(held(name, k)) ?? ""
+		return s.slice(at as i32, if (n < (s.length as i64) - at) (at + n) as i32 else s.length)
+	}
+	return b!.read(at, n)
+}
+
+export function body(db: Tables, name: string, k: string, at: i64, n: i64): Body {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b == null) {
+		return new Body(read(db, name, k, at, n))
+	}
+	return b!.body(at, n)
+}
+
+/// The blob of the body of k in the table named name, made of it if held in the tree.
+export function blob(db: Tables, name: string, k: string): Blob throws Fault {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b != null) {
+		return b!
+	}
+	return Blob.of(db.store.get(held(name, k)) ?? "")
+}
+
+export function keep[V extends Decodable](db: Tables, t: Table[V], name: string, k: string, v: V,
+	b: Blob) throws Fault {
+	if (b.size() < inline) {
+		db.store.put(held(name, k), b.read())
+		t.put(k, v)
+	} else {
+		t.put(k, v, b)
+	}
+}
