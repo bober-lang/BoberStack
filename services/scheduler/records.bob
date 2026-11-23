@@ -1,0 +1,60 @@
+//! EventBridge Scheduler's state in an account's region: its schedule groups by name, and their schedules by group
+//! and name.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { EncodeError } from "std/encoding/json"
+import { Decodable } from "std/types"
+
+/// A schedule group: its tags and the client token that made it.
+export class Group {
+	name = ""
+	token = ""
+	created: i64 = 0
+	modified: i64 = 0
+	tags: [string, string][] = []
+}
+
+/// A schedule, as its last CreateSchedule or UpdateSchedule gave it.
+export class Schedule {
+	group = ""
+	name = ""
+	token = ""
+	expression = ""
+	timezone: string | null = null
+	start: i64 | null = null
+	end: i64 | null = null
+	description: string | null = null
+	state: api.ScheduleState = "ENABLED"
+	key: string | null = null
+	target: api.Target = new api.Target()
+	window: api.FlexibleTimeWindow = new api.FlexibleTimeWindow()
+	after: api.ActionAfterCompletion = "NONE"
+	created: i64 = 0
+	modified: i64 = 0
+}
+
+/// Scheduler's tables in the account's regional tree s.
+export class Tables {
+	groups: Table[Group]
+	/// By the group's name, a NUL and the schedule's.
+	schedules: Table[Schedule]
+
+	constructor(s: Store) {
+		this.groups = new Table[Group](s, "scheduler/groups")
+		this.schedules = new Table[Schedule](s, "scheduler/schedules")
+	}
+}
+
+/// The key of the schedule named name in the group.
+export function key(group: string, name: string): string { return `${group}\x00${name}` }
+
+/// Puts the record x under k in t; a record holds no float, so JSON encodes it.
+export function save[T extends Decodable](t: Table[T], k: string, x: T) throws Fault {
+	try {
+		t.put(k, x)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

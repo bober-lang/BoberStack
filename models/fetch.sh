@@ -16,7 +16,8 @@ for model in sts/service/2011-06-15/sts-2011-06-15.json iam/service/2010-05-08/i
 	cloudwatch/service/2010-08-01/cloudwatch-2010-08-01.json firehose/service/2015-08-04/firehose-2015-08-04.json \
 	acm/service/2015-12-08/acm-2015-12-08.json ses/service/2010-12-01/ses-2010-12-01.json \
 	sesv2/service/2019-09-27/sesv2-2019-09-27.json \
-	cloudformation/service/2010-05-15/cloudformation-2010-05-15.json; do
+	cloudformation/service/2010-05-15/cloudformation-2010-05-15.json \
+	scheduler/service/2021-06-30/scheduler-2021-06-30.json; do
 	name=${model%%/*}
 	curl -fsS -A curl -o "$(echo "$name" | tr -d -).json" "https://raw.githubusercontent.com/aws/api-models-aws/$commit/models/$model"
 done

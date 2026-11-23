@@ -39,6 +39,8 @@ import * as secretsmanager from "./services/secretsmanager/secretsmanager"
 import * as sesApi from "./services/ses/api"
 import * as ses from "./services/ses/ses"
 import * as sesv2Api from "./services/ses/v2/api"
+import * as schedulerApi from "./services/scheduler/api"
+import * as scheduler from "./services/scheduler/scheduler"
 import * as snsApi from "./services/sns/api"
 import * as sns from "./services/sns/sns"
 import * as sqsApi from "./services/sqs/api"
@@ -133,6 +135,9 @@ export function stack(catalog: Catalog): Gateway {
 	const y = new cloudformation.Handler(q, n, o, l)
 	g.services.set(cloudformationApi.signingName, (caller, req) => cloudformationApi.handle(y, caller, req))
 	g.faults.set(cloudformationApi.signingName, (f, id) => query.error(f, id, cloudformationApi.ns))
+	const x = new scheduler.Handler()
+	g.services.set(schedulerApi.signingName, (caller, req) => schedulerApi.handle(x, caller, req))
+	g.faults.set(schedulerApi.signingName, (f, id) => restjson.error(schedulerApi.service, f, id))
 	g.anonymous = s3Api.signingName
 	return g
 }
