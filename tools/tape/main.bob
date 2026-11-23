@@ -1,0 +1,320 @@
+//! Records a tape from real AWS: `bober run tools/tape/main.bob -- record <scenario> [<tape>]` sends the scenario's
+//! steps, then its cleanup, to the scenario's region, by default us-east-1, or that a step names, signed by the
+//! credentials in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN, and writes the tape, by default over
+//! the scenario.
+//! ./tape.bob says what a scenario is.
+
+import { answer, authorize, bodyOf, captured, find, form, load, opaque, regionOf, request, signer, Step, Tape, text,
+	unlinked, organizations, unorganized, volatiles, hidden } from "./tape"
+
+import * as tape from "./tape"
+import { endsWith, indexOf, sortBy } from "std/algo"
+import { isDigit, isUpper } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import { mapFile, writeFile } from "std/fs"
+import { Request, Response, send } from "std/http"
+import { ParseError, replace, split } from "std/string"
+import { env } from "std/process"
+import { second, sleep } from "std/time"
+
+/// Why a recording stops.
+class Failure {
+	what: string
+
+	constructor(what: string) { this.what = what }
+}
+
+/// Whom requests are signed as, and who that is: of S3 too, the canonical user id of its account.
+class Caller {
+	accessKey = ""
+	secret = ""
+	token = ""
+	account = ""
+	arn = ""
+	userId = ""
+	canonical = ""
+}
+
+/// A recording: the caller, the prefix of its names, the values bound, and those of captures as a tape holds them.
+class Recording {
+	caller: Caller
+	prefix: string
+	values: [string, string][]
+	captured: [string, string][] = []
+
+	constructor(caller: Caller, prefix: string, region: string) {
+		this.caller = caller
+		this.prefix = prefix
+		this.values = [["prefix", prefix], ["account", caller.account], ["region", region]]
+		if (caller.canonical != "") {
+			this.captured.push(["owner", caller.canonical])
+		}
+	}
+
+	/// s as AWS answers it, retried until its status is s.until, if that is not 0, and its body holds s.untilBody, if
+	/// that is not ""; its answer is set on s, normalised, the values of members and headers named volatile or ignored,
+	/// there or on s, as their forms, and captured values of 8 characters or more as ${name}.
+	run(s: Step, t: Tape) throws IoError | ParseError | CryptoError | Failure {
+		let [res, body] = this.send(s)
+		for (let tries = 1; (s.until != 0 && res.status != s.until
+			|| s.untilBody != "" && indexOf(body, s.untilBody) < 0) && tries < 15; tries++) {
+			sleep(2 * second)
+			[res, body] = this.send(s)
+		}
+		for (const [name, path] of s.capture) {
+			const v = captured(res, body, path)
+			if (v == null) {
+				throw new Failure(`nothing at ${path} to capture as ${name}`)
+			}
+			tape.bind(this.values, name, v!)
+			if (v!.length >= 8) {
+				tape.bind(this.captured, name, this.normal(v!))
+			}
+		}
+		const names = t.volatile.slice(0, t.volatile.length)
+		names.append(t.ignored)
+		names.append(s.volatile)
+		names.append(s.ignored)
+		let normal = body
+		if (!opaque(s.service, body)) {
+			normal = this.normal(body)
+			for (const [name, v] of volatiles(normal, names)) {
+				if (!this.captured.some(c => c[1] == v)) {
+					normal = if (v.length >= 8) masked(normal, v) else hidden(normal, name, v)
+				}
+			}
+			normal = this.held(normal)
+		}
+		const a = answer(res, normal, s.service)
+		a.headers = a.headers.map(h => [h[0], if (names.includes(h[0])) form(h[1]) else this.held(this.normal(h[1]))])
+		s.response = a
+		print(`${s.name}: ${a.status} ${code(bodyOf(a))}`)
+	}
+
+	/// s with each value captured, the longest first, as ${name}.
+	held(s: string): string {
+		const captured = this.captured.slice(0, this.captured.length)
+		sortBy(captured, (a, b) => a[1].length > b[1].length)
+		let out = s
+		for (const [name, v] of captured) {
+			out = replace(out, v, "${" + name + "}")
+		}
+		return out
+	}
+
+	/// The answer to s, its body whole.
+	send(s: Step): [Response, string] throws IoError | ParseError | CryptoError | Failure {
+		const c = this.caller
+		const by = signer(s, this.values, [c.accessKey, c.secret, c.token])
+		if (by == null) {
+			throw new Failure(`no credentials captured as ${s.as}`)
+		}
+		return call(request(s, this.values, `https://${host(s, regionOf(s, this.values))}`), s, this.values, by!)
+	}
+
+	/// s with the caller as the root of 000000000000, the prefix the tape's, the ids of authorizations and those in
+	/// the ARNs of an organization 0s.
+	normal(s: string): string {
+		const c = this.caller
+		let out = replace(s, c.arn, "arn:aws:iam::000000000000:root")
+		out = replace(out, c.userId, "000000000000")
+		out = replace(out, c.account, "000000000000")
+		return unorganized(unlinked(replace(out, this.prefix, tape.prefix)))
+	}
+}
+
+function main(): i32 {
+	const a = args()
+	const at = indexOf(a, ["record"])
+	if (at < 0 || a.length < at + 2 || a.length > at + 3) {
+		print("usage: bober run tools/tape/main.bob -- record <scenario> [<tape>]")
+		return 2
+	}
+	const from = a[at + 1]
+	const to = if (a.length == at + 3) a[at + 2] else from
+	const c = new Caller()
+	c.accessKey = env("AWS_ACCESS_KEY_ID") ?? ""
+	c.secret = env("AWS_SECRET_ACCESS_KEY") ?? ""
+	c.token = env("AWS_SESSION_TOKEN") ?? ""
+	if (c.accessKey == "" || c.secret == "") {
+		print("tape: no AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+		return 1
+	}
+	let t = new Tape()
+	try {
+		t = load(from)
+		identify(c, t.steps.some(s => s.service == "s3"))
+	} catch (e: IoError | ParseError | CryptoError | Failure) {
+		print(`tape: ${message(e)}`)
+		return 1
+	}
+	let r: Recording | null = null
+	try {
+		r = new Recording(c, `boberstack-ab-${hex.encode(bytes(4))}`, if (t.region == "") "us-east-1" else t.region)
+	} catch (e: IoError) {
+		print(`tape: ${e}`)
+		return 1
+	}
+	print(`tape: names start ${r!.prefix}`)
+	let failed = false
+	for (const s of t.steps) {
+		try {
+			r!.run(s, t)
+		} catch (e: IoError | ParseError | CryptoError | Failure) {
+			print(`tape: ${s.name}: ${message(e)}`)
+			failed = true
+			break
+		}
+	}
+	for (const s of t.cleanup) {
+		try {
+			r!.run(s, t)
+		} catch (e: IoError | ParseError | CryptoError | Failure) {
+			print(`tape: ${s.name}: ${message(e)}`)
+			failed = true
+		}
+	}
+	if (failed) {
+		print(`tape: ${to} not written`)
+		return 1
+	}
+	const out = text(t)
+	let leak = ""
+	try {
+		leak = leaks(out, c, r!.values, mapFile("models/iam-managed-policies.jsonl"))
+	} catch (e: IoError) {
+		leak = `what it cannot check: ${e}`
+	}
+	if (leak != "") {
+		print(`tape: ${to} not written: it holds ${leak}`)
+		return 1
+	}
+	try {
+		writeFile(to, out)
+	} catch (e: IoError) {
+		print(`tape: ${e}`)
+		return 1
+	}
+	return 0
+}
+
+/// The host s is sent to in region: of IAM and Route 53 their global one.
+function host(s: Step, region: string): string {
+	return if (s.service == "iam" || s.service == "route53") `${s.service}.amazonaws.com`
+		else `${s.service}.${region}.amazonaws.com`
+}
+
+/// Sets on c its account, ARN and user id, as GetCallerIdentity answers, and if s3 its canonical user id, as
+/// ListBuckets does.
+function identify(c: Caller, s3: bool) throws IoError | ParseError | CryptoError | Failure {
+	const by: [string, string, string] = [c.accessKey, c.secret, c.token]
+	const s = new Step()
+	s.service = "sts"
+	s.query = [["Action", "GetCallerIdentity"], ["Version", "2011-06-15"]]
+	const [res, body] = call(request(s, [], `https://${host(s, "us-east-1")}`), s, [], by)
+	if (res.status != 200) {
+		throw new Failure(`GetCallerIdentity answers ${res.status} ${code(body)}`)
+	}
+	c.account = find(body, "Account") ?? ""
+	c.arn = find(body, "Arn") ?? ""
+	c.userId = find(body, "UserId") ?? ""
+	if (c.account == "" || c.arn == "" || c.userId == "") {
+		throw new Failure("GetCallerIdentity answers no identity")
+	}
+	if (!s3) {
+		return
+	}
+	const l = new Step()
+	l.service = "s3"
+	l.method = "GET"
+	l.params = [["max-buckets", "1"]]
+	const [listed, owners] = call(request(l, [], `https://${host(l, "us-east-1")}`), l, [], by)
+	c.canonical = find(owners, "Owner/ID") ?? ""
+	if (listed.status != 200 || c.canonical.length != 64) {
+		throw new Failure(`ListBuckets answers ${listed.status} ${code(owners)}, no owner`)
+	}
+}
+
+/// The answer to req, the request of s, signed now by the access key, secret and token of by, its body whole.
+function call(req: Request, s: Step, values: [string, string][],
+	by: [string, string, string]): [Response, string] throws IoError | ParseError | CryptoError {
+	authorize(req, s, values, by, now())
+	const res = send(req)
+	return [res, res.body.text(64 << 20)]
+}
+
+/// What of the account out holds, "" if nothing: its id or canonical user id, the caller's access key or a part of
+/// its ARN or user id, a secret or session token of values, or a unique id, which encodes the account, but those of
+/// AWS managed policies, which managed holds.
+function leaks(out: string, c: Caller, values: [string, string][], managed: string): string {
+	if (indexOf(out, c.account) >= 0) {
+		return "the account id"
+	}
+	if (c.canonical != "" && indexOf(out, c.canonical) >= 0) {
+		return "the canonical user id"
+	}
+	for (let i = indexOf(out, organizations); i >= 0; i = indexOf(out, organizations, i + 1)) {
+		if (indexOf(out, `${organizations}000000000000:`, i) != i) {
+			return "an organization's account id"
+		}
+	}
+	if (indexOf(out, c.accessKey) >= 0) {
+		return "the access key id"
+	}
+	for (const [name, v] of values) {
+		if ((endsWith(name, ".secret") || endsWith(name, ".token")) && v != "" && indexOf(out, v) >= 0) {
+			return `the secret ${name}`
+		}
+	}
+	const parts = split(c.arn, "/")
+	parts.append(split(c.userId, ":"))
+	for (const p of parts.slice(1, parts.length)) {
+		if (p.length >= 4 && indexOf(out, p) >= 0) {
+			return "a part of the caller's ARN or user id"
+		}
+	}
+	for (const prefix of ["AIDA", "AROA", "AKIA", "ASIA", "AGPA", "AIPA", "ANPA", "ANVA", "APKA"]) {
+		for (let i = indexOf(out, prefix); i >= 0; i = indexOf(out, prefix, i + 1)) {
+			let end = i + prefix.length
+			while (end < out.length && (isUpper(out[end]) || isDigit(out[end]))) {
+				end++
+			}
+			const id = out.slice(i, end)
+			if (id.length >= 16 && indexOf(managed, `"${id}"`) < 0) {
+				return `the unique id ${id}`
+			}
+		}
+	}
+	return ""
+}
+
+/// The body s with each v, a volatile member's value, as its form: quoted where it is a number of JSON, so that the
+/// body stays JSON.
+function masked(s: string, v: string): string {
+	let out = ""
+	let from = 0
+	for (let at = indexOf(s, v); at >= 0; at = indexOf(s, v, at + v.length)) {
+		const end = at + v.length
+		const bare = at > 0 && indexOf(":,[", s.slice(at - 1, at)) >= 0 && end < s.length
+			&& indexOf(",]}", s.slice(end, end + 1)) >= 0
+		out += s.slice(from, at) + (if (bare) `"${form(v)}"` else form(v))
+		from = end
+	}
+	return out + s.slice(from, s.length)
+}
+
+/// The error code in body, XML's Code or JSON's __type, "" if none.
+function code(body: string): string {
+	try {
+		return find(body, "Code") ?? find(body, "__type") ?? ""
+	} catch (e: ParseError) {
+		return ""
+	}
+}
+
+/// What e says.
+function message(e: IoError | ParseError | CryptoError | Failure): string {
+	return if (e instanceof Failure) e.what else `${e}`
+}

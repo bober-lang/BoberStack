@@ -1,0 +1,157 @@
+import * as sigv4 from "../../core/auth/sigv4"
+import { Gateway } from "../../core/gateway"
+import { authorize, content, hidden, play, regionOf, request, Step, Tape, unorganized, volatiles } from "./tape"
+import * as json from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { second } from "std/time"
+
+/// The step in the JSON text s.
+function step(s: string): Step { return json.decode[Step](s) }
+
+const t0: i64 = 1435327200 * second
+const by: [string, string, string] = ["AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", ""]
+
+test "a body is a text, bytes, or a pattern repeated" {
+	assert content(step(`{"body": "a \${x}"}`), [["x", "b"]]) == "a b"
+	assert content(step(`{"base64": "AAEC/w=="}`), []) == "\x00\x01\x02\xff"
+	const part = content(step(`{"repeat": "0123456789", "size": 5242880}`), [])
+	assert part.length == 5242880 && part.slice(5242870, 5242880) == "0123456789"
+	assert content(step(`{"repeat": "ab", "size": 3}`), []) == "aba"
+}
+
+test "an S3 path is encoded once, and a virtual-hosted one names its bucket in the host" {
+	const s = step(`{"service": "s3", "method": "GET", "path": "/\${prefix}-b/a key/ü+&", "params": {"versioning": "", "prefix": "a b"}}`)
+	const req = request(s, [["prefix", "p"]], "https://s3.eu-north-1.amazonaws.com")
+	assert req.url.toString() == "https://s3.eu-north-1.amazonaws.com/p-b/a%20key/%C3%BC%2B%26?versioning&prefix=a%20b"
+	assert req.headers.get("host") == "s3.eu-north-1.amazonaws.com"
+	s.virtual = true
+	const v = request(s, [["prefix", "p"]], "http://s3.localhost.localstack.cloud:4566")
+	assert v.url.host == "p-b.s3.localhost.localstack.cloud" && v.url.path == "/a%20key/%C3%BC%2B%26"
+	assert v.headers.get("host") == "p-b.s3.localhost.localstack.cloud:4566"
+	assert request(step(`{"service": "s3", "path": "/b", "virtual": true}`), [], "http://h").url.toString()
+		== "http://b.h/"
+}
+
+test "a step is signed for its region, else the tape's" {
+	assert regionOf(step(`{"region": "eu-west-1"}`), [["region", "eu-north-1"]]) == "eu-west-1"
+	assert regionOf(step(`{}`), [["region", "eu-north-1"]]) == "eu-north-1"
+}
+
+/// Why req, as authorize signed it, does not verify at the instant now; null if it does.
+function verified(req: Request, now: i64): string | null {
+	const a = sigv4.authorization(req)!
+	const why = sigv4.verify(req, req.body.whole ?? "", a, by[1], now)
+	return if (why == null) null else if (why instanceof string) why else why.message
+}
+
+test "S3 requests are signed over all their headers and the body's hash" {
+	const s = step(`{"service": "s3", "method": "PUT", "path": "/b/a key", "body": "hi", "headers": {"x-amz-meta-a": "1", "content-md5": "x"}}`)
+	const req = request(s, [], "http://s3.localhost.localstack.cloud:4566")
+	authorize(req, s, [], by, t0)
+	assert req.headers.get("x-amz-content-sha256") == "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+	assert sigv4.authorization(req)!.signedHeaders
+		== ["content-md5", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-meta-a"]
+	assert verified(req, t0) == null
+	req.headers.set("x-amz-meta-a", "2")
+	assert verified(req, t0) != null
+}
+
+test "a presigned URL verifies until it expires, and not once tampered with" {
+	const s = step(`{"service": "s3", "method": "GET", "path": "/b/k", "presign": 60}`)
+	const req = request(s, [], "http://s3.localhost.localstack.cloud:4566")
+	authorize(req, s, [], by, t0)
+	assert req.headers.get("authorization") == null && req.url.query.get("X-Amz-Expires") == "60"
+	assert verified(req, t0) == null
+	assert verified(req, t0 + 61 * second) == "Request has expired"
+	s.age = 120
+	const old = request(s, [], "http://s3.localhost.localstack.cloud:4566")
+	authorize(old, s, [], by, t0)
+	assert verified(old, t0) == "Request has expired"
+	s.age = 0
+	s.tamper = [["X-Amz-Expires", "3600"]]
+	const tampered = request(s, [], "http://s3.localhost.localstack.cloud:4566")
+	authorize(tampered, s, [], by, t0)
+	assert verified(tampered, t0) != null
+	const anonymous = step(`{"service": "s3", "method": "GET", "path": "/b/k", "anonymous": true}`)
+	const unsigned = request(anonymous, [], "http://h")
+	authorize(unsigned, anonymous, [], by, t0)
+	assert unsigned.headers.get("authorization") == null
+}
+
+test "a volatile member's text is hidden whatever its length, where it is that member's" {
+	const xml = "<m><entry><key>Users</key><value>5</value></entry><entry><key>5</key><value>12</value></entry></m>"
+	let out = xml
+	for (const [name, v] of volatiles(xml, ["value"])) {
+		out = hidden(out, name, v)
+	}
+	assert out == "<m><entry><key>Users</key><value>x</value></entry><entry><key>5</key><value>x</value></entry></m>"
+	assert hidden(`{"Users":5,"Roles": 5, "n":5,"Name":"5"}`, "Users", "5")
+		== `{"Users":"x","Roles": 5, "n":5,"Name":"5"}`
+	assert hidden(`{"Roles": 5}`, "Roles", "5") == `{"Roles": "x"}`
+	assert hidden(`{"Name":"5"}`, "Name", "5") == `{"Name":"x"}`
+}
+
+test "an organization's ARNs lose their ids" {
+	assert unorganized("deny in a service control policy: arn:aws:organizations::123456789012:policy/o-abcdefghij/"
+		+ "service_control_policy/p-abcd1234</Message>")
+		== "deny in a service control policy: "
+		+ "arn:aws:organizations::000000000000:policy/o-0000000000/service_control_policy/p-00000000</Message>"
+}
+
+/// A fake of S3: an object PUT is answered by its ETag and a version id, a GET by its bytes, and a GET of a bucket by a
+/// listing of its owner.
+function fake(): Gateway {
+	const g = new Gateway()
+	g.anonymous = "s3"
+	g.services.set("s3", (caller, req) => {
+		const res = new Response(200, "")
+		if (req.method == "PUT") {
+			res.headers.set("etag", "\"5d41402abc4b2a76b9719d911017c592\"")
+			res.headers.set("x-amz-version-id", "v1.abc")
+			res.headers.set("x-amz-request-id", "ignored")
+			res.headers.set("content-length", "0")
+			return res
+		}
+		if (req.url.path == "/b") {
+			const listing = new Response(200,
+				"<ListBucketResult><Owner><ID>c0ffee</ID></Owner><Version>v1.abc</Version></ListBucketResult>")
+			listing.headers.set("content-type", "application/xml")
+			listing.headers.set("content-length", "99")
+			return listing
+		}
+		const object = new Response(200, "hello")
+		object.headers.set("last-modified", "Fri, 26 Jun 2015 14:00:00 GMT")
+		object.headers.set("content-length", "5")
+		object.headers.set("x-amz-meta-color", if (caller.arn == "*") "anonymous" else "blue")
+		return object
+	})
+	return g
+}
+
+/// The tape in the JSON text s.
+function tape(s: string): Tape { return json.decode[Tape](s) }
+
+const steps = `[
+	{"name": "put", "service": "s3", "method": "PUT", "path": "/b/k", "body": "hello", "capture": {"v": "header:x-amz-version-id"},
+		"response": {"status": 200, "headers": {"etag": "\\"5d41402abc4b2a76b9719d911017c592\\"", "x-amz-version-id": "\${v}", "content-length": "0"}}},
+	{"name": "list", "service": "s3", "method": "GET", "path": "/b",
+		"response": {"status": 200, "headers": {"content-type": "application/xml"},
+			"body": "<ListBucketResult><Owner><ID>\${owner}</ID></Owner><Version>\${v}</Version></ListBucketResult>"}},
+	{"name": "get", "service": "s3", "method": "GET", "path": "/b/k",
+		"response": {"status": 200, "headers": {"last-modified": "Mon, 23 Nov 2026 10:00:00 GMT", "content-length": "5", "x-amz-meta-color": "blue"},
+			"size": 5, "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}}
+]`
+
+test "a replay of S3 compares the headers kept, an object's bytes by their hash, and binds the owner on sight" {
+	assert play(tape(`{"volatile": ["last-modified"], "steps": ${steps}}`), fake()) == []
+	assert play(tape(`{"steps": ${steps}}`), fake())
+		== ["step 3 (get): header last-modified: expected \"Mon, 23 Nov 2026 10:00:00 GMT\", got \"Fri, 26 Jun 2015 14:00:00 GMT\""]
+	assert play(tape(`{"ignored": ["last-modified"], "steps": ${steps}}`), fake()) == []
+	const anonymous = tape(`{"volatile": ["last-modified"], "steps": ${steps}}`)
+	anonymous.steps[2].anonymous = true
+	anonymous.steps[2].response!.sha256 = "00"
+	assert play(anonymous, fake())
+		== ["step 3 (get): header x-amz-meta-color: expected \"blue\", got \"anonymous\"",
+		"step 3 (get): body: expected 5 bytes of SHA-256 00, got 5 of "
+		+ "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"]
+}
