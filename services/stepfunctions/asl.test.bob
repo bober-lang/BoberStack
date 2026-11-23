@@ -1,0 +1,140 @@
+import { diagnostics, Execution, Failure, invalid } from "./asl"
+import { Json, num, obj, parse, str, write } from "./value"
+
+/// A host whose tasks echo their parameters, fail as a resource "fail" asks, and that counts its calls.
+class Fake {
+	calls = 0
+	events: string[] = []
+
+	task(resource: string, parameters: Json): Json throws Failure {
+		this.calls++
+		if (resource == "fail" || resource == "flaky" && this.calls < 3) {
+			throw new Failure("Boom", "it failed")
+		}
+		return parameters
+	}
+
+	event(kind: string, field: string, details: Json) { this.events.push(kind) }
+	token(): string { return `token${this.calls}` }
+	uuid(): string { return "11111111-2222-4333-8444-555555555555" }
+	random(): f64 { return 0.5 }
+	mapRun(label: string, id: string, run: Json): string { return `arn:aws:states:us-east-1:0:mapRun:m/${label}:${id}` }
+
+	child(run: string, id: string, input: Json, output: Json | null, failure: Failure | null, size: i32,
+		events: [string, string, Json][]) {}
+}
+
+function run(d: string, input: string, host: Fake = new Fake()): string {
+	const context = obj([["Execution",
+		obj([["Id", str("arn:aws:states:us-east-1:0:execution:m:e")], ["Name", str("e")]])]])
+	try {
+		return write(new Execution(host, context, "2026-11-23T00:00:00.000Z").run(parse(d), parse(input)))
+	} catch (f: Failure) {
+		return `${f.error}: ${f.cause}`
+	}
+}
+
+function one(s: string): string { return `{"StartAt":"A","States":{"A":${s}}}` }
+
+test "validation" {
+	assert diagnostics("{").length == 1 && diagnostics("{")[0][0] == "INVALID_JSON_DESCRIPTION"
+	assert invalid(diagnostics(`{"States":{}}`))
+		== "Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED: These fields are required: [StartAt] at /'"
+	assert invalid(diagnostics(one(`{"Type":"Pass","Next":"B"}`)))
+		== "Invalid State Machine Definition: "
+		+ "'MISSING_TRANSITION_TARGET: Missing 'Next' target: B at /States/A/Next, "
+		+ "MISSING_END_STATE: Workflow has no terminal state at /'"
+	assert diagnostics(one(`{"Type":"Nope","End":true}`))[0][2] == "/States/A/Type"
+	assert diagnostics(one(`{"Type":"Pass","End":true}`)).length == 0
+	assert diagnostics(`{"QueryLanguage":"JSONata","StartAt":"A","States":{}}`)[0][0] == "SCHEMA_VALIDATION_FAILED"
+}
+
+test "Pass and the paths" {
+	assert run(one(`{"Type":"Pass","End":true}`), `{"a":1}`) == `{"a":1}`
+	assert run(one(`{"Type":"Pass","Result":{"x":2},"ResultPath":"$.r","End":true}`), `{"a":1}`)
+		== `{"a":1,"r":{"x":2}}`
+	assert run(one(`{"Type":"Pass","InputPath":"$.a","Parameters":{"v.$":"$.b[1]","n.$":"$$.Execution.Name",
+		"s":"k"},"OutputPath":"$.v","End":true}`), `{"a":{"b":[5,6]}}`) == "6"
+	assert run(one(`{"Type":"Pass","InputPath":"$.nope","End":true}`), `{}`)
+		== "States.Runtime: An error occurred "
+		+ "while executing the state 'A'. Invalid path '$.nope' : The JSONPath '$.nope' specified for the field "
+		+ "'InputPath' could not be found in the input '{}'"
+	assert run(one(`{"Type":"Pass","Parameters":{"x.$":"$.xs[*].a","y.$":"$.xs[?(@.a > 1)].a","z.$":"$.xs[0:1]"},
+		"End":true}`), `{"xs":[{"a":1},{"a":2}]}`) == `{"x":[1,2],"y":[2],"z":[{"a":1}]}`
+}
+
+test "Choice" {
+	const d = `{"StartAt":"C","States":{"C":{"Type":"Choice","Choices":[
+		{"And":[{"Variable":"$.n","NumericGreaterThan":1},{"Not":{"Variable":"$.s","StringEquals":"no"}}],"Next":"Big"},
+		{"Variable":"$.s","StringMatches":"a*z","Next":"Wild"},
+		{"Variable":"$.m","IsPresent":true,"Next":"Present"},
+		{"Variable":"$.t","TimestampLessThanPath":"$.u","Next":"Early"}],"Default":"Other"},
+		"Big":{"Type":"Succeed"},"Wild":{"Type":"Pass","Result":"wild","End":true},
+		"Present":{"Type":"Pass","Result":"present","End":true},"Early":{"Type":"Pass","Result":"early","End":true},
+		"Other":{"Type":"Fail","Error":"E","Cause":"none matched"}}}`
+	assert run(d, `{"n":2,"s":"yes"}`) == `{"n":2,"s":"yes"}`
+	assert run(d, `{"n":2,"s":"no","t":"2022-01-01T00:00:00Z","u":"2021-01-01T00:00:00Z"}`) == "E: none matched"
+	assert run(d, `{"n":2,"s":"no"}`)
+		== "States.Runtime: An error occurred while executing the state 'C'. "
+		+ "Invalid path '$.t': The choice state's condition path references an invalid value."
+	assert run(d, `{"n":0,"s":"abcz"}`) == `"wild"`
+	assert run(d, `{"n":0,"s":"","m":null}`) == `"present"`
+	assert run(d, `{"n":0,"s":"","t":"2020-01-01T00:00:00Z","u":"2021-01-01T00:00:00Z"}`) == `"early"`
+}
+
+test "Retry and Catch" {
+	const retried = one(`{"Type":"Task","Resource":"flaky","Retry":[{"ErrorEquals":["Boom"],"MaxAttempts":2}],
+		"End":true}`)
+	const host = new Fake()
+	assert run(retried, `{"a":1}`, host) == `{"a":1}` && host.calls == 3
+	const caught = `{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"fail","Retry":[{"ErrorEquals":
+		["States.ALL"],"MaxAttempts":1}],"Catch":[{"ErrorEquals":["States.TaskFailed"],"ResultPath":"$.err",
+		"Next":"H"}],"End":true},"H":{"Type":"Pass","Parameters":{"e.$":"$.err.Error"},"End":true}}}`
+	assert run(caught, `{"a":1}`) == `{"e":"Boom"}`
+	assert run(one(`{"Type":"Task","Resource":"fail","End":true}`), `{}`) == "Boom: it failed"
+}
+
+test "Parallel and Map" {
+	const d = `{"StartAt":"P","States":{"P":{"Type":"Parallel","Branches":[
+		{"StartAt":"X","States":{"X":{"Type":"Pass","Result":1,"End":true}}},
+		{"StartAt":"Y","States":{"Y":{"Type":"Pass","InputPath":"$.k","End":true}}}],"ResultPath":"$.p","Next":"M"},
+		"M":{"Type":"Map","ItemsPath":"$.xs","MaxConcurrency":2,"ItemSelector":{"v.$":"$$.Map.Item.Value",
+		"i.$":"$$.Map.Item.Index"},"ItemProcessor":{"StartAt":"Q","States":{"Q":{"Type":"Task","Resource":"echo",
+		"End":true}}},"ResultPath":"$.m","End":true}}}`
+	const host = new Fake()
+	assert run(d, `{"k":"z","xs":[7,8]}`, host) == `{"k":"z","xs":[7,8],"p":[1,"z"],"m":[{"v":7,"i":0},{"v":8,"i":1}]}`
+	assert host.events.join(",")
+		== "ParallelStateEntered,ParallelStateStarted,PassStateEntered,PassStateExited,"
+		+ "PassStateEntered,PassStateExited,ParallelStateSucceeded,ParallelStateExited,MapStateEntered,"
+		+ "MapStateStarted,MapIterationStarted,TaskStateEntered,TaskScheduled,TaskStarted,TaskSucceeded,"
+		+ "TaskStateExited,MapIterationSucceeded,MapIterationStarted,TaskStateEntered,TaskScheduled,TaskStarted,"
+		+ "TaskSucceeded,TaskStateExited,MapIterationSucceeded,MapStateSucceeded,MapStateExited"
+}
+
+test "intrinsic functions" {
+	const d = one(`{"Type":"Pass","Parameters":{
+		"f.$":"States.Format('{} is {}', $.a, States.ArrayLength($.xs))",
+		"j.$":"States.StringToJson('{\\"k\\":1}')",
+		"s.$":"States.JsonToString($.xs)",
+		"p.$":"States.ArrayPartition(States.ArrayRange(1, 5, 1), 2)",
+		"c.$":"States.ArrayContains($.xs, 2)",
+		"g.$":"States.ArrayGetItem($.xs, 1)",
+		"u.$":"States.ArrayUnique(States.Array(1, 1, 'x'))",
+		"b.$":"States.Base64Decode(States.Base64Encode('hi'))",
+		"h.$":"States.Hash('abc', 'SHA-256')",
+		"m.$":"States.JsonMerge($.o, States.StringToJson('{\\"y\\":2}'), false)",
+		"r.$":"States.MathRandom(10, 20)",
+		"n.$":"States.MathAdd(1, -3)",
+		"t.$":"States.StringSplit('a,b;c', ',;')",
+		"id.$":"States.UUID()"},"End":true}`)
+	assert run(d, `{"a":"n","xs":[1,2],"o":{"x":1}}`)
+		== `{"f":"n is 2","j":{"k":1},"s":"[1,2]",` + `"p":[[1,2],[3,4],[5]],"c":true,"g":2,"u":[1,"x"],"b":"hi",`
+		+ `"h":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","m":{"x":1,"y":2},"r":15,"n":-2,`
+		+ `"t":["a","b","c"],"id":"11111111-2222-4333-8444-555555555555"}`
+	assert run(one(`{"Type":"Pass","Parameters":{"x.$":"States.Nope()"},"End":true}`), `{}`)
+		== "States.IntrinsicFailure: The intrinsic function States.Nope is not supported"
+}
+
+test "numbers keep their text" {
+	assert write(num(3.0)) == "3" && write(parse(`[1.50,{"a":"\\u00e9"}]`)) == `[1.50,{"a":"é"}]`
+}

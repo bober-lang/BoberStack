@@ -1,0 +1,1800 @@
+//! AWS Step Functions: state machines, STANDARD and EXPRESS, of the States Language of JSONPath (./asl), their
+//! executions, and activities. BoberStack has no timers and runs nothing between requests, so an execution advances
+//! only inside a request: StartExecution interprets the machine to its end, or to a task that waits for a token, before
+//! it answers. A Task calls the handler of its service directly, as a session of the machine's role.
+//!
+//! A paused execution's task token is the execution's ARN, the task's number in the run and a random secret, so
+//! SendTaskSuccess and SendTaskFailure find it and continue it within their request: they run the machine again from
+//! its start, replaying each task's outcome, UUID and random number the execution recorded. There is no long poll.
+//!
+//! Where AWS differs:
+//!
+//! - Tasks are the optimized integrations sqs:sendMessage, sns:publish, dynamodb:getItem, putItem, updateItem and
+//!   deleteItem, events:putEvents, states:startExecution and lambda:invoke, and the aws-sdk integrations
+//!   kinesis:putRecord and lambda:invoke. Their results are without AWS's SdkHttpMetadata and SdkResponseMetadata. A
+//!   failed call is named of the service and the fault's code with Exception after it, as
+//!   SQS.QueueDoesNotExistException.
+//! - No Lambda function runs here, so every function that exists answers its error, NotImplemented.
+//! - Heartbeats are accepted and change nothing; no task times out.
+//! - An alias of two versions does not pick at random: of each 100 executions it starts in a row, exactly as many as
+//!   the first's weight run the first version, spread evenly. DescribeStateMachine refuses an alias's ARN.
+//! - TestState's mocks, variables, context and state configuration are ignored, as is revealSecrets.
+//! - A redrive takes the execution again from the task whose failure ended it, else from its start.
+//! - A DISTRIBUTED Map is processed inline within the request, its child executions one after the other; a child that
+//!   pauses is not supported. Map run and child ARNs and the ResultWriter's layout are from memory, not checked
+//!   against AWS.
+//! - Branches of a Parallel and iterations of a Map run one after the other, and a pause in one stops the others.
+//!   Timeouts never pass, and an EXPRESS machine's executions are kept and described as a STANDARD one's.
+//! - A history's previousEventId is the event before it, whatever branch or iteration it is of.
+//! - The other aws-sdk integrations are not implemented; nor is JSONata, which CreateStateMachine refuses.
+
+import * as api from "./api"
+import * as asl from "./asl"
+import { Activity, Alias, Execution, Machine, MapRun, Tables, Version } from "./records"
+import { arr, boolean, Json, JsonError, nul, num, obj, parse, str, write } from "./value"
+import * as dynamodbApi from "../dynamodb/api"
+import * as eventsApi from "../events/api"
+import * as kinesisApi from "../kinesis/api"
+import * as lambdaApi from "../lambda/api"
+import * as s3Api from "../s3/api"
+import * as snsApi from "../sns/api"
+import * as sqsApi from "../sqs/api"
+import { actAs, passRole } from "../sts/sts"
+import { Fault } from "../../core/fault"
+import { uuid } from "../../core/random"
+import * as json from "../../core/protocol/json"
+import { Caller, requestTags, resourceTags } from "../../core/service"
+import { endsWith, startsWith } from "std/algo"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import { ParseError, parseInt, split } from "std/string"
+import { rfc3339, second } from "std/time"
+
+const principal = "states.amazonaws.com"
+
+export class Handler {
+	...api.Unimplemented
+
+	sqs: sqsApi.SQS
+	sns: snsApi.SNS
+	dynamodb: dynamodbApi.DynamoDB
+	events: eventsApi.EventBridge
+	kinesis: kinesisApi.Kinesis | null = null
+	lambda: lambdaApi.Lambda | null = null
+	s3: s3Api.S3 | null = null
+
+	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS, dynamodb: dynamodbApi.DynamoDB, events: eventsApi.EventBridge) {
+		this.sqs = sqs
+		this.sns = sns
+		this.dynamodb = dynamodb
+		this.events = events
+	}
+
+	createStateMachine(caller: Caller, input: api.CreateStateMachineInput): api.CreateStateMachineOutput throws Fault {
+		const arn = machineArn(caller, input.name)
+		const tags = pairs(input.tags ?? [])
+		passed(caller, input.roleArn, arn,
+			if (tags.length == 0) ["states:CreateStateMachine"]
+			else ["states:CreateStateMachine", "states:TagResource"], requestTags(tags))
+		named(input.name)
+		defined(input.definition)
+		const db = new Tables(caller.regional())
+		const kind = input.type ?? "STANDARD"
+		const was = db.machines.get(input.name)
+		if (was != null) {
+			if (was.definition == input.definition && was.role == input.roleArn && was.kind == kind) {
+				const out = new api.CreateStateMachineOutput()
+				out.stateMachineArn = arn
+				out.creationDate = was.created
+				return out
+			}
+			throw api.stateMachineAlreadyExists(`State Machine Already Exists: '${arn}'`)
+		}
+		const m = new Machine()
+		m.name = input.name
+		m.kind = kind
+		m.definition = input.definition
+		m.role = input.roleArn
+		m.created = now()
+		m.revision = uuid()
+		m.tags = tags
+		db.machines.put(m.name, m)
+		const out = new api.CreateStateMachineOutput()
+		out.stateMachineArn = arn
+		out.creationDate = m.created
+		if (input.publish) {
+			out.stateMachineVersionArn = publish(caller, db, m, input.versionDescription)[0]
+		}
+		return out
+	}
+
+	describeStateMachine(caller: Caller,
+		input: api.DescribeStateMachineInput): api.DescribeStateMachineOutput throws Fault {
+		const [name, qualifier] = qualified(input.stateMachineArn)
+		if (qualifier != "" && !isDigit(qualifier)) {
+			throw api.validationException(`Invalid Arn: 'Resource type not valid in this context: stateMachine alias'`)
+		}
+		const m = machine(caller, if (qualifier == "") input.stateMachineArn else machineArn(caller, name))
+		const out = new api.DescribeStateMachineOutput()
+		out.stateMachineArn = input.stateMachineArn
+		out.name = m.name
+		out.status = "ACTIVE"
+		out.definition = m.definition
+		out.roleArn = m.role
+		out.type = typeOf(m.kind)
+		out.creationDate = m.created
+		out.loggingConfiguration = logging()
+		out.tracingConfiguration = tracing()
+		out.revisionId = m.revision
+		if (qualifier != "") {
+			const v = version(new Tables(caller.regional()), name, qualifier, input.stateMachineArn)
+			out.definition = v.definition
+			out.roleArn = v.role
+			out.revisionId = v.revision
+			out.description = v.description
+			out.creationDate = v.created
+		}
+		return out
+	}
+
+	listStateMachines(caller: Caller, input: api.ListStateMachinesInput): api.ListStateMachinesOutput throws Fault {
+		caller.allow(machineArn(caller, "*"))
+		const all = new Tables(caller.regional()).machines.scan(null, 2147483647).map(e => e[1])
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListStateMachinesOutput()
+		out.stateMachines = page.map(m => {
+			const w = new api.StateMachineListItem()
+			w.stateMachineArn = machineArn(caller, m.name)
+			w.name = m.name
+			w.type = typeOf(m.kind)
+			w.creationDate = m.created
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	updateStateMachine(caller: Caller, input: api.UpdateStateMachineInput): api.UpdateStateMachineOutput throws Fault {
+		const name = machineName(input.stateMachineArn)
+		if (input.definition == null && input.roleArn == null && input.loggingConfiguration == null
+			&& input.tracingConfiguration == null && input.encryptionConfiguration == null) {
+			throw api.missingRequiredParameter("Either the definition, the role ARN, the LoggingConfiguration, "
+				+ "the EncryptionConfiguration or the TracingConfiguration must be specified")
+		}
+		const db = new Tables(caller.regional())
+		const m = db.machines.get(name)
+		const context = resourceTags(m?.tags ?? [])
+		if (input.roleArn != null) {
+			passed(caller, input.roleArn!, input.stateMachineArn, ["states:UpdateStateMachine"], context)
+		} else {
+			caller.actions = ["states:UpdateStateMachine"]
+			caller.allow(input.stateMachineArn, null, context)
+		}
+		if (m == null) {
+			throw doesNotExist(input.stateMachineArn)
+		}
+		if (input.definition != null) {
+			defined(input.definition!)
+			m.definition = input.definition!
+		}
+		m.role = input.roleArn ?? m.role
+		m.revision = uuid()
+		db.machines.put(m.name, m)
+		const out = new api.UpdateStateMachineOutput()
+		out.updateDate = now()
+		out.revisionId = m.revision
+		if (input.publish) {
+			out.stateMachineVersionArn = publish(caller, db, m, input.versionDescription)[0]
+		}
+		return out
+	}
+
+	publishStateMachineVersion(caller: Caller,
+		input: api.PublishStateMachineVersionInput): api.PublishStateMachineVersionOutput throws Fault {
+		const m = machine(caller, input.stateMachineArn)
+		if (input.revisionId != null && input.revisionId != m.revision) {
+			throw api.conflictException("Failed to publish the State Machine version due to mismatch between the "
+				+ `provided revision id '${input.revisionId}' and the current revision id '${m.revision}'.`)
+		}
+		const [arn, created] = publish(caller, new Tables(caller.regional()), m, input.description)
+		const out = new api.PublishStateMachineVersionOutput()
+		out.stateMachineVersionArn = arn
+		out.creationDate = created
+		return out
+	}
+
+	listStateMachineVersions(caller: Caller,
+		input: api.ListStateMachineVersionsInput): api.ListStateMachineVersionsOutput throws Fault {
+		const m = machine(caller, input.stateMachineArn)
+		const db = new Tables(caller.regional())
+		const all: api.StateMachineVersionListItem[] = []
+		for (let n = m.versions; n > 0; n--) {
+			const v = db.versions.get(`${m.name}\x00${n}`)
+			if (v != null) {
+				const w = new api.StateMachineVersionListItem()
+				w.stateMachineVersionArn = `${machineArn(caller, m.name)}:${n}`
+				w.creationDate = v.created
+				all.push(w)
+			}
+		}
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListStateMachineVersionsOutput()
+		out.stateMachineVersions = page
+		out.nextToken = next
+		return out
+	}
+
+	deleteStateMachineVersion(caller: Caller,
+		input: api.DeleteStateMachineVersionInput): api.DeleteStateMachineVersionOutput throws Fault {
+		const arn = input.stateMachineVersionArn
+		const [name, q] = qualified(arn)
+		if (!isDigit(q)) {
+			throw api.invalidArn(`Invalid Arn: 'Resource type not valid in this context: ${arn}'`)
+		}
+		caller.allow(arn)
+		const db = new Tables(caller.regional())
+		const by = db.aliases.scan(null, 2147483647, `${name}\x00`).map(e => e[1]).filter(a => a.routes.some(r => `${r[0]}`
+			== q)).map(a => `${machineArn(caller, name)}:${a.name}`)
+		if (by.length > 0) {
+			throw api.conflictException("Version to be deleted must not be referenced by an alias. "
+				+ `Current list of aliases referencing this version: [${by.join(", ")}]`)
+		}
+		db.versions.delete(`${name}\x00${q}`)
+		return new api.DeleteStateMachineVersionOutput()
+	}
+
+	createStateMachineAlias(caller: Caller,
+		input: api.CreateStateMachineAliasInput): api.CreateStateMachineAliasOutput throws Fault {
+		const db = new Tables(caller.regional())
+		const [rs, name] = routes(db, input.routingConfiguration)
+		const arn = `${machineArn(caller, name)}:${input.name}`
+		caller.allow(arn)
+		if (isDigit(input.name)) {
+			throw api.validationException(`Invalid alias name: '${input.name}'`)
+		}
+		named(input.name)
+		const k = `${name}\x00${input.name}`
+		const was = db.aliases.get(k)
+		if (was != null) {
+			const text = (routes: [i32, i32][]) => routes.map(r => `${r[0]}/${r[1]}`).join(",")
+			if (was.description == input.description && text(was.routes) == text(rs)) {
+				const out = new api.CreateStateMachineAliasOutput()
+				out.stateMachineAliasArn = arn
+				out.creationDate = was.created
+				return out
+			}
+			throw api.conflictException(`Failed to create alias because an alias with the same name and a different `
+				+ `routing configuration already exists.`)
+		}
+		const a = new Alias()
+		a.name = input.name
+		a.description = input.description
+		a.routes = rs
+		a.created = now()
+		a.updated = a.created
+		db.aliases.put(k, a)
+		const out = new api.CreateStateMachineAliasOutput()
+		out.stateMachineAliasArn = arn
+		out.creationDate = a.created
+		return out
+	}
+
+	describeStateMachineAlias(caller: Caller,
+		input: api.DescribeStateMachineAliasInput): api.DescribeStateMachineAliasOutput throws Fault {
+		const [name, a] = alias(caller, input.stateMachineAliasArn)
+		const out = new api.DescribeStateMachineAliasOutput()
+		out.stateMachineAliasArn = input.stateMachineAliasArn
+		out.name = a.name
+		out.description = a.description
+		out.routingConfiguration = routing(caller, name, a.routes)
+		out.creationDate = a.created
+		out.updateDate = a.updated
+		return out
+	}
+
+	updateStateMachineAlias(caller: Caller,
+		input: api.UpdateStateMachineAliasInput): api.UpdateStateMachineAliasOutput throws Fault {
+		if (input.description == null && input.routingConfiguration == null) {
+			throw api.validationException("Either the description or the RoutingConfiguration must be specified")
+		}
+		const [name, a] = alias(caller, input.stateMachineAliasArn)
+		const db = new Tables(caller.regional())
+		if (input.routingConfiguration != null) {
+			const [rs, of] = routes(db, input.routingConfiguration!)
+			if (of != name) {
+				throw api.validationException("Routing configuration must contain state machine version ARNs of the same state machine")
+			}
+			a.routes = rs
+		}
+		a.description = input.description ?? a.description
+		a.updated = now()
+		db.aliases.put(`${name}\x00${a.name}`, a)
+		const out = new api.UpdateStateMachineAliasOutput()
+		out.updateDate = a.updated
+		return out
+	}
+
+	deleteStateMachineAlias(caller: Caller,
+		input: api.DeleteStateMachineAliasInput): api.DeleteStateMachineAliasOutput throws Fault {
+		const [name, q] = aliasOf(input.stateMachineAliasArn)
+		caller.allow(input.stateMachineAliasArn)
+		new Tables(caller.regional()).aliases.delete(`${name}\x00${q}`)
+		return new api.DeleteStateMachineAliasOutput()
+	}
+
+	listStateMachineAliases(caller: Caller,
+		input: api.ListStateMachineAliasesInput): api.ListStateMachineAliasesOutput throws Fault {
+		const m = machine(caller, input.stateMachineArn)
+		const all = new Tables(caller.regional()).aliases.scan(null, 2147483647, `${m.name}\x00`).map(e => {
+			const w = new api.StateMachineAliasListItem()
+			w.stateMachineAliasArn = `${machineArn(caller, m.name)}:${e[1].name}`
+			w.creationDate = e[1].created
+			return w
+		})
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListStateMachineAliasesOutput()
+		out.stateMachineAliases = page
+		out.nextToken = next
+		return out
+	}
+
+	deleteStateMachine(caller: Caller, input: api.DeleteStateMachineInput): api.DeleteStateMachineOutput throws Fault {
+		const name = machineName(input.stateMachineArn)
+		caller.allow(input.stateMachineArn)
+		const db = new Tables(caller.regional())
+		for (const [k, _] of db.versions.scan(null, 2147483647, `${name}\x00`)) {
+			db.versions.delete(k)
+		}
+		for (const [k, _] of db.aliases.scan(null, 2147483647, `${name}\x00`)) {
+			db.aliases.delete(k)
+		}
+		db.machines.delete(name)
+		return new api.DeleteStateMachineOutput()
+	}
+
+	validateStateMachineDefinition(caller: Caller,
+		input: api.ValidateStateMachineDefinitionInput): api.ValidateStateMachineDefinitionOutput throws Fault {
+		caller.allow(machineArn(caller, "*"))
+		const out = new api.ValidateStateMachineDefinitionOutput()
+		for (const [code, message, location] of asl.diagnostics(input.definition)) {
+			const d = new api.ValidateStateMachineDefinitionDiagnostic()
+			d.code = code
+			d.message = message
+			d.location = if (location == "") null else location
+			out.diagnostics.push(d)
+		}
+		out.result = if (out.diagnostics.length == 0) "OK" else "FAIL"
+		out.truncated = false
+		return out
+	}
+
+	testState(caller: Caller, input: api.TestStateInput): api.TestStateOutput throws Fault {
+		let d = new Json()
+		try {
+			d = parse(input.definition)
+		} catch (j: JsonError) {
+			throw api.invalidDefinition(asl.invalid([["INVALID_JSON_DESCRIPTION", j.message, ""]]))
+		}
+		let state = d
+		const states = d.get("States")
+		if (states != null) {
+			const name = input.stateName ?? d.str("StartAt") ?? ""
+			const s = states.get(name)
+			if (s == null) {
+				throw api.validationException(`State '${name}' does not exist in the definition`)
+			}
+			state = s!
+		}
+		const wrapped = obj([["StartAt", str("S")], ["States", obj([["S", state]])]])
+		const ds = asl.diagnostics(write(wrapped)).filter(x => x[0] != "MISSING_TRANSITION_TARGET"
+			&& x[0] != "MISSING_END_STATE")
+		if (ds.length > 0) {
+			throw api.invalidDefinition(asl.invalid(ds))
+		}
+		if (input.roleArn != null) {
+			passed(caller, input.roleArn!, machineArn(caller, "*"), ["states:TestState"], [])
+		} else {
+			caller.allow(machineArn(caller, "*"))
+		}
+		let value = new Json()
+		try {
+			value = parse(input.input ?? "{}")
+		} catch (j: JsonError) {
+			throw api.invalidExecutionInput(`Invalid State Machine Execution Input: '${j.message}'`)
+		}
+		const e = new Execution()
+		e.name = "TestState"
+		e.machine = "TestState"
+		e.role = input.roleArn ?? ""
+		e.input = input.input ?? "{}"
+		e.started = now()
+		const arn = machineArn(caller, e.machine)
+		const time = stamp(e.started)
+		const context = obj([["Execution",
+			obj([["Id", str(executionArn(caller, e))], ["Input", value], ["StartTime", str(time)],
+			["Name", str(e.name)], ["RoleArn", str(e.role)]])],
+			["StateMachine", obj([["Id", str(arn)], ["Name", str(e.machine)]])]])
+		const t = new asl.Execution(new Host(this, caller, e, arn), context, time).test(state, value)
+		const out = new api.TestStateOutput()
+		out.status = switch (t.status) {
+			case "FAILED": "FAILED"
+			case "RETRIABLE": "RETRIABLE"
+			case "CAUGHT_ERROR": "CAUGHT_ERROR"
+			default: "SUCCEEDED"
+		}
+		out.output = if (t.output == null) null else write(t.output!)
+		out.nextState = t.next
+		out.error = t.failure?.error
+		out.cause = t.failure?.cause
+		if (input.inspectionLevel == "DEBUG" || input.inspectionLevel == "TRACE") {
+			const i = new api.InspectionData()
+			for (const [k, v] of t.steps) {
+				const text = write(v)
+				switch (k) {
+					case "input": i.input = text
+					case "afterInputPath": i.afterInputPath = text
+					case "afterParameters": i.afterParameters = text
+					case "result": i.result = text
+					case "afterResultSelector": i.afterResultSelector = text
+					case "afterResultPath": i.afterResultPath = text
+				}
+			}
+			if (t.retry >= 0 || t.catcher >= 0) {
+				const x = new api.InspectionErrorDetails()
+				x.retryIndex = if (t.retry >= 0) t.retry else null
+				x.catchIndex = if (t.catcher >= 0) t.catcher else null
+				i.errorDetails = x
+			}
+			out.inspectionData = i
+		}
+		return out
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceInput): api.TagResourceOutput throws Fault {
+		const given = pairs(input.tags)
+		retag(caller, input.resourceArn, requestTags(given), tags => {
+			const kept = tags.filter(t => !given.some(g => g[0] == t[0]))
+			kept.append(given)
+			return kept
+		})
+		return new api.TagResourceOutput()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceInput): api.UntagResourceOutput throws Fault {
+		retag(caller, input.resourceArn, [], tags => tags.filter(t => !input.tagKeys.includes(t[0])))
+		return new api.UntagResourceOutput()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceInput): api.ListTagsForResourceOutput throws Fault {
+		const out = new api.ListTagsForResourceOutput()
+		retag(caller, input.resourceArn, [], tags => {
+			out.tags = tags.map(t => ({ ...new api.Tag(), key: t[0], value: t[1] }))
+			return tags
+		})
+		return out
+	}
+
+	startExecution(caller: Caller, input: api.StartExecutionInput): api.StartExecutionOutput throws Fault {
+		const e = this.start(caller, input.stateMachineArn, input.name, input.input, false)
+		const out = new api.StartExecutionOutput()
+		out.executionArn = executionArn(caller, e)
+		out.startDate = e.started
+		return out
+	}
+
+	startSyncExecution(caller: Caller, input: api.StartSyncExecutionInput): api.StartSyncExecutionOutput throws Fault {
+		const e = this.start(caller, input.stateMachineArn, input.name, input.input, true)
+		const out = new api.StartSyncExecutionOutput()
+		out.executionArn = executionArn(caller, e)
+		out.stateMachineArn = input.stateMachineArn
+		out.name = e.name
+		out.startDate = e.started
+		out.stopDate = e.stopped ?? e.started
+		out.status = if (e.status == "SUCCEEDED") "SUCCEEDED" else "FAILED"
+		out.error = e.error
+		out.cause = e.cause
+		out.input = e.input
+		out.inputDetails = details()
+		out.output = e.output
+		out.outputDetails = if (e.output == null) null else details()
+		return out
+	}
+
+	describeExecution(caller: Caller, input: api.DescribeExecutionInput): api.DescribeExecutionOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const out = new api.DescribeExecutionOutput()
+		out.executionArn = input.executionArn
+		out.stateMachineArn = machineArn(caller, e.machine)
+		out.name = e.name
+		out.status = statusOf(e.status)
+		out.startDate = e.started
+		out.stopDate = e.stopped
+		out.input = e.input
+		out.inputDetails = details()
+		out.output = e.output
+		out.outputDetails = if (e.output == null) null else details()
+		out.error = e.error
+		out.cause = e.cause
+		out.stateMachineVersionArn = e.version
+		out.stateMachineAliasArn = e.alias
+		out.mapRunArn = e.mapRun
+		out.redriveCount = e.redrives
+		out.redriveDate = e.redriven
+		const reason = this.refusal(e)
+		out.redriveStatus = if (reason == "") "REDRIVABLE" else "NOT_REDRIVABLE"
+		out.redriveStatusReason = if (reason == "") null else reason
+		return out
+	}
+
+	describeStateMachineForExecution(caller: Caller,
+		input: api.DescribeStateMachineForExecutionInput): api.DescribeStateMachineForExecutionOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const out = new api.DescribeStateMachineForExecutionOutput()
+		out.stateMachineArn = machineArn(caller, e.machine)
+		out.name = e.machine
+		out.definition = e.definition
+		out.roleArn = e.role
+		out.updateDate = e.started
+		out.loggingConfiguration = logging()
+		out.tracingConfiguration = tracing()
+		return out
+	}
+
+	listMapRuns(caller: Caller, input: api.ListMapRunsInput): api.ListMapRunsOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const all = new Tables(caller.regional()).mapRuns.scan(null, 2147483647,
+			`${e.machine}/`).filter(m => m[1].execution == input.executionArn)
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListMapRunsOutput()
+		out.mapRuns = page.map(m => {
+			const w = new api.MapRunListItem()
+			w.executionArn = m[1].execution
+			w.mapRunArn = `arn:aws:states:${caller.region}:${caller.account}:mapRun:${m[0]}`
+			w.stateMachineArn = m[1].machine
+			w.startDate = m[1].started
+			w.stopDate = m[1].stopped
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	describeMapRun(caller: Caller, input: api.DescribeMapRunInput): api.DescribeMapRunOutput throws Fault {
+		const [_, m] = mapRun(caller, input.mapRunArn)
+		const out = new api.DescribeMapRunOutput()
+		out.mapRunArn = input.mapRunArn
+		out.executionArn = m.execution
+		out.status = if (m.status == "SUCCEEDED") "SUCCEEDED"
+			else if (m.status == "FAILED") "FAILED"
+			else if (m.status == "ABORTED") "ABORTED"
+			else "RUNNING"
+		out.startDate = m.started
+		out.stopDate = m.stopped
+		out.maxConcurrency = m.concurrency
+		out.toleratedFailurePercentage = m.percentage
+		out.toleratedFailureCount = m.count
+		const i = out.itemCounts
+		i.succeeded = m.succeeded
+		i.failed = m.failed
+		i.total = m.total
+		i.resultsWritten = m.written
+		i.failuresNotRedrivable = 0
+		i.pendingRedrive = 0
+		const x = out.executionCounts
+		x.total = m.executions
+		x.failed = if (m.total == 0) 0 else m.executions * m.failed / m.total
+		x.succeeded = m.executions - x.failed
+		x.resultsWritten = if (m.written == 0) 0 else x.total
+		x.failuresNotRedrivable = 0
+		x.pendingRedrive = 0
+		out.redriveCount = 0
+		return out
+	}
+
+	updateMapRun(caller: Caller, input: api.UpdateMapRunInput): api.UpdateMapRunOutput throws Fault {
+		const [k, m] = mapRun(caller, input.mapRunArn)
+		if (input.maxConcurrency == null && input.toleratedFailurePercentage == null
+			&& input.toleratedFailureCount == null) {
+			throw api.validationException("At least one of the parameters maxConcurrency, toleratedFailurePercentage, toleratedFailureCount "
+				+ "must be specified")
+		}
+		m.concurrency = input.maxConcurrency ?? m.concurrency
+		m.percentage = input.toleratedFailurePercentage ?? m.percentage
+		m.count = input.toleratedFailureCount ?? m.count
+		(new Tables(caller.regional()).mapRuns).put(k, m)
+		return new api.UpdateMapRunOutput()
+	}
+
+	listExecutions(caller: Caller, input: api.ListExecutionsInput): api.ListExecutionsOutput throws Fault {
+		if (input.stateMachineArn != null && input.mapRunArn != null) {
+			throw api.validationException("Cannot provide both a StateMachine ARN and a MapRun ARN")
+		}
+		if (input.mapRunArn != null) {
+			// A map run's child executions, of the machine the run's machine's name, a slash and the label.
+			const run = input.mapRunArn!
+			const [k, m] = mapRun(caller, run)
+			const machine = split(k, ":")[0]
+			const all = new Tables(caller.regional()).executions.scan(null, 2147483647, `${machine}\x00`).map(e => e[1]).filter(e => e.mapRun
+				== run && (input.statusFilter == null || e.status == input.statusFilter))
+			const [page, next] = part(all, input.nextToken, input.maxResults)
+			const out = new api.ListExecutionsOutput()
+			out.executions = page.map(e => {
+				const w = new api.ExecutionListItem()
+				w.executionArn = executionArn(caller, e)
+				w.stateMachineArn = machineArn(caller, e.machine)
+				w.name = e.name
+				w.status = statusOf(e.status)
+				w.startDate = e.started
+				w.stopDate = e.stopped
+				w.mapRunArn = run
+				w.itemCount = e.items
+				w.redriveCount = 0
+				return w
+			})
+			out.nextToken = next
+			return out
+		}
+		if (input.stateMachineArn == null) {
+			throw api.validationException("Must provide a StateMachine ARN or MapRun ARN")
+		}
+		const arn = input.stateMachineArn!
+		const [name, qualifier] = qualified(arn)
+		caller.allow(arn)
+		const db = new Tables(caller.regional())
+		if (db.machines.get(name) == null) {
+			throw doesNotExist(arn)
+		}
+		if (qualifier != ""
+			&& (if (isDigit(qualifier)) db.versions.get(`${name}\x00${qualifier}`) == null
+			else db.aliases.get(`${name}\x00${qualifier}`) == null)) {
+			throw doesNotExist(arn)
+		}
+		// A version's or alias's ARN lists the executions started by it.
+		const all = db.executions.scan(null, 2147483647, `${name}\x00`).map(e => e[1]).filter(e => (input.statusFilter
+			== null || e.status == input.statusFilter) && (qualifier == "" || e.version == arn || e.alias == arn)
+			&& (input.redriveFilter == null || (input.redriveFilter == "REDRIVEN") == (e.redrives > 0)))
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListExecutionsOutput()
+		out.executions = page.map(e => {
+			const w = new api.ExecutionListItem()
+			w.executionArn = executionArn(caller, e)
+			w.stateMachineArn = input.stateMachineArn!
+			w.name = e.name
+			w.status = statusOf(e.status)
+			w.startDate = e.started
+			w.stopDate = e.stopped
+			w.stateMachineVersionArn = e.version
+			w.stateMachineAliasArn = e.alias
+			w.redriveCount = e.redrives
+			w.redriveDate = e.redriven
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	stopExecution(caller: Caller, input: api.StopExecutionInput): api.StopExecutionOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		if (e.status == "RUNNING") {
+			e.status = "ABORTED"
+			e.error = input.error
+			e.cause = input.cause
+			e.stopped = now()
+			e.waiting = -1
+			e.activity = ""
+			e.work = ""
+			const details: [string, Json][] = []
+			if (input.error != null) {
+				details.push(["error", str(input.error!)])
+			}
+			if (input.cause != null) {
+				details.push(["cause", str(input.cause!)])
+			}
+			const host = new Host(this, caller, e, machineArn(caller, e.machine))
+			host.made = host.kept
+			host.event("ExecutionAborted", "executionAbortedEventDetails", obj(details))
+			this.ended(caller, e)
+			(new Tables(caller.regional()).executions).put(nameOf(input.executionArn, "execution"), e)
+		}
+		const out = new api.StopExecutionOutput()
+		out.stopDate = e.stopped ?? now()
+		return out
+	}
+
+	redriveExecution(caller: Caller, input: api.RedriveExecutionInput): api.RedriveExecutionOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const reason = this.refusal(e)
+		if (reason != "") {
+			throw api.executionNotRedrivable(reason)
+		}
+		// Taken again from the task whose failure ended it, if one did; else from its end, its steps replayed.
+		let kept = e.events.length - 1 - e.shift
+		if (e.status == "FAILED" && e.steps.length > 0 && e.steps.length == e.marks.length) {
+			let last = new Json()
+			try {
+				last = parse(e.steps[e.steps.length - 1])
+			} catch (j: JsonError) {} // written by write
+			if (last.kind == "object" && last.str("Error") == e.error && last.str("Cause") == e.cause) {
+				e.steps.pop()
+				kept = e.marks.pop()!
+			}
+		}
+		e.status = "RUNNING"
+		e.output = null
+		e.error = null
+		e.cause = null
+		e.stopped = null
+		e.redrives++
+		e.redriven = now()
+		const host = new Host(this, caller, e, machineArn(caller, e.machine))
+		host.made = host.kept
+		host.event("ExecutionRedriven", "executionRedrivenEventDetails",
+			obj([["redriveCount", num(e.redrives as f64)]]))
+		e.shift = e.events.length - kept
+		let given = new Json()
+		try {
+			given = parse(e.input)
+		} catch (j: JsonError) {} // validated when started
+		this.run(caller, e, e.version ?? machineArn(caller, e.machine), given)
+		(new Tables(caller.regional()).executions).put(nameOf(input.executionArn, "execution"), e)
+		const out = new api.RedriveExecutionOutput()
+		out.redriveDate = e.redriven!
+		return out
+	}
+
+	createActivity(caller: Caller, input: api.CreateActivityInput): api.CreateActivityOutput throws Fault {
+		const arn = activityArn(caller, input.name)
+		const tags = pairs(input.tags ?? [])
+		caller.actions = if (tags.length == 0) ["states:CreateActivity"]
+			else ["states:CreateActivity", "states:TagResource"]
+		caller.allow(arn, null, requestTags(tags))
+		named(input.name)
+		const db = new Tables(caller.regional())
+		let a = db.activities.get(input.name)
+		if (a == null) {
+			a = new Activity()
+			a.name = input.name
+			a.created = now()
+			a.tags = tags
+			db.activities.put(a.name, a!)
+		}
+		const out = new api.CreateActivityOutput()
+		out.activityArn = arn
+		out.creationDate = a.created
+		return out
+	}
+
+	describeActivity(caller: Caller, input: api.DescribeActivityInput): api.DescribeActivityOutput throws Fault {
+		const a = activity(caller, input.activityArn)
+		const out = new api.DescribeActivityOutput()
+		out.activityArn = input.activityArn
+		out.name = a.name
+		out.creationDate = a.created
+		return out
+	}
+
+	listActivities(caller: Caller, input: api.ListActivitiesInput): api.ListActivitiesOutput throws Fault {
+		caller.allow(activityArn(caller, "*"))
+		const all = new Tables(caller.regional()).activities.scan(null, 2147483647).map(e => e[1])
+		const [page, next] = part(all, input.nextToken, input.maxResults)
+		const out = new api.ListActivitiesOutput()
+		out.activities = page.map(a => {
+			const w = new api.ActivityListItem()
+			w.activityArn = activityArn(caller, a.name)
+			w.name = a.name
+			w.creationDate = a.created
+			return w
+		})
+		out.nextToken = next
+		return out
+	}
+
+	deleteActivity(caller: Caller, input: api.DeleteActivityInput): api.DeleteActivityOutput throws Fault {
+		const name = nameOf(input.activityArn, "activity")
+		caller.allow(input.activityArn)
+		new Tables(caller.regional()).activities.delete(name)
+		return new api.DeleteActivityOutput()
+	}
+
+	getActivityTask(caller: Caller, input: api.GetActivityTaskInput): api.GetActivityTaskOutput throws Fault {
+		activity(caller, input.activityArn)
+		const db = new Tables(caller.regional())
+		const out = new api.GetActivityTaskOutput()
+		let oldest: [string, Execution] | null = null
+		for (const [k, e] of db.executions.scan(null, 2147483647)) {
+			if (e.status == "RUNNING" && e.activity == input.activityArn && !e.handed
+				&& (oldest == null || e.scheduled < oldest![1].scheduled)) {
+				oldest = [k, e]
+			}
+		}
+		if (oldest == null) {
+			return out
+		}
+		const [k, e] = oldest!
+		e.handed = true
+		const host = new Host(this, caller, e, machineArn(caller, e.machine))
+		host.made = host.kept
+		host.event("ActivityStarted", "activityStartedEventDetails",
+			if (input.workerName == null) obj([]) else obj([["workerName", str(input.workerName!)]]))
+		db.executions.put(k, e)
+		out.taskToken = token(executionArn(caller, e), e.waiting, e.secret)
+		out.input = e.work
+		return out
+	}
+
+	sendTaskSuccess(caller: Caller, input: api.SendTaskSuccessInput): api.SendTaskSuccessOutput throws Fault {
+		let output = new Json()
+		try {
+			output = parse(input.output)
+		} catch (j: JsonError) {
+			throw api.invalidOutput(`Invalid Output: '${j.message}'`)
+		}
+		this.resume(caller, input.taskToken, obj([["Output", output]]))
+		return new api.SendTaskSuccessOutput()
+	}
+
+	sendTaskFailure(caller: Caller, input: api.SendTaskFailureInput): api.SendTaskFailureOutput throws Fault {
+		this.resume(caller, input.taskToken,
+			obj([["Error", str(input.error ?? "")], ["Cause", str(input.cause ?? "")]]))
+		return new api.SendTaskFailureOutput()
+	}
+
+	sendTaskHeartbeat(caller: Caller, input: api.SendTaskHeartbeatInput): api.SendTaskHeartbeatOutput throws Fault {
+		this.resume(caller, input.taskToken, nul())
+		return new api.SendTaskHeartbeatOutput()
+	}
+
+	getExecutionHistory(caller: Caller,
+		input: api.GetExecutionHistoryInput): api.GetExecutionHistoryOutput throws Fault {
+		const e = execution(caller, input.executionArn)
+		const events = e.events.map(s => {
+			try {
+				return json.decode[api.HistoryEvent](s, api.validation)
+			} catch (f: Fault) {
+				return new api.HistoryEvent() // stored as it decodes
+			}
+		})
+		if (input.reverseOrder) {
+			events.reverse()
+		}
+		const [page, next] = part(events, input.nextToken, input.maxResults)
+		const out = new api.GetExecutionHistoryOutput()
+		out.events = page
+		out.nextToken = next
+		return out
+	}
+
+	private start(caller: Caller, arn: string, name: string | null, given: string | null,
+		sync: bool): Execution throws Fault {
+		const [machineName, qualifier] = qualified(arn)
+		const db = new Tables(caller.regional())
+		const m = db.machines.get(machineName)
+		caller.allow(arn, null, resourceTags(m?.tags ?? []))
+		if (name != null) {
+			named(name!)
+		}
+		let input = new Json()
+		try {
+			input = parse(given ?? "{}")
+		} catch (e: JsonError) {
+			throw api.invalidExecutionInput(`Invalid State Machine Execution Input: '${e.message}'`)
+		}
+		if (m == null) {
+			throw doesNotExist(arn)
+		}
+		if (sync && m.kind != "EXPRESS") {
+			throw api.stateMachineTypeNotSupported("This operation is not supported by this type of state machine")
+		}
+		const e = new Execution()
+		e.name = name ?? uuid()
+		e.machine = m.name
+		e.express = m.kind == "EXPRESS"
+		e.input = given ?? "{}"
+		e.started = now()
+		e.definition = m.definition
+		e.role = m.role
+		e.secret = split(uuid(), "-").join("")
+		if (qualifier != "") {
+			const v = version(db, m.name, qualifier, arn, true)
+			e.definition = v.definition
+			e.role = v.role
+			e.version = `${machineArn(caller, m.name)}:${v.number}`
+			e.alias = if (isDigit(qualifier)) null else arn
+		}
+		const k = `${m.name}\x00${e.name}`
+		if (db.executions.get(k) != null) {
+			throw api.executionAlreadyExists(`Execution Already Exists: '${executionArn(caller, e)}'`)
+		}
+		this.run(caller, e, arn, input)
+		db.executions.put(k, e)
+		return e
+	}
+
+	private refusal(e: Execution): string {
+		if (e.express) {
+			return "Execution of an EXPRESS state machine cannot be redriven"
+		}
+		if (e.status == "RUNNING" || e.status == "SUCCEEDED") {
+			return `Execution is ${e.status} and cannot be redriven`
+		}
+		return ""
+	}
+
+	private run(caller: Caller, e: Execution, arn: string, input: Json) throws Fault {
+		const host = new Host(this, caller, e, arn)
+		const time = stamp(e.started)
+		const context = obj([["Execution",
+			obj([["Id", str(executionArn(caller, e))], ["Input", input], ["StartTime", str(time)],
+			["Name", str(e.name)], ["RoleArn", str(e.role)], ["RedriveCount", num(e.redrives as f64)]])],
+			["StateMachine", obj([["Id", str(arn)], ["Name", str(e.machine)]])]])
+		host.event("ExecutionStarted", "executionStartedEventDetails",
+			obj([["input", str(e.input)], ["inputDetails", truncated()], ["roleArn", str(e.role)]]))
+		let definition = new Json()
+		try {
+			definition = parse(e.definition)
+		} catch (j: JsonError) {} // validated when stored
+		try {
+			const out = write(new asl.Execution(host, context, time).run(definition, input))
+			e.status = "SUCCEEDED"
+			e.output = out
+			host.event("ExecutionSucceeded", "executionSucceededEventDetails",
+				obj([["output", str(out)], ["outputDetails", truncated()]]))
+		} catch (f: asl.Failure) {
+			if (!host.paused) {
+				e.status = "FAILED"
+				e.error = f.error
+				e.cause = f.cause
+				host.event("ExecutionFailed", "executionFailedEventDetails",
+					obj([["error", str(f.error)], ["cause", str(f.cause)]]))
+			}
+		}
+		e.stopped = if (host.paused) null else now()
+		if (host.fault != null) {
+			throw host.fault!
+		}
+		this.ended(caller, e)
+	}
+
+	private resume(caller: Caller, token: string, outcome: Json) throws Fault {
+		caller.allow("*")
+		let parts: string[] = []
+		let n = -1
+		try {
+			parts = split(base64.decode(token, "url", "raw"), "#")
+			n = if (parts.length == 3) parseInt(parts[1]) else -1
+		} catch (p: ParseError) {}
+		if (n < 0 || !startsWith(parts[0], "arn:aws:states:")) {
+			throw api.invalidToken("Invalid Token: 'Invalid token'")
+		}
+		let k = ""
+		try {
+			k = nameOf(parts[0], "execution")
+		} catch (f: Fault) {
+			throw api.invalidToken("Invalid Token: 'Invalid token'")
+		}
+		const db = new Tables(caller.regional())
+		const e = db.executions.get(k)
+		if (e != null && e.secret != parts[2]) {
+			throw api.invalidToken("Invalid Token: 'Invalid token'")
+		}
+		if (e == null || e.status != "RUNNING" || e.waiting != n) {
+			throw api.taskDoesNotExist("Task Does Not Exist")
+		}
+		if (outcome.kind == "null") {
+			return
+		}
+		e.steps.push(write(outcome))
+		// The run paused at the task, its events after it not made.
+		e.marks.push(e.events.length - e.shift)
+		e.waiting = -1
+		e.activity = ""
+		e.work = ""
+		let input = new Json()
+		try {
+			input = parse(e.input)
+		} catch (j: JsonError) {} // validated when started
+		this.run(caller, e!, machineArn(caller, e.machine), input)
+		db.executions.put(k, e!)
+	}
+
+	task(c: Caller, resource: string, parameters: Json): Json throws asl.Failure {
+		for (const k of ["MessageBody", "Message"]) {
+			const v = parameters.get(k)
+			if (v != null && v.kind != "string") {
+				parameters.set(k, str(write(v!)))
+			}
+		}
+		const p = write(parameters)
+		const prefix = "arn:aws:states:::"
+		const op = if (startsWith(resource, prefix)) resource.slice(prefix.length, resource.length) else ""
+		if (op == "lambda:invoke" || op == "aws-sdk:lambda:invoke" || isLambda(resource)) {
+			return this.invoke(c, op, resource, parameters)
+		}
+		try {
+			switch (op) {
+				case "sqs:sendMessage":
+					c.actions = ["sqs:SendMessage"]
+					return result(json.result(this.sqs.sendMessage(c, json.decode[sqsApi.SendMessageRequest](p))))
+				case "sns:publish":
+					c.actions = ["sns:Publish"]
+					return result(json.result(this.sns.publish(c, json.decode[snsApi.PublishInput](p))))
+				case "dynamodb:getItem":
+					c.actions = ["dynamodb:GetItem"]
+					return result(json.result(this.dynamodb.getItem(c,
+						json.decode[dynamodbApi.GetItemInput](p, dynamodbApi.validation))))
+				case "dynamodb:putItem":
+					c.actions = ["dynamodb:PutItem"]
+					return result(json.result(this.dynamodb.putItem(c,
+						json.decode[dynamodbApi.PutItemInput](p, dynamodbApi.validation))))
+				case "dynamodb:updateItem":
+					c.actions = ["dynamodb:UpdateItem"]
+					return result(json.result(this.dynamodb.updateItem(c,
+						json.decode[dynamodbApi.UpdateItemInput](p, dynamodbApi.validation))))
+				case "dynamodb:deleteItem":
+					c.actions = ["dynamodb:DeleteItem"]
+					return result(json.result(this.dynamodb.deleteItem(c,
+						json.decode[dynamodbApi.DeleteItemInput](p, dynamodbApi.validation))))
+				case "events:putEvents":
+					c.actions = ["events:PutEvents"]
+					return result(json.result(this.events.putEvents(c,
+						json.decode[eventsApi.PutEventsRequest](p, eventsApi.validation))))
+			}
+			if (op == "aws-sdk:kinesis:putRecord" && this.kinesis != null) {
+				c.actions = ["kinesis:PutRecord"]
+				return result(json.result(this.kinesis!.putRecord(c,
+					json.decode[kinesisApi.PutRecordInput](p, kinesisApi.validation))))
+			}
+			if (op == "states:startExecution" || op == "states:startExecution.sync"
+				|| op == "states:startExecution.sync:2") {
+				return this.child(c, op, parameters)
+			}
+			if ((op == "s3:getObject" || op == "s3:listObjectsV2" || op == "s3:putObject") && this.s3 != null) {
+				return this.object(c, op, parameters)
+			}
+		} catch (f: Fault) {
+			const service = split(op, ":")[if (startsWith(op, "aws-sdk:")) 1 else 0]
+			const named = if (service == "dynamodb") "DynamoDB"
+				else if (service == "s3") "S3"
+				else if (service == "kinesis") "Kinesis"
+				else if (service == "events") "EventBridge"
+				else if (service == "sns") "SNS"
+				else if (service == "states") "StepFunctions"
+				else "SQS"
+			const code = split(f.code, ".")
+			const name = code[code.length - 1]
+			throw new asl.Failure(`${named}.${name}${if (endsWith(name, "Exception")) "" else "Exception"}`, f.message)
+		}
+		if (startsWith(op, "states:")) {
+			throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
+		}
+		throw new asl.Failure("States.TaskFailed", `The resource ${resource} is not supported by BoberStack`)
+	}
+
+	/// The S3 call op of a Distributed Map's ItemReader or ResultWriter, as the session c; a listing's every page.
+	private object(c: Caller, op: string, parameters: Json): Json throws Fault {
+		const bucket = parameters.str("Bucket") ?? ""
+		if (op == "s3:getObject") {
+			c.actions = ["s3:GetObject"]
+			const r = new s3Api.GetObjectRequest()
+			r.Bucket = bucket
+			r.Key = parameters.str("Key") ?? ""
+			return obj([["Body", str(this.s3!.getObject(c, r).Body)]])
+		}
+		if (op == "s3:putObject") {
+			c.actions = ["s3:PutObject"]
+			const r = new s3Api.PutObjectRequest()
+			r.Bucket = bucket
+			r.Key = parameters.str("Key") ?? ""
+			r.Body = parameters.str("Body") ?? ""
+			return obj([["ETag", str(this.s3!.putObject(c, r).ETag ?? "")]])
+		}
+		c.actions = ["s3:ListBucket"]
+		const items: Json[] = []
+		let token: string | null = null
+		while (true) {
+			const r = new s3Api.ListObjectsV2Request()
+			r.Bucket = bucket
+			r.Prefix = parameters.str("Prefix")
+			r.ContinuationToken = token
+			const out = this.s3!.listObjectsV2(c, r)
+			for (const o of out.Contents ?? []) {
+				items.push(obj([["Etag", str(o.ETag ?? "")], ["Key", str(o.Key ?? "")],
+					["LastModified", num(((o.LastModified ?? 0) / second) as f64)], ["Size", num((o.Size ?? 0) as f64)],
+					["StorageClass", str(o.StorageClass ?? "STANDARD")]]))
+			}
+			if (out.IsTruncated != true || out.NextContinuationToken == null) {
+				break
+			}
+			token = out.NextContinuationToken
+		}
+		return obj([["Contents", arr(items)]])
+	}
+
+	/// A call Lambda refuses fails with Lambda.<its exception>, AWSLambdaException where Lambda models none. A function's
+	/// error fails the optimized and ARN tasks with its errorType, Lambda.Unknown if none, and is the aws-sdk output.
+	private invoke(c: Caller, op: string, resource: string, parameters: Json): Json throws asl.Failure {
+		const sdk = op == "aws-sdk:lambda:invoke"
+		const r = new lambdaApi.InvocationRequest()
+		let payload: Json | null = parameters
+		if (op == "") {
+			r.FunctionName = resource
+		} else {
+			r.FunctionName = parameters.str("FunctionName") ?? ""
+			r.Qualifier = parameters.str("Qualifier")
+			const t = parameters.str("InvocationType")
+			r.InvocationType = if (t == "Event") "Event" else if (t == "DryRun") "DryRun" else null
+			payload = parameters.get("Payload")
+		}
+		r.Payload = if (payload == null) null else if (payload.kind == "string") payload.text else write(payload!)
+		if (this.lambda == null) {
+			throw new asl.Failure("Lambda.ServiceException", "Lambda is not served")
+		}
+		let out = new lambdaApi.InvocationResponse()
+		try {
+			c.actions = ["lambda:InvokeFunction"]
+			out = this.lambda!.invoke(c, r)
+		} catch (f: Fault) {
+			const parts = split(f.code, ".")
+			const last = parts[parts.length - 1]
+			const code = if (endsWith(last, "Exception")) last else `${last}Exception`
+			const modeled = endsWith(code, "Exception") && code != "AccessDeniedException"
+			let id = ""
+			try {
+				id = uuid()
+			} catch (g: Fault) {} // no randomness: no request ID
+			throw new asl.Failure(`Lambda.${if (modeled) code else "AWSLambdaException"}`,
+				if (sdk) `${f.message} (Service: Lambda, Status Code: ${f.status}, Request ID: ${id})`
+				else `${f.message} (Service: AWSLambda; Status Code: ${f.status}; Error Code: ${code}; `
+				+ `Request ID: ${id}; Proxy: null)`)
+		}
+		let result: Json = nul()
+		try {
+			result = parse(out.Payload ?? "null")
+		} catch (j: JsonError) {
+			result = str(out.Payload ?? "")
+		}
+		if (out.FunctionError != null && !sdk) {
+			throw new asl.Failure(if (result.kind == "object") result.str("errorType") ?? "Lambda.Unknown"
+				else "Lambda.Unknown", out.Payload ?? "")
+		}
+		if (op == "") {
+			return result
+		}
+		const keys: [string, Json][] = []
+		if (out.ExecutedVersion != null) {
+			keys.push(["ExecutedVersion", str(out.ExecutedVersion!)])
+		}
+		if (out.FunctionError != null) {
+			keys.push(["FunctionError", str(out.FunctionError!)])
+		}
+		keys.push(["Payload", if (sdk) str(out.Payload ?? "") else result])
+		keys.push(["StatusCode", num(out.StatusCode as f64)])
+		return obj(keys)
+	}
+
+	/// At once its ARN and start, or as .sync, its description once it has run.
+	private child(c: Caller, op: string, parameters: Json): Json throws Fault | asl.Failure {
+		c.actions = ["states:StartExecution"]
+		const given = parameters.get("Input")
+		const e = this.start(c, parameters.str("StateMachineArn") ?? "", parameters.str("Name"),
+			if (given == null) null else if (given.kind == "string") given.text else write(given!), false)
+		const arn = executionArn(c, e)
+		if (op == "states:startExecution") {
+			return obj([["ExecutionArn", str(arn)], ["StartDate", millis(e.started)]])
+		}
+		const sync2 = endsWith(op, ":2")
+		if (e.status == "RUNNING") {
+			throw new asl.Failure(childRunning, `${arn}#${sync2}`)
+		}
+		const out = outcome(c, e, sync2)
+		if (out.get("Output") == null) {
+			throw new asl.Failure("States.TaskFailed", out.str("Cause") ?? "")
+		}
+		return out.get("Output")!
+	}
+
+	private ended(caller: Caller, e: Execution) throws Fault {
+		if (e.parent != "" && e.status != "RUNNING") {
+			const t = e.parent
+			e.parent = ""
+			this.resume(caller, t, outcome(caller, e, e.sync2))
+		}
+	}
+}
+
+/// The error a .sync task's call fails with when its nested execution pauses, its cause the execution's ARN, a # and
+/// whether the task is of .sync:2.
+const childRunning = "BoberStack.ChildRunning"
+
+/// Its description as {"Output"} if it succeeded, shaped for .sync:2; else States.TaskFailed of the description.
+function outcome(c: Caller, e: Execution, sync2: bool): Json {
+	const keys: [string, Json][] = [["ExecutionArn", str(executionArn(c, e))], ["Input", shaped(e.input, sync2)],
+		["InputDetails", obj([["Included", boolean(true)]])], ["Name", str(e.name)]]
+	if (e.output != null) {
+		keys.push(["Output", shaped(e.output, sync2)])
+		keys.push(["OutputDetails", obj([["Included", boolean(true)]])])
+	}
+	keys.push(["RedriveCount", num(0.0)])
+	keys.push(["StartDate", millis(e.started)])
+	keys.push(["StateMachineArn", str(machineArn(c, e.machine))])
+	keys.push(["Status", str(e.status)])
+	if (e.stopped != null) {
+		keys.push(["StopDate", millis(e.stopped!)])
+	}
+	if (e.error != null) {
+		keys.push(["Error", str(e.error!)])
+		keys.push(["Cause", str(e.cause ?? "")])
+	}
+	const d = obj(keys)
+	return if (e.status == "SUCCEEDED") obj([["Output", d]])
+		else obj([["Error", str("States.TaskFailed")], ["Cause", str(write(d))]])
+}
+
+/// The milliseconds since the epoch of the time t, as a nested execution's result has its dates.
+function millis(t: i64): Json { return num((t / 1000000) as f64) }
+
+/// The value s as a nested execution's result has its input or output: the JSON's text, or as sync2, the JSON.
+function shaped(s: string | null, sync2: bool): Json {
+	if (s == null) {
+		return nul()
+	}
+	if (sync2) {
+		try {
+			return parse(s!)
+		} catch (e: JsonError) {} // the JSON an execution keeps
+	}
+	return str(s!)
+}
+
+function isLambda(resource: string): bool { return startsWith(resource, "arn:aws:lambda:") }
+
+function result(s: string): Json {
+	try {
+		return parse(if (s == "") "{}" else s)
+	} catch (e: JsonError) {
+		return obj([])
+	}
+}
+
+/// A run replays the steps the execution has recorded, and makes again the events it has, before it adds to either.
+class Host {
+	handler: Handler
+	caller: Caller
+	e: Execution
+	arn: string
+	/// The fault no task can stand for, which fails the request.
+	fault: Fault | null = null
+	step = 0
+	tasks = 0
+	made = 0
+	/// The events before this run that a run makes again: all but those its redrives left behind.
+	kept: i32
+	paused = false
+
+	constructor(handler: Handler, caller: Caller, e: Execution, arn: string) {
+		this.handler = handler
+		this.caller = caller
+		this.e = e
+		this.arn = arn
+		this.kept = e.events.length - e.shift
+	}
+
+	private record(s: Json) {
+		this.e.steps.push(write(s))
+		this.e.marks.push(this.made)
+	}
+
+	task(resource: string, parameters: Json): Json throws asl.Failure {
+		const at = this.step
+		this.step++
+		const n = this.tasks
+		this.tasks++
+		if (at < this.e.steps.length) {
+			const was = this.replayed(at)
+			const output = was.get("Output")
+			if (output == null) {
+				throw new asl.Failure(was.str("Error") ?? "", was.str("Cause") ?? "")
+			}
+			return output!
+		}
+		if (split(resource, ":").length == 7 && split(resource, ":")[5] == "activity") {
+			this.e.waiting = n
+			this.e.activity = resource
+			this.e.work = write(parameters)
+			this.e.handed = false
+			this.e.scheduled = now()
+			this.paused = true
+			throw new asl.Failure("States.Runtime", "The execution waits for a worker of its activity")
+		}
+		const callback = ".waitForTaskToken"
+		const waits = endsWith(resource, callback)
+		let c: Caller | null = null
+		try {
+			c = actAs(this.caller, principal, this.e.role, this.arn, [], this.e.name)
+		} catch (f: Fault) {} // no session, as of a role not there
+		if (c == null) {
+			throw new asl.Failure("States.TaskFailed", untrusted)
+		}
+		try {
+			const out = this.handler.task(c!,
+				if (waits) resource.slice(0, resource.length - callback.length) else resource, parameters)
+			if (waits) {
+				this.e.waiting = n
+				this.paused = true
+				throw new asl.Failure("States.Runtime", "The execution waits for its task token")
+			}
+			this.record(obj([["Output", out]]))
+			return out
+		} catch (f: asl.Failure) {
+			if (f.error == childRunning) {
+				this.e.waiting = n
+				this.paused = true
+				this.link(f.cause, n)
+				throw new asl.Failure("States.Runtime", "The execution waits for its nested execution")
+			}
+			if (!this.paused) {
+				this.record(obj([["Error", str(f.error)], ["Cause", str(f.cause)]]))
+			}
+			throw f
+		}
+	}
+
+	private link(child: string, n: i32) {
+		const parts = split(child, "#")
+		try {
+			const db = new Tables(this.caller.regional())
+			const k = nameOf(parts[0], "execution")
+			const c = db.executions.get(k)
+			if (c != null) {
+				c.parent = token(executionArn(this.caller, this.e), n, this.e.secret)
+				c.sync2 = parts[1] == "true"
+				db.executions.put(k, c!)
+			}
+		} catch (f: Fault) {
+			this.fault = f
+		}
+	}
+
+	private replayed(at: i32): Json {
+		try {
+			return parse(this.e.steps[at])
+		} catch (j: JsonError) {
+			return obj([]) // written by write
+		}
+	}
+
+	event(kind: string, field: string, details: Json) {
+		this.made++
+		if (this.paused || this.made <= this.kept) {
+			return
+		}
+		const id = this.made + this.e.shift
+		const t = now()
+		const ms = (t % second) / 1000000
+		const keys: [string, Json][] = [["timestamp", num(((t / second) as f64) + (ms as f64) / 1000.0)],
+			["type", str(kind)], ["id", num(id as f64)], ["previousEventId", num((id - 1) as f64)]]
+		if (field != "") {
+			keys.push([field, details])
+		}
+		this.e.events.push(write(obj(keys)))
+	}
+
+	token(): string { return token(executionArn(this.caller, this.e), this.tasks, this.e.secret) }
+
+	uuid(): string {
+		const at = this.step
+		this.step++
+		if (at < this.e.steps.length) {
+			return this.replayed(at).text
+		}
+		let u = ""
+		try {
+			u = uuid()
+		} catch (f: Fault) {
+			this.fault = f
+		}
+		this.record(str(u))
+		return u
+	}
+
+	random(): f64 {
+		const at = this.step
+		this.step++
+		if (at < this.e.steps.length) {
+			return this.replayed(at).number()
+		}
+		let x = 0.0
+		try {
+			const b = bytes(4)
+			x = (((b[0] as i64) << 16 | (b[1] as i64) << 8 | (b[2] as i64)) as f64) / 16777216.0
+		} catch (e: IoError) {}
+		this.record(num(x))
+		return x
+	}
+
+	child(run: string, id: string, input: Json, output: Json | null, failure: asl.Failure | null, size: i32,
+		events: [string, string, Json][]) {
+		if (this.paused) {
+			return
+		}
+		const e = new Execution()
+		e.machine = split(run, ":")[6]
+		e.name = id
+		e.mapRun = run
+		e.items = size
+		e.input = write(input)
+		e.output = if (output == null) null else write(output!)
+		e.status = if (failure == null) "SUCCEEDED" else "FAILED"
+		e.error = failure?.error
+		e.cause = failure?.cause
+		e.definition = this.e.definition
+		e.role = this.e.role
+		e.started = now()
+		e.stopped = e.started
+		const all: [string, string, Json][] = [["ExecutionStarted", "executionStartedEventDetails",
+			obj([["input", str(e.input)], ["inputDetails", obj([["truncated", boolean(false)]])],
+			["roleArn", str(e.role)]])]]
+		for (const v of events) {
+			all.push(v)
+		}
+		all.push(if (failure == null) ["ExecutionSucceeded", "executionSucceededEventDetails",
+			obj([["output", str(e.output ?? "")], ["outputDetails", obj([["truncated", boolean(false)]])]])]
+			else ["ExecutionFailed", "executionFailedEventDetails",
+			obj([["error", str(failure!.error)], ["cause", str(failure!.cause)]])])
+		const ms = (e.started % second) / 1000000
+		const at = num(((e.started / second) as f64) + (ms as f64) / 1000.0)
+		for (let i = 0; i < all.length; i++) {
+			const keys: [string, Json][] = [["timestamp", at], ["type", str(all[i][0])], ["id", num((i + 1) as f64)],
+				["previousEventId", num(i as f64)]]
+			if (all[i][1] != "") {
+				keys.push([all[i][1], all[i][2]])
+			}
+			e.events.push(write(obj(keys)))
+		}
+		try {
+			(new Tables(this.caller.regional()).executions).put(`${e.machine}\x00${id}`, e)
+		} catch (f: Fault) {
+			this.fault = f
+		}
+	}
+
+	mapRun(label: string, id: string, run: Json): string {
+		const k = `${this.e.machine}/${label}:${id}`
+		const arn = `arn:aws:states:${this.caller.region}:${this.caller.account}:mapRun:${k}`
+		try {
+			const db = new Tables(this.caller.regional())
+			const m = db.mapRuns.get(k) ?? new MapRun()
+			if (m.execution == "") {
+				m.execution = executionArn(this.caller, this.e)
+				m.machine = this.arn
+				m.started = now()
+				m.concurrency = (run.get("concurrency")?.number() ?? 0.0) as i32
+				m.percentage = (run.get("percentage")?.number() ?? 0.0) as f32
+				m.count = (run.get("count")?.number() ?? 0.0) as i64
+			}
+			m.status = run.str("status") ?? "RUNNING"
+			m.total = (run.get("total")?.number() ?? 0.0) as i64
+			m.succeeded = (run.get("succeeded")?.number() ?? 0.0) as i64
+			m.failed = (run.get("failed")?.number() ?? 0.0) as i64
+			m.written = (run.get("written")?.number() ?? 0.0) as i64
+			m.executions = (run.get("executions")?.number() ?? 0.0) as i64
+			m.stopped = if (m.status == "RUNNING") null else now()
+			if (!this.paused) {
+				db.mapRuns.put(k, m)
+			}
+		} catch (f: Fault) {
+			this.fault = f
+		}
+		return arn
+	}
+}
+
+function token(arn: string, n: i32, secret: string): string {
+	return base64.encode(`${arn}#${n}#${secret}`, "url", "raw")
+}
+
+function passed(caller: Caller, role: string, resource: string, actions: string[],
+	context: [string, string | string[]][]) throws Fault {
+	const parts = split(role, ":")
+	if (parts.length != 6 || parts[0] != "arn" || parts[2] != "iam" || parts[4].length != 12
+		|| !startsWith(parts[5], "role/")) {
+		throw api.invalidArn(`Invalid Role Arn: '${role}'`)
+	}
+	if (parts[4] != caller.account) {
+		throw new Fault(400, "AccessDeniedException", "Cross-account pass role is not allowed.")
+	}
+	caller.actions = actions
+	caller.allow(resource, null, context)
+	passRole(caller, role, principal)
+	if (actAs(caller, principal, role, resource, [], "") == null) {
+		throw new Fault(400, "AccessDeniedException", untrusted)
+	}
+}
+
+const untrusted = "Neither the global service principal states.amazonaws.com, nor the regional one is authorized to "
+	+ "assume the provided role."
+
+function named(name: string) throws Fault {
+	const bad = " \t\n\r<>{}[]?*\"#%\\^|~`$&,;:/"
+	if (name.length == 0 || name.length > 80 || name.some(c => c < 0x20 || c == 0x7f || bad.some(b => b == c))) {
+		throw api.invalidName(`Invalid Name: '${name}'`)
+	}
+}
+
+function defined(definition: string) throws Fault {
+	const ds = asl.diagnostics(definition)
+	if (ds.length > 0) {
+		throw api.invalidDefinition(asl.invalid(ds))
+	}
+}
+
+function machineArn(caller: Caller, name: string): string {
+	return `arn:aws:states:${caller.region}:${caller.account}:stateMachine:${name}`
+}
+
+function executionArn(caller: Caller, e: Execution): string {
+	return `arn:aws:states:${caller.region}:${caller.account}:${if (e.express) "express" else "execution"}:`
+		+ `${e.machine}:${e.name}`
+}
+
+function nameOf(arn: string, kind: string): string throws Fault {
+	const parts = split(arn, ":")
+	if (parts.length < 6 || parts[0] != "arn" || parts[2] != "states") {
+		throw api.invalidArn(`Invalid Arn: 'Invalid ARN prefix: ${arn}'`)
+	}
+	const n = if (kind == "execution") 8 else 7
+	if (parts.length != n || parts[5] != kind && !(kind == "execution" && parts[5] == "express")) {
+		throw api.invalidArn(`Invalid Arn: 'Resource path not valid: ${arn}'`)
+	}
+	return if (kind == "execution") `${parts[6]}\x00${parts[7]}` else parts[6]
+}
+
+function mapRun(caller: Caller, arn: string): [string, MapRun] throws Fault {
+	const parts = split(arn, ":")
+	if (parts.length != 8 || parts[0] != "arn" || parts[2] != "states" || parts[5] != "mapRun") {
+		throw api.invalidArn(`Invalid Arn: 'Resource path not valid: ${arn}'`)
+	}
+	caller.allow(arn)
+	const k = `${parts[6]}:${parts[7]}`
+	const m = new Tables(caller.regional()).mapRuns.get(k)
+	if (m == null) {
+		throw api.resourceNotFound(`Resource not found: '${arn}'`)
+	}
+	return [k, m!]
+}
+
+function machineName(arn: string): string throws Fault { return nameOf(arn, "stateMachine") }
+
+function qualified(arn: string): [string, string] throws Fault {
+	const parts = split(arn, ":")
+	if (parts.length == 8 && parts[0] == "arn" && parts[2] == "states" && parts[5] == "stateMachine"
+		&& parts[7] != "") {
+		return [parts[6], parts[7]]
+	}
+	return [machineName(arn), ""]
+}
+
+function isDigit(s: string): bool { return s.length > 0 && s.every(c => c >= 0x30 && c <= 0x39) }
+
+/// Of an alias, as started counts, its first version for the k-th start (from 0) if (k + 1) * w / 100 passes a whole
+/// number k * w / 100 does not, w the first's weight.
+function version(db: Tables, name: string, qualifier: string, arn: string, started = false): Version throws Fault {
+	let n = 0
+	if (isDigit(qualifier)) {
+		try {
+			n = parseInt(qualifier)
+		} catch (e: ParseError) {}
+	} else {
+		const k = `${name}\x00${qualifier}`
+		const a = db.aliases.get(k)
+		if (a == null) {
+			throw api.resourceNotFound(`Resource not found: '${arn}'`)
+		}
+		n = a.routes[0][0]
+		const w = a.routes[0][1]
+		if (a.routes.length == 2 && (a.starts + 1) * w / 100 == a.starts * w / 100) {
+			n = a.routes[1][0]
+		}
+		if (started) {
+			a.starts++
+			db.aliases.put(k, a!)
+		}
+	}
+	const v = db.versions.get(`${name}\x00${n}`)
+	if (v == null) {
+		throw doesNotExist(arn)
+	}
+	return v!
+}
+
+/// Publishes the current revision of m, unless its last version is of it.
+function publish(caller: Caller, db: Tables, m: Machine, description: string | null): [string, i64] throws Fault {
+	const last = db.versions.get(`${m.name}\x00${m.versions}`)
+	if (last != null && last.revision == m.revision) {
+		return [`${machineArn(caller, m.name)}:${last.number}`, last.created]
+	}
+	m.versions++
+	const v = new Version()
+	v.number = m.versions
+	v.definition = m.definition
+	v.role = m.role
+	v.revision = m.revision
+	v.description = description
+	v.created = now()
+	db.versions.put(`${m.name}\x00${v.number}`, v)
+	db.machines.put(m.name, m)
+	return [`${machineArn(caller, m.name)}:${v.number}`, v.created]
+}
+
+function routes(db: Tables, rc: api.RoutingConfigurationListItem[]): [[i32, i32][], string] throws Fault {
+	if (rc.length < 1 || rc.length > 2) {
+		throw api.validationException("1 validation error detected: Value at 'routingConfiguration' failed to "
+			+ "satisfy constraint: Member must have length less than or equal to 2")
+	}
+	const out: [i32, i32][] = []
+	let name = ""
+	let sum = 0
+	for (const r of rc) {
+		const [m, q] = qualified(r.stateMachineVersionArn)
+		if (!isDigit(q)) {
+			throw api.validationException(`Routing configuration must contain state machine version ARNs. Received: [${r.stateMachineVersionArn}]`)
+		}
+		if (name != "" && m != name) {
+			throw api.validationException("Routing configuration must contain state machine version ARNs of the same state machine")
+		}
+		name = m
+		const v = version(db, m, q, r.stateMachineVersionArn)
+		if (out.some(o => o[0] == v.number)) {
+			throw api.validationException("Routing configuration must contain distinct state machine version ARNs")
+		}
+		out.push([v.number, r.weight])
+		sum += r.weight
+	}
+	if (sum != 100) {
+		throw api.validationException("Sum of routing configuration weights must be equal to 100")
+	}
+	return [out, name]
+}
+
+function routing(caller: Caller, name: string, rs: [i32, i32][]): api.RoutingConfigurationListItem[] {
+	return rs.map(r => {
+		const item = new api.RoutingConfigurationListItem()
+		item.stateMachineVersionArn = `${machineArn(caller, name)}:${r[0]}`
+		item.weight = r[1]
+		return item
+	})
+}
+
+function alias(caller: Caller, arn: string): [string, Alias] throws Fault {
+	const [name, q] = aliasOf(arn)
+	caller.allow(arn)
+	const a = new Tables(caller.regional()).aliases.get(`${name}\x00${q}`)
+	if (a == null) {
+		throw api.resourceNotFound(`Resource not found: '${arn}'`)
+	}
+	return [name, a!]
+}
+
+function aliasOf(arn: string): [string, string] throws Fault {
+	const [m, q] = qualified(arn)
+	if (q == "" || isDigit(q)) {
+		throw api.invalidArn(`Invalid Arn: 'Resource type not valid in this context: ${arn}'`)
+	}
+	return [m, q]
+}
+
+function machine(caller: Caller, arn: string): Machine throws Fault {
+	const m = new Tables(caller.regional()).machines.get(machineName(arn))
+	caller.allow(arn, null, resourceTags(m?.tags ?? []))
+	if (m == null) {
+		throw doesNotExist(arn)
+	}
+	return m!
+}
+
+function execution(caller: Caller, arn: string): Execution throws Fault {
+	const k = nameOf(arn, "execution")
+	caller.allow(arn)
+	const e = new Tables(caller.regional()).executions.get(k)
+	if (e == null) {
+		throw api.executionDoesNotExist(`Execution Does Not Exist: '${arn}'`)
+	}
+	return e!
+}
+
+function activityArn(caller: Caller, name: string): string {
+	return `arn:aws:states:${caller.region}:${caller.account}:activity:${name}`
+}
+
+function activity(caller: Caller, arn: string): Activity throws Fault {
+	const a = new Tables(caller.regional()).activities.get(nameOf(arn, "activity"))
+	caller.allow(arn)
+	if (a == null) {
+		throw api.activityDoesNotExist(`Activity Does Not Exist: '${arn}'`)
+	}
+	return a!
+}
+
+function doesNotExist(arn: string): Fault {
+	return api.stateMachineDoesNotExist(`State Machine Does Not Exist: '${arn}'`)
+}
+
+function retag(caller: Caller, arn: string, context: [string, string | string[]][],
+	edit: (tags: [string, string][]) => [string, string][]) throws Fault {
+	const name = machineName(arn)
+	const db = new Tables(caller.regional())
+	const m = db.machines.get(name)
+	const keys = resourceTags(m?.tags ?? [])
+	keys.append(context)
+	caller.allow(arn, null, keys)
+	if (m == null) {
+		throw api.resourceNotFound(`Resource not found: '${arn}'`)
+	}
+	m.tags = edit(m.tags)
+	db.machines.put(name, m)
+}
+
+function pairs(tags: api.Tag[]): [string, string][] {
+	const out: [string, string][] = []
+	for (const t of tags) {
+		out.push([t.key ?? "", t.value ?? ""])
+	}
+	return out
+}
+
+function typeOf(kind: string): api.StateMachineType { return if (kind == "EXPRESS") "EXPRESS" else "STANDARD" }
+
+function statusOf(s: string): api.ExecutionStatus {
+	switch (s) {
+		case "SUCCEEDED": return "SUCCEEDED"
+		case "FAILED": return "FAILED"
+		case "TIMED_OUT": return "TIMED_OUT"
+		case "ABORTED": return "ABORTED"
+		default: return "RUNNING"
+	}
+}
+
+/// A machine's logging configuration: none, as AWS describes one made without.
+function logging(): api.LoggingConfiguration {
+	const l = new api.LoggingConfiguration()
+	l.level = "OFF"
+	l.includeExecutionData = false
+	return l
+}
+
+function tracing(): api.TracingConfiguration {
+	const t = new api.TracingConfiguration()
+	t.enabled = false
+	return t
+}
+
+function details(): api.CloudWatchEventsExecutionDataDetails {
+	const d = new api.CloudWatchEventsExecutionDataDetails()
+	d.included = true
+	return d
+}
+
+function truncated(): Json { return obj([["truncated", boolean(false)]]) }
+
+function stamp(t: i64): string {
+	const whole = rfc3339(t - t % second)
+	const ms = (t % second) / 1000000
+	const pad = if (ms < 10) "00" else if (ms < 100) "0" else ""
+	return `${whole.slice(0, whole.length - 1)}.${pad}${ms}Z`
+}
+
+function part[T](items: T[], token: string | null, limit: i32): [T[], string | null] throws Fault {
+	let from = 0
+	try {
+		from = if (token == null) 0 else parseInt(token!)
+	} catch (e: ParseError) {
+		throw api.invalidToken(`Invalid Token: '${token}'`)
+	}
+	if (from < 0 || from > items.length) {
+		throw api.invalidToken(`Invalid Token: '${token}'`)
+	}
+	const n = if (limit <= 0) 100 else limit
+	const to = if (from + n < items.length) from + n else items.length
+	return [items.slice(from, to), if (to < items.length) `${to}` else null]
+}

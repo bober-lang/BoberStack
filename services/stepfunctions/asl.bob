@@ -1,0 +1,1244 @@
+//! The Amazon States Language of the JSONPath query language: a definition validated as Step Functions validates it,
+//! and an interpreter that runs one to its end at once. Retry does not wait between attempts, a Wait waits for
+//! nothing, and branches and iterations run one after the other, MaxConcurrency read and ignored. A Task's resource
+//! is performed by the host, as is the history's every event written.
+
+import { arr, boolean, copy, Json, JsonError, num, nul, obj, parse, put, same, select, str, write } from "./value"
+import { endsWith, startsWith } from "std/algo"
+import { isDigit, isSpace } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { md5, sha1, sha256, sha512 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { floor } from "std/math"
+import { ParseError, split } from "std/string"
+
+const types = ["Pass", "Task", "Choice", "Wait", "Succeed", "Fail", "Parallel", "Map"]
+
+export class Failure {
+	error: string
+	cause: string
+
+	constructor(error: string, cause: string) {
+		this.error = error
+		this.cause = cause
+	}
+}
+
+export class Test {
+	status = "SUCCEEDED"
+	output: Json | null = null
+	next: string | null = null
+	failure: Failure | null = null
+	steps: [string, Json][] = []
+	retry = -1
+	catcher = -1
+}
+
+export interface Host {
+	task(resource: string, parameters: Json): Json throws Failure
+	event(kind: string, field: string, details: Json)
+	token(): string
+	uuid(): string
+	random(): f64
+	/// Keeps the map run of id of the DISTRIBUTED Map state of label, as run describes it; its ARN.
+	mapRun(label: string, id: string, run: Json): string
+
+	/// Keeps the child execution id of the map run of ARN run, its output or else failure, and its events.
+	child(run: string, id: string, input: Json, output: Json | null, failure: Failure | null, size: i32,
+		events: [string, string, Json][])
+}
+
+export function diagnostics(text: string): [string, string, string][] {
+	const out: [string, string, string][] = []
+	let d = new Json()
+	try {
+		d = parse(text)
+	} catch (e: JsonError) {
+		out.push(["INVALID_JSON_DESCRIPTION", e.message, ""])
+		return out
+	}
+	if (d.kind != "object") {
+		out.push(["SCHEMA_VALIDATION_FAILED", "Expected value of type: Object", "/"])
+		return out
+	}
+	if (d.str("QueryLanguage") == "JSONata") {
+		out.push(["SCHEMA_VALIDATION_FAILED", "The QueryLanguage JSONata is not supported by BoberStack",
+			"/QueryLanguage"])
+		return out
+	}
+	machine(d, "", out)
+	return out
+}
+
+export function invalid(ds: [string, string, string][]): string {
+	const each = ds.map(d => `${d[0]}: ${d[1]}${if (d[2] == "") "" else ` at ${d[2]}`}`)
+	return `Invalid State Machine Definition: '${each.join(", ")}'`
+}
+
+function machine(d: Json, at: string, out: [string, string, string][]): void {
+	const missing = ["StartAt", "States"].filter(k => d.get(k) == null)
+	if (missing.length > 0) {
+		out.push(["SCHEMA_VALIDATION_FAILED", `These fields are required: [${missing.join(", ")}]`, at + "/"])
+		return
+	}
+	const states = d.get("States")!
+	const start = d.str("StartAt") ?? ""
+	if (states.get(start) == null) {
+		out.push(["MISSING_TRANSITION_TARGET", `Missing 'Next' target: ${start}`, `${at}/StartAt`])
+	}
+	let terminal = false
+	for (const [name, s] of states.keys) {
+		const here = `${at}/States/${name}`
+		const t = s.str("Type")
+		if (t == null) {
+			out.push(["SCHEMA_VALIDATION_FAILED", "These fields are required: [Type]", here])
+			continue
+		}
+		if (!types.includes(t!)) {
+			out.push(["SCHEMA_VALIDATION_FAILED", `Field 'Type' should be one of: ${types.join(", ")}`, `${here}/Type`])
+			continue
+		}
+		const target = (k: string, next: string | null, where: string) => {
+			if (next != null && states.get(next!) == null) {
+				out.push(["MISSING_TRANSITION_TARGET", `Missing '${k}' target: ${next}`, where])
+			}
+		}
+		if (t == "Succeed" || t == "Fail") {
+			terminal = true
+		} else if (t == "Choice") {
+			const choices = s.get("Choices")
+			if (choices == null || choices.items.length == 0) {
+				out.push(["SCHEMA_VALIDATION_FAILED", "These fields are required: [Choices]", here])
+			} else {
+				for (let i = 0; i < choices.items.length; i++) {
+					target("Next", choices.items[i].str("Next"), `${here}/Choices[${i}]/Next`)
+				}
+			}
+			target("Default", s.str("Default"), `${here}/Default`)
+		} else {
+			const end = s.get("End")
+			if (end != null && end.text == "true") {
+				terminal = true
+			} else if (s.str("Next") == null) {
+				out.push(["SCHEMA_VALIDATION_FAILED", "Either 'Next' or 'End' field is required", here])
+			}
+			target("Next", s.str("Next"), `${here}/Next`)
+		}
+		if (t == "Task" && s.str("Resource") == null) {
+			out.push(["SCHEMA_VALIDATION_FAILED", "These fields are required: [Resource]", here])
+		}
+		const catchers = s.get("Catch")
+		if (catchers != null) {
+			for (let i = 0; i < catchers.items.length; i++) {
+				target("Next", catchers.items[i].str("Next"), `${here}/Catch[${i}]/Next`)
+			}
+		}
+		if (t == "Parallel") {
+			const branches = s.get("Branches")
+			if (branches == null) {
+				out.push(["SCHEMA_VALIDATION_FAILED", "These fields are required: [Branches]", here])
+			} else {
+				for (let i = 0; i < branches.items.length; i++) {
+					machine(branches.items[i], `${here}/Branches[${i}]`, out)
+				}
+			}
+		}
+		if (t == "Map") {
+			const p = s.get("ItemProcessor") ?? s.get("Iterator")
+			if (p == null) {
+				out.push(["SCHEMA_VALIDATION_FAILED", "These fields are required: [ItemProcessor]", here])
+			} else {
+				machine(p!, `${here}/${if (s.get("ItemProcessor") == null) "Iterator" else "ItemProcessor"}`, out)
+			}
+		}
+	}
+	if (!terminal) {
+		out.push(["MISSING_END_STATE", "Workflow has no terminal state", if (at == "") "/" else at])
+	}
+}
+
+export class Execution {
+	host: Host
+	context: Json
+	time: string
+	/// How deep within the child executions of map runs it is, whose events are not the execution's.
+	muted = 0
+	heard: [string, string, Json][] = []
+
+	constructor(host: Host, context: Json, time: string) {
+		this.host = host
+		this.context = context
+		this.time = time
+	}
+
+	private event(kind: string, field: string, details: Json) {
+		if (this.muted == 0) {
+			this.host.event(kind, field, details)
+		} else {
+			this.heard.push([kind, field, details])
+		}
+	}
+
+	run(definition: Json, input: Json): Json throws Failure { return this.states(definition, input) }
+
+	/// The state s run alone given input, as TestState runs it.
+	test(s: Json, input: Json): Test {
+		const t = new Test()
+		const steps = t.steps
+		steps.push(["input", input])
+		const kind = s.str("Type") ?? ""
+		t.next = if (s.get("End")?.text == "true") null else s.str("Next")
+		try {
+			const aip = this.inputPath(s, input)
+			steps.push(["afterInputPath", aip])
+			switch (kind) {
+				case "Choice":
+					t.next = this.choose(s, aip)
+					t.output = this.outputPath(s, aip)
+				case "Fail": throw this.fail(s, input)
+				case "Succeed":
+					t.next = null
+					t.output = this.outputPath(s, aip)
+				case "Wait": t.output = this.outputPath(s, aip)
+				case "Pass":
+					const ap = this.parameters(s, "Parameters", aip)
+					steps.push(["afterParameters", ap])
+					const result = s.get("Result") ?? ap
+					steps.push(["result", result])
+					const arp = this.resultPath(s, input, result)
+					steps.push(["afterResultPath", arp])
+					t.output = this.outputPath(s, arp)
+				case "Task":
+					const p = this.parameters(s, "Parameters", aip)
+					steps.push(["afterParameters", p])
+					const r = this.task(s, p)
+					steps.push(["result", r])
+					const rs = this.parameters(s, "ResultSelector", r)
+					steps.push(["afterResultSelector", rs])
+					const rp = this.resultPath(s, input, rs)
+					steps.push(["afterResultPath", rp])
+					t.output = this.outputPath(s, rp)
+				default: t.output = this.attempt(s, kind, input)[0]
+			}
+		} catch (f: Failure) {
+			t.failure = f
+			t.status = "FAILED"
+			t.next = null
+			if (f.error == "States.Runtime" || kind == "Fail") {
+				return t
+			}
+			const retriers = s.get("Retry")?.items ?? []
+			for (let i = 0; i < retriers.length; i++) {
+				if (matches(retriers[i], f.error)) {
+					if (retriers[i].get("MaxAttempts")?.text != "0") {
+						t.status = "RETRIABLE"
+						t.retry = i
+						return t
+					}
+					break
+				}
+			}
+			const catchers = s.get("Catch")?.items ?? []
+			for (let i = 0; i < catchers.length; i++) {
+				const c = catchers[i]
+				if (matches(c, f.error)) {
+					const e = obj([["Error", str(f.error)], ["Cause", str(f.cause)]])
+					const p = c.get("ResultPath")
+					try {
+						t.output = if (p != null && p.kind == "null") input
+							else this.put(input, c.str("ResultPath") ?? "$", e)
+					} catch (g: Failure) {
+						t.failure = g
+						return t
+					}
+					t.status = "CAUGHT_ERROR"
+					t.next = c.str("Next")
+					t.catcher = i
+					return t
+				}
+			}
+		}
+		return t
+	}
+
+	private states(d: Json, input: Json): Json throws Failure {
+		const states = d.get("States")!
+		let name = d.str("StartAt") ?? ""
+		let value = input
+		while (true) {
+			const s = states.get(name)!
+			const t = s.str("Type") ?? ""
+			const st = obj([["EnteredTime", str(this.time)], ["Name", str(name)], ["RetryCount", num(0.0)]])
+			this.context.set("State", st)
+			this.event(`${t}StateEntered`, "stateEnteredEventDetails",
+				obj([["name", str(name)], ["input", str(write(value))], ["inputDetails", truncated()]]))
+			let next: string | null = s.str("Next")
+			let end = s.get("End")?.text == "true"
+			let out = value
+			switch (t) {
+				case "Pass":
+					const eff = this.parameters(s, "Parameters", this.inputPath(s, value))
+					out = this.outputPath(s, this.resultPath(s, value, s.get("Result") ?? eff))
+				case "Choice":
+					const at = this.inputPath(s, value)
+					next = this.choose(s, at)
+					out = this.outputPath(s, at)
+				case "Wait": out = this.outputPath(s, this.inputPath(s, value))
+				case "Succeed":
+					out = this.outputPath(s, this.inputPath(s, value))
+					next = null
+				case "Fail": throw this.fail(s, value)
+				default:
+					const [o, caught] = this.attempt(s, t, value)
+					out = o
+					if (caught != null) {
+						next = caught
+						end = false
+					}
+			}
+			this.event(`${t}StateExited`, "stateExitedEventDetails",
+				obj([["name", str(name)], ["output", str(write(out))], ["outputDetails", truncated()]]))
+			if (next == null || end) {
+				return out
+			}
+			name = next!
+			value = out
+		}
+	}
+
+	private fail(s: Json, value: Json): Failure throws Failure {
+		const pick = (k: string) => {
+			const p = s.str(`${k}Path`)
+			if (p == null) {
+				return s.str(k) ?? ""
+			}
+			const v = this.path(p!, value, k + "Path")
+			return if (v.kind == "string") v.text else write(v)
+		}
+		return new Failure(pick("Error"), pick("Cause"))
+	}
+
+	/// The output of s, retried as its Retry says, and the state a Catch that caught it goes to, else null.
+	private attempt(s: Json, t: string, value: Json): [Json, string | null] throws Failure {
+		const counts: i32[] = (s.get("Retry")?.items ?? []).map(_ => 0)
+		let retries = 0
+		while (true) {
+			try {
+				if (t == "Task" && endsWith(s.str("Resource") ?? "", ".waitForTaskToken")) {
+					this.context.set("Task", obj([["Token", str(this.host.token())]]))
+				}
+				const eff = this.parameters(s, if (t == "Map") "" else "Parameters", this.inputPath(s, value))
+				let result = new Json()
+				if (t == "Task") {
+					result = this.task(s, eff)
+				} else if (t == "Parallel") {
+					result = this.parallel(s, eff)
+				} else {
+					result = this.map(s, eff)
+				}
+				result = this.parameters(s, "ResultSelector", result)
+				return [this.outputPath(s, this.resultPath(s, value, result)), null]
+			} catch (f: Failure) {
+				if (f.error == "States.Runtime") {
+					throw f
+				}
+				const retriers = s.get("Retry")?.items ?? []
+				let again = false
+				for (let i = 0; i < retriers.length; i++) {
+					const r = retriers[i]
+					if (!matches(r, f.error)) {
+						continue
+					}
+					const max = r.get("MaxAttempts")
+					if (counts[i] < (if (max == null) 3 else max.number() as i32)) {
+						counts[i]++
+						retries++
+						this.context.get("State")!.set("RetryCount", num(retries as f64))
+						again = true
+					}
+					break
+				}
+				if (again) {
+					continue
+				}
+				for (const c of s.get("Catch")?.items ?? []) {
+					if (matches(c, f.error)) {
+						const e = obj([["Error", str(f.error)], ["Cause", str(f.cause)]])
+						const p = c.get("ResultPath")
+						const out = if (p != null && p.kind == "null") value
+							else this.put(value, c.str("ResultPath") ?? "$", e)
+						return [out, c.str("Next")]
+					}
+				}
+				throw f
+			}
+		}
+	}
+
+	private task(s: Json, eff: Json): Json throws Failure {
+		const resource = s.str("Resource") ?? ""
+		const [kind, op] = typed(resource)
+		if (kind == "states" && startsWith(op, "activity:")) {
+			return this.activity(resource, eff)
+		}
+		if (startsWith(resource, "arn:aws:lambda:")) {
+			return this.function(resource, eff)
+		}
+		const named: [string, Json][] = [["resourceType", str(kind)], ["resource", str(op)]]
+		const scheduled = named.slice(0, 2)
+		scheduled.push(["region", str(this.region())])
+		scheduled.push(["parameters", str(write(eff))])
+		this.event("TaskScheduled", "taskScheduledEventDetails", obj(scheduled))
+		this.event("TaskStarted", "taskStartedEventDetails", obj(named.slice(0, 2)))
+		try {
+			const out = this.host.task(resource, eff)
+			const done = named.slice(0, 2)
+			done.push(["output", str(write(out))])
+			done.push(["outputDetails", truncated()])
+			this.event("TaskSucceeded", "taskSucceededEventDetails", obj(done))
+			return out
+		} catch (f: Failure) {
+			const failed = named.slice(0, 2)
+			failed.push(["error", str(f.error)])
+			failed.push(["cause", str(f.cause)])
+			this.event("TaskFailed", "taskFailedEventDetails", obj(failed))
+			throw f
+		}
+	}
+
+	/// Its events recorded as of a function AWS invokes itself.
+	private function(resource: string, eff: Json): Json throws Failure {
+		this.event("LambdaFunctionScheduled", "lambdaFunctionScheduledEventDetails",
+			obj([["resource", str(resource)], ["input", str(write(eff))], ["inputDetails", truncated()]]))
+		this.event("LambdaFunctionStarted", "", obj([]))
+		try {
+			const out = this.host.task(resource, eff)
+			this.event("LambdaFunctionSucceeded", "lambdaFunctionSucceededEventDetails",
+				obj([["output", str(write(out))], ["outputDetails", truncated()]]))
+			return out
+		} catch (f: Failure) {
+			this.event("LambdaFunctionFailed", "lambdaFunctionFailedEventDetails",
+				obj([["error", str(f.error)], ["cause", str(f.cause)]]))
+			throw f
+		}
+	}
+
+	/// Its start is the worker's, recorded by the host when a worker takes it, and made again here as the history has it.
+	private activity(resource: string, eff: Json): Json throws Failure {
+		this.event("ActivityScheduled", "activityScheduledEventDetails",
+			obj([["resource", str(resource)], ["input", str(write(eff))], ["inputDetails", truncated()]]))
+		try {
+			const out = this.host.task(resource, eff)
+			this.event("ActivityStarted", "activityStartedEventDetails", obj([]))
+			this.event("ActivitySucceeded", "activitySucceededEventDetails",
+				obj([["output", str(write(out))], ["outputDetails", truncated()]]))
+			return out
+		} catch (f: Failure) {
+			this.event("ActivityStarted", "activityStartedEventDetails", obj([]))
+			this.event("ActivityFailed", "activityFailedEventDetails",
+				obj([["error", str(f.error)], ["cause", str(f.cause)]]))
+			throw f
+		}
+	}
+
+	private region(): string {
+		const id = this.context.get("Execution")?.str("Id") ?? ""
+		const parts = split(id, ":")
+		return if (parts.length > 3) parts[3] else ""
+	}
+
+	private parallel(s: Json, eff: Json): Json throws Failure {
+		this.event("ParallelStateStarted", "", nul())
+		const outs: Json[] = []
+		try {
+			for (const b of s.get("Branches")?.items ?? []) {
+				outs.push(this.states(b, copy(eff)))
+			}
+		} catch (f: Failure) {
+			this.event("ParallelStateFailed", "", nul())
+			throw f
+		}
+		this.event("ParallelStateSucceeded", "", nul())
+		return arr(outs)
+	}
+
+	private map(s: Json, eff: Json): Json throws Failure {
+		const p = s.get("ItemProcessor") ?? s.get("Iterator")!
+		if (p.get("ProcessorConfig")?.str("Mode") == "DISTRIBUTED") {
+			return this.distributed(s, eff, p)
+		}
+		const items = this.path(s.str("ItemsPath") ?? "$", eff, "ItemsPath")
+		if (items.kind != "array") {
+			throw new Failure("States.Runtime",
+				`An error occurred while executing the state '${this.state()}'. `
+				+ `Invalid path '${s.str("ItemsPath") ?? "$"}': The ItemsPath field must point to a JSON array.`)
+		}
+		const processor = s.get("ItemProcessor") ?? s.get("Iterator")!
+		const name = this.state()
+		const state = this.context.get("State")!
+		this.event("MapStateStarted", "mapStateStartedEventDetails", obj([["length", num(items.items.length as f64)]]))
+		const outs: Json[] = []
+		for (let i = 0; i < items.items.length; i++) {
+			const item = obj([["Index", num(i as f64)], ["Value", items.items[i]]])
+			this.context.set("Map", obj([["Item", item]]))
+			this.context.set("State", state)
+			const selector = if (s.get("ItemSelector") != null) "ItemSelector" else "Parameters"
+			const input = if (s.get(selector) == null) items.items[i] else this.parameters(s, selector, eff)
+			const iteration = obj([["name", str(name)], ["index", num(i as f64)]])
+			this.event("MapIterationStarted", "mapIterationStartedEventDetails", iteration)
+			try {
+				outs.push(this.states(processor, copy(input)))
+			} catch (f: Failure) {
+				this.event("MapIterationFailed", "mapIterationFailedEventDetails", iteration)
+				this.event("MapStateFailed", "", nul())
+				throw f
+			}
+			this.event("MapIterationSucceeded", "mapIterationSucceededEventDetails", iteration)
+		}
+		this.context.set("State", state)
+		this.context.keys = this.context.keys.filter(e => e[0] != "Map")
+		this.event("MapStateSucceeded", "", nul())
+		return arr(outs)
+	}
+
+	/// A map run whose items run as child executions one after the other within this run, their events not the
+	/// execution's.
+	private distributed(s: Json, eff: Json, processor: Json): Json throws Failure {
+		const name = this.state()
+		const state = this.context.get("State")!
+		const items = this.items(s, eff)
+		const selected: Json[] = []
+		for (let i = 0; i < items.length; i++) {
+			this.context.set("Map", obj([["Item", obj([["Index", num(i as f64)], ["Value", items[i]]])]]))
+			selected.push(if (s.get("ItemSelector") == null) items[i] else this.parameters(s, "ItemSelector", eff))
+		}
+		this.context.keys = this.context.keys.filter(e => e[0] != "Map")
+		let inputs = selected
+		const batcher = s.get("ItemBatcher")
+		if (batcher != null) {
+			const size = this.number(batcher!, "MaxItemsPerBatch", eff) ?? 0.0
+			const base = this.parameters(batcher!, "BatchInput", eff)
+			inputs = []
+			let at = 0
+			while (at < selected.length) {
+				const n = if (size >= 1.0) size as i32 else selected.length
+				const keys: [string, Json][] = []
+				if (batcher!.get("BatchInput") != null) {
+					for (const kv of base.keys) {
+						keys.push(kv)
+					}
+				}
+				keys.push(["Items", arr(selected.slice(at, if (at + n > selected.length) selected.length else at + n))])
+				inputs.push(obj(keys))
+				at += n
+			}
+		}
+		const id = this.host.uuid()
+		const label = s.str("Label") ?? name
+		const percentage = this.number(s, "ToleratedFailurePercentage", eff)
+		const count = this.number(s, "ToleratedFailureCount", eff)
+		const limits: [string, Json][] = [["concurrency", num(s.get("MaxConcurrency")?.number() ?? 0.0)],
+			["percentage", num(percentage ?? 0.0)], ["count", num(count ?? 0.0)]]
+		const run = (status: string, ok: i32, failed: i32, written: i32): Json => {
+			const keys: [string, Json][] = [["status", str(status)], ["total", num(items.length as f64)],
+				["succeeded", num(ok as f64)], ["failed", num(failed as f64)], ["written", num(written as f64)],
+				["executions", num(inputs.length as f64)]]
+			for (const kv of limits) {
+				keys.push(kv)
+			}
+			return obj(keys)
+		}
+		const arn = this.host.mapRun(label, id, run("RUNNING", 0, 0, 0))
+		this.event("MapRunStarted", "mapRunStartedEventDetails", obj([["mapRunArn", str(arn)]]))
+		const outcomes: [Json, Json, Failure | null, string][] = []
+		for (const input of inputs) {
+			const child = this.host.uuid()
+			const outer = this.heard
+			this.heard = []
+			this.muted++
+			try {
+				outcomes.push([input, this.states(processor, copy(input)), null, child])
+			} catch (f: Failure) {
+				outcomes.push([input, nul(), f, child])
+			}
+			this.muted--
+			const o = outcomes[outcomes.length - 1]
+			const size = if (batcher == null) 1 else input.get("Items")?.items?.length ?? 0
+			this.host.child(arn, child, o[0], if (o[2] == null) o[1] else null, o[2], size, this.heard)
+			this.heard = outer
+			this.context.set("State", state)
+		}
+		const failed = outcomes.filter(o => o[2] != null).length
+		const ok = outcomes.length - failed
+		const exceeded = if (percentage == null && count == null) failed > 0
+			else count != null && (failed as f64) > count!
+			|| percentage != null && (failed as f64) * 100.0 > percentage! * (outcomes.length as f64)
+		let out = arr(outcomes.map(o => if (o[2] == null) o[1]
+			else obj([["Error", str(o[2]!.error)], ["Cause", str(o[2]!.cause)]])))
+		let written = 0
+		const writer = s.get("ResultWriter")
+		if (writer != null) {
+			const where = this.parameters(writer!, if (writer!.get("Arguments") != null) "Arguments" else "Parameters",
+				eff)
+			const bucket = where.str("Bucket") ?? ""
+			const prefix = where.str("Prefix") ?? ""
+			const dir = `${if (prefix == "" || endsWith(prefix, "/")) prefix else `${prefix}/`}${id}/`
+			// The children's machine: the run's machine's name, a slash and the label.
+			const machine = replaced(arn.slice(0, arn.length - id.length - 1), ":mapRun:", ":stateMachine:")
+			const files: [string, Json][] = []
+			for (const status of ["SUCCEEDED", "FAILED"]) {
+				const entries: Json[] = []
+				for (const o of outcomes) {
+					if ((o[2] == null) != (status == "SUCCEEDED")) {
+						continue
+					}
+					const child = o[3]
+					const keys: [string, Json][] = [["ExecutionArn",
+						str(`${replaced(machine, ":stateMachine:", ":execution:")}:${child}`)],
+						["Input", str(write(o[0]))], ["InputDetails", obj([["Included", boolean(true)]])],
+						["Name", str(child)]]
+					if (o[2] == null) {
+						keys.push(["Output", str(write(o[1]))])
+						keys.push(["OutputDetails", obj([["Included", boolean(true)]])])
+					} else {
+						keys.push(["Error", str(o[2]!.error)])
+						keys.push(["Cause", str(o[2]!.cause)])
+					}
+					keys.push(["RedriveCount", num(0.0)])
+					keys.push(["RedriveStatus", str("NOT_REDRIVABLE")])
+					keys.push(["RedriveStatusReason", str(`Execution is ${status} and cannot be redriven`)])
+					keys.push(["StartDate", str(this.time)])
+					keys.push(["StateMachineArn", str(machine)])
+					keys.push(["Status", str(status)])
+					keys.push(["StopDate", str(this.time)])
+					entries.push(obj(keys))
+				}
+				const listed: Json[] = []
+				if (entries.length > 0) {
+					const body = write(arr(entries))
+					const key = `${dir}${status}_0.json`
+					this.host.task("arn:aws:states:::s3:putObject",
+						obj([["Bucket", str(bucket)], ["Key", str(key)], ["Body", str(body)]]))
+					listed.push(obj([["Key", str(key)], ["Size", num(body.length as f64)]]))
+					written += entries.length
+				}
+				files.push([status, arr(listed)])
+			}
+			files.push(["PENDING", arr([])])
+			const manifest = obj([["DestinationBucket", str(bucket)], ["MapRunArn", str(arn)],
+				["ResultFiles", obj(files)]])
+			this.host.task("arn:aws:states:::s3:putObject",
+				obj([["Bucket", str(bucket)], ["Key", str(`${dir}manifest.json`)], ["Body", str(write(manifest))]]))
+			out = obj([["MapRunArn", str(arn)],
+				["ResultWriterDetails", obj([["Bucket", str(bucket)], ["Key", str(`${dir}manifest.json`)]])]])
+		}
+		if (exceeded) {
+			const why = "The specified tolerated failure threshold was exceeded"
+			this.host.mapRun(label, id, run("FAILED", ok, failed, written))
+			this.event("MapRunFailed", "mapRunFailedEventDetails",
+				obj([["error", str("States.ExceedToleratedFailureThreshold")], ["cause", str(why)]]))
+			throw new Failure("States.ExceedToleratedFailureThreshold", why)
+		}
+		this.host.mapRun(label, id, run("SUCCEEDED", ok, failed, written))
+		this.event("MapRunSucceeded", "", nul())
+		return out
+	}
+
+	/// Those its ItemReader reads, through the host as a task, else the array its ItemsPath selects; at most MaxItems.
+	private items(s: Json, eff: Json): Json[] throws Failure {
+		const reader = s.get("ItemReader")
+		if (reader == null) {
+			const items = this.path(s.str("ItemsPath") ?? "$", eff, "ItemsPath")
+			if (items.kind != "array") {
+				throw new Failure("States.Runtime",
+					`An error occurred while executing the state '${this.state()}'. `
+					+ `Invalid path '${s.str("ItemsPath") ?? "$"}': The ItemsPath field must point to a JSON array.`)
+			}
+			return items.items
+		}
+		const r = reader!
+		const resource = r.str("Resource") ?? ""
+		const given = this.parameters(r, if (r.get("Arguments") != null) "Arguments" else "Parameters", eff)
+		const config = r.get("ReaderConfig") ?? obj([])
+		let items: Json[] = []
+		if (endsWith(resource, ":s3:listObjectsV2")) {
+			items = this.host.task(resource, given).get("Contents")?.items ?? []
+		} else if (endsWith(resource, ":s3:getObject")) {
+			const body = this.host.task(resource, given).str("Body") ?? ""
+			const kind = config.str("InputType") ?? "JSON"
+			try {
+				if (kind == "JSONL") {
+					for (const line of split(body, "\n")) {
+						if (line != "" && line != "\r") {
+							items.push(parse(line))
+						}
+					}
+				} else if (kind == "CSV") {
+					items = csv(body, config)
+				} else {
+					const v = parse(body)
+					if (v.kind != "array") {
+						throw new Failure("States.ItemReaderFailed", "The JSON in the S3 object is not an array")
+					}
+					items = v.items
+				}
+			} catch (j: JsonError) {
+				throw new Failure("States.ItemReaderFailed", `The S3 object is not ${kind}: ${j.message}`)
+			}
+		} else {
+			throw new Failure("States.Runtime", `The ItemReader resource ${resource} is not supported by BoberStack`)
+		}
+		const max = this.number(config, "MaxItems", eff)
+		return if (max != null && max! >= 1.0 && (max! as i32) < items.length) items.slice(0, max! as i32) else items
+	}
+
+	private number(s: Json, k: string, eff: Json): f64 | null throws Failure {
+		const v = s.get(k)
+		if (v != null && v.kind == "number") {
+			return v.number()
+		}
+		const p = s.str(`${k}Path`)
+		if (p == null) {
+			return null
+		}
+		const x = this.path(p!, eff, `${k}Path`)
+		return if (x.kind == "number") x.number() else null
+	}
+
+	private state(): string { return this.context.get("State")?.str("Name") ?? "" }
+
+	private choose(s: Json, value: Json): string throws Failure {
+		for (const r of s.get("Choices")?.items ?? []) {
+			if (this.holds(r, value)) {
+				return r.str("Next") ?? ""
+			}
+		}
+		const d = s.str("Default")
+		if (d == null) {
+			throw new Failure("States.NoChoiceMatched",
+				`No Choice Rules matched and no Default was specified for '${this.state()}'`)
+		}
+		return d!
+	}
+
+	private holds(r: Json, value: Json): bool throws Failure {
+		const and = r.get("And")
+		if (and != null) {
+			for (const x of and.items) {
+				if (!this.holds(x, value)) {
+					return false
+				}
+			}
+			return true
+		}
+		const or = r.get("Or")
+		if (or != null) {
+			for (const x of or.items) {
+				if (this.holds(x, value)) {
+					return true
+				}
+			}
+			return false
+		}
+		const not = r.get("Not")
+		if (not != null) {
+			return !this.holds(not!, value)
+		}
+		const variable = r.str("Variable") ?? "$"
+		for (const [op, operand] of r.keys) {
+			if (op == "Variable" || op == "Next" || op == "Comment") {
+				continue
+			}
+			let v: Json | null = null
+			try {
+				v = select(this.root(variable, value), tail(variable))
+			} catch (e: JsonError) {
+				throw runtime(this.state(), e.message)
+			}
+			if (op == "IsPresent") {
+				return (v != null) == (operand.text == "true")
+			}
+			if (v == null) {
+				throw new Failure("States.Runtime",
+					`An error occurred while executing the state '${this.state()}'. `
+					+ `Invalid path '${variable}': The choice state's condition path references an invalid value.`)
+			}
+			const x = v!
+			switch (op) {
+				case "IsNull": return (x.kind == "null") == (operand.text == "true")
+				case "IsNumeric": return (x.kind == "number") == (operand.text == "true")
+				case "IsString": return (x.kind == "string") == (operand.text == "true")
+				case "IsBoolean": return (x.kind == "bool") == (operand.text == "true")
+				case "IsTimestamp": return (x.kind == "string" && timestamp(x.text)) == (operand.text == "true")
+			}
+			const pathed = endsWith(op, "Path")
+			const name = if (pathed) op.slice(0, op.length - 4) else op
+			const b = if (pathed) this.path(operand.text, value, op) else operand
+			return compare(name, x, b)
+		}
+		return false
+	}
+
+	/// The part its InputPath selects, all of value if none, {} if null.
+	private inputPath(s: Json, value: Json): Json throws Failure {
+		const p = s.get("InputPath")
+		if (p != null && p.kind == "null") {
+			return obj([])
+		}
+		return if (p == null) value else this.path(p.text, value, "InputPath")
+	}
+
+	/// The part its OutputPath selects, all of value if none, {} if null.
+	private outputPath(s: Json, value: Json): Json throws Failure {
+		const p = s.get("OutputPath")
+		if (p != null && p.kind == "null") {
+			return obj([])
+		}
+		return if (p == null) value else this.path(p.text, value, "OutputPath")
+	}
+
+	/// ResultPath $ if none; value alone if it is null.
+	private resultPath(s: Json, value: Json, result: Json): Json throws Failure {
+		const p = s.get("ResultPath")
+		if (p != null && p.kind == "null") {
+			return value
+		}
+		return this.put(value, if (p == null) "$" else p.text, result)
+	}
+
+	private put(value: Json, p: string, result: Json): Json throws Failure {
+		try {
+			return put(if (p == "$") value else copy(value), p, result)
+		} catch (e: JsonError) {
+			throw runtime(this.state(), `Invalid path '${p}': ${e.message}`)
+		}
+	}
+
+	private parameters(s: Json, k: string, value: Json): Json throws Failure {
+		const t = if (k == "") null else s.get(k)
+		return if (t == null) value else this.template(t!, value)
+	}
+
+	private template(t: Json, value: Json): Json throws Failure {
+		if (t.kind == "array") {
+			return arr(t.items.map(x => this.template(x, value)))
+		}
+		if (t.kind != "object") {
+			return t
+		}
+		const keys: [string, Json][] = []
+		for (const [k, v] of t.keys) {
+			if (endsWith(k, ".$") && v.kind == "string") {
+				const name = k.slice(0, k.length - 2)
+				keys.push([name,
+					if (startsWith(v.text, "States.")) this.intrinsic(v.text, value)
+					else this.path(v.text, value, name)])
+			} else {
+				keys.push([k, this.template(v, value)])
+			}
+		}
+		return obj(keys)
+	}
+
+	private path(p: string, value: Json, field: string): Json throws Failure {
+		const root = this.root(p, value)
+		let v: Json | null = null
+		try {
+			v = select(root, tail(p))
+		} catch (e: JsonError) {
+			throw runtime(this.state(), e.message)
+		}
+		if (v == null) {
+			throw runtime(this.state(),
+				`Invalid path '${p}' : The JSONPath '${p}' specified for the field '${field}' `
+				+ `could not be found in the input '${write(root)}'`)
+		}
+		return v!
+	}
+
+	private root(p: string, value: Json): Json { return if (startsWith(p, "$$")) this.context else value }
+
+	intrinsic(e: string, value: Json): Json throws Failure {
+		const r = new Reader(e)
+		const v = this.call(r, value)
+		r.space()
+		if (r.i < e.length) {
+			throw intrinsicFailure(`The value of the field has an invalid intrinsic function '${e}'`)
+		}
+		return v
+	}
+
+	private call(r: Reader, value: Json): Json throws Failure {
+		const from = r.i
+		while (r.i < r.s.length && r.s[r.i] != 0x28) {
+			r.i++
+		}
+		const name = r.s.slice(from, r.i)
+		r.i++
+		const args: Json[] = []
+		r.space()
+		if (r.next(0x29)) {
+			return this.apply(name, args)
+		}
+		while (true) {
+			r.space()
+			args.push(this.argument(r, value))
+			r.space()
+			if (r.next(0x29)) {
+				return this.apply(name, args)
+			}
+			if (!r.next(0x2c)) {
+				throw intrinsicFailure(`Invalid arguments in ${name}`)
+			}
+		}
+	}
+
+	private argument(r: Reader, value: Json): Json throws Failure {
+		if (r.i >= r.s.length) {
+			throw intrinsicFailure("Unexpected end of the intrinsic function")
+		}
+		const c = r.s[r.i]
+		if (c == 0x27) {
+			r.i++
+			let out = ""
+			while (r.i < r.s.length && r.s[r.i] != 0x27) {
+				if (r.s[r.i] == 0x5c && r.i + 1 < r.s.length) {
+					r.i++
+				}
+				out += r.s.slice(r.i, r.i + 1)
+				r.i++
+			}
+			r.i++
+			return str(out)
+		}
+		const from = r.i
+		let depth = 0
+		while (r.i < r.s.length && (depth > 0 || r.s[r.i] != 0x2c && r.s[r.i] != 0x29)) {
+			if (r.s[r.i] == 0x28) {
+				depth++
+			} else if (r.s[r.i] == 0x29) {
+				depth--
+			} else if (r.s[r.i] == 0x5b) {
+				depth++
+			} else if (r.s[r.i] == 0x5d) {
+				depth--
+			}
+			r.i++
+		}
+		const t = r.s.slice(from, r.i)
+		if (startsWith(t, "States.")) {
+			return this.intrinsic(t, value)
+		}
+		if (startsWith(t, "$")) {
+			return this.path(t, value, "")
+		}
+		try {
+			return parse(t)
+		} catch (e: JsonError) {
+			throw intrinsicFailure(`Invalid argument '${t}'`)
+		}
+	}
+
+	private apply(name: string, args: Json[]): Json throws Failure {
+		const arg = (i: i32, kind: string) => {
+			if (i >= args.length || kind != "" && args[i].kind != kind) {
+				throw intrinsicFailure(`Invalid arguments in ${name}`)
+			}
+			return args[i]
+		}
+		switch (name) {
+			case "States.Format":
+				const template = arg(0, "string").text
+				let out = ""
+				let n = 1
+				let i = 0
+				while (i < template.length) {
+					if (template[i] == 0x5c && i + 1 < template.length) {
+						out += template.slice(i + 1, i + 2)
+						i += 2
+					} else if (template[i] == 0x7b && i + 1 < template.length && template[i + 1] == 0x7d) {
+						const v = arg(n, "")
+						out += if (v.kind == "string") v.text else write(v)
+						n++
+						i += 2
+					} else {
+						out += template.slice(i, i + 1)
+						i++
+					}
+				}
+				if (n != args.length) {
+					throw intrinsicFailure(`Number of arguments in ${name} do not match the number of placeholders`)
+				}
+				return str(out)
+			case "States.StringToJson": try {
+				return parse(arg(0, "string").text)
+			} catch (e: JsonError) {
+				throw intrinsicFailure(`Invalid JSON in ${name}`)
+			}
+			case "States.JsonToString": return str(write(arg(0, "")))
+			case "States.Array": return arr(args)
+			case "States.ArrayPartition":
+				const xs = arg(0, "array").items
+				const size = arg(1, "number").number() as i32
+				if (size <= 0) {
+					throw intrinsicFailure(`The chunk size in ${name} must be positive`)
+				}
+				const parts: Json[] = []
+				for (let j = 0; j < xs.length; j += size) {
+					parts.push(arr(xs.slice(j, if (j + size < xs.length) j + size else xs.length)))
+				}
+				return arr(parts)
+			case "States.ArrayContains":
+				const it = arg(1, "")
+				return boolean(arg(0, "array").items.some(x => same(x, it)))
+			case "States.ArrayRange":
+				const first = arg(0, "number").number()
+				const last = arg(1, "number").number()
+				const step = arg(2, "number").number()
+				if (step == 0.0) {
+					throw intrinsicFailure(`The step in ${name} cannot be 0`)
+				}
+				const range: Json[] = []
+				let x = first
+				while (if (step > 0.0) x <= last else x >= last) {
+					range.push(num(x))
+					x += step
+					if (range.length > 1000) {
+						throw intrinsicFailure(`The array of ${name} would have more than 1000 items`)
+					}
+				}
+				return arr(range)
+			case "States.ArrayGetItem":
+				const items = arg(0, "array").items
+				const at = arg(1, "number").number() as i32
+				if (at < 0 || at >= items.length) {
+					throw intrinsicFailure(`The index ${at} in ${name} is out of bounds`)
+				}
+				return items[at]
+			case "States.ArrayLength": return num(arg(0, "array").items.length as f64)
+			case "States.ArrayUnique":
+				const unique: Json[] = []
+				for (const y of arg(0, "array").items) {
+					if (!unique.some(u => same(u, y))) {
+						unique.push(y)
+					}
+				}
+				return arr(unique)
+			case "States.Base64Encode": return str(base64.encode(arg(0, "string").text))
+			case "States.Base64Decode": try {
+				return str(base64.decode(arg(0, "string").text))
+			} catch (e: ParseError) {
+				throw intrinsicFailure(`Invalid base64 in ${name}`)
+			}
+			case "States.Hash":
+				const data = arg(0, "")
+				const text = if (data.kind == "string") data.text else write(data)
+				try {
+					switch (arg(1, "string").text) {
+						case "MD5": return str(hex.encode(md5(text)))
+						case "SHA-1": return str(hex.encode(sha1(text)))
+						case "SHA-256": return str(hex.encode(sha256(text)))
+						case "SHA-512": return str(hex.encode(sha512(text)))
+					}
+				} catch (e: CryptoError) {}
+				throw intrinsicFailure(`The hash algorithm in ${name} is not supported`)
+			case "States.JsonMerge":
+				const a = copy(arg(0, "object"))
+				const b = arg(1, "object")
+				for (const [k, v] of b.keys) {
+					a.set(k, v)
+				}
+				return a
+			case "States.MathRandom":
+				const lo = arg(0, "number").number()
+				const hi = arg(1, "number").number()
+				return num(floor(lo + this.host.random() * (hi - lo)))
+			case "States.MathAdd": return num(arg(0, "number").number() + arg(1, "number").number())
+			case "States.StringSplit":
+				const s = arg(0, "string").text
+				const seps = arg(1, "string").text
+				const pieces: Json[] = []
+				let from = 0
+				for (let j = 0; j <= s.length; j++) {
+					if (j == s.length || seps.some(c => c == s[j])) {
+						if (j > from) {
+							pieces.push(str(s.slice(from, j)))
+						}
+						from = j + 1
+					}
+				}
+				return arr(pieces)
+			case "States.UUID": return str(this.host.uuid())
+			default: throw intrinsicFailure(`The intrinsic function ${name} is not supported`)
+		}
+	}
+}
+
+function tail(p: string): string { return if (startsWith(p, "$$")) p.slice(1, p.length) else p }
+
+/// Of its ErrorEquals: States.ALL any, States.TaskFailed any but a timeout.
+function matches(r: Json, error: string): bool {
+	for (const e of r.get("ErrorEquals")?.items ?? []) {
+		if (e.text == error || e.text == "States.ALL" || e.text == "States.TaskFailed" && error != "States.Timeout") {
+			return true
+		}
+	}
+	return false
+}
+
+/// As its history names them: arn:aws:states:::sqs:sendMessage as sqs and sendMessage.
+function typed(resource: string): [string, string] {
+	const parts = split(resource, ":")
+	if (parts.length >= 7 && parts[2] == "states" && parts[4] == "") {
+		const rest = parts.slice(5, parts.length)
+		return if (rest[0] == "aws-sdk"
+			&& rest.length >= 3) [`aws-sdk:${rest[1]}`, rest.slice(2, rest.length).join(":")]
+			else [rest[0], rest.slice(1, rest.length).join(":")]
+	}
+	return if (parts.length >= 6) [parts[2], parts.slice(5, parts.length).join(":")] else ["", resource]
+}
+
+function truncated(): Json { return obj([["truncated", boolean(false)]]) }
+
+function runtime(state: string, why: string): Failure {
+	return new Failure("States.Runtime", `An error occurred while executing the state '${state}'. ${why}`)
+}
+
+function intrinsicFailure(why: string): Failure { return new Failure("States.IntrinsicFailure", why) }
+
+function timestamp(s: string): bool {
+	if (s.length < 20 || s[4] != 0x2d || s[7] != 0x2d || s[10] != 0x54 || s[13] != 0x3a || s[16] != 0x3a) {
+		return false
+	}
+	return [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18].every(i => isDigit(s[i]))
+}
+
+function compare(name: string, x: Json, b: Json): bool {
+	const kinds = [["String", "string"], ["Numeric", "number"], ["Boolean", "bool"], ["Timestamp", "string"]]
+	for (const [prefix, kind] of kinds) {
+		if (!startsWith(name, prefix)) {
+			continue
+		}
+		const op = name.slice(prefix.length, name.length)
+		if (x.kind != kind || b.kind != kind || prefix == "Timestamp" && !(timestamp(x.text) && timestamp(b.text))) {
+			return false
+		}
+		if (op == "Matches") {
+			return wild(b.text, x.text)
+		}
+		const c = if (kind == "number") (if (x.number() < b.number()) -1 else if (x.number() > b.number()) 1 else 0)
+			else (if (x.text < b.text) -1 else if (x.text > b.text) 1 else 0)
+		switch (op) {
+			case "Equals": return c == 0
+			case "LessThan": return c < 0
+			case "GreaterThan": return c > 0
+			case "LessThanEquals": return c <= 0
+			case "GreaterThanEquals": return c >= 0
+		}
+	}
+	return false
+}
+
+function wild(p: string, s: string): bool {
+	if (p.length == 0) {
+		return s.length == 0
+	}
+	if (p[0] == 0x2a) {
+		for (let i = 0; i <= s.length; i++) {
+			if (wild(p.slice(1, p.length), s.slice(i, s.length))) {
+				return true
+			}
+		}
+		return false
+	}
+	const escaped = p[0] == 0x5c && p.length > 1
+	const c = if (escaped) p[1] else p[0]
+	const rest = p.slice(if (escaped) 2 else 1, p.length)
+	return s.length > 0 && s[0] == c && wild(rest, s.slice(1, s.length))
+}
+
+class Reader {
+	s: string
+	i = 0
+
+	constructor(s: string) { this.s = s }
+
+	space() {
+		while (this.i < this.s.length && isSpace(this.s[this.i])) {
+			this.i++
+		}
+	}
+
+	next(c: u8): bool {
+		if (this.i < this.s.length && this.s[this.i] == c) {
+			this.i++
+			return true
+		}
+		return false
+	}
+}
+
+function replaced(s: string, from: string, to: string): string { return split(s, from).join(to) }
+
+/// Its headers the first row's unless CSVHeaderLocation is GIVEN and CSVHeaders names them.
+function csv(text: string, config: Json): Json[] {
+	const d = config.str("CSVDelimiter") ?? "COMMA"
+	const sep = if (d == "PIPE") "|"
+		else if (d == "SEMICOLON") ";"
+		else if (d == "SPACE") " "
+		else if (d == "TAB") "\t"
+		else ","
+	const rows: string[][] = []
+	let row: string[] = []
+	let field = ""
+	let quoted = false
+	let i = 0
+	while (i < text.length) {
+		const c = text.slice(i, i + 1)
+		if (quoted) {
+			if (c == "\"" && text.slice(i + 1, i + 2) == "\"") {
+				field += "\""
+				i++
+			} else if (c == "\"") {
+				quoted = false
+			} else {
+				field += c
+			}
+		} else if (c == "\"") {
+			quoted = true
+		} else if (c == sep) {
+			row.push(field)
+			field = ""
+		} else if (c == "\n") {
+			row.push(field)
+			rows.push(row)
+			row = []
+			field = ""
+		} else if (c != "\r") {
+			field += c
+		}
+		i++
+	}
+	if (field != "" || row.length > 0) {
+		row.push(field)
+		rows.push(row)
+	}
+	let headers: string[] = []
+	let first = 0
+	if (config.str("CSVHeaderLocation") == "GIVEN") {
+		headers = (config.get("CSVHeaders")?.items ?? []).map(h => h.text)
+	} else if (rows.length > 0) {
+		headers = rows[0]
+		first = 1
+	}
+	const out: Json[] = []
+	for (let r = first; r < rows.length; r++) {
+		const keys: [string, Json][] = []
+		for (let k = 0; k < headers.length; k++) {
+			keys.push([headers[k], str(if (k < rows[r].length) rows[r][k] else "")])
+		}
+		out.push(obj(keys))
+	}
+	return out
+}

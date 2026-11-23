@@ -1,0 +1,401 @@
+//! JSON values as the States Language works on them: a tree parsed from and written back to compact JSON, numbers kept
+//! as written; and the JSONPath of Step Functions, of which paths select values and reference paths set them.
+
+import { isSpace, lbrace, lbracket, quote } from "std/ascii"
+import { formatFloat, parseFloat } from "std/float"
+import * as std from "std/encoding/json"
+import { floor } from "std/math"
+import { formatInt, ParseError, parseInt, replace } from "std/string"
+
+/// A JSON value of a kind: "null", "bool", "number", "string", "array" or "object". A bool's text is true or false, a
+/// number's its literal, a string's its value.
+export class Json {
+	kind = "null"
+	text = ""
+	items: Json[] = []
+	keys: [string, Json][] = []
+
+	get(k: string): Json | null {
+		for (const [n, v] of this.keys) {
+			if (n == k) {
+				return v
+			}
+		}
+		return null
+	}
+
+	str(k: string): string | null {
+		const v = this.get(k)
+		return if (v == null || v.kind != "string") null else v.text
+	}
+
+	set(k: string, v: Json) {
+		for (let i = 0; i < this.keys.length; i++) {
+			if (this.keys[i][0] == k) {
+				this.keys[i] = [k, v]
+				return
+			}
+		}
+		this.keys.push([k, v])
+	}
+
+	number(): f64 {
+		try {
+			return parseFloat(this.text)
+		} catch (e: ParseError) {
+			return 0.0
+		}
+	}
+}
+
+export class JsonError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+export function nul(): Json { return new Json() }
+export function str(s: string): Json { return { ...new Json(), kind: "string", text: s } }
+export function boolean(b: bool): Json { return { ...new Json(), kind: "bool", text: if (b) "true" else "false" } }
+export function arr(items: Json[]): Json { return { ...new Json(), kind: "array", items: items } }
+export function obj(keys: [string, Json][]): Json { return { ...new Json(), kind: "object", keys: keys } }
+
+export function num(x: f64): Json {
+	const whole = floor(x) == x && x < 9.0e15 && x > -9.0e15
+	return { ...new Json(), kind: "number", text: if (whole) formatInt(x as i64) else formatFloat(x) }
+}
+
+export function parse(s: string): Json throws JsonError {
+	try {
+		return tree(s)
+	} catch (e: ParseError) {
+		throw new JsonError(if (e.at >= s.length) "Unexpected end of input"
+			else `Unexpected character '${s.slice(e.at, e.at + 1)}' at ${e.at}`)
+	}
+}
+
+/// The tree of the JSON s; std reads the whole of s first, so a ParseError is at a position in s.
+function tree(s: string): Json throws ParseError {
+	let i = 0
+	while (i < s.length && isSpace(s[i])) {
+		i++
+	}
+	const c = if (i < s.length) s[i] else 0
+	if (c == lbrace) {
+		const keys: [string, Json][] = []
+		for (const [k, v] of std.decode[std.Keys](s).all) {
+			keys.push([k, tree(v.text)])
+		}
+		return obj(keys)
+	}
+	if (c == lbracket) {
+		const items: Json[] = []
+		for (const x of std.decode[std.Raw[]](s)) {
+			items.push(tree(x.text))
+		}
+		return arr(items)
+	}
+	if (c == quote) {
+		return str(std.decode[string](s))
+	}
+	const t = std.decode[std.Raw](s).text
+	switch (t) {
+		case "null": return nul()
+		case "true", "false": return boolean(t == "true")
+		default: return { ...new Json(), kind: "number", text: t }
+	}
+}
+
+export function write(v: Json): string {
+	switch (v.kind) {
+		case "null": return "null"
+		case "bool", "number": return v.text
+		case "string": return std.quoted(v.text)
+		case "array": return `[${v.items.map(x => write(x)).join(",")}]`
+		default: return `{${v.keys.map(e => `${std.quoted(e[0])}:${write(e[1])}`).join(",")}}`
+	}
+}
+
+/// Whether a and b are the same value, numbers by their values, objects whatever the order of their members.
+export function same(a: Json, b: Json): bool {
+	if (a.kind != b.kind) {
+		return false
+	}
+	switch (a.kind) {
+		case "number": return a.number() == b.number()
+		case "array":
+			if (a.items.length != b.items.length) {
+				return false
+			}
+			for (let i = 0; i < a.items.length; i++) {
+				if (!same(a.items[i], b.items[i])) {
+					return false
+				}
+			}
+			return true
+		case "object":
+			if (a.keys.length != b.keys.length) {
+				return false
+			}
+			for (const [k, x] of a.keys) {
+				const y = b.get(k)
+				if (y == null || !same(x, y!)) {
+					return false
+				}
+			}
+			return true
+		default: return a.text == b.text
+	}
+}
+
+class Step {
+	kind = "name"
+	name = ""
+	index = 0
+	to = 0
+	/// A filter's member path, operator and operand: @.a > 1 as ["a"], ">", 1.
+	member: string[] = []
+	op = ""
+	operand = new Json()
+}
+
+function steps(p: string, at = false): Step[] throws JsonError {
+	const bad = new JsonError(`Invalid path '${p}'`)
+	if (p.length == 0 || p[0] != (if (at) 0x40 else 0x24)) {
+		throw bad
+	}
+	const out: Step[] = []
+	let i = 1
+	while (i < p.length) {
+		const c = p[i]
+		if (c == 0x2e) {
+			i++
+			if (i < p.length && p[i] == 0x2a) {
+				out.push({ ...new Step(), kind: "all" })
+				i++
+				continue
+			}
+			const from = i
+			while (i < p.length && p[i] != 0x2e && p[i] != 0x5b) {
+				i++
+			}
+			if (i == from) {
+				throw bad
+			}
+			out.push({ ...new Step(), name: p.slice(from, i) })
+			continue
+		}
+		if (c != 0x5b) {
+			throw bad
+		}
+		const end = close(p, i)
+		if (end < 0) {
+			throw bad
+		}
+		const inner = p.slice(i + 1, end)
+		i = end + 1
+		if (inner == "*") {
+			out.push({ ...new Step(), kind: "all" })
+		} else if (inner.length >= 2 && (inner[0] == 0x27 || inner[0] == 0x22)) {
+			out.push({ ...new Step(), name: inner.slice(1, inner.length - 1) })
+		} else if (inner.length > 3 && inner[0] == 0x3f && inner[1] == 0x28) {
+			out.push(filter(inner.slice(2, inner.length - 1), bad))
+		} else {
+			const colon = indexOfByte(inner, 0x3a)
+			try {
+				if (colon < 0) {
+					out.push({ ...new Step(), kind: "index", index: parseInt(inner) })
+				} else {
+					const a = inner.slice(0, colon)
+					const b = inner.slice(colon + 1, inner.length)
+					out.push({ ...new Step(), kind: "slice", index: if (a == "") 0 else parseInt(a),
+						to: if (b == "") 2147483647 else parseInt(b) })
+				}
+			} catch (e: ParseError) {
+				throw bad
+			}
+		}
+	}
+	return out
+}
+
+function close(p: string, i: i32): i32 {
+	let quote: u8 = 0
+	for (let j = i + 1; j < p.length; j++) {
+		const c = p[j]
+		if (quote != 0) {
+			quote = if (c == quote) 0 else quote
+		} else if (c == 0x27 || c == 0x22) {
+			quote = c
+		} else if (c == 0x5d) {
+			return j
+		}
+	}
+	return -1
+}
+
+function indexOfByte(s: string, c: u8): i32 {
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == c) {
+			return i
+		}
+	}
+	return -1
+}
+
+function filter(e: string, bad: JsonError): Step throws JsonError {
+	const f = { ...new Step(), kind: "filter" }
+	for (const op of ["==", "!=", "<=", ">=", "<", ">"]) {
+		const at = indexOfOp(e, op)
+		if (at > 0) {
+			f.op = op
+			f.member = steps(trimmed(e.slice(0, at)), true).map(s => s.name)
+			f.operand = parse(replace(trimmed(e.slice(at + op.length, e.length)), "'", "\""))
+			return f
+		}
+	}
+	f.member = steps(trimmed(e), true).map(s => s.name)
+	return f
+}
+
+function indexOfOp(e: string, op: string): i32 {
+	for (let i = 0; i + op.length <= e.length; i++) {
+		if (e.slice(i, i + op.length) == op) {
+			return i
+		}
+	}
+	return -1
+}
+
+function trimmed(s: string): string {
+	let a = 0
+	let b = s.length
+	while (a < b && isSpace(s[a])) {
+		a++
+	}
+	while (b > a && isSpace(s[b - 1])) {
+		b--
+	}
+	return s.slice(a, b)
+}
+
+export function definite(p: string): bool throws JsonError {
+	return steps(p).every(s => s.kind == "name" || s.kind == "index")
+}
+
+/// The one value of a definite path, null if there is none; the array of the values of any other.
+export function select(v: Json, p: string): Json | null throws JsonError {
+	const ss = steps(p)
+	let at = [v]
+	for (const s of ss) {
+		const next: Json[] = []
+		for (const x of at) {
+			switch (s.kind) {
+				case "name":
+					const m = x.get(s.name)
+					if (m != null) {
+						next.push(m!)
+					}
+				case "index":
+					const i = if (s.index < 0) x.items.length + s.index else s.index
+					if (x.kind == "array" && i >= 0 && i < x.items.length) {
+						next.push(x.items[i])
+					}
+				case "slice":
+					const from = if (s.index < 0) x.items.length + s.index else s.index
+					const to = if (s.to < 0) x.items.length + s.to else s.to
+					for (let j = if (from < 0) 0 else from; j < to && j < x.items.length; j++) {
+						next.push(x.items[j])
+					}
+				case "all": next.append(if (x.kind == "object") x.keys.map(e => e[1]) else x.items)
+				default: for (const y of x.items) {
+					if (kept(s, y)) {
+						next.push(y)
+					}
+				}
+			}
+		}
+		at = next
+	}
+	if (ss.every(s => s.kind == "name" || s.kind == "index")) {
+		return at.at(0)
+	}
+	return arr(at)
+}
+
+function kept(s: Step, y: Json): bool {
+	let v: Json | null = y
+	for (const n of s.member) {
+		v = v?.get(n) ?? null
+	}
+	if (v == null) {
+		return false
+	}
+	if (s.op == "") {
+		return true
+	}
+	const o = s.operand
+	if (s.op == "==" || s.op == "!=") {
+		return same(v!, o) == (s.op == "==")
+	}
+	if (v.kind != o.kind || v.kind != "number" && v.kind != "string") {
+		return false
+	}
+	const c = if (v.kind == "number") (if (v.number() < o.number()) -1 else if (v.number() > o.number()) 1 else 0)
+		else (if (v.text < o.text) -1 else if (v.text > o.text) 1 else 0)
+	switch (s.op) {
+		case "<": return c < 0
+		case "<=": return c <= 0
+		case ">": return c > 0
+		default: return c >= 0
+	}
+}
+
+/// root itself is changed, objects made where it has none, unless p is $, which gives v.
+export function put(root: Json, p: string, v: Json): Json throws JsonError {
+	const ss = steps(p)
+	if (!ss.every(s => s.kind == "name" || s.kind == "index")) {
+		throw new JsonError(`Invalid reference path '${p}'`)
+	}
+	if (ss.length == 0) {
+		return v
+	}
+	let at = root
+	for (let i = 0; i < ss.length; i++) {
+		const s = ss[i]
+		const last = i == ss.length - 1
+		if (s.kind == "index") {
+			if (at.kind != "array" || s.index < 0 || s.index >= at.items.length) {
+				throw new JsonError(`Unable to set the index ${s.index} of the path '${p}'`)
+			}
+			if (last) {
+				at.items[s.index] = v
+			} else {
+				at = at.items[s.index]
+			}
+			continue
+		}
+		if (at.kind != "object") {
+			throw new JsonError(`Unable to set the field '${s.name}' of the path '${p}' in a value not an object`)
+		}
+		if (last) {
+			at.set(s.name, v)
+		} else {
+			let m = at.get(s.name)
+			if (m == null) {
+				m = obj([])
+				at.set(s.name, m!)
+			}
+			at = m!
+		}
+	}
+	return root
+}
+
+export function copy(v: Json): Json {
+	const keys: [string, Json][] = []
+	for (const [k, x] of v.keys) {
+		keys.push([k, copy(x)])
+	}
+	return { ...new Json(), kind: v.kind, text: v.text, items: v.items.map(x => copy(x)), keys: keys }
+}
