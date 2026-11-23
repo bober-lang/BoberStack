@@ -1,0 +1,162 @@
+import { sign } from "../../core/client"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import * as protocol from "../../core/protocol/json"
+import * as api from "./api"
+import { Handler } from "./ssm"
+import { indexOf } from "std/algo"
+import { Request, Response } from "std/http"
+import { Decodable } from "std/types"
+
+function gateway(): Gateway {
+	const g = new Gateway()
+	const h = new Handler()
+	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	return g
+}
+
+function call(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `AmazonSSM.${op}`)
+	sign(req, body, "ssm", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function out[T extends Decodable](res: Response): T {
+	assert res.status == 200
+	let r: T | null = null
+	try {
+		r = protocol.decode[T](res.body.whole ?? "")
+	} catch (f: Fault) {}
+	return r!
+}
+
+function fails(res: Response, code: string, why = ""): bool {
+	const body = res.body.whole ?? ""
+	return res.status == 400 && indexOf(body, `"__type":"${code}"`) >= 0 && indexOf(body, why) >= 0
+}
+
+function put(g: Gateway, name: string, value: string, more = ""): i64 {
+	return out[api.PutParameterResult](call(g, "PutParameter",
+		`{"Name":"${name}","Value":"${value}","Type":"String"${more}}`)).Version
+}
+
+function get(g: Gateway, name: string, decrypt = false): api.Parameter {
+	return out[api.GetParameterResult](call(g, "GetParameter",
+		`{"Name":"${name}","WithDecryption":${decrypt}}`)).Parameter!
+}
+
+test "parameters: put, overwrite, get, versions, selectors and labels" {
+	const g = gateway()
+	assert put(g, "/app/db/host", "a") == 1
+	assert fails(call(g, "PutParameter", `{"Name":"/app/db/host","Value":"b","Type":"String"}`),
+		"ParameterAlreadyExists", "The parameter already exists.")
+	assert put(g, "/app/db/host", "b", `,"Overwrite":true`) == 2
+	const p = get(g, "/app/db/host")
+	assert p.Value == "b" && p.Version == 2 && p.ARN == "arn:aws:ssm:us-east-1:000000000000:parameter/app/db/host"
+	assert p.DataType == "text" && p.Type == "String"
+	const v1 = get(g, "/app/db/host:1")
+	assert v1.Value == "a" && v1.Selector == ":1" && v1.Name == "/app/db/host"
+	assert fails(call(g, "GetParameter", `{"Name":"/app/db/host:9"}`), "ParameterVersionNotFound")
+	assert fails(call(g, "GetParameter", `{"Name":"/none"}`), "ParameterNotFound")
+	const labeled = out[api.LabelParameterVersionResult](call(g, "LabelParameterVersion",
+		`{"Name":"/app/db/host","ParameterVersion":1,"Labels":["prod","1bad","awsx"]}`))
+	assert labeled.ParameterVersion == 1 && labeled.InvalidLabels! == ["1bad", "awsx"]
+	assert get(g, "/app/db/host:prod").Value == "a"
+	// A label moves to the version it is put on.
+	assert call(g, "LabelParameterVersion", `{"Name":"/app/db/host","Labels":["prod"]}`).status == 200
+	assert get(g, "/app/db/host:prod").Version == 2
+	const unlabeled = out[api.UnlabelParameterVersionResult](call(g, "UnlabelParameterVersion",
+		`{"Name":"/app/db/host","ParameterVersion":2,"Labels":["prod","other"]}`))
+	assert unlabeled.RemovedLabels! == ["prod"] && unlabeled.InvalidLabels! == ["other"]
+	const history = out[api.GetParameterHistoryResult](call(g, "GetParameterHistory", `{"Name":"/app/db/host"}`))
+	assert history.Parameters!.map(h => h.Value!) == ["a", "b"]
+	const both = out[api.GetParametersResult](call(g, "GetParameters",
+		`{"Names":["/app/db/host","/none","/app/db/host:1"]}`))
+	assert both.Parameters!.map(x => x.Value!) == ["b", "a"] && both.InvalidParameters! == ["/none"]
+	g.close()
+}
+
+test "names, types, patterns and tiers" {
+	const g = gateway()
+	assert fails(call(g, "PutParameter", `{"Name":"/aws/x","Value":"v","Type":"String"}`), "ValidationException",
+		"can't be prefixed with")
+	assert fails(call(g, "PutParameter", `{"Name":"a/b","Value":"v","Type":"String"}`), "ValidationException",
+		"Parameter name must be a fully qualified name.")
+	assert fails(call(g, "PutParameter", `{"Name":"/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p","Value":"v","Type":"String"}`),
+		"HierarchyLevelLimitExceededException")
+	assert fails(call(g, "PutParameter", `{"Name":"x","Value":"v"}`), "ValidationException")
+	assert fails(call(g, "PutParameter", `{"Name":"n","Value":"abc","Type":"String","AllowedPattern":"^[0-9]+$"}`),
+		"ParameterPatternMismatchException")
+	assert put(g, "n", "123", `,"AllowedPattern":"^[0-9]+$"`) == 1
+	assert fails(call(g, "PutParameter",
+		`{"Name":"n","Value":"v","Type":"String","Tags":[{"Key":"a","Value":"b"}],` + `"Overwrite":true}`),
+		"ValidationException", "tags and overwrite")
+	const secret = out[api.PutParameterResult](call(g, "PutParameter",
+		`{"Name":"/s","Value":"hidden","Type":"SecureString","Tier":"Advanced"}`))
+	assert secret.Tier == "Advanced"
+	assert get(g, "/s", true).Value == "hidden" && get(g, "/s").Value != "hidden"
+	assert fails(call(g, "PutParameter", `{"Name":"/s","Value":"v","Overwrite":true,"Tier":"Standard"}`),
+		"ValidationException", "downgrade")
+	const d = out[api.DescribeParametersResult](call(g, "DescribeParameters",
+		`{"ParameterFilters":[{"Key":"Type","Values":["SecureString"]}]}`)).Parameters!
+	assert d.length == 1 && d[0].KeyId == "alias/aws/ssm" && d[0].Tier == "Advanced"
+	g.close()
+}
+
+test "paths, filters, paging, tags and deletion" {
+	const g = gateway()
+	for (const n of ["/a/1", "/a/2", "/a/b/3", "/c"]) {
+		put(g, n, "v")
+	}
+	const one = out[api.GetParametersByPathResult](call(g, "GetParametersByPath", `{"Path":"/a"}`))
+	assert one.Parameters!.map(p => p.Name!) == ["/a/1", "/a/2"]
+	const all = out[api.GetParametersByPathResult](call(g, "GetParametersByPath", `{"Path":"/a","Recursive":true}`))
+	assert all.Parameters!.map(p => p.Name!) == ["/a/1", "/a/2", "/a/b/3"]
+	const first = out[api.GetParametersByPathResult](call(g, "GetParametersByPath",
+		`{"Path":"/","Recursive":true,"MaxResults":3}`))
+	assert first.Parameters!.length == 3 && first.NextToken != null
+	const rest = out[api.GetParametersByPathResult](call(g, "GetParametersByPath",
+		`{"Path":"/","Recursive":true,"MaxResults":3,"NextToken":"${first.NextToken!}"}`))
+	assert rest.Parameters!.map(p => p.Name!) == ["/c"] && rest.NextToken == null
+	assert fails(call(g, "GetParametersByPath", `{"Path":"/","ParameterFilters":[{"Key":"Name","Values":["x"]}]}`),
+		"InvalidFilterKey")
+	const begins = out[api.DescribeParametersResult](call(g, "DescribeParameters",
+		`{"ParameterFilters":[{"Key":"Name","Option":"BeginsWith","Values":["/a/b"]}]}`))
+	assert begins.Parameters!.map(p => p.Name!) == ["/a/b/3"]
+	const level = out[api.DescribeParametersResult](call(g, "DescribeParameters",
+		`{"ParameterFilters":[{"Key":"Path","Values":["/a"]}]}`))
+	assert level.Parameters!.map(p => p.Name!) == ["/a/1", "/a/2"]
+	assert call(g, "AddTagsToResource",
+		`{"ResourceType":"Parameter","ResourceId":"/c","Tags":[{"Key":"k","Value":"v"}]}`).status == 200
+	const tags = out[api.ListTagsForResourceResult](call(g, "ListTagsForResource",
+		`{"ResourceType":"Parameter","ResourceId":"/c"}`)).TagList!
+	assert tags.length == 1 && tags[0].Key == "k"
+	const byTag = out[api.DescribeParametersResult](call(g, "DescribeParameters",
+		`{"ParameterFilters":[{"Key":"tag:k","Values":["v"]}]}`))
+	assert byTag.Parameters!.map(p => p.Name!) == ["/c"]
+	assert call(g, "RemoveTagsFromResource", `{"ResourceType":"Parameter","ResourceId":"/c","TagKeys":["k"]}`).status
+		== 200
+	assert fails(call(g, "AddTagsToResource", `{"ResourceType":"Parameter","ResourceId":"/none","Tags":[]}`),
+		"InvalidResourceId")
+	assert call(g, "DeleteParameter", `{"Name":"/c"}`).status == 200
+	assert fails(call(g, "DeleteParameter", `{"Name":"/c"}`), "ParameterNotFound")
+	const deleted = out[api.DeleteParametersResult](call(g, "DeleteParameters", `{"Names":["/a/1","/none"]}`))
+	assert deleted.DeletedParameters! == ["/a/1"] && deleted.InvalidParameters! == ["/none"]
+	g.close()
+}
+
+test "a parameter keeps 100 versions, but not over a labeled oldest" {
+	const g = gateway()
+	for (let i = 1; i <= 100; i++) {
+		put(g, "/v", `${i}`, `,"Overwrite":true`)
+	}
+	assert put(g, "/v", "101", `,"Overwrite":true`) == 101
+	const history = out[api.GetParameterHistoryResult](call(g, "GetParameterHistory", `{"Name":"/v"}`))
+	assert history.Parameters![0].Version == 2 && history.NextToken != null
+	assert call(g, "LabelParameterVersion", `{"Name":"/v","ParameterVersion":2,"Labels":["keep"]}`).status == 200
+	assert fails(call(g, "PutParameter", `{"Name":"/v","Value":"x","Type":"String","Overwrite":true}`),
+		"ParameterMaxVersionLimitExceeded")
+	g.close()
+}

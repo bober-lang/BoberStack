@@ -1,0 +1,31 @@
+//! Parameter Store's state in an account's regional tree: its parameters by name, each with its versions.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+
+export class Version {
+	version: i64 = 0
+	/// A SecureString's as the base64 of its ciphertext blob.
+	value = ""
+	type = "String"
+	description: string | null = null
+	/// A SecureString's KMS key as given, or alias/aws/ssm.
+	keyId: string | null = null
+	allowedPattern: string | null = null
+	tier = "Standard"
+	policies: string | null = null
+	dataType = "text"
+	labels: string[] = []
+	modified: i64 = 0
+	user = ""
+}
+
+export class Parameter {
+	name = ""
+	tags: [string, string][] = []
+	/// Oldest first, the last current.
+	versions: Version[] = []
+}
+
+export function parameters(s: Store): Table[Parameter] { return new Table[Parameter](s, "ssm/parameters") }
+export function save(t: Table[Parameter], p: Parameter) throws Fault { t.put(p.name, p) }

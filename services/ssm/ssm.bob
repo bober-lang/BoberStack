@@ -1,0 +1,595 @@
+//! AWS Systems Manager Parameter Store; the rest of Systems Manager is not implemented. Where AWS differs:
+//!
+//! - A SecureString is encrypted by KMS directly, as AWS encrypts one of the standard tier, an advanced one too.
+//! - Parameter policies are stored and listed, Pending, but never act; Intelligent-Tiering picks a tier only at
+//!   PutParameter.
+//! - A Label filter matches a parameter of which any version has the label, answered at its latest version.
+//! - A request breaking the model's constraints is checked only where noted; AWS checks the rest after authorizing it.
+
+import { Fault } from "../../core/fault"
+import { Violations, Validation } from "../../core/protocol/model"
+import { Caller } from "../../core/service"
+import { Table } from "../../core/state/store"
+import { decryptAs, encryptAs } from "../kms/kms"
+import * as api from "./api"
+import { Parameter, parameters, save, Version } from "./records"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, lbracket } from "std/ascii"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { compile, Regex } from "std/regex"
+import { lower, ParseError, parseInt, split } from "std/string"
+
+/// The versions a parameter keeps, the labels a version has, the levels of a name's hierarchy, at most.
+const versions = 100
+const labels = 10
+const levels = 15
+
+const invalidName = "Parameter name: can't be prefixed with \"aws\" or \"ssm\" (case-insensitive). If formed as a path, "
+	+ "it can consist of sub-paths divided by slash symbol; each sub-path can be formed as a mix of letters, numbers "
+	+ "and the following 3 symbols .-_"
+
+export class Handler {
+	...api.Unimplemented
+
+	putParameter(caller: Caller, input: api.PutParameterRequest): api.PutParameterResult throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a == "ssm:PutParameter" || tags.length > 0)
+		caller.allow(arnOf(caller, input.Name))
+		const name = input.Name
+		named(name)
+		const overwrite = input.Overwrite ?? false
+		if (tags.length > 0 && overwrite) {
+			throw validation("Invalid request: tags and overwrite can't be used together. To create a parameter with "
+				+ "tags, please remove overwrite flag. To update tags for an existing parameter, please use "
+				+ "AddTagsToResource or RemoveTagsFromResource.")
+		}
+		const dataType = input.DataType ?? "text"
+		if (!["text", "aws:ec2:image", "aws:ssm:integration"].includes(dataType)) {
+			throw validation(`The following data type is not supported: ${dataType} (Data type names are all lowercase.)`)
+		}
+		const db = parameters(caller.regional())
+		const old = db.get(name)
+		if (old != null && !overwrite) {
+			const why = "The parameter already exists. To overwrite this value, set the overwrite option in the request to true."
+			throw api.parameterAlreadyExists(why)
+		}
+		const last = (if (old == null) null else latest(old!))
+		if (last == null && input.Type == null) {
+			throw validation("A parameter type is required when you create a parameter.")
+		}
+		const kind = input.Type ?? (last!.type as api.ParameterType)
+		const tier = tierOf(input, last)
+		const pattern = input.AllowedPattern ?? last?.allowedPattern
+		if (pattern != null) {
+			if (!regex(pattern!).test(input.Value)) {
+				const why = `Parameter value, cannot be validated against allowedPattern: ${pattern}`
+				throw api.parameterPatternMismatchException(why)
+			}
+		}
+		const p = old ?? { ...new Parameter(), name: name }
+		if (p.versions.length == versions) {
+			if (p.versions[0].labels.length > 0) {
+				throw api.parameterMaxVersionLimitExceeded(`You attempted to create a new version of ${name} by calling `
+					+ `the PutParameter API with the overwrite flag. Version ${p.versions[0].version}, the oldest version, `
+					+ "can't be deleted because it has a label associated with it. Move the label to another version of "
+					+ "the parameter, and try again.")
+			}
+			p.versions = p.versions.slice(1, p.versions.length)
+		}
+		const secure = kind == "SecureString"
+		const keyId = if (!secure) null
+			else input.KeyId ?? (if (last?.type == "SecureString") last?.keyId else null) ?? "alias/aws/ssm"
+		let value = input.Value
+		if (secure) {
+			try {
+				value = base64.encode(encryptAs(caller, "ssm", keyId!, value, [["PARAMETER_ARN", arnOf(caller, name)]]))
+			} catch (f: Fault) {
+				throw failure(caller, f)
+			}
+		}
+		const v = { ...new Version(), version: (last?.version ?? 0) + 1, value: value, type: kind,
+			description: input.Description ?? last?.description, keyId: keyId, allowedPattern: pattern, tier: tier,
+			policies: input.Policies ?? last?.policies, dataType: dataType, modified: now(), user: caller.arn }
+		p.versions.push(v)
+		p.tags = tagged(p.tags, tags)
+		save(db, p)
+		const r = new api.PutParameterResult()
+		r.Version = v.version
+		r.Tier = tier as api.ParameterTier
+		return r
+	}
+
+	getParameter(caller: Caller, input: api.GetParameterRequest): api.GetParameterResult throws Fault {
+		const [name, selector] = selected(input.Name)
+		caller.allow(arnOf(caller, name))
+		const db = parameters(caller.regional())
+		const p = db.get(name)
+		if (p == null) {
+			throw api.parameterNotFound("")
+		}
+		const r = new api.GetParameterResult()
+		r.Parameter = wire(caller, p!, version(p!, selector), selector, input.WithDecryption ?? false)
+		return r
+	}
+
+	getParameters(caller: Caller, input: api.GetParametersRequest): api.GetParametersResult throws Fault {
+		if (input.Names.length > 10) {
+			throw new Violations(new Validation("ValidationException")).fault(`[${input.Names.join(", ")}]`, "names",
+				"Member must have length less than or equal to 10")
+		}
+		const db = parameters(caller.regional())
+		const r = new api.GetParametersResult()
+		r.Parameters = []
+		r.InvalidParameters = []
+		if (input.Names.length == 0) {
+			caller.allow(`arn:aws:ssm:${caller.region}:${caller.account}:*`)
+		}
+		for (const given of input.Names) {
+			const [name, selector] = selected(given)
+			caller.allow(arnOf(caller, name))
+			const p = db.get(name)
+			try {
+				if (p == null) {
+					throw api.parameterNotFound("")
+				}
+				r.Parameters!.push(wire(caller, p!, version(p!, selector), selector, input.WithDecryption ?? false))
+			} catch (f: Fault) {
+				if (f.code != "ParameterNotFound" && f.code != "ParameterVersionNotFound") {
+					throw f
+				}
+				r.InvalidParameters!.push(given)
+			}
+		}
+		return r
+	}
+
+	getParametersByPath(caller: Caller,
+		input: api.GetParametersByPathRequest): api.GetParametersByPathResult throws Fault {
+		const path = input.Path
+		caller.allow(if (path == "") `arn:aws:ssm:${caller.region}:${caller.account}:*` else arnOf(caller, path))
+		if (!startsWith(path, "/")) {
+			throw validation("The parameter doesn't meet the parameter name requirements. The parameter name must begin "
+				+ "with a forward slash \"/\".")
+		}
+		const filters = input.ParameterFilters ?? []
+		for (const f of filters) {
+			if (!["Type", "KeyId", "Label"].includes(f.Key) && !startsWith(f.Key, "tag:")) {
+				throw api.invalidFilterKey()
+			}
+		}
+		const under = if (path == "/") "/" else `${path}/`
+		const recursive = input.Recursive ?? false
+		const [found, next] = page(parameters(caller.regional()), under, input.NextToken, input.MaxResults, 10,
+			p => (recursive || indexOf(p.name, "/", under.length) < 0) && filters.every(f => matches(p, f)))
+		const r = new api.GetParametersByPathResult()
+		r.Parameters = found.map(p => wire(caller, p, latest(p), null, input.WithDecryption ?? false))
+		r.NextToken = next
+		return r
+	}
+
+	describeParameters(caller: Caller,
+		input: api.DescribeParametersRequest): api.DescribeParametersResult throws Fault {
+		caller.allow(`arn:aws:ssm:${caller.region}:${caller.account}:*`)
+		const filters = input.Filters ?? []
+		const strings = input.ParameterFilters ?? []
+		if (filters.length > 0 && strings.length > 0) {
+			throw validation("You can use either Filters or ParameterFilters in a single request.")
+		}
+		const all = strings.slice(0, strings.length)
+		for (const f of filters) {
+			all.push({ ...new api.ParameterStringFilter(), Key: f.Key,
+				Option: if (f.Key == "Name") "BeginsWith" else null, Values: f.Values })
+		}
+		for (const f of all) {
+			const known = ["Name", "Path", "Type", "KeyId", "Label", "Tier", "DataType"]
+			if (!known.includes(f.Key) && !startsWith(f.Key, "tag:")) {
+				throw api.invalidFilterKey()
+			}
+		}
+		const [found, next] = page(parameters(caller.regional()), "", input.NextToken, input.MaxResults, 50,
+			p => all.every(f => matches(p, f)))
+		const r = new api.DescribeParametersResult()
+		r.Parameters = found.map(p => {
+			const v = latest(p)
+			return { ...new api.ParameterMetadata(), Name: p.name, ARN: arnOf(caller, p.name),
+				Type: v.type as api.ParameterType, KeyId: v.keyId, LastModifiedDate: v.modified,
+				LastModifiedUser: v.user, Description: v.description, AllowedPattern: v.allowedPattern,
+				Version: v.version, Tier: v.tier as api.ParameterTier, Policies: policies(v.policies),
+				DataType: v.dataType }
+		})
+		r.NextToken = next
+		return r
+	}
+
+	getParameterHistory(caller: Caller,
+		input: api.GetParameterHistoryRequest): api.GetParameterHistoryResult throws Fault {
+		const p = found(caller, input.Name)
+		const max = input.MaxResults ?? 50
+		if (max < 1 || max > 50) {
+			throw new Violations(new Validation("ValidationException")).fault(`${max}`, "maxResults",
+				if (max < 1) "Member must have value greater than or equal to 1"
+				else "Member must have value less than or equal to 50")
+		}
+		let from = 0
+		if (input.NextToken != null) {
+			try {
+				from = parseInt(base64.decode(input.NextToken!))
+			} catch (e: ParseError) {
+				throw api.invalidNextToken("The specified token isn't valid.")
+			}
+		}
+		const to = if (from + max < p.versions.length) from + max else p.versions.length
+		const decrypt = input.WithDecryption ?? false
+		const r = new api.GetParameterHistoryResult()
+		r.Parameters = p.versions.slice(from, to).map(v => ({ ...new api.ParameterHistory(), Name: p.name,
+			Type: v.type as api.ParameterType, KeyId: v.keyId, LastModifiedDate: v.modified, LastModifiedUser: v.user,
+			Description: v.description, Value: shown(caller, p, v, decrypt), AllowedPattern: v.allowedPattern,
+			Version: v.version, Labels: v.labels, Tier: v.tier as api.ParameterTier, Policies: policies(v.policies),
+			DataType: v.dataType }))
+		r.NextToken = if (to < p.versions.length) base64.encode(`${to}`) else null
+		return r
+	}
+
+	deleteParameter(caller: Caller, input: api.DeleteParameterRequest): api.DeleteParameterResult throws Fault {
+		found(caller, input.Name)
+		parameters(caller.regional()).delete(input.Name)
+		return new api.DeleteParameterResult()
+	}
+
+	deleteParameters(caller: Caller, input: api.DeleteParametersRequest): api.DeleteParametersResult throws Fault {
+		if (input.Names.length > 10) {
+			throw new Violations(new Validation("ValidationException")).fault(`[${input.Names.join(", ")}]`, "names",
+				"Member must have length less than or equal to 10")
+		}
+		const db = parameters(caller.regional())
+		const r = new api.DeleteParametersResult()
+		r.DeletedParameters = []
+		r.InvalidParameters = []
+		for (const name of input.Names) {
+			caller.allow(arnOf(caller, name))
+			if (db.delete(name)) {
+				r.DeletedParameters!.push(name)
+			} else {
+				r.InvalidParameters!.push(name)
+			}
+		}
+		return r
+	}
+
+	labelParameterVersion(caller: Caller,
+		input: api.LabelParameterVersionRequest): api.LabelParameterVersionResult throws Fault {
+		const p = found(caller, input.Name)
+		const v = numbered(p, input.ParameterVersion ?? latest(p).version)
+		const valid = input.Labels.filter(l => label(l))
+		const adding = valid.filter(l => !v.labels.includes(l))
+		if (v.labels.length + adding.length > labels) {
+			throw api.parameterVersionLabelLimitExceeded("A parameter version can have maximum 10 labels.Move one or "
+				+ "more labels to another version and try again.")
+		}
+		for (const o of p.versions) {
+			o.labels = o.labels.filter(l => !adding.includes(l))
+		}
+		v.labels.append(adding)
+		save(parameters(caller.regional()), p)
+		const r = new api.LabelParameterVersionResult()
+		r.InvalidLabels = input.Labels.filter(l => !label(l))
+		r.ParameterVersion = v.version
+		return r
+	}
+
+	unlabelParameterVersion(caller: Caller,
+		input: api.UnlabelParameterVersionRequest): api.UnlabelParameterVersionResult throws Fault {
+		const p = found(caller, input.Name)
+		const v = numbered(p, input.ParameterVersion)
+		const r = new api.UnlabelParameterVersionResult()
+		r.RemovedLabels = input.Labels.filter(l => v.labels.includes(l))
+		r.InvalidLabels = input.Labels.filter(l => !v.labels.includes(l))
+		v.labels = v.labels.filter(l => !input.Labels.includes(l))
+		save(parameters(caller.regional()), p)
+		return r
+	}
+
+	addTagsToResource(caller: Caller, input: api.AddTagsToResourceRequest): api.AddTagsToResourceResult throws Fault {
+		const [db, p] = tagging(caller, input.ResourceType, input.ResourceId)
+		const tags = tagged(p.tags, input.Tags)
+		if (tags.length > 50) {
+			throw api.tooManyTagsError()
+		}
+		p.tags = tags
+		save(db, p)
+		return new api.AddTagsToResourceResult()
+	}
+
+	removeTagsFromResource(caller: Caller,
+		input: api.RemoveTagsFromResourceRequest): api.RemoveTagsFromResourceResult throws Fault {
+		const [db, p] = tagging(caller, input.ResourceType, input.ResourceId)
+		p.tags = p.tags.filter(t => !input.TagKeys.includes(t[0]))
+		save(db, p)
+		return new api.RemoveTagsFromResourceResult()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResult throws Fault {
+		const p = tagging(caller, input.ResourceType, input.ResourceId)[1]
+		const r = new api.ListTagsForResourceResult()
+		r.TagList = p.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return r
+	}
+}
+
+function found(caller: Caller, name: string): Parameter throws Fault {
+	caller.allow(arnOf(caller, name))
+	const p = parameters(caller.regional()).get(name)
+	if (p == null) {
+		throw api.parameterNotFound(`Parameter ${name} not found.`)
+	}
+	return p!
+}
+
+function tagging(caller: Caller, kind: api.ResourceTypeForTagging,
+	id: string): [Table[Parameter], Parameter] throws Fault {
+	if (kind != "Parameter") {
+		throw api.invalidResourceType()
+	}
+	caller.allow(arnOf(caller, id))
+	const db = parameters(caller.regional())
+	const p = db.get(id)
+	if (p == null) {
+		throw api.invalidResourceId()
+	}
+	return [db, p!]
+}
+
+function arnOf(caller: Caller, name: string): string {
+	const prefix = `arn:aws:ssm:${caller.region}:${caller.account}:`
+	return if (name == "") `${prefix}*`
+		else `${prefix}parameter/${if (startsWith(name, "/")) name.slice(1, name.length) else name}`
+}
+
+function named(n: string) throws Fault {
+	const path = startsWith(n, "/")
+	if (!path && indexOf(n, "/") >= 0) {
+		throw validation("Parameter name must be a fully qualified name.")
+	}
+	const parts = split(if (path) n.slice(1, n.length) else n, "/")
+	const first = lower(parts[0])
+	const ok = n.length <= 1011 && !startsWith(first, "aws") && !startsWith(first, "ssm")
+		&& parts.every(s => s.length > 0
+		&& s.every(c => isAlphanumeric(c) || c == "."[0] || c == "-"[0] || c == "_"[0]))
+	if (!ok) {
+		throw validation(invalidName)
+	}
+	if (parts.length > levels) {
+		throw api.hierarchyLevelLimitExceededException("A parameter name can't exceed 15 hierarchy levels, including the parameter name.")
+	}
+}
+
+/// A parameter's name and its selector, as name:3 or name:label, null if none.
+function selected(given: string): [string, string | null] {
+	const at = lastIndexOf(given, ":")
+	return if (at < 0) [given, null] else [given.slice(0, at), given.slice(at + 1, given.length)]
+}
+
+function version(p: Parameter, selector: string | null): Version throws Fault {
+	if (selector == null) {
+		return latest(p)
+	}
+	const s = selector!
+	if (s.length > 0 && s.every(c => isDigit(c))) {
+		let n: i64 = 0
+		try {
+			n = parseInt[i64](s)
+		} catch (e: ParseError) {}
+		return numbered(p, n)
+	}
+	const v = p.versions.find(v => v.labels.includes(s))
+	if (v == null) {
+		throw api.parameterVersionNotFound(`Systems Manager could not find version ${s} of ${p.name}. Verify the `
+			+ "version and try again.")
+	}
+	return v!
+}
+
+function latest(p: Parameter): Version { return p.versions[p.versions.length - 1] }
+
+function numbered(p: Parameter, n: i64): Version throws Fault {
+	const v = p.versions.find(v => v.version == n)
+	if (v == null) {
+		throw api.parameterVersionNotFound(`Systems Manager could not find version ${n} of ${p.name}. Verify the `
+			+ "version and try again.")
+	}
+	return v!
+}
+
+function wire(caller: Caller, p: Parameter, v: Version, selector: string | null,
+	decrypt: bool): api.Parameter throws Fault {
+	return { ...new api.Parameter(), Name: p.name, Type: v.type as api.ParameterType,
+		Value: shown(caller, p, v, decrypt), Version: v.version,
+		Selector: if (selector == null) null else `:${selector}`, LastModifiedDate: v.modified,
+		ARN: arnOf(caller, p.name), DataType: v.dataType }
+}
+
+function shown(caller: Caller, p: Parameter, v: Version, decrypt: bool): string throws Fault {
+	if (v.type != "SecureString" || !decrypt) {
+		return v.value
+	}
+	let blob = ""
+	try {
+		blob = base64.decode(v.value)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A SecureString's ciphertext does not decode")
+	}
+	try {
+		return decryptAs(caller, "ssm", blob, [["PARAMETER_ARN", arnOf(caller, p.name)]])[0]
+	} catch (f: Fault) {
+		throw failure(caller, f)
+	}
+}
+
+/// SSM's fault for KMS's f: an AccessDeniedException of an access denied, else an InvalidKeyId, of KMS's message as
+/// SSM gives it.
+function failure(caller: Caller, f: Fault): Fault {
+	if (f.status >= 500) {
+		return f
+	}
+	const code = if (f.code == "AccessDeniedException") f.code else "InvalidKeyId"
+	return new Fault(400, code,
+		`${f.message} (Service: AWSKMS; Status Code: 400; Error Code: ${f.code}; Request ID: `
+		+ `${caller.requestId}; Proxy: null)`)
+}
+
+function tierOf(input: api.PutParameterRequest, last: Version | null): string throws Fault {
+	const long = input.Value.length > 4096
+	const advanced = long || input.Policies != null
+	let tier = input.Tier ?? (if (last?.tier == "Advanced") "Advanced" else "Standard")
+	if (tier == "Intelligent-Tiering") {
+		tier = if (advanced || last?.tier == "Advanced") "Advanced" else "Standard"
+	}
+	if (tier == "Standard" && last?.tier == "Advanced") {
+		throw validation("This parameter uses the advanced-parameter tier. You can't downgrade a parameter from the "
+			+ "advanced-parameter tier to the standard-parameter tier. If necessary, you can delete the advanced "
+			+ "parameter and recreate it as a standard parameter.")
+	}
+	if (tier == "Standard" && long) {
+		throw validation("Standard tier parameters support a maximum parameter value of 4096 characters. To create a "
+			+ "larger parameter value, upgrade the parameter to use the advanced-parameter tier.")
+	}
+	if (input.Value.length > 8192) {
+		throw new Violations(new Validation("ValidationException")).fault(input.Value, "value",
+			"Member must have length less than or equal to 8192")
+	}
+	if (tier == "Standard" && input.Policies != null) {
+		throw api.incompatiblePolicyException("Policies are supported only by advanced tier parameters.")
+	}
+	return tier
+}
+
+function matches(p: Parameter, f: api.ParameterStringFilter): bool {
+	const v = latest(p)
+	const values = f.Values ?? []
+	const option = f.Option ?? (if (f.Key == "Path") "OneLevel" else "Equals")
+	switch (f.Key) {
+		case "Name": return values.some(x => {
+			const n = if (startsWith(x, "/") || !startsWith(p.name, "/")) x else `/${x}`
+			return if (option == "BeginsWith") startsWith(p.name, n)
+				else if (option == "Contains") indexOf(p.name, x) >= 0
+				else p.name == n
+		})
+		case "Path": return values.some(x => {
+			const under = if (x == "/") "/" else `${x}/`
+			return startsWith(p.name, under) && (option == "Recursive" || indexOf(p.name, "/", under.length) < 0)
+		})
+		case "Type": return values.includes(v.type)
+		case "KeyId": return values.includes(v.keyId ?? "")
+		case "Tier": return values.includes(v.tier)
+		case "DataType": return values.includes(v.dataType)
+		case "Label": return p.versions.some(o => o.labels.some(l => values.includes(l)))
+		default:
+			const key = f.Key.slice(4, f.Key.length)
+			return p.tags.some(t => t[0] == key && (values.length == 0 || values.includes(t[1])))
+	}
+}
+
+function page(db: Table[Parameter], prefix: string, token: string | null, max: i32 | null, most: i32,
+	keep: (p: Parameter) => bool): [Parameter[], string | null] throws Fault {
+	const n = max ?? most
+	if (n < 1 || n > most) {
+		throw new Violations(new Validation("ValidationException")).fault(`${n}`, "maxResults",
+			if (n < 1) "Member must have value greater than or equal to 1"
+			else `Member must have value less than or equal to ${most}`)
+	}
+	let from: string | null = null
+	try {
+		from = if (token == null) null else base64.decode(token!)
+	} catch (e: ParseError) {
+		throw api.invalidNextToken("The specified token isn't valid.")
+	}
+	const out: Parameter[] = []
+	while (true) {
+		const chunk = db.scan(from, 100, prefix)
+		for (const [k, p] of chunk) {
+			if (keep(p)) {
+				if (out.length == n) {
+					return [out, base64.encode(out[n - 1].name)]
+				}
+				out.push(p)
+			}
+		}
+		if (chunk.length < 100) {
+			return [out, null]
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+function label(l: string): bool {
+	const low = lower(l)
+	return l.length >= 1 && l.length <= 100 && !isDigit(l[0]) && !startsWith(low, "aws") && !startsWith(low, "ssm")
+		&& l.every(c => isAlphanumeric(c) || c == "."[0] || c == "-"[0] || c == "_"[0])
+}
+
+function policies(given: string | null): api.ParameterInlinePolicy[] | null {
+	if (given == null) {
+		return null
+	}
+	return items(given!).map(text => {
+		let kind: string | null = null
+		try {
+			for (const [k, v] of json.decode[json.Keys](text).all) {
+				if (k == "Type") {
+					kind = json.decode[string](v)
+				}
+			}
+		} catch (e: ParseError) {}
+		return { ...new api.ParameterInlinePolicy(), PolicyText: text, PolicyType: kind, PolicyStatus: "Pending" }
+	})
+}
+
+function items(s: string): string[] {
+	const out: string[] = []
+	let depth = 0
+	let quoted = false
+	let start = -1
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		if (quoted) {
+			if (c == "\\"[0]) {
+				i++
+			} else if (c == "\""[0]) {
+				quoted = false
+			}
+		} else if (c == "\""[0]) {
+			quoted = true
+		} else if (c == "{"[0] || c == lbracket) {
+			depth++
+			if (depth == 2) {
+				start = i
+			}
+		} else if (c == "}"[0] || c == "]"[0]) {
+			if (depth == 2) {
+				out.push(s.slice(start, i + 1))
+			}
+			depth--
+		}
+	}
+	return out
+}
+
+function tagged(tags: [string, string][], given: api.Tag[]): [string, string][] {
+	const out = tags.filter(t => !given.some(g => g.Key == t[0]))
+	for (const g of given) {
+		out.push([g.Key, g.Value])
+	}
+	return out
+}
+
+function regex(p: string): Regex throws Fault {
+	try {
+		return compile(p)
+	} catch (e: ParseError) {
+		throw api.invalidAllowedPatternException(`The allowed pattern ${p} is not valid.`)
+	}
+}
+
+function validation(why: string): Fault { return new Fault(400, "ValidationException", why) }
