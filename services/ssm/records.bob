@@ -1,0 +1,43 @@
+//! Parameter Store's state in an account's regional tree: its parameters by name, each with its versions.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+
+/// A version of a parameter: what PutParameter gave it.
+export class Version {
+	version: i64 = 0
+	value = ""
+	type = "String"
+	description: string | null = null
+	/// A SecureString's KMS key as given, or alias/aws/ssm.
+	keyId: string | null = null
+	allowedPattern: string | null = null
+	tier = "Standard"
+	/// The policies as given, null if none.
+	policies: string | null = null
+	dataType = "text"
+	labels: string[] = []
+	modified: i64 = 0
+	/// The ARN of who put it.
+	user = ""
+}
+
+export class Parameter {
+	name = ""
+	tags: [string, string][] = []
+	/// Oldest first, the last current.
+	versions: Version[] = []
+}
+
+/// The parameters of an account's regional tree, by name.
+export function parameters(s: Store): Table[Parameter] { return new Table[Parameter](s, "ssm/parameters") }
+
+/// Puts p in t; a record holds no float, the one thing JSON cannot encode.
+export function save(t: Table[Parameter], p: Parameter) throws Fault {
+	try {
+		t.put(p.name, p)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

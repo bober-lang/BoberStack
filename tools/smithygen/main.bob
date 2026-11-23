@@ -193,7 +193,9 @@ const denials: [string, i32, string, string][] = [["com.amazonaws.iam#AWSIdentit
 	["com.amazonaws.sqs#AmazonSQS", 403, "AccessDenied", "reasoned"],
 	["com.amazonaws.dynamodb#DynamoDB_20120810", 400, "AccessDeniedException", "reasoned"],
 	["com.amazonaws.sns#AmazonSimpleNotificationService", 403, "AuthorizationError", "reasoned"],
-	["com.amazonaws.eventbridge#AWSEvents", 400, "AccessDeniedException", "reasoned"]]
+	["com.amazonaws.eventbridge#AWSEvents", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.secretsmanager#secretsmanager", 400, "AccessDeniedException", "reasoned"],
+	["com.amazonaws.ssm#AmazonSSM", 400, "AccessDeniedException", "reasoned"]]
 
 /// The members of the services below whose enums are strings, by their shape ids: AWS answers a name outside the enum
 /// with an error of the service's own.
@@ -315,7 +317,7 @@ class Generator {
 		sortNames(this.enums)
 		const body: Decl[] = []
 		for (const id of this.enums) {
-			body.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, this.values(id))))
+			body.push(new Decl("type", fill(`export type ${this.declare(enumName(id))} = `, this.values(id))))
 		}
 		const classes: Decl[] = []
 		for (const id of this.structures) {
@@ -734,7 +736,7 @@ class Generator {
 	typeOf(r: Ref, tags: string[], inner: bool): string throws ModelError {
 		const s = this.shape(r.target)
 		if (enumerates(s)) {
-			return if (this.open) "string" else name(r.target)
+			return if (this.open) "string" else enumName(r.target)
 		}
 		const xml = this.protocol == "awsQuery" || this.protocol == "restXml"
 		if (!xml && ["timestamp", "document", "list", "map"].includes(s.type)) {
@@ -1399,6 +1401,11 @@ function enumerates(s: Shape): bool { return s.type == "enum" || s.traits.enum !
 function sortNames(ids: string[]) { sortBy(ids, (a, b) => name(a) < name(b)) }
 /// The name of the shape id, without its namespace.
 function name(id: string): string { return split(id, "#")[1] }
+
+/// The name of the enum id, followed by a $ if the API imports one of that name, as SSM's Fault.
+function enumName(id: string): string {
+	return if (["Caller", "Fault", "Request", "Response"].includes(name(id))) `${name(id)}$` else name(id)
+}
 
 /// s with its leading capitals lowered, but for the last of several that starts a word: IDPError as idpError.
 function lowerCamel(s: string): string {

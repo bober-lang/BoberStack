@@ -1,0 +1,51 @@
+//! Secrets Manager's state in an account's regional tree: its secrets by name, each with its versions.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+
+/// A version of a secret's value: a string, or bytes in base64.
+export class Version {
+	id = ""
+	string: string | null = null
+	binary: string | null = null
+	/// Its staging labels; none if it is deprecated.
+	stages: string[] = []
+	created: i64 = 0
+	/// The day it was last read, null if never.
+	accessed: i64 | null = null
+	/// The KMS key it was encrypted under as given, null for the account's default.
+	kmsKey: string | null = null
+}
+
+export class Secret {
+	name = ""
+	arn = ""
+	description: string | null = null
+	kmsKey: string | null = null
+	/// As given to CreateSecret or UpdateSecret, null if never.
+	type: string | null = null
+	tags: [string, string][] = []
+	/// The resource policy as given, null if none.
+	policy: string | null = null
+	created: i64 = 0
+	changed: i64 = 0
+	/// The day a value was last read, null if never.
+	accessed: i64 | null = null
+	/// When it is scheduled to be deleted, null if it is not.
+	deleting: i64 | null = null
+	/// Oldest first.
+	versions: Version[] = []
+}
+
+/// The secrets of an account's regional tree, by name.
+export function secrets(s: Store): Table[Secret] { return new Table[Secret](s, "secretsmanager/secrets") }
+
+/// Puts s in t; a record holds no float, the one thing JSON cannot encode.
+export function save(t: Table[Secret], s: Secret) throws Fault {
+	try {
+		t.put(s.name, s)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

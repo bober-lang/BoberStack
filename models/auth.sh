@@ -4,7 +4,7 @@
 # call each operation. The URL is not versioned; these were fetched on 2026-11-23.
 set -eu
 cd "$(dirname "$0")"
-for service in iam sts sqs dynamodb sns events s3; do
+for service in iam sts sqs dynamodb sns events s3 secretsmanager ssm; do
 	curl -fsS -A curl "https://servicereference.us-east-1.amazonaws.com/v1/$service/$service.json" \
 		| jq "del(.Operations[].SDK)" >"$service-auth.json"
 done

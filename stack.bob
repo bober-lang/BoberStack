@@ -9,10 +9,14 @@ import * as iamApi from "./services/iam/api"
 import { Catalog } from "./services/iam/catalog"
 import * as iam from "./services/iam/iam"
 import { identify } from "./services/iam/identities"
+import * as secretsmanagerApi from "./services/secretsmanager/api"
+import * as secretsmanager from "./services/secretsmanager/secretsmanager"
 import * as snsApi from "./services/sns/api"
 import * as sns from "./services/sns/sns"
 import * as sqsApi from "./services/sqs/api"
 import * as sqs from "./services/sqs/sqs"
+import * as ssmApi from "./services/ssm/api"
+import * as ssm from "./services/ssm/ssm"
 import * as stsApi from "./services/sts/api"
 import * as sts from "./services/sts/sts"
 
@@ -27,11 +31,15 @@ export function stack(catalog: Catalog): Gateway {
 	const d = new dynamodb.Handler()
 	const n = new sns.Handler(q)
 	const e = new events.Handler(q, n)
+	const m = new secretsmanager.Handler()
+	const p = new ssm.Handler()
 	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
 	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
 	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
 	g.services.set(dynamodbApi.signingName, (caller, req) => dynamodbApi.handle(d, caller, req))
 	g.services.set(snsApi.signingName, (caller, req) => snsApi.handle(n, caller, req))
 	g.services.set(eventsApi.signingName, (caller, req) => eventsApi.handle(e, caller, req))
+	g.services.set(secretsmanagerApi.signingName, (caller, req) => secretsmanagerApi.handle(m, caller, req))
+	g.services.set(ssmApi.signingName, (caller, req) => ssmApi.handle(p, caller, req))
 	return g
 }
