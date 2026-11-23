@@ -348,6 +348,8 @@ export class Handler {
 			try {
 				authorize(caller, f.bucket, arn(input.Bucket, o.Key))
 				const [id, marker] = remove(caller, f, o.Key, o.VersionId)
+				this.notify(caller, f, if (marker) "ObjectRemoved:DeleteMarkerCreated" else "ObjectRemoved:Delete",
+					{ ...new Version(), key: o.Key, id: id ?? "null", order: f.bucket.next })
 				if (input.Delete.Quiet != true) {
 					deleted.push({ ...new api.DeletedObject(), Key: o.Key, VersionId: o.VersionId,
 						DeleteMarker: if (marker) true else null,

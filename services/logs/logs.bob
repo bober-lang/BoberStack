@@ -3,9 +3,13 @@
 //! Logs Insights, exports, deliveries, anomaly detection, transformers and the rest are not implemented. Where AWS
 //! differs:
 //!
-//! - Nothing runs between requests: retention hides events older than it at each request, and nothing is delivered.
-//!   A subscription filter is stored and described, its destination never tried nor sent an event; a metric filter
-//!   publishes no metric.
+//! - Nothing runs between requests: retention hides events older than it at each request, and a metric filter
+//!   publishes no metric. A subscription filter to a Kinesis stream is tried with AWS's control message when put, and
+//!   sent the events of each PutLogEvents it matches within that request, gzipped as AWS sends them, by calling the
+//!   Kinesis handler directly as a session of the filter's role, whose trust policy is not consulted; one the stream
+//!   refuses is dropped, never retried, and the record's partition key is the request's id. A filter's events carry no
+//!   extractedFields. There is no Lambda, Firehose or destination to deliver to: a filter to one is refused, as AWS
+//!   refuses one that cannot be reached.
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
 
@@ -14,12 +18,15 @@ import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../c
 import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { match, parse } from "./pattern"
+import { list, member } from "../events/pattern"
+import * as kinesisApi from "../kinesis/api"
 
 import { events, Event, Group, groups, MetricFilter, metricFilters, policies, Policy, save, Sequence, sequence, Stream,
 	streams, Subscription, subscriptions } from "./records"
 
 import { endsWith, indexOf, sortBy, startsWith } from "std/algo"
 import { isDigit } from "std/ascii"
+import { gzip } from "std/compress/gzip"
 import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { ParseError, parseInt, split } from "std/string"
@@ -42,6 +49,27 @@ const badToken = "The specified nextToken is invalid."
 /// The service, of the operations on log groups, streams, events, filters and resource policies.
 export class Handler {
 	...api.Unimplemented
+
+	/// What subscription filters deliver to, which the stack sets.
+	kinesis: kinesisApi.Kinesis | null = null
+
+	/// Puts data gzipped on the Kinesis stream of the ARN stream, as CloudWatch Logs under the role of the ARN role on
+	/// behalf of the log group of the ARN source: whether the stream took it.
+	private send(caller: Caller, stream: string, role: string, source: string, data: string): bool {
+		if (this.kinesis == null) {
+			return false
+		}
+		const r = new kinesisApi.PutRecordInput()
+		r.StreamARN = stream
+		r.Data = gzip(data)
+		r.PartitionKey = caller.requestId
+		try {
+			this.kinesis!.putRecord(assumed(caller, role, source, ["kinesis:PutRecord"]), r)
+		} catch (f: Fault) {
+			return false
+		}
+		return true
+	}
 
 	createLogGroup(caller: Caller, input: api.CreateLogGroupRequest): Unit throws Fault {
 		const tags = input.tags ?? []
@@ -184,7 +212,7 @@ export class Handler {
 
 	createLogStream(caller: Caller, input: api.CreateLogStreamRequest): Unit throws Fault {
 		const [g, name] = [input.logGroupName, input.logStreamName]
-		caller.allow(streamArn(caller, g, name))
+		caller.allow(streamArn(caller, g, name), accountPolicy(caller))
 		found(caller, g)
 		const db = streams(caller.regional())
 		if (db.get(keyOf(g, name)) != null) {
@@ -247,7 +275,7 @@ export class Handler {
 
 	putLogEvents(caller: Caller, input: api.PutLogEventsRequest): api.PutLogEventsResponse throws Fault {
 		const [g, name] = [input.logGroupName, input.logStreamName]
-		caller.allow(streamArn(caller, g, name))
+		caller.allow(streamArn(caller, g, name), accountPolicy(caller))
 		const given = input.logEvents
 		let bytes = 0
 		for (let i = 0; i < given.length; i++) {
@@ -288,9 +316,11 @@ export class Handler {
 		const seq = sequence(s)
 		const counter = seq.get("") ?? new Sequence()
 		const edb = events(s)
+		const put: [string, api.InputLogEvent][] = []
 		for (const e of given.slice(expired, tooNew)) {
 			counter.n++
 			const id = pad(e.timestamp, 20) + pad(counter.n, 36)
+			put.push([id, e])
 			save(edb, keyOf(g, name) + "\x00" + id, { ...new Event(), message: e.message, ingested: t })
 			st.first = if (st.token == "" || e.timestamp < st.first) e.timestamp else st.first
 			st.last = if (st.token == "" || e.timestamp > st.last) e.timestamp else st.last
@@ -299,6 +329,20 @@ export class Handler {
 		}
 		save(seq, "", counter)
 		save(sdb, keyOf(g, name), st)
+		// Each subscription filter's events go to its stream as one record, one the stream refuses dropped.
+		for (const [_, f] of subscriptions(s).scan(null, 1000, g + "\x00")) {
+			const p = parse(f.pattern)
+			const matched = put.filter(e => match(p, e[1].message) != null)
+			if (matched.length == 0 || f.role == null) {
+				continue
+			}
+			const logged = matched.map(e => `{"id":${json.quoted(e[0])},"timestamp":${e[1].timestamp},`
+				+ `"message":${json.quoted(e[1].message)}}`)
+			this.send(caller, f.destination, f.role!, arnOf(caller, g),
+				`{"messageType":"DATA_MESSAGE",`
+				+ `"owner":${json.quoted(caller.account)},"logGroup":${json.quoted(g)},"logStream":${json.quoted(name)},`
+				+ `"subscriptionFilters":[${json.quoted(f.name)}],"logEvents":[${logged.join(",")}]}`)
+		}
 		const r = new api.PutLogEventsResponse()
 		r.nextSequenceToken = if (st.token == "") pad(0, 56) else st.token
 		if (tooOld > 0 || expired > tooOld || tooNew < given.length) {
@@ -490,6 +534,33 @@ export class Handler {
 		const others = db.scan(null, 1000, g + "\x00").filter(e => e[1].name != input.filterName)
 		if (others.length >= subscriptionLimit) {
 			throw api.limitExceededException("Resource limit exceeded.")
+		}
+		const parts = split(input.destinationArn, ":")
+		if (parts.length < 6) {
+			throw invalid(`1 validation error detected: Unable to parse destinationArn ${input.destinationArn}`)
+		}
+		const vendor = parts[2]
+		if (vendor == "lambda") {
+			// There is no Lambda to execute.
+			throw invalid("Could not execute the lambda function. Make sure you have given CloudWatch Logs permission "
+				+ "to execute your function.")
+		}
+		if (vendor == "logs") {
+			throw api.resourceNotFoundException("The specified destination does not exist.")
+		}
+		if (vendor != "kinesis" && vendor != "firehose") {
+			throw invalid(`PutSubscriptionFilter operation cannot work with destinationArn for vendor ${vendor}`)
+		}
+		if (role == null) {
+			throw invalid(`destinationArn for vendor ${vendor} cannot be used without roleArn`)
+		}
+		const control = `{"messageType":"CONTROL_MESSAGE","owner":"CloudwatchLogs","logGroup":"","logStream":"",`
+			+ `"subscriptionFilters":[],"logEvents":[{"id":"","timestamp":${ms()},`
+			+ `"message":"CWL CONTROL MESSAGE: Checking health of destination Kinesis stream."}]}`
+		if (vendor == "firehose" || !this.send(caller, input.destinationArn, role!, arnOf(caller, g), control)) {
+			const named = if (vendor == "kinesis") "Kinesis" else "Firehose"
+			throw invalid(`Could not deliver test message to specified ${named} stream. Check if the given ${named} `
+				+ "stream is in ACTIVE state.")
 		}
 		save(db, keyOf(g, input.filterName),
 			{ ...new Subscription(), name: input.filterName, pattern: input.filterPattern,
@@ -759,6 +830,33 @@ function described(caller: Caller, g: string, s: Stream): api.LogStream {
 function resourcePolicy(p: Policy): api.ResourcePolicy {
 	return { ...new api.ResourcePolicy(), policyName: p.name, policyDocument: p.document, lastUpdatedTime: p.updated,
 		policyScope: "ACCOUNT" }
+}
+
+/// The account's resource policies of the caller's region as one, of all their statements; null if there are none.
+function accountPolicy(caller: Caller): string | null throws Fault {
+	const statements: string[] = []
+	for (const [_, p] of policies(caller.regional()).scan(null, policyLimit, "")) {
+		const s = member(p.document, "Statement")
+		if (s != null) {
+			statements.append(if (startsWith(s!, "[")) list(s!) else [s!])
+		}
+	}
+	return if (statements.length == 0) null else `{"Version":"2012-10-17","Statement":[${statements.join(",")}]}`
+}
+
+/// The caller that CloudWatch Logs is in a session of the role of the ARN role, on behalf of the log group of the ARN
+/// source, to perform actions; the role's trust policy is not consulted.
+function assumed(caller: Caller, role: string, source: string, actions: string[]): Caller {
+	const c = caller.internal("logs.amazonaws.com", source, actions)
+	const parts = split(role, ":")
+	const path = split(parts[parts.length - 1], "/")
+	if (parts.length == 6) {
+		c.account = parts[4]
+	}
+	c.arn = `arn:aws:sts::${c.account}:assumed-role/${path[path.length - 1]}/CWLtoKinesisSession`
+	c.userId = c.arn
+	c.source = ""
+	return c
 }
 
 /// The ARN of the log group name, as TagResource takes it.

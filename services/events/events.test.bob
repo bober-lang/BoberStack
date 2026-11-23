@@ -283,6 +283,11 @@ test "a FIFO queue gets the group and the event's id to deduplicate by" {
 test "an event goes on to another bus, and not back" {
 	const w = new World()
 	w.ok("CreateEventBus", `{"Name":"b"}`)
+	// b takes what EventBridge puts on it; default, which has no policy, does not.
+	w.ok("PutPermission",
+		`{"EventBusName":"b","Policy":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":`
+		+ `\\"Allow\\",\\"Principal\\":{\\"Service\\":\\"events.amazonaws.com\\"},\\"Action\\":\\"events:PutEvents\\",`
+		+ `\\"Resource\\":\\"arn:aws:events:us-east-1:000000000000:event-bus/b\\"}]}"}`)
 	const p = `{\\"source\\":[\\"a\\"]}`
 	w.ok("PutRule", `{"Name":"on","EventPattern":"${p}"}`)
 	w.ok("PutTargets", `{"Rule":"on","Targets":[{"Id":"1","Arn":"arn:aws:events:us-east-1:000000000000:event-bus/b"}]}`)

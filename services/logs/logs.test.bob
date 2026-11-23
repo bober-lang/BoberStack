@@ -2,6 +2,8 @@ import { sign } from "../../core/client"
 import { Fault } from "../../core/fault"
 import { Gateway } from "../../core/gateway"
 import * as protocol from "../../core/protocol/json"
+import { Caller } from "../../core/service"
+import * as kinesisApi from "../kinesis/api"
 import * as api from "./api"
 import { Handler } from "./logs"
 import { indexOf } from "std/algo"
@@ -12,9 +14,19 @@ import { Decodable } from "std/types"
 const t: i64 = 1435327200000
 const day: i64 = 86400000
 
+/// A Kinesis that takes every record.
+class Sink {
+	...kinesisApi.Unimplemented
+
+	putRecord(caller: Caller, input: kinesisApi.PutRecordInput): kinesisApi.PutRecordOutput throws Fault {
+		return new kinesisApi.PutRecordOutput()
+	}
+}
+
 function gateway(): Gateway {
 	const g = new Gateway()
 	const h = new Handler()
+	h.kinesis = new Sink()
 	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
 	return g
 }
@@ -172,7 +184,8 @@ test "subscription filters: stored, two a group, and resource policies" {
 	const g = made([])
 	const sub = (name: string) => call(g, "PutSubscriptionFilter",
 		`{"logGroupName":"/g","filterName":"${name}",`
-		+ `"filterPattern":"","destinationArn":"arn:aws:lambda:us-east-1:000000000000:function:f"}`)
+		+ `"filterPattern":"","destinationArn":"arn:aws:kinesis:us-east-1:000000000000:stream/s",`
+		+ `"roleArn":"arn:aws:iam::000000000000:role/r"}`)
 	assert sub("a").status == 200 && sub("b").status == 200 && sub("a").status == 200
 	assert fails(sub("c"), "LimitExceededException", "Resource limit exceeded.")
 	const described = out[api.DescribeSubscriptionFiltersResponse](call(g, "DescribeSubscriptionFilters",

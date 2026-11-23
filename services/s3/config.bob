@@ -1,12 +1,15 @@
 //! S3's bucket configuration: public access block, ownership controls and the ACLs they disable, default encryption,
 //! CORS and its preflight requests, lifecycle rules (kept, never run), website, logging, request payment, Object
-//! Lock, and notifications, which deliver to SQS queues and SNS topics within the request that makes the event. The
-//! operations of the Handler of ./s3 that it mixes in.
+//! Lock, and notifications, which deliver to SQS queues and SNS topics, and with EventBridge on to the bucket owner's
+//! default event bus, within the request that makes the event. The operations of the Handler of ./s3 that it mixes in.
+//! Where AWS differs: an EventBridge event's key is as given, not URL-encoded, and of a removal of an object never
+//! versioned it has no etag; the events of tags, ACLs, restores and lifecycle are never made.
 
 import { Fault } from "../../core/fault"
 import { Policy } from "../../core/auth/policy"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
+import * as events from "../events/events"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
@@ -87,6 +90,7 @@ export class Config {
 	/// What notifications are delivered to, which the stack sets.
 	sqs: sqsApi.SQS | null = null
 	sns: snsApi.SNS | null = null
+	events: events.Handler | null = null
 
 	putPublicAccessBlock(caller: Caller, input: api.PutPublicAccessBlockRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketPublicAccessBlock"]
@@ -480,6 +484,15 @@ export class Config {
 		for (const t of topics) {
 			this.toTopic(caller, f, t.TopicArn, record(caller, f, event, v, t.Id ?? ""))
 		}
+		if (c.EventBridgeConfiguration != null && this.events != null) {
+			// S3 puts it on the bucket owner's default bus of the bucket's region.
+			const s = caller.internal("s3.amazonaws.com", arn(f.bucket.name), [])
+			s.account = f.bucket.owner
+			s.region = f.bucket.region
+			const created = startsWith(event, "ObjectCreated:")
+			this.events!.emit(s, "aws.s3", if (created) "Object Created" else "Object Deleted", [arn(f.bucket.name)],
+				detail(caller, f, event, v))
+		}
 	}
 
 	/// Sends body to the queue of the ARN a, as S3 for the bucket of f: null if it takes it, else why not.
@@ -656,6 +669,36 @@ function record(caller: Caller, f: Found, event: string, v: Version, id: string)
 		+ `"configurationId":${json.quoted(id)},"bucket":{"name":${json.quoted(f.bucket.name)},`
 		+ `"ownerIdentity":{"principalId":${json.quoted(owner(f.bucket.owner).ID ?? "")}},`
 		+ `"arn":${json.quoted(arn(f.bucket.name))}},"object":{${object}}}}]}`
+}
+
+/// The detail of the EventBridge event of the event named event, as ObjectCreated:Put, of the version v of the bucket
+/// of f: its reason the operation, and of a removal what it removed.
+function detail(caller: Caller, f: Found, event: string, v: Version): string {
+	const kind = split(event, ":")[1]
+	const created = startsWith(event, "ObjectCreated:")
+	let object = `"key":${json.quoted(v.key)}`
+	if (created) {
+		object += `,"size":${v.size}`
+	}
+	if (v.etag != "") {
+		object += `,"etag":${json.quoted(v.etag.slice(1, v.etag.length - 1))}`
+	} else if (kind == "DeleteMarkerCreated") {
+		object += `,"etag":"d41d8cd98f00b204e9800998ecf8427e"`
+	}
+	if (f.bucket.versioning != "") {
+		object += `,"version-id":${json.quoted(v.id)}`
+	}
+	object += `,"sequencer":${json.quoted(sequencer(v))}`
+	const reason = if (!created) "DeleteObject"
+		else if (kind == "Put") "PutObject"
+		else if (kind == "Post") "POST Object"
+		else if (kind == "Copy") "CopyObject"
+		else kind
+	const removed = if (created) ""
+		else `,"deletion-type":${if (kind == "Delete") `"Permanently Deleted"` else `"Delete Marker Created"`}`
+	return `{"version":"0","bucket":{"name":${json.quoted(f.bucket.name)}},"object":{${object}},`
+		+ `"request-id":${json.quoted(caller.requestId)},"requester":${json.quoted(caller.account)},`
+		+ `"source-ip-address":"127.0.0.1","reason":${json.quoted(reason)}${removed}}`
 }
 
 /// The sequencer of the version v, which orders the events of a key: its order in hex, 16 digits.

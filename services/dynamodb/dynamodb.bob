@@ -3,7 +3,12 @@
 //! Query and Scan; and PartiQL's statements, as the operations they amount to. A request is one transaction over the
 //! state, so a write, its indexes' entries and its stream record commit together or not at all; a write that changes
 //! nothing writes no record, as AWS's. Each time a table's stream is enabled it gets a new one, of a single shard,
-//! which ../dynamodbstreams reads. Time to live is as AWS's until its background deletes an expired item, which it
+//! which ../dynamodbstreams reads. A write that changes an item also puts its change record, in the format AWS
+//! documents, on each Kinesis streaming destination of the table, within the request, by calling the Kinesis handler
+//! directly as the account, as DynamoDB's service-linked role would; a destination is ACTIVE or DISABLED at once, a
+//! record the stream refuses is dropped, and a record's partition key is the table's name. Enabling one names a
+//! stream that does not exist in a ValidationException of BoberStack's wording, as does changing one not enabled.
+//! Time to live is as AWS's until its background deletes an expired item, which it
 //! does within days and until then reads still return the item: here nothing runs but requests, so that time never
 //! comes and expired items stay, as their TTL deletions' stream records never are. Other known differences from AWS,
 //! for the same reason: tables and indexes are ACTIVE at once, time to live is ENABLED or DISABLED at once and may
@@ -23,6 +28,7 @@ import { Violations } from "../../core/protocol/model"
 import { Caller, requestTags, Unit } from "../../core/service"
 import * as service from "../../core/service"
 import * as api from "./api"
+import * as kinesisApi from "../kinesis/api"
 
 import { Action, apply, condition, Context, copy, holds, invalid, Item, Node, project, projection, same, shown, Step,
 	typeName, update, validation } from "./expression"
@@ -32,8 +38,8 @@ import { attributes, expected, filter, unmixed, updates } from "./legacy"
 import { format, parse } from "./number"
 import { joined, statement, Statement, Term } from "./partiql"
 
-import { attribute, Change, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected,
-	sizeOf, stored, Stream, streamKey, Tables, Token, typeOf } from "./records"
+import { attribute, Change, Definition, Destination, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed,
+	projected, sizeOf, stored, Stream, streamKey, Tables, Token, typeOf } from "./records"
 
 import { keyArn } from "../kms/kms"
 import { id } from "../../core/auth/credentials"
@@ -46,6 +52,9 @@ import { millisecond, minute } from "std/time"
 /// The service, of the operations implemented.
 export class Handler {
 	...api.Unimplemented
+
+	/// What Kinesis streaming destinations are, which the stack sets.
+	kinesis: kinesisApi.Kinesis | null = null
 
 	createTable(caller: Caller, input: api.CreateTableInput): api.CreateTableOutput throws Fault {
 		named(input.TableName, "tableName")
@@ -277,6 +286,75 @@ export class Handler {
 		return r
 	}
 
+	enableKinesisStreamingDestination(caller: Caller,
+		input: api.KinesisStreamingDestinationInput): api.KinesisStreamingDestinationOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const precision = input.EnableKinesisStreamingConfiguration?.ApproximateCreationDateTimePrecision
+			?? "MILLISECOND"
+		const s = new kinesisApi.DescribeStreamSummaryInput()
+		s.StreamARN = input.StreamArn
+		try {
+			if (this.kinesis == null) {
+				throw validation("There is no Kinesis")
+			}
+			this.kinesis!.describeStreamSummary(account(caller, ["kinesis:DescribeStreamSummary"]), s)
+		} catch (f: Fault) {
+			throw validation(`Stream ${input.StreamArn} does not exist`)
+		}
+		d.destinations = d.destinations.filter(x => x.arn != input.StreamArn)
+		d.destinations.push({ ...new Destination(), arn: input.StreamArn, precision: `${precision}` })
+		new Tables(caller.regional()).save(d)
+		return destination(d, input.StreamArn, "ENABLING", input.EnableKinesisStreamingConfiguration)
+	}
+
+	disableKinesisStreamingDestination(caller: Caller,
+		input: api.KinesisStreamingDestinationInput): api.KinesisStreamingDestinationOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const x = enabled(d, input.StreamArn)
+		x.status = "DISABLED"
+		new Tables(caller.regional()).save(d)
+		return destination(d, input.StreamArn, "DISABLING", input.EnableKinesisStreamingConfiguration)
+	}
+
+	updateKinesisStreamingDestination(caller: Caller,
+		input: api.UpdateKinesisStreamingDestinationInput): api.UpdateKinesisStreamingDestinationOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const x = enabled(d, input.StreamArn)
+		x.precision = `${input.UpdateKinesisStreamingConfiguration?.ApproximateCreationDateTimePrecision ?? x.precision}`
+		new Tables(caller.regional()).save(d)
+		const r = new api.UpdateKinesisStreamingDestinationOutput()
+		r.TableName = d.name
+		r.StreamArn = x.arn
+		r.DestinationStatus = "UPDATING"
+		r.UpdateKinesisStreamingConfiguration = input.UpdateKinesisStreamingConfiguration
+		return r
+	}
+
+	describeKinesisStreamingDestination(caller: Caller, input: api.DescribeKinesisStreamingDestinationInput): api.DescribeKinesisStreamingDestinationOutput throws Fault {
+		const d = table(caller, input.TableName)
+		const r = new api.DescribeKinesisStreamingDestinationOutput()
+		r.TableName = d.name
+		r.KinesisDataStreamDestinations = d.destinations.map(x => ({ ...new api.KinesisDataStreamDestination(),
+			StreamArn: x.arn, DestinationStatus: x.status as api.DestinationStatus,
+			ApproximateCreationDateTimePrecision: x.precision as api.ApproximateCreationDateTimePrecision }))
+		return r
+	}
+
+	/// Puts the records of db's outbox on their Kinesis streams, as the account, and empties it; one a stream refuses
+	/// is dropped.
+	private flush(caller: Caller, db: Tables) throws Fault {
+		for (const [a, k, data] of db.outbox) {
+			const r = new kinesisApi.PutRecordInput()
+			r.StreamARN = a
+			r.PartitionKey = k
+			r.Data = `{"awsRegion":"${caller.region}",${data}`
+			try {
+				this.kinesis!.putRecord(account(caller, ["kinesis:PutRecord"]), r)
+			} catch (f: Fault) {}
+		}
+		db.outbox = []
+	}
+
 	describeLimits(caller: Caller, input: api.DescribeLimitsInput): api.DescribeLimitsOutput throws Fault {
 		caller.allow("*")
 		const r = new api.DescribeLimitsOutput()
@@ -337,6 +415,7 @@ export class Handler {
 		const before = db.item(d, k)
 		check(cond, before, input.ReturnValuesOnConditionCheckFailure)
 		write(db, d, k, before, input.Item)
+		this.flush(caller, db)
 		const r = new api.PutItemOutput()
 		r.Attributes = if (input.ReturnValues == "ALL_OLD") before else null
 		r.ConsumedCapacity = consumed(input.ReturnConsumedCapacity, d.name, writeUnits(before, input.Item), false)
@@ -381,6 +460,7 @@ export class Handler {
 		check(cond, before, input.ReturnValuesOnConditionCheckFailure)
 		if (before != null) {
 			write(db, d, k, before, null)
+			this.flush(caller, db)
 		}
 		const r = new api.DeleteItemOutput()
 		r.Attributes = if (input.ReturnValues == "ALL_OLD") before else null
@@ -424,6 +504,7 @@ export class Handler {
 		const after = apply(actions, before ?? copy(input.Key))
 		values(after)
 		write(db, d, k, before, after)
+		this.flush(caller, db)
 		const paths = actions.map(a => a.path)
 		const r = new api.UpdateItemOutput()
 		r.Attributes = switch (input.ReturnValues ?? "NONE") {
@@ -628,6 +709,7 @@ export class Handler {
 				used.push(u!)
 			}
 		}
+		this.flush(caller, db)
 		const r = new api.BatchWriteItemOutput()
 		r.UnprocessedItems = []
 		r.ConsumedCapacity = if (used.length == 0) null else used
@@ -718,6 +800,7 @@ export class Handler {
 				throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
 			}
 		}
+		this.flush(caller, db)
 		return new api.TransactWriteItemsOutput()
 	}
 
@@ -1336,11 +1419,44 @@ function write(db: Tables, d: Definition, k: string, before: Item | null, after:
 		db.store.delete(items(d.name) + k)
 	}
 	db.save(d)
-	if (d.stream
-		&& (before == null || after == null
-		|| !same({ ...new api.AttributeValue$M(), M: before! }, { ...new api.AttributeValue$M(), M: after! }))) {
+	if (before != null && after != null
+		&& same({ ...new api.AttributeValue$M(), M: before! }, { ...new api.AttributeValue$M(), M: after! })) {
+		return
+	}
+	if (d.stream) {
 		changed(db, d, before, after)
 	}
+	for (const x of d.destinations.filter(x => x.status == "ACTIVE")) {
+		db.outbox.push([x.arn, d.name, streamed(d, x, before, after)])
+	}
+}
+
+/// The Kinesis record of the write of d that replaces before with after, either null for none, for the destination
+/// x, as DynamoDB writes it, but for its leading awsRegion member.
+function streamed(d: Definition, x: Destination, before: Item | null, after: Item | null): string throws Fault {
+	const t = now()
+	const at = if (x.precision == "MICROSECOND") t / 1000 else t / millisecond
+	const k = project(after ?? before!, keyNames(d, null).map(n => [{ ...new Step(), name: n }]))
+	let dynamodb = `"ApproximateCreationDateTime":${at},"Keys":${inner(k)}`
+	let size = sizeOf(k)
+	if (after != null) {
+		dynamodb += `,"NewImage":${inner(after!)}`
+		size += sizeOf(after!)
+	}
+	if (before != null) {
+		dynamodb += `,"OldImage":${inner(before!)}`
+		size += sizeOf(before!)
+	}
+	const kind = if (before == null) "INSERT" else if (after == null) "REMOVE" else "MODIFY"
+	return `"dynamodb":{${dynamodb},"SizeBytes":${size},"ApproximateCreationDateTimePrecision":"${x.precision}"},`
+		+ `"eventID":"${uuid()}","eventName":"${kind}","userIdentity":null,"recordFormat":"application/json",`
+		+ `"tableName":"${d.name}","eventSource":"aws:dynamodb"}`
+}
+
+/// The JSON of item, its attributes as the wire has them.
+function inner(item: Item): string {
+	const s = stored(item)
+	return s.slice(8, s.length - 1)
 }
 
 /// Appends to d's stream the record of the write that replaces before with after, either null for none.
@@ -1624,6 +1740,36 @@ function arn(caller: Caller, name: string): string {
 
 /// The definition of the table that name, or its ARN, names; the caller allowed to act on it, or on its index of that
 /// name if not null, of the context keys that context gives of the table if it exists.
+/// The caller that DynamoDB is when it reads or writes Kinesis for the caller's account: the account itself, as
+/// DynamoDB's service-linked role is, to perform actions.
+function account(caller: Caller, actions: string[]): Caller {
+	const c = caller.internal("dynamodb.amazonaws.com", "", actions)
+	c.arn = `arn:aws:iam::${caller.account}:root`
+	c.userId = caller.account
+	return c
+}
+
+/// The destination of d of the ARN a, enabled, else a fault as AWS's.
+function enabled(d: Definition, a: string): Destination throws Fault {
+	for (const x of d.destinations) {
+		if (x.arn == a && x.status == "ACTIVE") {
+			return x
+		}
+	}
+	throw validation(`Table ${d.name} is not streaming to ${a}`)
+}
+
+/// The answer of a change of d's destination of the ARN a to status, of the configuration c.
+function destination(d: Definition, a: string, status: api.DestinationStatus,
+	c: api.EnableKinesisStreamingConfiguration | null): api.KinesisStreamingDestinationOutput {
+	const r = new api.KinesisStreamingDestinationOutput()
+	r.TableName = d.name
+	r.StreamArn = a
+	r.DestinationStatus = status
+	r.EnableKinesisStreamingConfiguration = c
+	return r
+}
+
 function table(caller: Caller, name: string, index: string | null = null,
 	context: (d: Definition) => service.Context throws Fault = d => []): Definition throws Fault {
 	const n = if (startsWith(name, "arn:")) name.slice(lastIndexOf(name, "/") + 1, name.length) else name

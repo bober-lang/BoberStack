@@ -6,9 +6,14 @@ import { Catalog } from "./services/iam/catalog"
 import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
 import { indexOf, startsWith } from "std/algo"
+import { gunzip } from "std/compress/gzip"
+import { md5 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
 import { Request, Response } from "std/http"
+import { ParseError } from "std/string"
+import { millisecond } from "std/time"
 import { escape } from "std/url"
 
 const account = "000000000000"
@@ -334,6 +339,9 @@ test "EventBridge to SNS to SQS, as the topic's policy allows EventBridge; and b
 	subscribe(g, t, queueArn("q"))
 	subscribe(g, closed, queueArn("q"))
 	assert call(g, "events", "CreateEventBus", `{"Name":"b"}`).status == 200
+	const open = policy([statement("Allow", `"events:PutEvents"`, "arn:aws:events:us-east-1:000000000000:event-bus/b",
+		`{"Service":"events.amazonaws.com"}`)])
+	assert call(g, "events", "PutPermission", `{"EventBusName":"b","Policy":${json.quoted(open)}}`).status == 200
 	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
 	assert call(g, "events", "PutTargets",
 		`{"Rule":"r","Targets":[{"Id":"1","Arn":"${t}"},`
@@ -897,5 +905,203 @@ test "DynamoDB: a table under a KMS key describes it; under a key AWS owns, noth
 		"ValidationException")
 	res = call(g, "dynamodb", "UpdateTable", `{"TableName":"mine","SSESpecification":{"Enabled":false}}`)
 	assert res.status == 200 && indexOf(res.body.whole ?? "", "SSEDescription") < 0
+	g.close()
+}
+
+/// Deletes the keys of bucket by DeleteObjects, signed by the account's root.
+function deleteObjects(g: Gateway, bucket: string, keys: string[]): Response {
+	const body = "<Delete>" + keys.map(k => `<Object><Key>${k}</Key></Object>`).join("") + "</Delete>"
+	const req = new Request("POST", `http://localhost:4566/${bucket}?delete`, body)
+	req.headers.set("content-md5", base64.encode(md5(body)))
+	sign(req, body, "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "S3 puts its object events on the default bus, without a policy; DeleteObjects notifies each key, a topic too" {
+	const g = gateway()
+	const t = topicArn("t")
+	queue(g, "q", sendable("q", "events.amazonaws.com", "arn:aws:events:us-east-1:000000000000:rule/s3"))
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, `{"Service":"s3.amazonaws.com"}`)]))
+	queue(g, "fromT", sendable("fromT", "sns.amazonaws.com", t))
+	subscribe(g, t, queueArn("fromT"))
+	assert call(g, "events", "PutRule", `{"Name":"s3","EventPattern":"{\\"source\\":[\\"aws.s3\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets", `{"Rule":"s3","Targets":[{"Id":"1","Arn":"${queueArn("q")}"}]}`).status
+		== 200
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert s3(g, "PUT", "/bkt?notification",
+		`<NotificationConfiguration><TopicConfiguration><Id>c</Id>`
+		+ `<Topic>${t}</Topic><Event>s3:ObjectRemoved:*</Event></TopicConfiguration>`
+		+ "<EventBridgeConfiguration></EventBridgeConfiguration></NotificationConfiguration>").status == 200
+	assert indexOf(envelope(bodies(g, "fromT")[0]).Message, `"Event":"s3:TestEvent"`) > 0
+	assert s3(g, "PUT", "/bkt/a", "ab").status == 200
+	assert s3(g, "PUT", "/bkt/b", "b").status == 200
+	assert deleteObjects(g, "bkt", ["a", "b"]).status == 200
+	const got = bodies(g, "q")
+	assert got.length == 4
+	assert indexOf(got[0], `"detail-type":"Object Created","source":"aws.s3","account":"000000000000"`) > 0
+	assert indexOf(got[0],
+		`"resources":["arn:aws:s3:::bkt"],"detail":{"version":"0","bucket":{"name":"bkt"},`
+		+ `"object":{"key":"a","size":2,"etag":"187ef4436122d1cc2f40dc2b92f0eba0","sequencer":`) > 0
+	assert indexOf(got[0], `"requester":"000000000000","source-ip-address":"127.0.0.1","reason":"PutObject"}`) > 0
+	assert indexOf(got[2], `"detail-type":"Object Deleted"`) > 0 && indexOf(got[3], `"object":{"key":"b",`) > 0
+	assert indexOf(got[3], `"reason":"DeleteObject","deletion-type":"Permanently Deleted"}`) > 0
+	const removed = bodies(g, "fromT")
+	assert removed.length == 2 && envelope(removed[0]).Subject == "Amazon S3 Notification"
+	assert indexOf(envelope(removed[1]).Message, `"eventName":"ObjectRemoved:Delete"`) > 0
+	assert indexOf(envelope(removed[1]).Message, `"key":"b"`) > 0
+	g.close()
+}
+
+/// The answer of g to the operation op of Kinesis or CloudWatch Logs, of JSON 1.1, with body, signed by the root.
+function json11Of(g: Gateway, service: string, op: string, body: string): Response {
+	const target = if (service == "kinesis") "Kinesis_20131202" else "Logs_20140328"
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.1")
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// Makes the role name, which service may assume, of the inline policy document if not "".
+function role(g: Gateway, name: string, service: string, document = "") {
+	const trust = policy([`{"Effect":"Allow","Principal":{"Service":"${service}"},"Action":"sts:AssumeRole"}`])
+	assert query(g, "iam", [["Action", "CreateRole"], ["RoleName", name], ["AssumeRolePolicyDocument", trust]]).status
+		== 200
+	if (document != "") {
+		assert query(g, "iam",
+			[["Action", "PutRolePolicy"], ["RoleName", name], ["PolicyName", "p"], ["PolicyDocument", document]]).status
+			== 200
+	}
+}
+
+/// The data of the records of the Kinesis stream name's first shard, from its start.
+function streamed(g: Gateway, name: string): string[] {
+	const it = member(json11Of(g, "kinesis", "GetShardIterator",
+		`{"StreamName":"${name}","ShardId":"shardId-000000000000","ShardIteratorType":"TRIM_HORIZON"}`),
+		"ShardIterator")
+	const body = json11Of(g, "kinesis", "GetRecords", `{"ShardIterator":"${it}"}`).body.whole ?? ""
+	const out: string[] = []
+	let at = indexOf(body, `"Data":"`)
+	while (at >= 0) {
+		const from = at + 8
+		const to = indexOf(body, "\"", from)
+		try {
+			out.push(base64.decode(body.slice(from, to)))
+		} catch (e: ParseError) {
+			assert false
+		}
+		at = indexOf(body, `"Data":"`, to)
+	}
+	return out
+}
+
+test "a subscription filter tries its Kinesis stream as its role, then puts matching events there gzipped" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	role(g, "toKinesis", "logs.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	role(g, "none", "logs.amazonaws.com")
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	const filter = (role: string) => {
+		const r = if (role == "") "" else `,"roleArn":"arn:aws:iam::000000000000:role/${role}"`
+		return json11Of(g, "logs", "PutSubscriptionFilter",
+			`{"logGroupName":"/g","filterName":"f","filterPattern":"ERROR","destinationArn":"${stream}"${r}}`)
+	}
+	assert fails(filter(""), 400, "InvalidParameterException",
+		"destinationArn for vendor kinesis cannot be used without roleArn")
+	assert fails(filter("none"), 400, "InvalidParameterException",
+		"Could not deliver test message to specified Kinesis stream. Check if the given Kinesis stream is in ACTIVE state.")
+	assert filter("toKinesis").status == 200
+	const t = now() / millisecond
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":`
+		+ `[{"timestamp":${t},"message":"ERROR one"},{"timestamp":${t},"message":"fine"}]}`).status == 200
+	const got = streamed(g, "s")
+	assert got.length == 2
+	try {
+		assert indexOf(gunzip(got[0]), `"messageType":"CONTROL_MESSAGE"`) >= 0
+		const data = gunzip(got[1])
+		assert indexOf(data,
+			`{"messageType":"DATA_MESSAGE","owner":"000000000000","logGroup":"/g","logStream":"l",`
+			+ `"subscriptionFilters":["f"],"logEvents":[{"id":"`) == 0
+		assert indexOf(data, `"timestamp":${t},"message":"ERROR one"}]}`) > 0 && indexOf(data, "fine") < 0
+	} catch (e: ParseError) {
+		assert false
+	}
+	g.close()
+}
+
+test "EventBridge targets: a Kinesis stream and a bus as the target's role, a log group as the account's policy allows" {
+	const g = gateway()
+	role(g, "put", "events.amazonaws.com",
+		policy([statement("Allow", `["kinesis:PutRecord","events:PutEvents"]`, "*")]))
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/events/g"}`).status == 200
+	const logged = policy([statement("Allow", `["logs:CreateLogStream","logs:PutLogEvents"]`,
+		"arn:aws:logs:us-east-1:000000000000:log-group:/events/g:*",
+		`{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]}`)])
+	assert json11Of(g, "logs", "PutResourcePolicy", `{"policyName":"p","policyDocument":${json.quoted(logged)}}`).status
+		== 200
+	for (const b of ["b2", "b3"]) {
+		assert call(g, "events", "CreateEventBus", `{"Name":"${b}"}`).status == 200
+		queue(g, b, sendable(b, "events.amazonaws.com", `arn:aws:events:us-east-1:000000000000:rule/${b}/r`))
+		assert call(g, "events", "PutRule",
+			`{"Name":"r","EventBusName":"${b}","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+		assert call(g, "events", "PutTargets",
+			`{"Rule":"r","EventBusName":"${b}","Targets":[{"Id":"1","Arn":"${queueArn(b)}"}]}`).status == 200
+	}
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	assert fails(call(g, "events", "PutTargets", `{"Rule":"r","Targets":[{"Id":"k","Arn":"${stream}"}]}`), 400,
+		"ValidationException", "Parameter(s) RoleArn must be specified for target: k.")
+	const put = "arn:aws:iam::000000000000:role/put"
+	const bus = "arn:aws:events:us-east-1:000000000000:event-bus/"
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[`
+		+ `{"Id":"k","Arn":"${stream}","RoleArn":"${put}","KinesisParameters":{"PartitionKeyPath":"$.detail.k"}},`
+		+ `{"Id":"l","Arn":"arn:aws:logs:us-east-1:000000000000:log-group:/events/g","InputPath":"$.detail"},`
+		+ `{"Id":"b2","Arn":"${bus}b2","RoleArn":"${put}"},{"Id":"b3","Arn":"${bus}b3"}]}`).status == 200
+	assert call(g, "events", "PutEvents",
+		`{"Entries":[{"Source":"app","DetailType":"t","Detail":"{\\"k\\":\\"v\\"}"}]}`).status == 200
+	const [record] = streamed(g, "s")
+	assert indexOf(record, `"source":"app"`) > 0 && indexOf(record, `"detail":{"k":"v"}`) > 0
+	const name = member(json11Of(g, "logs", "DescribeLogStreams", `{"logGroupName":"/events/g"}`), "logStreamName")
+	assert indexOf(record, `"id":"${name}"`) > 0
+	const events = json11Of(g, "logs", "GetLogEvents", `{"logGroupName":"/events/g","logStreamName":"${name}"}`)
+	assert indexOf(events.body.whole ?? "", `"message":"{\\"k\\":\\"v\\"}"`) > 0
+	assert bodies(g, "b2").length == 1 && bodies(g, "b3").length == 0
+	g.close()
+}
+
+test "DynamoDB puts each item write's change record on its Kinesis streaming destination within the write" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status == 200
+	assert fails(call(g, "dynamodb", "EnableKinesisStreamingDestination",
+		`{"TableName":"tab","StreamArn":"${stream}x"}`), 400, "ValidationException")
+	let res = call(g, "dynamodb", "EnableKinesisStreamingDestination", `{"TableName":"tab","StreamArn":"${stream}"}`)
+	assert res.status == 200 && member(res, "DestinationStatus") == "ENABLING"
+	res = call(g, "dynamodb", "DescribeKinesisStreamingDestination", `{"TableName":"tab"}`)
+	assert member(res, "DestinationStatus") == "ACTIVE" && member(res, "StreamArn") == stream
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"a"},"v":{"N":"1"}}}`).status == 200
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"a"},"v":{"N":"1"}}}`).status == 200
+	assert call(g, "dynamodb", "DeleteItem", `{"TableName":"tab","Key":{"k":{"S":"a"}}}`).status == 200
+	assert call(g, "dynamodb", "DisableKinesisStreamingDestination",
+		`{"TableName":"tab","StreamArn":"${stream}"}`).status == 200
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"tab","Item":{"k":{"S":"b"}}}`).status == 200
+	const got = streamed(g, "s")
+	assert got.length == 2
+	assert indexOf(got[0], `{"awsRegion":"us-east-1","dynamodb":{"ApproximateCreationDateTime":`) == 0
+	assert indexOf(got[0], `"Keys":{"k":{"S":"a"}},"NewImage":{"k":{"S":"a"},"v":{"N":"1"}},"SizeBytes":`) > 0
+	assert indexOf(got[0], `"ApproximateCreationDateTimePrecision":"MILLISECOND"},"eventID":"`) > 0
+	assert indexOf(got[0],
+		`"eventName":"INSERT","userIdentity":null,"recordFormat":"application/json",`
+		+ `"tableName":"tab","eventSource":"aws:dynamodb"}`) > 0
+	assert indexOf(got[1], `"Keys":{"k":{"S":"a"}},"OldImage":{"k":{"S":"a"},"v":{"N":"1"}}`) > 0
+	assert indexOf(got[1], `"eventName":"REMOVE"`) > 0
 	g.close()
 }

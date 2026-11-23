@@ -33,6 +33,14 @@ export class Index {
 	size: i64 = 0
 }
 
+/// A Kinesis stream a table's changes go to: its ARN, ACTIVE or DISABLED, and the precision of its records' times,
+/// MILLISECOND or MICROSECOND.
+export class Destination {
+	arn = ""
+	status = "ACTIVE"
+	precision = "MILLISECOND"
+}
+
 /// A table's definition.
 export class Definition {
 	name = ""
@@ -51,6 +59,7 @@ export class Definition {
 	stream = false
 	streamView = ""
 	streamLabel = ""
+	destinations: Destination[] = []
 	tags: [string, string][] = []
 	tableClass = "STANDARD"
 	deletionProtection = false
@@ -107,6 +116,9 @@ export class Tables {
 	tokens: Table[Token]
 	streams: Table[Stream]
 	changes: Table[Change]
+	/// The Kinesis records of the request's writes, not yet put: the ARN of the stream each goes to, its partition key,
+	/// the table's name, and its data but for its leading awsRegion member.
+	outbox: [string, string, string][] = []
 
 	constructor(s: Store) {
 		this.store = s
