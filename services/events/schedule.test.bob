@@ -1,5 +1,5 @@
 import { next, parse } from "./schedule"
-import { load, parseRfc3339, rfc3339, utc, Zone } from "std/time"
+import { hour, load, parseRfc3339, rfc3339, utc, Zone } from "std/time"
 
 function after(s: string, t: string, zone: Zone = utc, from = ""): string | null {
 	const e = parse(s, true)
@@ -63,17 +63,18 @@ test "crons, by the table" {
 }
 
 test "expressions that are none" {
-	const bad = ["rate(1 minutes)", "rate(5 minute)", "rate(0 minutes)", "rate(5 weeks)", "rate(-1 days)", "rate(5)",
-		"cron(0 10 * * * *)", "cron(0 10 ? * ? *)", "cron(0 10 * * ?)", "cron(60 10 * * ? *)", "cron(0 24 * * ? *)",
-		"cron(0 0 32 * ? *)", "cron(0 0 1 13 ? *)", "cron(0 0 ? * 8 *)", "cron(0 0 ? * 3#1,6#3 *)",
-		"cron(0 0 1 1 ? 1969)", "cron(0 0 1 1 ? 2200)", "cron(0 0 1 1 ? 2023-2022)", "cron(0 0 ? * 3#6 *)",
-		"cron(0 0 1 FOO ? *)", "cron(0/0 * * * ? *)", "at(2030-01-01T00:00)", "at(2030-02-30T00:00:00)", "daily"]
+	const bad = ["rate(5 minute)", "rate(0 minutes)", "rate(5 weeks)", "rate(-1 days)", "rate(5)", "cron(0 10 * * * *)",
+		"cron(0 10 ? * ? *)", "cron(0 10 * * ?)", "cron(60 10 * * ? *)", "cron(0 24 * * ? *)", "cron(0 0 32 * ? *)",
+		"cron(0 0 1 13 ? *)", "cron(0 0 ? * 8 *)", "cron(0 0 ? * 3#1,6#3 *)", "cron(0 0 1 1 ? 1969)",
+		"cron(0 0 1 1 ? 2200)", "cron(0 0 1 1 ? 2023-2022)", "cron(0 0 ? * 3#6 *)", "cron(0 0 1 FOO ? *)",
+		"cron(0/0 * * * ? *)", "at(2030-01-01T00:00)", "at(2030-02-30T00:00:00)", "daily"]
 	for (const s of bad) {
 		test `${s}` {
 			assert parse(s, true) == null
 		}
 	}
 	assert parse("at(2030-01-01T00:00:00)") == null && parse("at(2030-01-01T00:00:00)", true) != null
+	assert parse("rate(1 hours)") == null && parse("rate(1 hours)", true)!.every == hour
 }
 
 test "a time zone's changes: a reading skipped does not fire, one read twice fires at the later" {

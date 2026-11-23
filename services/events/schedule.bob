@@ -1,8 +1,9 @@
 //! AWS's schedule expressions, one grammar for EventBridge's scheduled rules and Scheduler's schedules: rate(n unit),
-//! its unit plural unless n is 1; cron of six fields (minutes, hours, day of month, month, day of week, year) with
-//! `, - * /` in each, `? L W` in the day of month and `? L #` in the day of week, exactly one of the two `?`; and
-//! Scheduler's at(yyyy-mm-ddThh:mm:ss). A cron reading that a time zone skips does not fire, and one it reads twice
-//! fires at the later, as Scheduler documents. A range whose end is below its start wraps, as 20-2 hours do.
+//! its unit plural unless n is 1, when Scheduler takes it plural too, as its guide writes rate(1 days); cron of six
+//! fields (minutes, hours, day of month, month, day of week, year) with `, - * /` in each, `? L W` in the day of month
+//! and `? L #` in the day of week, exactly one of the two `?`; and Scheduler's at(yyyy-mm-ddThh:mm:ss). A cron reading
+//! that a time zone skips does not fire, and one it reads twice fires at the later, as Scheduler documents. A range
+//! whose end is below its start wraps, as 20-2 hours do.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -38,14 +39,14 @@ export class Expression {
 	nth = 0
 }
 
-/// s as an expression, null if it is none; at() only if at.
-export function parse(s: string, at = false): Expression | null {
+/// s as an expression, null if it is none; at() only of Scheduler's.
+export function parse(s: string, scheduler = false): Expression | null {
 	const e = new Expression()
-	if (at && startsWith(s, "at(") && endsWith(s, ")")) {
+	if (scheduler && startsWith(s, "at(") && endsWith(s, ")")) {
 		return if (s.length == 23 && s[13] == "T"[0] && reading(e, s.slice(3, 22))) e else null
 	}
 	if (startsWith(s, "rate(") && endsWith(s, ")")) {
-		return if (rate(e, s.slice(5, s.length - 1))) e else null
+		return if (rate(e, s.slice(5, s.length - 1), scheduler)) e else null
 	}
 	if (!startsWith(s, "cron(") || !endsWith(s, ")")) {
 		return null
@@ -154,13 +155,16 @@ function instant(k: string): i64 {
 	return t
 }
 
-function rate(e: Expression, s: string): bool {
+function rate(e: Expression, s: string, scheduler: bool): bool {
 	const words = split(s, " ")
 	if (words.length != 2 || words[0].length == 0 || words[0].length > 9 || !words[0].every(isDigit)) {
 		return false
 	}
 	const n = number(words[0])
-	const unit = if (n == 1) words[1] else if (endsWith(words[1], "s")) words[1].slice(0, words[1].length - 1) else ""
+	const plural = endsWith(words[1], "s")
+	const unit = if (n == 1 && !(scheduler && plural)) words[1]
+		else if (plural) words[1].slice(0, words[1].length - 1)
+		else ""
 	const each: i64 = if (unit == "minute") minute else if (unit == "hour") hour else if (unit == "day") day else 0
 	e.every = (n as i64) * each
 	return e.every > 0
