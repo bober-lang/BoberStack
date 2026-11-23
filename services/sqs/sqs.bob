@@ -6,7 +6,7 @@
 //! is checked and an empty queue answers at once. Message move tasks are not implemented.
 
 import { Fault } from "../../core/fault"
-import { Caller, Unit } from "../../core/service"
+import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
 import { Attribute, digits, Message, Place, position, Queue, save, Seen, Tables, within } from "./records"
@@ -22,6 +22,8 @@ import { codePoint, lower, ParseError, parseInt, split } from "std/string"
 import { millisecond, minute, second } from "std/time"
 import { Decodable } from "std/types"
 
+/// The SenderId of a message that SNS delivers, as AWS shows it.
+const sns = "AIDAIT2UOQQY3AUEKVGXU"
 /// The most bytes of a message, and of a batch's messages together.
 const largest = 1048576
 
@@ -35,12 +37,12 @@ export class Handler {
 
 	getQueueUrl(caller: Caller, input: api.GetQueueUrlRequest): api.GetQueueUrlResult throws Fault {
 		const account = input.QueueOwnerAWSAccountId ?? caller.account
-		const db = new Tables(caller.tree(`${account}/${caller.region}`))
-		const q = db.queues.get(input.QueueName)
+		const tree = caller.existing(`${account}/${caller.region}`)
+		const q = if (tree == null) null else new Tables(tree!).queues.get(input.QueueName)
 		if (q == null) {
 			throw missing()
 		}
-		caller.allow(arn(caller, account, q.name), q.policy)
+		caller.allow(arn(caller, account, q.name), q.policy, resourceTags(q.tags))
 		const r = new api.GetQueueUrlResult()
 		r.QueueUrl = url(caller, account, q.name)
 		return r
@@ -228,13 +230,14 @@ export function found(caller: Caller, u: string): Found throws Fault {
 	if (account.length != 12 || !account.every(isDigit)) {
 		throw missing()
 	}
-	const db = new Tables(caller.tree(`${account}/${caller.region}`))
-	const q = db.queues.get(parts[parts.length - 1])
+	const tree = caller.existing(`${account}/${caller.region}`)
+	const db = if (tree == null) null else new Tables(tree!)
+	const q = db?.queues.get(parts[parts.length - 1]) ?? null
 	if (q == null) {
 		throw missing()
 	}
-	const f = new Found(db, q, account, arn(caller, account, q.name))
-	caller.allow(f.arn, q.policy)
+	const f = new Found(db!, q, account, arn(caller, account, q.name))
+	caller.allow(f.arn, q.policy, resourceTags(q.tags))
 	return f
 }
 
@@ -254,7 +257,10 @@ export function create(caller: Caller, input: api.CreateQueueRequest, now: i64):
 	if (!fifo && !(named(name) && name.length <= 80)) {
 		throw invalidParameter("Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length")
 	}
-	caller.allow(arn(caller, caller.account, name))
+	// TagQueue is authorized only of a queue created with tags.
+	const tags = input.tags ?? []
+	caller.actions = if (tags.length == 0) ["sqs:CreateQueue"] else ["sqs:CreateQueue", "sqs:TagQueue"]
+	caller.allow(arn(caller, caller.account, name), null, requestTags(tags))
 	const db = new Tables(caller.regional())
 	const q = new Queue()
 	q.name = name
@@ -264,7 +270,7 @@ export function create(caller: Caller, input: api.CreateQueueRequest, now: i64):
 	for (const [k, v] of given) {
 		set(caller, db, q, k, v, true)
 	}
-	q.tags = tagged([], input.tags ?? [], name)
+	q.tags = tagged([], tags, name)
 	const r = new api.CreateQueueResult()
 	r.QueueUrl = url(caller, caller.account, name)
 	const existing = db.queues.get(name)
@@ -432,7 +438,11 @@ function byArn(caller: Caller, a: string): Found | null throws Fault {
 	if (parts.length != 6 || parts[0] != "arn" || parts[2] != "sqs") {
 		return null
 	}
-	const db = new Tables(caller.tree(`${parts[4]}/${parts[3]}`))
+	const tree = caller.existing(`${parts[4]}/${parts[3]}`)
+	if (tree == null) {
+		return null
+	}
+	const db = new Tables(tree!)
 	const q = db.queues.get(parts[5])
 	return if (q == null) null else new Found(db, q, parts[4], a)
 }
@@ -836,7 +846,7 @@ function enqueue(caller: Caller, f: Found, input: api.SendMessageRequest,
 	m.body = body
 	m.attributes = attributes
 	m.trace = trace
-	m.sender = caller.userId
+	m.sender = if (caller.userId == "sns.amazonaws.com") sns else caller.userId
 	m.sent = now
 	m.order = q.next
 	q.next++

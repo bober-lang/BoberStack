@@ -7,7 +7,8 @@
 
 import { Fault } from "../../core/fault"
 import { Violations } from "../../core/protocol/model"
-import { Caller, Unit } from "../../core/service"
+import { Caller, requestTags, Unit } from "../../core/service"
+import * as service from "../../core/service"
 import * as api from "./api"
 
 import { Action, apply, condition, Context, copy, holds, invalid, Item, Node, project, projection, same, shown, Step,
@@ -29,7 +30,11 @@ export class Handler {
 
 	createTable(caller: Caller, input: api.CreateTableInput): api.CreateTableOutput throws Fault {
 		named(input.TableName, "tableName")
-		caller.allow(arn(caller, input.TableName))
+		const tags = tagged([], input.Tags ?? [])
+		// The other actions its dispatch names are authorized of replicas, resource policies and tags.
+		caller.actions = if (tags.length == 0) ["dynamodb:CreateTable"]
+			else ["dynamodb:CreateTable", "dynamodb:TagResource"]
+		caller.allow(arn(caller, input.TableName), null, requestTags(tags))
 		const db = new Tables(caller.regional())
 		const d = new Definition()
 		d.name = input.TableName
@@ -94,6 +99,7 @@ export class Handler {
 	}
 
 	describeTable(caller: Caller, input: api.DescribeTableInput): api.DescribeTableOutput throws Fault {
+		caller.actions = ["dynamodb:DescribeTable"]
 		const d = table(caller, input.TableName)
 		const r = new api.DescribeTableOutput()
 		r.Table = describe(caller, d, "ACTIVE")
@@ -101,7 +107,7 @@ export class Handler {
 	}
 
 	listTables(caller: Caller, input: api.ListTablesInput): api.ListTablesOutput throws Fault {
-		caller.allow("*")
+		caller.allow(arn(caller, "*"))
 		const n = input.Limit ?? 100
 		if (n < 1 || n > 100) {
 			const why = if (n < 1) "greater than or equal to 1" else "less than or equal to 100"
@@ -132,6 +138,7 @@ export class Handler {
 	}
 
 	updateTable(caller: Caller, input: api.UpdateTableInput): api.UpdateTableOutput throws Fault {
+		caller.actions = ["dynamodb:UpdateTable"]
 		const d = table(caller, input.TableName)
 		const db = new Tables(caller.regional())
 		if (input.BillingMode != null && input.BillingMode != d.billing) {
@@ -221,6 +228,7 @@ export class Handler {
 	}
 
 	describeTimeToLive(caller: Caller, input: api.DescribeTimeToLiveInput): api.DescribeTimeToLiveOutput throws Fault {
+		caller.actions = ["dynamodb:DescribeTimeToLive"]
 		const d = table(caller, input.TableName)
 		const r = new api.DescribeTimeToLiveOutput()
 		r.TimeToLiveDescription = new api.TimeToLiveDescription()
@@ -230,6 +238,7 @@ export class Handler {
 	}
 
 	updateTimeToLive(caller: Caller, input: api.UpdateTimeToLiveInput): api.UpdateTimeToLiveOutput throws Fault {
+		caller.actions = ["dynamodb:UpdateTimeToLive"]
 		const d = table(caller, input.TableName)
 		const s = input.TimeToLiveSpecification
 		if (s.Enabled == d.ttlEnabled) {
@@ -256,8 +265,8 @@ export class Handler {
 		return r
 	}
 
+	/// Unauthorized, as AWS's.
 	describeEndpoints(caller: Caller, input: api.DescribeEndpointsRequest): api.DescribeEndpointsResponse throws Fault {
-		caller.allow("*")
 		const r = new api.DescribeEndpointsResponse()
 		const host = caller.endpoint.slice(indexOf(caller.endpoint, "//") + 2, caller.endpoint.length)
 		r.Endpoints = [{ ...new api.Endpoint(), Address: host, CachePeriodInMinutes: 1440 }]
@@ -286,7 +295,8 @@ export class Handler {
 		} catch (f: Fault) {
 			throw counted(f)
 		}
-		const d = table(caller, input.TableName)
+		caller.actions = ["dynamodb:PutItem"]
+		const d = table(caller, input.TableName, null, d => keys(d, [input.Item], input.Item.map(a => a[0])))
 		const db = new Tables(caller.regional())
 		const k = itemKey(d, input.Item)
 		const before = db.item(d, k)
@@ -302,7 +312,8 @@ export class Handler {
 		const c = new Context(input.ExpressionAttributeNames, null)
 		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
 		placeholders(c, paths != null, input.ExpressionAttributeNames, null)
-		const d = table(caller, input.TableName)
+		caller.actions = ["dynamodb:GetItem"]
+		const d = table(caller, input.TableName, null, d => keys(d, [input.Key], attributesOf(paths)))
 		const db = new Tables(caller.regional())
 		const found = db.item(d, keyFrom(d, input.Key))
 		const r = new api.GetItemOutput()
@@ -322,7 +333,8 @@ export class Handler {
 		} catch (f: Fault) {
 			throw counted(f)
 		}
-		const d = table(caller, input.TableName)
+		caller.actions = ["dynamodb:DeleteItem"]
+		const d = table(caller, input.TableName, null, d => keys(d, [input.Key], input.Key.map(a => a[0])))
 		const db = new Tables(caller.regional())
 		const k = keyFrom(d, input.Key)
 		const before = db.item(d, k)
@@ -347,7 +359,13 @@ export class Handler {
 		} catch (f: Fault) {
 			throw counted(f)
 		}
-		const d = table(caller, input.TableName)
+		const changed = input.Key.map(a => a[0])
+		for (const a of actions) {
+			if (!changed.includes(a.path[0].name)) {
+				changed.push(a.path[0].name)
+			}
+		}
+		const d = table(caller, input.TableName, null, d => keys(d, [input.Key], changed))
 		const db = new Tables(caller.regional())
 		const k = keyFrom(d, input.Key)
 		for (const a of actions) {
@@ -385,8 +403,16 @@ export class Handler {
 		const paths = if (input.ProjectionExpression == null) null else projection(input.ProjectionExpression!, c)
 		placeholders(c, true, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
 		limited(input.Limit)
-		const d = table(caller, input.TableName)
-		const x = indexed(caller, d, input.IndexName, input.ConsistentRead)
+		const d = table(caller, input.TableName, input.IndexName, d => {
+			const x = indexed(d, input.IndexName, null)
+			const out = keys(d, [], attributesOf(paths))
+			if (x == null) {
+				const [hash, _] = keyConditions(d, x, keyed)
+				out.push(["dynamodb:LeadingKeys", [text(hash.args[1].value!)]])
+			}
+			return out
+		})
+		const x = indexed(d, input.IndexName, input.ConsistentRead)
 		const select = selected(input.Select, paths, x)
 		const [hash, range] = keyConditions(d, x, keyed)
 		const prefix = (if (x == null) items(d.name) else entries(d.name, x!.name)) + encode(hash.args[1].value!)
@@ -431,8 +457,9 @@ export class Handler {
 		if (segment < 0 || segment >= total) {
 			throw validation("The Segment parameter is zero-based and must be less than parameter TotalSegments")
 		}
-		const d = table(caller, input.TableName)
-		const x = indexed(caller, d, input.IndexName, input.ConsistentRead)
+		caller.actions = ["dynamodb:Scan"]
+		const d = table(caller, input.TableName, input.IndexName, d => keys(d, [], attributesOf(paths)))
+		const x = indexed(d, input.IndexName, input.ConsistentRead)
 		const select = selected(input.Select, paths, x)
 		const prefix = if (x == null) items(d.name) else entries(d.name, x!.name)
 		const p = read(new Tables(caller.regional()), d, x, prefix, prefix, true, start(d, x, input.ExclusiveStartKey),
@@ -460,16 +487,16 @@ export class Handler {
 			const c = new Context(ka.ExpressionAttributeNames, null)
 			const paths = if (ka.ProjectionExpression == null) null else projection(ka.ProjectionExpression!, c)
 			placeholders(c, paths != null, ka.ExpressionAttributeNames, null)
-			const d = table(caller, name)
-			const keys: string[] = []
+			const d = table(caller, name, null, d => keys(d, ka.Keys, attributesOf(paths)))
+			const seen: string[] = []
 			const found: Item[] = []
 			let bytes: i64 = 0
 			for (const key of ka.Keys) {
 				const k = keyFrom(d, key)
-				if (keys.includes(k)) {
+				if (seen.includes(k)) {
 					throw validation("Provided list of item keys contains duplicates")
 				}
-				keys.push(k)
+				seen.push(k)
 				const item = db.item(d, k)
 				if (item != null) {
 					bytes += sizeOf(item!)
@@ -498,8 +525,21 @@ export class Handler {
 		const db = new Tables(caller.regional())
 		const used: api.ConsumedCapacity[] = []
 		for (const [name, requests] of input.RequestItems) {
-			const d = table(caller, name)
-			const keys: string[] = []
+			const d = table(caller, name, null, d => {
+				const given: Item[] = []
+				const names: string[] = []
+				for (const w of requests) {
+					const i = w.PutRequest?.Item ?? w.DeleteRequest?.Key ?? []
+					given.push(i)
+					for (const [n, _] of i) {
+						if (!names.includes(n)) {
+							names.push(n)
+						}
+					}
+				}
+				return keys(d, given, names)
+			})
+			const seen: string[] = []
 			let units = 0.0
 			for (const w of requests) {
 				if ((w.PutRequest == null) == (w.DeleteRequest == null)) {
@@ -511,10 +551,10 @@ export class Handler {
 					values(item!)
 				}
 				const k = if (item != null) itemKey(d, item!) else keyFrom(d, w.DeleteRequest!.Key)
-				if (keys.includes(k)) {
+				if (seen.includes(k)) {
 					throw validation("Provided list of item keys contains duplicates")
 				}
-				keys.push(k)
+				seen.push(k)
 				const before = db.item(d, k)
 				if (item != null || before != null) {
 					write(db, d, k, before, item)
@@ -545,7 +585,7 @@ export class Handler {
 			const c = new Context(g.ExpressionAttributeNames, null)
 			const paths = if (g.ProjectionExpression == null) null else projection(g.ProjectionExpression!, c)
 			placeholders(c, paths != null, g.ExpressionAttributeNames, null)
-			const d = table(caller, g.TableName)
+			const d = table(caller, g.TableName, null, d => keys(d, [g.Key], attributesOf(paths)))
 			const item = db.item(d, keyFrom(d, g.Key))
 			r.Responses!.push({ ...new api.ItemResponse(),
 				Item: if (item == null) null else if (paths == null) item else project(item!, paths!) })
@@ -664,7 +704,16 @@ function plan(caller: Caller, db: Tables, t: api.TransactWriteItem): Planned thr
 	}
 	p.test = if (expression == null) null else condition(expression!, "ConditionExpression", c)
 	c.unused()
-	p.d = table(caller, name)
+	// Each write is authorized as the operation of its kind.
+	caller.actions = [`dynamodb:${p.kind}Item`]
+	const given = p.item!
+	const names = given.map(a => a[0])
+	for (const a of p.actions) {
+		if (!names.includes(a.path[0].name)) {
+			names.push(a.path[0].name)
+		}
+	}
+	p.d = table(caller, name, null, d => keys(d, [given], names))
 	p.k = if (p.kind == "Put") itemKey(p.d, p.item!) else keyFrom(p.d, p.item!)
 	if (p.kind == "Update") {
 		for (const a of p.actions) {
@@ -856,8 +905,7 @@ function limited(limit: i32 | null) throws Fault {
 }
 
 /// The index of d named name, null if name is; checked against whether the read is consistent.
-function indexed(caller: Caller, d: Definition, name: string | null,
-	consistent: bool | null): Index | null throws Fault {
+function indexed(d: Definition, name: string | null, consistent: bool | null): Index | null throws Fault {
 	if (name == null) {
 		return null
 	}
@@ -865,7 +913,6 @@ function indexed(caller: Caller, d: Definition, name: string | null,
 	if (x == null) {
 		throw validation(`The table does not have the specified index: ${name}`)
 	}
-	caller.allow(`${arn(caller, d.name)}/index/${name}`)
 	if (x!.global && consistent == true) {
 		throw validation("Consistent reads are not supported on global secondary indexes")
 	}
@@ -928,6 +975,40 @@ function keyConditions(d: Definition, x: Index | null, n: Node): [Node, Node | n
 	}
 	return [h!, rest.at(0)]
 }
+
+/// The context keys of fine-grained access to the items of d given, or their keys: dynamodb:LeadingKeys, of their
+/// partition keys' values, and dynamodb:Attributes, of the attributes named, if any.
+function keys(d: Definition, given: Item[], attributes: string[]): service.Context {
+	const leading: string[] = []
+	for (const i of given) {
+		const v = attribute(i, d.hash.name)
+		if (v != null && !leading.includes(text(v!))) {
+			leading.push(text(v!))
+		}
+	}
+	const out: service.Context = []
+	if (leading.length > 0) {
+		out.push(["dynamodb:LeadingKeys", leading])
+	}
+	if (attributes.length > 0) {
+		out.push(["dynamodb:Attributes", attributes])
+	}
+	return out
+}
+
+/// The top-level attributes that the document paths name, none if there are none.
+function attributesOf(paths: Step[][] | null): string[] {
+	const out: string[] = []
+	for (const p of paths ?? []) {
+		if (!out.includes(p[0].name)) {
+			out.push(p[0].name)
+		}
+	}
+	return out
+}
+
+/// The text of a key's value: a string's, a number's or a binary's.
+function text(v: api.AttributeValue): string { return if (v instanceof api.AttributeValue$N) v.N else scalar(v) }
 
 /// The text of a string's or binary's value.
 function scalar(v: api.AttributeValue): string {
@@ -1236,12 +1317,15 @@ function arn(caller: Caller, name: string): string {
 	return `arn:aws:dynamodb:${caller.region}:${caller.account}:table/${name}`
 }
 
-/// The definition of the table that name, or its ARN, names; the caller allowed to act on it.
-function table(caller: Caller, name: string): Definition throws Fault {
+/// The definition of the table that name, or its ARN, names; the caller allowed to act on it, or on its index of that
+/// name if not null, of the context keys that context gives of the table if it exists.
+function table(caller: Caller, name: string, index: string | null = null,
+	context: (d: Definition) => service.Context throws Fault = d => []): Definition throws Fault {
 	const n = if (startsWith(name, "arn:")) name.slice(lastIndexOf(name, "/") + 1, name.length) else name
 	named(n, "tableName")
-	caller.allow(arn(caller, n))
 	const d = new Tables(caller.regional()).get(n)
+	const a = arn(caller, n)
+	caller.allow(if (index == null) a else `${a}/index/${index}`, null, if (d == null) [] else context(d!))
 	if (d == null) {
 		throw api.resourceNotFoundException(`Requested resource not found: Table: ${n} not found`)
 	}

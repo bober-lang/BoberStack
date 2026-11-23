@@ -7,7 +7,7 @@ import { Store } from "./state/store"
 import { lastIndexOf, startsWith } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
 import { bytes } from "std/crypto/random"
-import { split } from "std/string"
+import { lower, split } from "std/string"
 import { rfc3339, second } from "std/time"
 
 /// How an access denied's message is worded: "reasoned", with the kind of policy that denies; "linked", with it and
@@ -122,15 +122,26 @@ export class Caller {
 	}
 
 	/// The caller that a service is, by its principal as sns.amazonaws.com, when it calls another for this request on
-	/// behalf of source, its resource's ARN: of the request's account, region and trees, so that what it writes
-	/// commits with the request or not at all.
-	internal(principal: string, source: string): Caller {
+	/// behalf of source, its resource's ARN, to perform actions, as IAM names them: of the request's account, region
+	/// and trees, so that what it writes commits with the request or not at all.
+	internal(principal: string, source: string, actions: string[]): Caller {
 		const c = new Caller(this.account, this.region, principal, this.requestId, principal, this.committed)
 		c.source = source
+		c.actions = actions
 		c.endpoint = this.endpoint
 		c.identify = this.identify
 		c.opened = this.opened
 		return c
+	}
+
+	/// account's state as tree gives it, or null if it has none yet, which looking does not make.
+	existing(account: string): Store | null throws Fault {
+		for (const [a, _] of this.opened) {
+			if (a == account) {
+				return this.tree(account)
+			}
+		}
+		return if (this.committed.get(account) == null) null else this.tree(account)
 	}
 
 	/// The state of the caller's account.
@@ -170,6 +181,7 @@ export class Caller {
 	/// The access denied of the request r, which d denies, as the service words it, naming the resource as shown.
 	private denial(r: auth.Request, d: auth.Decision, shown: string | null): Fault throws Fault {
 		const [status, code, wording] = this.denied
+		r.action = spelled(r.action)
 		let why = auth.denied(r, d, shown)
 		if (wording == "plain") {
 			const on = shown ?? r.resource
@@ -196,8 +208,38 @@ export function notImplemented(op: string): Fault {
 	return new Fault(501, "NotImplemented", `The operation ${op} is not implemented`)
 }
 
+/// The context keys aws:ResourceTag/<key> of a resource of tags.
+export function resourceTags(tags: [string, string][]): Context {
+	const out: Context = []
+	for (const [k, v] of tags) {
+		out.push([`aws:ResourceTag/${k}`, v])
+	}
+	return out
+}
+
+/// The context keys aws:RequestTag/<key> and aws:TagKeys of a request that tags a resource with tags; none if there
+/// are none.
+export function requestTags(tags: [string, string][]): Context {
+	const out: Context = []
+	for (const [k, v] of tags) {
+		out.push([`aws:RequestTag/${k}`, v])
+	}
+	if (tags.length > 0) {
+		out.push(["aws:TagKeys", tags.map(t => t[0])])
+	}
+	return out
+}
+
 /// The input or output of an operation that has none.
 export class Unit {}
+
+/// The action as its service's access denied names it: SQS's in lower case, SNS's of the prefix SNS, as AWS's.
+function spelled(action: string): string {
+	if (startsWith(action, "sqs:")) {
+		return lower(action)
+	}
+	return if (startsWith(action, "sns:")) `SNS:${action.slice(4, action.length)}` else action
+}
 
 /// The account of the resource of ARN a, null if it names none, as "*" or an S3 bucket's.
 function owner(a: string): string | null {

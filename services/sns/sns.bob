@@ -15,7 +15,7 @@
 
 import { secret } from "../../core/auth/credentials"
 import { Fault } from "../../core/fault"
-import { Caller, Unit } from "../../core/service"
+import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
@@ -48,7 +48,14 @@ export class Handler {
 		const arn = `arn:aws:sns:${caller.region}:${caller.account}:${name}`
 		const db = new Tables(caller.regional())
 		const found = db.topics.get(name)
-		caller.allow(arn, policy(found))
+		const tags = tagged([], input.Tags ?? [])
+		// TagResource is authorized only of a topic created with tags.
+		caller.actions = if (tags.length == 0) ["sns:CreateTopic"] else ["sns:CreateTopic", "sns:TagResource"]
+		const context = requestTags(tags)
+		if (found != null) {
+			context.append(resourceTags(found!.tags))
+		}
+		caller.allow(arn, policy(found), context)
 		if (input.DataProtectionPolicy != null) {
 			throw new Fault(501, "NotImplemented", "Data protection policies are not implemented")
 		}
@@ -71,8 +78,9 @@ export class Handler {
 			if (given.some(a => attribute(f.attributes, a[0]) != a[1])) {
 				throw invalid("Attributes Reason: Topic already exists with different attributes")
 			}
-			const tags = input.Tags
-			if (tags != null && (tags.length != f.tags.length || tags.some(t => attribute(f.tags, t.Key) != t.Value))) {
+			const asked = input.Tags
+			if (asked != null
+				&& (asked.length != f.tags.length || asked.some(t => attribute(f.tags, t.Key) != t.Value))) {
 				throw invalid("Tags Reason: Topic already exists with different tags")
 			}
 			return r
@@ -80,7 +88,7 @@ export class Handler {
 		const t = new Topic()
 		t.name = name
 		t.attributes = given
-		t.tags = tagged([], input.Tags ?? [])
+		t.tags = tags
 		save(db.topics, name, t)
 		return r
 	}
@@ -88,7 +96,7 @@ export class Handler {
 	deleteTopic(caller: Caller, input: api.DeleteTopicInput): Unit throws Fault {
 		const p = place(caller, input.TopicArn, "TopicArn")
 		const t = p.db.topics.get(p.name)
-		caller.allow(p.arn, policy(t))
+		caller.allow(p.arn, policy(t), tagsOf(t))
 		if (t != null) {
 			for (const [k, _] of subscriptions(p.db, p.name)) {
 				p.db.subscriptions.delete(k)
@@ -137,6 +145,8 @@ export class Handler {
 	}
 
 	setTopicAttributes(caller: Caller, input: api.SetTopicAttributesInput): Unit throws Fault {
+		// iam:PassRole is authorized of a role given, which no attribute implemented here takes.
+		caller.actions = ["sns:SetTopicAttributes"]
 		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
 		const v = normal(input.AttributeName, input.AttributeValue ?? "")
 		topicAttribute(input.AttributeName, v, fifo(t), false)
@@ -202,13 +212,14 @@ export class Handler {
 	}
 
 	subscribe(caller: Caller, input: api.SubscribeInput): api.SubscribeResponse throws Fault {
-		const p = place(caller, input.TopicArn, "TopicArn")
+		caller.actions = ["sns:Subscribe"]
 		const protocol = input.Protocol
 		if (!protocols.includes(protocol)) {
 			throw invalid(`Amazon SNS does not support this protocol string: ${protocol}`)
 		}
-		const [_, t] = topic(caller, input.TopicArn, "TopicArn")
 		const endpoint = input.Endpoint ?? ""
+		const [p,
+			t] = topic(caller, input.TopicArn, "TopicArn", [["sns:Protocol", protocol], ["sns:Endpoint", endpoint]])
 		endpointOf(protocol, endpoint)
 		if (fifo(t) && protocol != "sqs") {
 			throw invalid(`Invalid protocol type: ${protocol}`)
@@ -239,19 +250,27 @@ export class Handler {
 		s.endpoint = endpoint
 		s.owner = caller.account
 		s.principal = caller.arn
-		s.confirmed = !pending.includes(protocol)
+		// A queue of another account than the subscriber's is sent a confirmation, as AWS does.
+		s.confirmed = !pending.includes(protocol) && (protocol != "sqs" || split(endpoint, ":")[4] == caller.account)
 		s.token = if (s.confirmed) "" else hex.encode(random(64))
 		s.attributes = given
 		save(p.db.subscriptions, within(t.name, s.id), s)
+		if (protocol == "sqs" && !s.confirmed) {
+			this.confirm(caller, p, s)
+		}
 		r.SubscriptionArn = if (s.confirmed || input.ReturnSubscriptionArn) `${p.arn}:${s.id}`
 			else "pending confirmation"
 		return r
 	}
 
+	/// Unauthorized, as AWS's, which the token alone authorizes.
 	confirmSubscription(caller: Caller,
 		input: api.ConfirmSubscriptionInput): api.ConfirmSubscriptionResponse throws Fault {
-		const [p, t] = topic(caller, input.TopicArn, "TopicArn")
-		for (const [k, s] of subscriptions(p.db, t.name)) {
+		const p = place(caller, input.TopicArn, "TopicArn")
+		if (p.db.topics.get(p.name) == null) {
+			throw api.notFoundException("Topic does not exist")
+		}
+		for (const [k, s] of subscriptions(p.db, p.name)) {
 			if (s.token != "" && s.token == input.Token) {
 				s.confirmed = true
 				save(p.db.subscriptions, k, s)
@@ -265,7 +284,8 @@ export class Handler {
 
 	unsubscribe(caller: Caller, input: api.UnsubscribeInput): Unit throws Fault {
 		const [p, id] = subscriptionPlace(caller, input.SubscriptionArn)
-		caller.allow(p.arn, policy(p.db.topics.get(p.name)))
+		const t = p.db.topics.get(p.name)
+		caller.allow(p.arn, policy(t), tagsOf(t))
 		p.db.subscriptions.delete(within(p.name, id))
 		return new Unit()
 	}
@@ -310,6 +330,9 @@ export class Handler {
 	}
 
 	setSubscriptionAttributes(caller: Caller, input: api.SetSubscriptionAttributesInput): Unit throws Fault {
+		// iam:PassRole is authorized of a SubscriptionRoleArn, which only firehose subscriptions, never delivered to,
+		// take.
+		caller.actions = ["sns:SetSubscriptionAttributes"]
 		const [p, s] = subscription(caller, input.SubscriptionArn)
 		const name = input.AttributeName
 		const v = normal(name, input.AttributeValue ?? "")
@@ -444,6 +467,25 @@ export class Handler {
 		return [id, seq]
 	}
 
+	/// Sends the queue of s, a subscription to the topic at p pending, the message that confirms it; one the queue
+	/// refuses is dropped.
+	private confirm(caller: Caller, p: Place, s: Subscription) throws Fault {
+		const members: [string, string][] = [["Type", "SubscriptionConfirmation"], ["MessageId", uuid(random(16))],
+			["Token", s.token], ["TopicArn", p.arn],
+			["Message",
+			`You have chosen to subscribe to the topic ${p.arn}.\nTo confirm the subscription, visit the `
+			+ "SubscribeURL included in this message."],
+			["SubscribeURL", `${caller.endpoint}/?Action=ConfirmSubscription&TopicArn=${p.arn}&Token=${s.token}`],
+			["Timestamp", timestamp(now())], ["SignatureVersion", "1"], ["Signature", `${secret(342)}==`],
+			["SigningCertURL", certificate(caller)]]
+		const input = new sqsApi.SendMessageRequest()
+		input.QueueUrl = queueUrl(caller, s.endpoint)
+		input.MessageBody = `{${members.map(x => `${json.quoted(x[0])}:${json.quoted(x[1])}`).join(",")}}`
+		try {
+			this.sqs.sendMessage(caller.internal("sns.amazonaws.com", p.arn, ["sqs:SendMessage"]), input)
+		} catch (f: Fault) {} // dropped
+	}
+
 	/// Sends m, of id and sequence number seq, published to t at p, to the queue of s unless its filter policy does
 	/// not match; or to its dead-letter queue if the queue refuses it.
 	private deliver(caller: Caller, p: Place, t: Topic, s: Subscription, m: Message, id: string,
@@ -470,7 +512,7 @@ export class Handler {
 		if (queueFifo) {
 			input.MessageDeduplicationId = m.dedup
 		}
-		const as = caller.internal("sns.amazonaws.com", p.arn)
+		const as = caller.internal("sns.amazonaws.com", p.arn, ["sqs:SendMessage"])
 		try {
 			this.sqs.sendMessage(as, input)
 		} catch (f: Fault) {
@@ -564,15 +606,28 @@ function placeOf(caller: Caller, parts: string[], m: string): Place throws Fault
 		throw new Fault(403, "InvalidClientTokenId", "No account found for the given parameters")
 	}
 	const name = parts[5]
-	return new Place(new Tables(caller.tree(`${account}/${caller.region}`)), name, account,
-		topicArn(caller, account, name))
+	const arn = topicArn(caller, account, name)
+	const tree = caller.existing(`${account}/${caller.region}`)
+	if (tree == null) {
+		// Another account that has nothing yet.
+		caller.allow(arn)
+		throw switch (m) {
+			case "ResourceArn": api.resourceNotFoundException("Resource does not exist")
+			case "SubscriptionArn": api.notFoundException("Subscription does not exist")
+			default: api.notFoundException("Topic does not exist")
+		}
+	}
+	return new Place(new Tables(tree!), name, account, arn)
 }
 
-/// The topic of ARN a, given as the member m, and its place, once the caller is allowed it.
-function topic(caller: Caller, a: string, m: string): [Place, Topic] throws Fault {
+/// The topic of ARN a, given as the member m, and its place, once the caller is allowed it, of the context keys of
+/// context besides its tags.
+function topic(caller: Caller, a: string, m: string, context: Context = []): [Place, Topic] throws Fault {
 	const p = place(caller, a, m)
 	const t = p.db.topics.get(p.name)
-	caller.allow(p.arn, policy(t))
+	const keys = tagsOf(t)
+	keys.append(context)
+	caller.allow(p.arn, policy(t), keys)
 	if (t == null) {
 		throw api.notFoundException("Topic does not exist")
 	}
@@ -583,7 +638,7 @@ function topic(caller: Caller, a: string, m: string): [Place, Topic] throws Faul
 function resource(caller: Caller, a: string): [Place, Topic] throws Fault {
 	const p = place(caller, a, "ResourceArn")
 	const t = p.db.topics.get(p.name)
-	caller.allow(p.arn, policy(t))
+	caller.allow(p.arn, policy(t), tagsOf(t))
 	if (t == null) {
 		throw api.resourceNotFoundException("Resource does not exist")
 	}
@@ -605,7 +660,8 @@ function subscriptionPlace(caller: Caller, a: string): [Place, string] throws Fa
 /// The subscription of ARN a, and its topic's place, once the caller is allowed the topic.
 function subscription(caller: Caller, a: string): [Place, Subscription] throws Fault {
 	const [p, id] = subscriptionPlace(caller, a)
-	caller.allow(p.arn, policy(p.db.topics.get(p.name)))
+	const t = p.db.topics.get(p.name)
+	caller.allow(p.arn, policy(t), tagsOf(t))
 	const s = p.db.subscriptions.get(within(p.name, id))
 	if (s == null) {
 		throw api.notFoundException("Subscription does not exist")
@@ -653,6 +709,8 @@ function named(name: string): bool {
 
 /// The topic's policy, null if it has none of its own or there is no topic.
 function policy(t: Topic | null): string | null { return if (t == null) null else attribute(t.attributes, "Policy") }
+/// The context keys of the tags of t, none if there is no topic.
+function tagsOf(t: Topic | null): Context { return if (t == null) [] else resourceTags(t.tags) }
 /// Whether t is a FIFO topic.
 function fifo(t: Topic): bool { return attribute(t.attributes, "FifoTopic") == "true" }
 
@@ -945,8 +1003,7 @@ function envelope(caller: Caller, p: Place, t: Topic, s: Subscription, m: Messag
 	if (seq == null) {
 		members.push(["SignatureVersion", attribute(t.attributes, "SignatureVersion") ?? "1"])
 		members.push(["Signature", `${secret(342)}==`])
-		members.push(["SigningCertURL",
-			`https://sns.${caller.region}.amazonaws.com/SimpleNotificationService-0000000000000000000000000000000.pem`])
+		members.push(["SigningCertURL", certificate(caller)])
 	}
 	members.push(["UnsubscribeURL", `${caller.endpoint}/?Action=Unsubscribe&SubscriptionArn=${p.arn}:${s.id}`])
 	let out = `{${members.map(x => `${json.quoted(x[0])}:${json.quoted(x[1])}`).join(",")}`
@@ -959,6 +1016,11 @@ function envelope(caller: Caller, p: Place, t: Topic, s: Subscription, m: Messag
 		out += `,"MessageAttributes":{${attrs.join(",")}}`
 	}
 	return out + "}"
+}
+
+/// The URL of the certificate that notifications name, which names none.
+function certificate(caller: Caller): string {
+	return `https://sns.${caller.region}.amazonaws.com/SimpleNotificationService-0000000000000000000000000000000.pem`
 }
 
 /// The instant t as SNS stamps a notification: in UTC to the millisecond.

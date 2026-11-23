@@ -19,7 +19,7 @@ import { list, matches, member, members, str, validate } from "./pattern"
 import { Fault } from "../../core/fault"
 import { result } from "../../core/protocol/json"
 import * as json from "../../core/protocol/json"
-import { Caller, Unit } from "../../core/service"
+import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
@@ -52,7 +52,11 @@ export class Handler {
 
 	createEventBus(caller: Caller, input: api.CreateEventBusRequest): api.CreateEventBusResponse throws Fault {
 		const arn = busArn(caller.region, caller.account, input.Name)
-		caller.allow(arn)
+		const tags = tagged([], input.Tags ?? [])
+		// TagResource is authorized only of a bus made with tags.
+		caller.actions = if (tags.length == 0) ["events:CreateEventBus"]
+			else ["events:CreateEventBus", "events:TagResource"]
+		caller.allow(arn, null, requestTags(tags))
 		if (input.EventSourceName != null) {
 			throw api.resourceNotFoundException(`Event source ${input.EventSourceName} does not exist.`)
 		}
@@ -68,7 +72,7 @@ export class Handler {
 		b.description = input.Description
 		b.created = now()
 		b.modified = b.created
-		b.tags = tagged([], input.Tags ?? [])
+		b.tags = tags
 		save(db.buses, b.name, b)
 		const r = new api.CreateEventBusResponse()
 		r.EventBusArn = arn
@@ -107,7 +111,7 @@ export class Handler {
 	}
 
 	listEventBuses(caller: Caller, input: api.ListEventBusesRequest): api.ListEventBusesResponse throws Fault {
-		caller.allow("*")
+		caller.allow(busArn(caller.region, caller.account, "*"))
 		const buses = all(tables(caller).buses, input.NamePrefix ?? "").map(e => e[1])
 		const [page, next] = part(buses, input.NextToken, input.Limit)
 		const r = new api.ListEventBusesResponse()
@@ -126,7 +130,7 @@ export class Handler {
 	}
 
 	putPermission(caller: Caller, input: api.PutPermissionRequest): Unit throws Fault {
-		caller.allow("*")
+		caller.allow(busArn(caller.region, caller.account, input.EventBusName ?? "default"))
 		const db = tables(caller)
 		const b = bus(db, input.EventBusName ?? "default")
 		const arn = busArn(caller.region, caller.account, b.name)
@@ -159,7 +163,7 @@ export class Handler {
 	}
 
 	removePermission(caller: Caller, input: api.RemovePermissionRequest): Unit throws Fault {
-		caller.allow("*")
+		caller.allow(busArn(caller.region, caller.account, input.EventBusName ?? "default"))
 		const db = tables(caller)
 		const b = bus(db, input.EventBusName ?? "default")
 		if (input.RemoveAllPermissions) {
@@ -192,7 +196,21 @@ export class Handler {
 		r.name = input.Name
 		r.bus = name
 		const arn = ruleArn(caller.region, caller.account, r)
-		caller.allow(arn)
+		const tags = tagged([], input.Tags ?? [])
+		// iam:PassRole is authorized of a role passed, which nothing here assumes; TagResource of a rule made with tags.
+		caller.actions = if (tags.length == 0) ["events:PutRule"] else ["events:PutRule", "events:TagResource"]
+		const context = requestTags(tags)
+		if (input.EventPattern != null) {
+			const source = member(input.EventPattern!, "source")
+			const detailType = member(input.EventPattern!, "detail-type")
+			if (source != null) {
+				context.push(["events:source", texts(source!)])
+			}
+			if (detailType != null) {
+				context.push(["events:detail-type", texts(detailType!)])
+			}
+		}
+		caller.allow(arn, null, context)
 		const db = tables(caller)
 		bus(db, name)
 		if (input.EventPattern == null && input.ScheduleExpression == null) {
@@ -237,9 +255,10 @@ export class Handler {
 	}
 
 	listRules(caller: Caller, input: api.ListRulesRequest): api.ListRulesResponse throws Fault {
-		caller.allow("*")
+		const name = busName(caller, input.EventBusName)
+		caller.allow(rules(caller, name))
 		const db = tables(caller)
-		const b = bus(db, busName(caller, input.EventBusName))
+		const b = bus(db, name)
 		const rules = all(db.rules, within(b.name, input.NamePrefix ?? "")).map(e => e[1])
 		const [page, next] = part(rules, input.NextToken, input.Limit)
 		const out = new api.ListRulesResponse()
@@ -288,9 +307,10 @@ export class Handler {
 
 	listRuleNamesByTarget(caller: Caller,
 		input: api.ListRuleNamesByTargetRequest): api.ListRuleNamesByTargetResponse throws Fault {
-		caller.allow("*")
+		const name = busName(caller, input.EventBusName)
+		caller.allow(rules(caller, name))
 		const db = tables(caller)
-		const b = bus(db, busName(caller, input.EventBusName))
+		const b = bus(db, name)
 		const names: string[] = []
 		for (const [k, t] of all(db.targets, within(b.name, ""))) {
 			const rule = split(k, "\x00")[1]
@@ -306,7 +326,9 @@ export class Handler {
 	}
 
 	putTargets(caller: Caller, input: api.PutTargetsRequest): api.PutTargetsResponse throws Fault {
-		const r = allowed(caller, input.Rule, input.EventBusName)
+		// iam:PassRole is authorized of a target's role, which nothing here assumes.
+		caller.actions = ["events:PutTargets"]
+		const r = allowed(caller, input.Rule, input.EventBusName, [["events:TargetArn", input.Targets.map(t => t.Arn)]])
 		const db = tables(caller)
 		const k = within(r.bus, r.name)
 		const ids = all(db.targets, within(k, "")).map(e => e[1].id)
@@ -404,6 +426,23 @@ export class Handler {
 			throw validation("Total size of the entries in the request is over the limit.")
 		}
 		const db = tables(caller)
+		// The request is authorized as a whole, on each bus it names, of each entry's source and detail type.
+		for (const e of input.Entries) {
+			let name = ""
+			try {
+				name = busName(caller, e.EventBusName)
+			} catch (f: Fault) {
+				continue
+			}
+			const context: Context = []
+			if (e.Source != null) {
+				context.push(["events:source", e.Source!])
+			}
+			if (e.DetailType != null) {
+				context.push(["events:detail-type", e.DetailType!])
+			}
+			caller.allow(busArn(caller.region, caller.account, name), db.buses.get(name)?.policy ?? null, context)
+		}
 		const out = new api.PutEventsResponse()
 		out.Entries = []
 		for (const e of input.Entries) {
@@ -444,7 +483,6 @@ export class Handler {
 		if (b == null) {
 			throw new Fault(400, "NotFound", `Event bus ${name} does not exist.`)
 		}
-		caller.allow(busArn(caller.region, caller.account, name), b.policy)
 		if (startsWith(e.Source!, "aws.")) {
 			throw new Fault(400, "NotAuthorizedForSourceException", "Not authorized for the source.")
 		}
@@ -505,7 +543,6 @@ export class Handler {
 	private send(caller: Caller, source: string, arn: string, body: string, group: string | null,
 		id: string) throws Fault {
 		const [service, _, account, resource] = parts(arn)
-		const internal = caller.internal(principal, source)
 		if (service == "sqs") {
 			const m = new sqsApi.SendMessageRequest()
 			m.QueueUrl = `${caller.endpoint}/${account}/${resource}`
@@ -514,14 +551,34 @@ export class Handler {
 				m.MessageGroupId = group
 				m.MessageDeduplicationId = id
 			}
-			this.sqs.sendMessage(internal, m)
+			this.sqs.sendMessage(caller.internal(principal, source, ["sqs:SendMessage"]), m)
 		} else if (service == "sns") {
 			const m = new snsApi.PublishInput()
 			m.TopicArn = arn
 			m.Message = body
-			this.sns.publish(internal, m)
+			this.sns.publish(caller.internal(principal, source, ["sns:Publish"]), m)
 		}
 	}
+}
+
+/// The ARN that names every rule of the bus named name, as a listing's access denied names it.
+function rules(caller: Caller, name: string): string {
+	const r = new Rule()
+	r.name = "*"
+	r.bus = name
+	return ruleArn(caller.region, caller.account, r)
+}
+
+/// The strings of the JSON array v, or of v if it is a string.
+function texts(v: string): string[] {
+	const out: string[] = []
+	for (const x of if (v.length > 0 && v[0] == lbracket) list(v) else [v]) {
+		const t = str(x)
+		if (t != null) {
+			out.push(t!)
+		}
+	}
+	return out
 }
 
 /// The tables of the caller's regional tree, where the default bus is from the first request on.
@@ -560,15 +617,17 @@ function bus(db: Tables, name: string): Bus throws Fault {
 }
 
 /// The rule named name of the bus that busName takes from given, which caller is allowed to act on.
-function allowed(caller: Caller, name: string, given: string | null): Rule throws Fault {
+function allowed(caller: Caller, name: string, given: string | null, context: Context = []): Rule throws Fault {
 	const b = busName(caller, given)
 	const r = new Rule()
 	r.name = name
 	r.bus = b
-	caller.allow(ruleArn(caller.region, caller.account, r))
 	const db = tables(caller)
-	bus(db, b)
 	const found = db.rules.get(within(b, name))
+	const keys = resourceTags(found?.tags ?? [])
+	keys.append(context)
+	caller.allow(ruleArn(caller.region, caller.account, r), null, keys)
+	bus(db, b)
 	if (found == null) {
 		throw api.resourceNotFoundException(`Rule ${name} does not exist on EventBus ${b}.`)
 	}

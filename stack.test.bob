@@ -1,0 +1,511 @@
+import { sign, text } from "./core/client"
+import { Fault } from "./core/fault"
+import { Gateway } from "./core/gateway"
+import * as protocol from "./core/protocol/json"
+import { Catalog } from "./services/iam/catalog"
+import * as sqsApi from "./services/sqs/api"
+import { stack } from "./stack"
+import { indexOf } from "std/algo"
+import * as json from "std/encoding/json"
+import { Keys } from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+const account = "000000000000"
+const other = "111111111111"
+
+/// Who signs a request: an access key, its secret and its session token, if any; an unknown key is its account's root.
+class Key {
+	id = "test"
+	secret = "test"
+	token = ""
+}
+
+/// The root of 000000000000, of 111111111111, and of the account given.
+function root(): Key { return new Key() }
+function otherRoot(): Key { return rootOf(other) }
+
+function rootOf(of: string): Key {
+	const k = new Key()
+	if (of != account) {
+		k.id = of
+	}
+	return k
+}
+
+/// A notification as SNS delivers it to a queue.
+class Envelope {
+	Type = ""
+	MessageId = ""
+	SequenceNumber: string | null = null
+	TopicArn = ""
+	Subject: string | null = null
+	Message = ""
+	Timestamp = ""
+	SignatureVersion: string | null = null
+	Signature: string | null = null
+	SigningCertURL: string | null = null
+	UnsubscribeURL = ""
+	MessageAttributes: Keys | null = null
+}
+
+/// A subscription's confirmation as SNS sends it to a queue.
+class Confirmation {
+	Type = ""
+	MessageId = ""
+	Token = ""
+	TopicArn = ""
+	Message = ""
+	SubscribeURL = ""
+	Timestamp = ""
+	SignatureVersion = ""
+	Signature = ""
+	SigningCertURL = ""
+}
+
+/// The answer of g to a query of params to service, of its API's version, signed by k.
+function query(g: Gateway, service: string, params: [string, string][], k: Key = root()): Response {
+	const version = switch (service) {
+		case "iam": "2010-05-08"
+		case "sts": "2011-06-15"
+		default: "2010-03-31"
+	}
+	const body = `Version=${version}`
+		+ params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// The answer of g to the operation op of service, of a JSON protocol, with body, signed by k.
+function call(g: Gateway, service: string, op: string, body: string, k: Key = root()): Response {
+	const [target, version] = switch (service) {
+		case "sqs": ["AmazonSQS", "1.0"]
+		case "dynamodb": ["DynamoDB_20120810", "1.0"]
+		default: ["AWSEvents", "1.1"]
+	}
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", `application/x-amz-json-${version}`)
+	req.headers.set("x-amz-target", `${target}.${op}`)
+	sign(req, body, service, "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// Whether res is the error of status and code, of message unless that is "".
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	const body = res.body.whole ?? ""
+	if (res.status != status) {
+		return false
+	}
+	if (indexOf(body, "<Code>") >= 0) {
+		return text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+	}
+	return indexOf(body, code) >= 0 && indexOf(body, message) >= 0
+}
+
+/// An identity-based or resource-based policy of the statements given.
+function policy(statements: string[]): string {
+	return `{"Version":"2012-10-17","Statement":[${statements.join(",")}]}`
+}
+
+/// A statement of effect over actions on resource, by principal unless "", of the condition unless "".
+function statement(effect: string, actions: string, resource: string, principal = "", condition = ""): string {
+	return `{"Effect":"${effect}"${if (principal == "") "" else `,"Principal":${principal}`},"Action":${actions},`
+		+ `"Resource":"${resource}"${if (condition == "") "" else `,"Condition":${condition}`}}`
+}
+
+/// The user name of g's account of k, with the inline policy document if not "", and its access key.
+function user(g: Gateway, name: string, document = "", k: Key = root()): Key {
+	assert query(g, "iam", [["Action", "CreateUser"], ["UserName", name]], k).status == 200
+	if (document != "") {
+		assert query(g, "iam",
+			[["Action", "PutUserPolicy"], ["UserName", name], ["PolicyName", "p"], ["PolicyDocument", document]],
+			k).status == 200
+	}
+	const res = query(g, "iam", [["Action", "CreateAccessKey"], ["UserName", name]], k)
+	return { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")! }
+}
+
+/// The ARN of the queue name of account, and its URL.
+function queueArn(name: string, of = account): string { return `arn:aws:sqs:us-east-1:${of}:${name}` }
+function queueUrl(name: string, of = account): string { return `http://localhost:4566/${of}/${name}` }
+function topicArn(name: string, of = account): string { return `arn:aws:sns:us-east-1:${of}:${name}` }
+
+/// Creates the queue name, of the attributes given as JSON members, with the policy document if not "".
+function queue(g: Gateway, name: string, document = "", attributes = "", k: Key = root()) {
+	const members: string[] = []
+	if (attributes != "") {
+		members.push(attributes)
+	}
+	if (document != "") {
+		members.push(`"Policy":${json.quoted(document)}`)
+	}
+	const res = call(g, "sqs", "CreateQueue", `{"QueueName":"${name}","Attributes":{${members.join(",")}}}`, k)
+	assert res.status == 200
+}
+
+/// The policy that lets the service principal send to the queue name on behalf of the resource of ARN source.
+function sendable(name: string, principal: string, source: string): string {
+	return policy([statement("Allow", `"sqs:SendMessage"`, queueArn(name), `{"Service":"${principal}"}`,
+		`{"ArnEquals":{"aws:SourceArn":"${source}"}}`)])
+}
+
+/// The messages of the queue name, of their system attributes, received.
+function received(g: Gateway, name: string, of = account): sqsApi.Message[] {
+	const res = call(g, "sqs", "ReceiveMessage",
+		`{"QueueUrl":"${queueUrl(name, of)}","MaxNumberOfMessages":10,"MessageSystemAttributeNames":["All"],"MessageAttributeNames":["All"]}`,
+		rootOf(of))
+	assert res.status == 200
+	try {
+		return protocol.decode[sqsApi.ReceiveMessageResult](res.body.whole ?? "").Messages ?? []
+	} catch (f: Fault) {
+		assert false
+		return []
+	}
+}
+
+/// The bodies of the messages of the queue name, received.
+function bodies(g: Gateway, name: string, of = account): string[] {
+	return received(g, name, of).map(m => m.Body ?? "")
+}
+
+/// The notification that body is.
+function envelope(body: string): Envelope { return json.decode[Envelope](body) }
+
+/// Creates the topic name, with the policy document if not "", of the attributes given.
+function topic(g: Gateway, name: string, document = "", attributes: [string, string][] = []) {
+	const params: [string, string][] = [["Action", "CreateTopic"], ["Name", name]]
+	const all = attributes.slice(0, attributes.length)
+	if (document != "") {
+		all.push(["Policy", document])
+	}
+	for (let i = 0; i < all.length; i++) {
+		params.push([`Attributes.entry.${i + 1}.key`, all[i][0]])
+		params.push([`Attributes.entry.${i + 1}.value`, all[i][1]])
+	}
+	assert query(g, "sns", params).status == 200
+}
+
+/// Subscribes the queue of ARN q to the topic of ARN t, of the attributes given; the subscription's ARN.
+function subscribe(g: Gateway, t: string, q: string, attributes: [string, string][] = [], k: Key = root()): string {
+	const params: [string, string][] = [["Action", "Subscribe"], ["TopicArn", t], ["Protocol", "sqs"], ["Endpoint", q]]
+	for (let i = 0; i < attributes.length; i++) {
+		params.push([`Attributes.entry.${i + 1}.key`, attributes[i][0]])
+		params.push([`Attributes.entry.${i + 1}.value`, attributes[i][1]])
+	}
+	const res = query(g, "sns", params, k)
+	assert res.status == 200
+	return text(res, "SubscriptionArn")!
+}
+
+/// Publishes message to the topic of ARN t, as k, of the message attribute c if not "".
+function publish(g: Gateway, t: string, message: string, c = "", k: Key = root()): Response {
+	const params: [string, string][] = [["Action", "Publish"], ["TopicArn", t], ["Message", message]]
+	if (c != "") {
+		params.push(["MessageAttributes.entry.1.Name", "c"])
+		params.push(["MessageAttributes.entry.1.Value.DataType", "String"])
+		params.push(["MessageAttributes.entry.1.Value.StringValue", c])
+	}
+	return query(g, "sns", params, k)
+}
+
+/// The value of the system attribute name of m.
+function system(m: sqsApi.Message, name: string): string | null {
+	const found = (m.Attributes ?? []).find(a => a[0] == name)
+	return if (found == null) null else found[1]
+}
+
+function gateway(): Gateway { return stack(new Catalog(0, 0)) }
+
+test "SNS delivers to a queue only as the queue's policy allows SNS on behalf of the topic" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t")
+	queue(g, "open", sendable("open", "sns.amazonaws.com", t))
+	queue(g, "closed")
+	queue(g, "elsewhere", sendable("elsewhere", "sns.amazonaws.com", topicArn("another")))
+	queue(g, "raw", sendable("raw", "sns.amazonaws.com", t))
+	queue(g, "red", sendable("red", "sns.amazonaws.com", t))
+	for (const q of ["open", "closed", "elsewhere"]) {
+		subscribe(g, t, queueArn(q))
+	}
+	subscribe(g, t, queueArn("raw"), [["RawMessageDelivery", "true"]])
+	subscribe(g, t, queueArn("red"), [["FilterPolicy", `{"c":["red"]}`]])
+	assert publish(g, t, "hello", "blue").status == 200
+	const [m] = received(g, "open")
+	const e = envelope(m.Body!)
+	assert e.Type == "Notification" && e.TopicArn == t && e.Message == "hello" && e.MessageAttributes != null
+	assert system(m, "SenderId") == "AIDAIT2UOQQY3AUEKVGXU"
+	assert bodies(g, "closed") == [] && bodies(g, "elsewhere") == [] && bodies(g, "red") == []
+	const [raw] = received(g, "raw")
+	assert raw.Body == "hello" && raw.MessageAttributes?.[0][1].StringValue == "blue"
+	assert publish(g, t, "again", "red").status == 200
+	assert bodies(g, "red").map(b => envelope(b).Message) == ["again"]
+	g.close()
+}
+
+test "SNS: a subscription's dead-letter queue takes what its queue refuses, under its own policy" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t")
+	queue(g, "closed")
+	queue(g, "dlq", sendable("dlq", "sns.amazonaws.com", t))
+	subscribe(g, t, queueArn("closed"), [["RedrivePolicy", `{"deadLetterTargetArn":"${queueArn("dlq")}"}`]])
+	assert publish(g, t, "lost").status == 200
+	assert bodies(g, "closed") == [] && bodies(g, "dlq").map(b => envelope(b).Message) == ["lost"]
+	g.close()
+}
+
+test "SNS: a FIFO topic delivers to a FIFO queue in its group" {
+	const g = gateway()
+	const t = topicArn("t.fifo")
+	topic(g, "t.fifo", "", [["FifoTopic", "true"], ["ContentBasedDeduplication", "true"]])
+	queue(g, "q.fifo", sendable("q.fifo", "sns.amazonaws.com", t), `"FifoQueue":"true"`)
+	subscribe(g, t, queueArn("q.fifo"))
+	assert query(g, "sns", [["Action", "Publish"], ["TopicArn", t], ["Message", "m"], ["MessageGroupId", "g1"]]).status
+		== 200
+	const [m] = received(g, "q.fifo")
+	assert envelope(m.Body!).Message == "m" && system(m, "MessageGroupId") == "g1"
+	g.close()
+}
+
+test "SNS: a queue of another account is subscribed pending, and sent the confirmation" {
+	const g = gateway()
+	const t = topicArn("t")
+	topic(g, "t", policy([statement("Allow", `"sns:Subscribe"`, t, `{"AWS":"arn:aws:iam::111111111111:root"}`)]))
+	queue(g, "theirs",
+		policy([statement("Allow", `"sqs:SendMessage"`, queueArn("theirs", other), `{"Service":"sns.amazonaws.com"}`,
+		`{"ArnEquals":{"aws:SourceArn":"${t}"}}`)]), "", otherRoot())
+	assert subscribe(g, t, queueArn("theirs", other)) == "pending confirmation"
+	assert publish(g, t, "early").status == 200
+	const [c] = bodies(g, "theirs", other)
+	const e = json.decode[Confirmation](c)
+	assert e.Type == "SubscriptionConfirmation" && e.TopicArn == t && indexOf(e.SubscribeURL, e.Token) > 0
+	const res = query(g, "sns", [["Action", "ConfirmSubscription"], ["TopicArn", t], ["Token", e.Token]], otherRoot())
+	assert res.status == 200
+	assert publish(g, t, "now").status == 200
+	assert bodies(g, "theirs", other).map(b => envelope(b).Message) == ["now"]
+	// The queue's owner subscribing it itself, as the topic's policy allows, is confirmed at once.
+	queue(g, "mine", "", "", otherRoot())
+	assert subscribe(g, t, queueArn("mine", other), [], otherRoot()) != "pending confirmation"
+	g.close()
+}
+
+test "EventBridge delivers to a queue only as its policy allows the rule: input, InputPath, InputTransformer" {
+	const g = gateway()
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	queue(g, "whole", sendable("whole", "events.amazonaws.com", rule))
+	queue(g, "path", sendable("path", "events.amazonaws.com", rule))
+	queue(g, "shaped", sendable("shaped", "events.amazonaws.com", rule))
+	queue(g, "closed")
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	queue(g, "q.fifo", sendable("q.fifo", "events.amazonaws.com", rule), `"FifoQueue":"true"`)
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	const targets = [`{"Id":"1","Arn":"${queueArn("whole")}"}`,
+		`{"Id":"2","Arn":"${queueArn("path")}","InputPath":"$.detail"}`,
+		`{"Id":"3","Arn":"${queueArn("shaped")}","InputTransformer":{"InputPathsMap":{"k":"$.detail.k"},`
+		+ `"InputTemplate":"\\"got <k>\\""}}`,
+		`{"Id":"4","Arn":"${queueArn("closed")}","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}}`,
+		`{"Id":"5","Arn":"${queueArn("q.fifo")}","SqsParameters":{"MessageGroupId":"g1"}}`]
+	assert call(g, "events", "PutTargets", `{"Rule":"r","Targets":[${targets.join(",")}]}`).status == 200
+	const res = call(g, "events", "PutEvents",
+		`{"Entries":[{"Source":"app","DetailType":"t","Detail":"{\\"k\\":\\"v\\"}"}]}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", `"FailedEntryCount":0`) >= 0
+	const [whole] = bodies(g, "whole")
+	assert indexOf(whole, `"source":"app"`) >= 0 && indexOf(whole, `"detail":{"k":"v"}`) >= 0
+	assert bodies(g, "path") == [`{"k":"v"}`]
+	assert bodies(g, "shaped") == [`"got v"`]
+	assert bodies(g, "closed") == [] && bodies(g, "dlq") == [whole]
+	const [f] = received(g, "q.fifo")
+	assert f.Body == whole && system(f, "MessageGroupId") == "g1"
+	g.close()
+}
+
+test "EventBridge to SNS to SQS, as the topic's policy allows EventBridge; and bus to bus" {
+	const g = gateway()
+	const rule = "arn:aws:events:us-east-1:000000000000:rule/r"
+	const t = topicArn("t")
+	const closed = topicArn("closed")
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, `{"Service":"events.amazonaws.com"}`)]))
+	topic(g, "closed")
+	queue(g, "q", sendable("q", "sns.amazonaws.com", t))
+	queue(g, "dlq", sendable("dlq", "events.amazonaws.com", rule))
+	subscribe(g, t, queueArn("q"))
+	subscribe(g, closed, queueArn("q"))
+	assert call(g, "events", "CreateEventBus", `{"Name":"b"}`).status == 200
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","Targets":[{"Id":"1","Arn":"${t}"},`
+		+ `{"Id":"2","Arn":"${closed}","DeadLetterConfig":{"Arn":"${queueArn("dlq")}"}},`
+		+ `{"Id":"3","Arn":"arn:aws:events:us-east-1:000000000000:event-bus/b"}]}`).status == 200
+	const onB = "arn:aws:events:us-east-1:000000000000:rule/b/r"
+	queue(g, "fromB", sendable("fromB", "events.amazonaws.com", onB))
+	assert call(g, "events", "PutRule",
+		`{"Name":"r","EventBusName":"b","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets",
+		`{"Rule":"r","EventBusName":"b","Targets":[{"Id":"1",` + `"Arn":"${queueArn("fromB")}"}]}`).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	const [n] = bodies(g, "q")
+	assert envelope(n).TopicArn == t && indexOf(envelope(n).Message, `"source":"app"`) >= 0
+	assert bodies(g, "dlq").length == 1 && bodies(g, "fromB").length == 1
+	g.close()
+}
+
+test "a user with no policy is denied by each service, as each words it" {
+	const g = gateway()
+	const k = user(g, "bob")
+	const who = "User: arn:aws:iam::000000000000:user/bob is not authorized to perform:"
+	queue(g, "q")
+	topic(g, "t")
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k",`
+		+ `"AttributeType":"S"}],"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status
+		== 200
+	let res = call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k)
+	assert fails(res, 403, "AccessDenied",
+		`${who} sqs:sendmessage on resource: ${queueArn("q")} because no `
+		+ "identity-based policy allows the sqs:sendmessage action")
+	res = publish(g, topicArn("t"), "x", "", k)
+	assert fails(res, 403, "AuthorizationError",
+		`${who} SNS:Publish on resource: ${topicArn("t")} because no `
+		+ "identity-based policy allows the SNS:Publish action")
+	res = call(g, "dynamodb", "GetItem", `{"TableName":"tab","Key":{"k":{"S":"a"}}}`, k)
+	assert fails(res, 400, "AccessDeniedException",
+		`${who} dynamodb:GetItem on resource: `
+		+ "arn:aws:dynamodb:us-east-1:000000000000:table/tab because no identity-based policy allows the "
+		+ "dynamodb:GetItem action")
+	res = call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`, k)
+	assert fails(res, 400, "AccessDeniedException",
+		`${who} events:PutEvents on resource: `
+		+ "arn:aws:events:us-east-1:000000000000:event-bus/default because no identity-based policy allows the "
+		+ "events:PutEvents action")
+	// Listings name what AWS names.
+	assert fails(call(g, "dynamodb", "ListTables", "{}", k), 400, "AccessDeniedException",
+		"on resource: arn:aws:dynamodb:us-east-1:000000000000:table/*")
+	assert fails(call(g, "events", "ListRules", "{}", k), 400, "AccessDeniedException",
+		"on resource: arn:aws:events:us-east-1:000000000000:rule/*")
+	// A queue that does not exist is said so first.
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("none")}","MessageBody":"x"}`, k), 400,
+		"QueueDoesNotExist")
+	g.close()
+}
+
+test "an identity-based policy for one queue, table, topic and bus allows there only" {
+	const g = gateway()
+	const k = user(g, "bob",
+		policy([statement("Allow", `"sqs:*"`, queueArn("mine")), statement("Allow", `"sns:Publish"`, topicArn("mine")),
+		statement("Allow", `["dynamodb:PutItem","dynamodb:GetItem"]`,
+		"arn:aws:dynamodb:us-east-1:000000000000:table/mine"),
+		statement("Allow", `"dynamodb:Query"`, "arn:aws:dynamodb:us-east-1:000000000000:table/mine/index/*"),
+		statement("Allow", `"events:PutEvents"`, "arn:aws:events:us-east-1:000000000000:event-bus/mine")]))
+	for (const n of ["mine", "theirs"]) {
+		queue(g, n)
+		topic(g, n)
+		assert call(g, "dynamodb", "CreateTable",
+			`{"TableName":"${n}","AttributeDefinitions":[{"AttributeName":"k",`
+			+ `"AttributeType":"S"},{"AttributeName":"x","AttributeType":"S"}],"KeySchema":[{"AttributeName":"k",`
+			+ `"KeyType":"HASH"}],"GlobalSecondaryIndexes":[{"IndexName":"byx","KeySchema":[{"AttributeName":"x",`
+			+ `"KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}],"BillingMode":"PAY_PER_REQUEST"}`).status
+			== 200
+		assert call(g, "events", "CreateEventBus", `{"Name":"${n}"}`).status == 200
+	}
+	assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("mine")}","MessageBody":"x"}`, k).status == 200
+	assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("theirs")}","MessageBody":"x"}`, k).status == 403
+	assert publish(g, topicArn("mine"), "x", "", k).status == 200
+	assert publish(g, topicArn("theirs"), "x", "", k).status == 403
+	assert call(g, "dynamodb", "PutItem", `{"TableName":"mine","Item":{"k":{"S":"a"},"x":{"S":"b"}}}`, k).status == 200
+	assert call(g, "dynamodb", "GetItem", `{"TableName":"mine","Key":{"k":{"S":"a"}}}`, k).status == 200
+	assert call(g, "dynamodb", "GetItem", `{"TableName":"theirs","Key":{"k":{"S":"a"}}}`, k).status == 400
+	// A query of an index is authorized on the index alone.
+	assert call(g, "dynamodb", "Query",
+		`{"TableName":"mine","IndexName":"byx","KeyConditionExpression":"x = :x",`
+		+ `"ExpressionAttributeValues":{":x":{"S":"b"}}}`, k).status == 200
+	assert call(g, "dynamodb", "Query",
+		`{"TableName":"mine","KeyConditionExpression":"k = :k",` + `"ExpressionAttributeValues":{":k":{"S":"a"}}}`,
+		k).status == 400
+	const entry = (bus: string) => `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}","EventBusName":"${bus}"}]}`
+	assert call(g, "events", "PutEvents", entry("mine"), k).status == 200
+	assert call(g, "events", "PutEvents", entry("theirs"), k).status == 400
+	g.close()
+}
+
+test "a queue's or topic's policy alone allows a user or role session of its account; another account's only with its own" {
+	const g = gateway()
+	const t = topicArn("t")
+	const q = queueArn("q")
+	const named = `{"AWS":["arn:aws:iam::000000000000:user/bob","arn:aws:iam::000000000000:role/r",`
+		+ `"arn:aws:iam::111111111111:user/eve","arn:aws:iam::111111111111:user/mallory"]}`
+	queue(g, "q", policy([statement("Allow", `"sqs:SendMessage"`, q, named)]))
+	topic(g, "t", policy([statement("Allow", `"sns:Publish"`, t, named)]))
+	const bob = user(g, "bob", policy([statement("Allow", `"sts:AssumeRole"`, "*")]))
+	const trust = policy([`{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},`
+		+ `"Action":"sts:AssumeRole"}`])
+	assert query(g, "iam", [["Action", "CreateRole"], ["RoleName", "r"], ["AssumeRolePolicyDocument", trust]]).status
+		== 200
+	let res = query(g, "sts",
+		[["Action", "AssumeRole"], ["RoleArn", "arn:aws:iam::000000000000:role/r"], ["RoleSessionName", "session"]],
+		bob)
+	assert res.status == 200
+	const session = { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")!,
+		token: text(res, "SessionToken")! }
+	const eve = user(g, "eve", policy([statement("Allow", `["sqs:SendMessage","sns:Publish"]`, "*")]), otherRoot())
+	const mallory = user(g, "mallory", "", otherRoot())
+	for (const k of [bob, session, eve]) {
+		assert call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k).status == 200
+		assert publish(g, t, "x", "", k).status == 200
+	}
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, mallory), 403,
+		"AccessDenied")
+	assert fails(publish(g, t, "x", "", mallory), 403, "AuthorizationError")
+	// Of another account, a queue or topic is found without making that account's state.
+	assert call(g, "sqs", "GetQueueUrl", `{"QueueName":"q","QueueOwnerAWSAccountId":"222222222222"}`).status == 400
+	assert publish(g, topicArn("t", "222222222222"), "x").status == 403
+	assert g.trees.get("222222222222/us-east-1") == null
+	g.close()
+}
+
+test "an explicit deny in a resource policy binds the owner's users" {
+	const g = gateway()
+	const k = user(g, "bob", policy([statement("Allow", `["sqs:*","sns:*"]`, "*")]))
+	const deny = `{"AWS":"arn:aws:iam::000000000000:user/bob"}`
+	queue(g, "q", policy([statement("Deny", `"sqs:SendMessage"`, queueArn("q"), deny)]))
+	topic(g, "t", policy([statement("Deny", `"sns:Publish"`, topicArn("t"), deny)]))
+	assert fails(call(g, "sqs", "SendMessage", `{"QueueUrl":"${queueUrl("q")}","MessageBody":"x"}`, k), 403,
+		"AccessDenied",
+		"User: arn:aws:iam::000000000000:user/bob is not authorized to perform: sqs:sendmessage on "
+		+ `resource: ${queueArn("q")} with an explicit deny in a resource-based policy`)
+	assert fails(publish(g, topicArn("t"), "x", "", k), 403, "AuthorizationError")
+	assert call(g, "sqs", "ReceiveMessage", `{"QueueUrl":"${queueUrl("q")}"}`, k).status == 200
+	g.close()
+}
+
+test "condition keys: sns:Protocol and sns:Endpoint, dynamodb:LeadingKeys and dynamodb:Attributes, events:source" {
+	const g = gateway()
+	const k = user(g, "bob",
+		policy([statement("Allow", `"sns:Subscribe"`, "*", "",
+		`{"StringEquals":{"sns:Protocol":"sqs","sns:Endpoint":"${queueArn("q")}"}}`),
+		statement("Allow", `["dynamodb:GetItem","dynamodb:PutItem"]`, "*", "",
+		`{"ForAllValues:StringEquals":{"dynamodb:LeadingKeys":["bob"],"dynamodb:Attributes":["k","v"]}}`),
+		statement("Allow", `"events:PutEvents"`, "*", "", `{"StringEquals":{"events:source":"app"}}`)]))
+	topic(g, "t")
+	queue(g, "q")
+	queue(g, "other")
+	subscribe(g, topicArn("t"), queueArn("q"), [], k)
+	const res = query(g, "sns",
+		[["Action", "Subscribe"], ["TopicArn", topicArn("t")], ["Protocol", "sqs"], ["Endpoint", queueArn("other")]], k)
+	assert fails(res, 403, "AuthorizationError")
+	assert call(g, "dynamodb", "CreateTable",
+		`{"TableName":"tab","AttributeDefinitions":[{"AttributeName":"k",`
+		+ `"AttributeType":"S"}],"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`).status
+		== 200
+	const put = (key: string, attribute: string) => call(g, "dynamodb", "PutItem",
+		`{"TableName":"tab","Item":{"k":{"S":"${key}"},"${attribute}":{"S":"x"}}}`, k)
+	assert put("bob", "v").status == 200
+	assert put("eve", "v").status == 400
+	assert put("bob", "secret").status == 400
+	const entry = (source: string) => `{"Entries":[{"Source":"${source}","DetailType":"t","Detail":"{}"}]}`
+	assert call(g, "events", "PutEvents", entry("app"), k).status == 200
+	assert call(g, "events", "PutEvents", entry("other"), k).status == 400
+	g.close()
+}
