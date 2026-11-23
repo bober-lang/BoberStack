@@ -1,0 +1,104 @@
+//! AWS Signature Version 2 in a presigned URL's query (AWSAccessKeyId, Expires, Signature), as S3 still takes it.
+
+import { Fault } from "../fault"
+import { Authorization, iso, mismatch } from "./sigv4"
+import { endsWith, lastIndexOf, sortBy, startsWith } from "std/algo"
+import { CryptoError } from "std/crypto/error"
+import { equal, sha1 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import { Request } from "std/http"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { second } from "std/time"
+import { escape, unescape } from "std/url"
+
+/// The query parameters of S3's that its resource signs.
+const subresources = ["acl", "cors", "delete", "lifecycle", "location", "logging", "notification", "partNumber",
+	"policy", "requestPayment", "response-cache-control", "response-content-disposition", "response-content-encoding",
+	"response-content-language", "response-content-type", "response-expires", "restore", "tagging", "torrent",
+	"uploadId", "uploads", "versionId", "versioning", "versions", "website"]
+
+/// The SigV2 authorization req's query bears, null if none; throws if it is incomplete, as S3 words it.
+export function presigned(req: Request): Authorization | null throws Fault {
+	const q = req.url.query
+	if (!q.has("AWSAccessKeyId")) {
+		return null
+	}
+	if (!q.has("Signature") || !q.has("Expires")) {
+		throw new Fault(403, "AccessDenied",
+			"Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters")
+	}
+	const a = { ...new Authorization(), version: 2, accessKey: q.get("AWSAccessKeyId")!, region: "us-east-1",
+		service: "s3", signature: replace(q.get("Signature")!, " ", "+") }
+	try {
+		a.expires = parseInt[i64](q.get("Expires")!)
+	} catch (e: ParseError) {
+		throw new Fault(403, "AccessDenied", `Invalid date (should be seconds since epoch): ${q.get("Expires")}`)
+	}
+	return a
+}
+
+/// Why req does not bear auth's SigV2 signature by secret at the instant now, as S3 words it; null if it does.
+export function verify(req: Request, auth: Authorization, secret: string, now: i64): Fault | null throws CryptoError {
+	if (now > auth.expires * second) {
+		const members = `<Expires>${iso(auth.expires * second)}</Expires><ServerTime>${iso(now)}</ServerTime>`
+		return new Fault(403, "AccessDenied", "Request has expired", true, members)
+	}
+	if (!equal(signature(req, auth, secret), auth.signature)) {
+		return mismatch(auth, stringToSign(req, auth), [])
+	}
+	return null
+}
+
+export function signature(req: Request, auth: Authorization, secret: string): string throws CryptoError {
+	return base64.encode(hmacSha1(secret, stringToSign(req, auth)))
+}
+
+/// What SigV2 signs of req: its method, Content-MD5, Content-Type and Expires, its x-amz-* headers in order, with
+/// their values joined, and its resource: the bucket a host names, its path, and the subresources of its query.
+export function stringToSign(req: Request, auth: Authorization): string {
+	const amz: [string, string][] = []
+	for (const [k, v] of req.headers.entries) {
+		const name = lower(k)
+		if (startsWith(name, "x-amz-") && !amz.some(e => e[0] == name)) {
+			amz.push([name, req.headers.all(name).map(trim).join(",")])
+		}
+	}
+	sortBy(amz, (a, b) => a[0] < b[0])
+	const raw = if (req.url.path == "") "/" else req.url.path
+	const path = split(raw, "/").map(s => escape(unescape(s, "path"), "component")).join("/")
+	const named = hosted(req)
+	const sub = req.url.query.entries.filter(e => subresources.includes(e[0]))
+	sortBy(sub, (a, b) => a[0] < b[0])
+	const query = sub.map(e => if (e[1] == "") e[0] else `${e[0]}=${e[1]}`).join("&")
+	return [req.method, req.headers.get("content-md5") ?? "", req.headers.get("content-type") ?? "", `${auth.expires}`,
+		...amz.map(e => `${e[0]}:${e[1]}`),
+		(if (named == "") "" else `/${named}`) + path + (if (query == "") "" else `?${query}`)].join("\n")
+}
+
+/// The bucket a virtual-hosted request to S3 names in its host, "" if none.
+export function hosted(req: Request): string {
+	const host = lower(split(req.headers.get("host") ?? req.url.host, ":")[0])
+	let bucket = ""
+	const at = lastIndexOf(host, ".s3.")
+	const dash = lastIndexOf(host, ".s3-")
+	if (at > 0 || dash > 0) {
+		bucket = host.slice(0, if (at > dash) at else dash)
+	} else if (endsWith(host, ".localhost.localstack.cloud")) {
+		bucket = host.slice(0, host.length - ".localhost.localstack.cloud".length)
+	} else if (endsWith(host, ".localhost")) {
+		bucket = host.slice(0, host.length - ".localhost".length)
+	}
+	return if (bucket == "s3" || startsWith(bucket, "s3.")) "" else bucket
+}
+
+export function hmacSha1(key: string, message: string): string throws CryptoError {
+	const k = if (key.length > 64) sha1(key) else key
+	const inner: u8[] = []
+	const outer: u8[] = []
+	for (const i of 0 ... 63) {
+		const b = if (i < k.length) k[i] else 0 as u8
+		inner.push(b ^ 0x36)
+		outer.push(b ^ 0x5c)
+	}
+	return sha1(fromBytes(outer) + sha1(fromBytes(inner) + message))
+}

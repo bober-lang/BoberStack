@@ -177,6 +177,21 @@ export function signature(req: Request, body: string, auth: Authorization, secre
 		stringToSign(req, auth, canonicalRequest(req, hash ?? payload(req, body, auth), auth))))
 }
 
+/// Signs req as an SDK does: over its host, its Content-Type and X-Amz-Target if set, X-Amz-Date and the token.
+export function sign(req: Request, body: string, service: string, region: string, accessKey: string, secret: string,
+	token: string, stamp: string) throws CryptoError {
+	req.headers.set("host", `${req.url.host}${if (req.url.port == null) "" else `:${req.url.port}`}`)
+	req.headers.set("x-amz-date", stamp)
+	if (token != "") {
+		req.headers.set("x-amz-security-token", token)
+	}
+	const signed = ["content-type", "host", "x-amz-date", "x-amz-security-token",
+		"x-amz-target"].filter(h => req.headers.has(h)).join(";")
+	const header = `AWS4-HMAC-SHA256 Credential=${accessKey}/${stamp.slice(0, 8)}/${region}/${service}/aws4_request, `
+		+ `SignedHeaders=${signed}, Signature=`
+	req.headers.set("authorization", header + signature(req, body, parse(header + "0")!, secret))
+}
+
 function stringToSign(req: Request, auth: Authorization, canonical: string): string throws CryptoError {
 	return `AWS4-HMAC-SHA256\n${stampOf(req, auth)}\n${scope(auth)}\n${hex.encode(sha256(canonical))}`
 }

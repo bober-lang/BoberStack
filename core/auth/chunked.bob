@@ -1,0 +1,106 @@
+//! The aws-chunked encoding that S3's clients stream a body in: chunks of hex sizes, each signed in a chain from the
+//! request's signature or none, then trailing headers, as a checksum, signed or not.
+
+import { Fault } from "../fault"
+import { Authorization, key, scope, stampOf } from "./sigv4"
+import { endsWith, indexOf, startsWith } from "std/algo"
+import { CryptoError } from "std/crypto/error"
+import { equal, hmacSha256, sha256 } from "std/crypto/hash"
+import * as hex from "std/encoding/hex"
+import { Request } from "std/http"
+import { ParseError, lower, parseInt, split, trim } from "std/string"
+
+export function chunked(req: Request): bool {
+	return startsWith(req.headers.get("x-amz-content-sha256") ?? "", "STREAMING-")
+}
+
+/// The bytes req's aws-chunked body stands for; its trailing headers become req's headers, and aws-chunked leaves its
+/// Content-Encoding. Signatures are checked unless secret is null. Throws as S3 answers a short or mismatched body.
+export function decode(req: Request, body: string, auth: Authorization,
+	secret: string | null): string throws Fault | CryptoError {
+	const mode = req.headers.get("x-amz-content-sha256") ?? ""
+	const signed = startsWith(mode, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	const k = if (signed && secret != null) key(auth, secret!) else null
+	const head = `${stampOf(req, auth)}\n${scope(auth)}\n`
+	const empty = hex.encode(sha256(""))
+	const cut = new Fault(400, "IncompleteBody", "The request body terminated unexpectedly")
+	let previous = auth.signature
+	const check = (kind: string, hash: string, given: string) => {
+		if (k != null) {
+			const sig = hex.encode(hmacSha256(k!, `AWS4-HMAC-SHA256-${kind}\n${head}${previous}\n${hash}`))
+			if (!equal(sig, given)) {
+				throw new Fault(403, "SignatureDoesNotMatch",
+					"The request signature we calculated does not match the "
+					+ "signature you provided. Check your key and signing method.")
+			}
+			previous = sig
+		}
+	}
+	const pieces: string[] = []
+	let at = 0
+	while (true) {
+		const end = indexOf(body, "\r\n", at)
+		if (end < 0) {
+			throw cut
+		}
+		const line = split(body.slice(at, end), ";")
+		let size = 0
+		try {
+			size = parseInt(line[0], 16)
+		} catch (e: ParseError) {
+			throw cut
+		}
+		const given = if (line.length > 1 && startsWith(line[1], "chunk-signature=")) line[1].slice(16, line[1].length)
+			else ""
+		at = end + 2
+		if (size < 0 || at + size > body.length || size > 0 && body.slice(at + size, at + size + 2) != "\r\n") {
+			throw cut
+		}
+		const data = body.slice(at, at + size)
+		check("PAYLOAD", `${empty}\n${hex.encode(sha256(data))}`, given)
+		if (size == 0) {
+			break
+		}
+		pieces.push(data)
+		at += size + 2
+	}
+	let trailers = ""
+	let trailerSignature = ""
+	while (true) {
+		const end = indexOf(body, "\r\n", at)
+		if (end < 0) {
+			throw cut
+		}
+		const line = body.slice(at, end)
+		at = end + 2
+		if (line == "") {
+			break
+		}
+		const colon = indexOf(line, ":")
+		const name = lower(trim(line.slice(0, if (colon < 0) 0 else colon)))
+		const v = trim(line.slice(colon + 1, line.length))
+		if (name == "x-amz-trailer-signature") {
+			trailerSignature = v
+		} else {
+			trailers += `${name}:${v}\n`
+			req.headers.set(name, v)
+		}
+	}
+	if (endsWith(mode, "-TRAILER") && signed) {
+		check("TRAILER", hex.encode(sha256(trailers)), trailerSignature)
+	}
+	const decoded = pieces.join("")
+	const declared = req.headers.get("x-amz-decoded-content-length")
+	if (declared != null && declared != `${decoded.length}`) {
+		throw new Fault(400, "IncompleteBody",
+			"You did not provide the number of bytes specified by the X-Amz-Decoded-Content-Length HTTP header")
+	}
+	const encodings = split(req.headers.get("content-encoding") ?? "",
+		",").map(trim).filter(e => e != "" && e != "aws-chunked")
+	if (encodings.length == 0) {
+		req.headers.delete("content-encoding")
+	} else {
+		req.headers.set("content-encoding", encodings.join(", "))
+	}
+	return decoded
+}

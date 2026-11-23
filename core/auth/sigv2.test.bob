@@ -1,0 +1,58 @@
+import { Request } from "std/http"
+import { Fault } from "../fault"
+import * as hex from "std/encoding/hex"
+import { second } from "std/time"
+import { hmacSha1, presigned, signature, stringToSign, verify } from "./sigv2"
+import { indexOf } from "std/algo"
+
+// The case is S3's documentation's of query string request authentication.
+const secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+function request(url: string): Request {
+	const req = new Request("GET", url)
+	req.headers.set("host", "johnsmith.s3.amazonaws.com")
+	return req
+}
+
+function times(b: u8, n: i32): string { return fromBytes(new u8[](n).map(x => b)) }
+
+test "HMAC-SHA1, as RFC 2202's first and long-keyed cases" {
+	assert hex.encode(hmacSha1(times(0x0b, 20), "Hi There")) == "b617318655057264e28bc0b6fb378c8ef146be00"
+	const long = "Test Using Larger Than Block-Size Key - Hash Key First"
+	assert hex.encode(hmacSha1(times(0xaa, 80), long)) == "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+}
+
+test "a presigned URL's string to sign names the host's bucket, and its signature is S3's" {
+	const req = request("http://johnsmith.s3.amazonaws.com/photos/puppy.jpg?AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE"
+		+ "&Expires=1175139620&Signature=NpgCjnDzrM%2BWFzoENXmpNDUsSn8%3D")
+	const a = presigned(req)!
+	assert a.version == 2 && a.accessKey == "AKIAIOSFODNN7EXAMPLE" && a.expires == 1175139620
+	assert stringToSign(req, a) == "GET\n\n\n1175139620\n/johnsmith/photos/puppy.jpg"
+	assert signature(req, a, secret) == a.signature
+	assert verify(req, a, secret, 1175139600 * second) == null
+	const wrong = verify(req, a, "other", 1175139600 * second)
+	assert wrong instanceof Fault && (wrong as Fault).code == "SignatureDoesNotMatch"
+	assert indexOf((wrong as Fault).members,
+		"<StringToSign>GET\n\n\n1175139620\n/johnsmith/photos/puppy.jpg</StringToSign>") > 0
+	const expired = verify(req, a, secret, 1175139621 * second)
+	assert expired instanceof Fault && (expired as Fault).code == "AccessDenied"
+}
+
+test "the resource keeps the subresources of the query, sorted, and x-amz-* headers are signed" {
+	const req = new Request("PUT",
+		"http://localhost/b/k?uploadId=u&partNumber=2&AWSAccessKeyId=A&Expires=9&Signature=s")
+	req.headers.set("X-Amz-Meta-B", "2")
+	req.headers.set("x-amz-acl", "private")
+	assert stringToSign(req, presigned(req)!)
+		== "PUT\n\n\n9\nx-amz-acl:private\nx-amz-meta-b:2\n/b/k?partNumber=2&uploadId=u"
+}
+
+test "a presigned URL without its Signature is AccessDenied, one with none of SigV2 is not one" {
+	try {
+		presigned(new Request("GET", "http://localhost/b/k?AWSAccessKeyId=A&Expires=9"))
+		assert false
+	} catch (f: Fault) {
+		assert f.status == 403 && f.code == "AccessDenied"
+	}
+	assert presigned(new Request("GET", "http://localhost/b/k")) == null
+}
