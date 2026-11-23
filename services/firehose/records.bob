@@ -1,0 +1,50 @@
+//! Firehose's state in an account's regional tree: its delivery streams by name.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+
+export class Stream {
+	name = ""
+	kind = "DirectPut"
+	/// In ns, as are all times here; updated is null until a change after its creation.
+	created: i64 = 0
+	updated: i64 | null = null
+	/// Its configuration's version, which each change to a destination takes the next of.
+	version = 1
+	tags: [string, string][] = []
+	/// The Kinesis stream it reads, and the role it reads as, of a KinesisStreamAsSource; "" of a DirectPut.
+	source = ""
+	sourceRole = ""
+	/// The JSON of the configuration of an MSKAsSource or DatabaseAsSource, of ./shapes; "" of any other.
+	sourceConfig = ""
+	encryption = "DISABLED"
+	keyType: string | null = null
+	keyArn: string | null = null
+	destinations: Destination[] = []
+}
+
+/// An S3 destination, as an extended one is; or one of another kind, as its configuration's JSON, of ./shapes.
+export class Destination {
+	id = ""
+	kind = "S3"
+	config = ""
+	role = ""
+	bucket = ""
+	prefix: string | null = null
+	errorPrefix: string | null = null
+	/// The buffer's size in MiB and its interval in seconds.
+	size = 5
+	interval = 300
+	compression = "UNCOMPRESSED"
+	key: string | null = null
+	logging = false
+	logGroup: string | null = null
+	logStream: string | null = null
+	/// Of an extended one: whether a backup is made, the objects' extension and time zone.
+	backup = "Disabled"
+	extension: string | null = null
+	zone: string | null = null
+}
+
+export function streams(s: Store): Table[Stream] { return new Table[Stream](s, "firehose/streams") }
+export function save(t: Table[Stream], s: Stream) throws Fault { t.put(s.name, s) }

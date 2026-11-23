@@ -1,0 +1,51 @@
+//! ACM's state in an account's regional tree: its certificates by id, and the account's configuration.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+
+export class Domain {
+	name = ""
+	/// The domain its validation is sent to, by email, or the name.
+	validation = ""
+	record = ""
+	value = ""
+}
+
+export class Certificate {
+	id = ""
+	arn = ""
+	type = ""
+	/// Its subject's common name, else the first of its names.
+	domain: string | null = null
+	domains: Domain[] = []
+	method = ""
+	keyAlgorithm = ""
+	signatureAlgorithm = ""
+	serial = ""
+	subject = ""
+	issuer = ""
+	issuedBy = ""
+	token: string | null = null
+	transparency = "ENABLED"
+	exportable = "DISABLED"
+	tags: [string, string][] = []
+	created: i64 = 0
+	/// When it was imported last, 0 if it was requested.
+	imported: i64 = 0
+	notBefore: i64 = 0
+	notAfter: i64 = 0
+	/// The certificate's PEM: as imported, or self-signed for a request; an imported one's chain and key as given.
+	body = ""
+	chain: string | null = null
+	key = ""
+}
+
+/// The account's configuration: the days before a certificate expires that EventBridge is told of it.
+export class Account {
+	daysBeforeExpiry: i32 = 45
+}
+
+export function certificates(s: Store): Table[Certificate] { return new Table[Certificate](s, "acm/certificates") }
+/// The account's configuration in its regional tree, by "".
+export function accounts(s: Store): Table[Account] { return new Table[Account](s, "acm/account") }
+export function save(t: Table[Certificate], c: Certificate) throws Fault { t.put(c.id, c) }

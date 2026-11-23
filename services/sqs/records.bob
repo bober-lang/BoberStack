@@ -1,0 +1,123 @@
+//! SQS's state in an account's regional tree. Messages are keyed by queue, the instant they are next due and their
+//! order, so that a receive reads a queue's head.
+
+import { Store, Table } from "../../core/state/store"
+
+export class Queue {
+	name = ""
+	created: i64 = 0
+	modified: i64 = 0
+	delay = 0
+	maxSize = 1048576
+	retention = 345600
+	wait = 0
+	visibility = 30
+	policy: string | null = null
+	redrive: string | null = null
+	deadLetter = ""
+	maxReceives = 0
+	redriveAllow: string | null = null
+	fifo = false
+	contentDeduplication = false
+	deduplicationScope = "queue"
+	throughputLimit = "perQueue"
+	kmsKey: string | null = null
+	kmsReuse = 300
+	sse = true
+	/// The latest data key the queue's KMS key sealed, in base64, "" for none.
+	dataKey = ""
+	tags: [string, string][] = []
+	next: i64 = 1
+	purged: i64 | null = null
+}
+
+/// Its value is a string's or, of a Binary type, the bytes in base64.
+export class Attribute {
+	type = ""
+	value = ""
+}
+
+export class Message {
+	id = ""
+	body = ""
+	attributes: [string, Attribute][] = []
+	/// AWSTraceHeader, the one system attribute a sender sets.
+	trace: string | null = null
+	sender = ""
+	sent: i64 = 0
+	firstReceived: i64 = 0
+	receives = 0
+	visible: i64 = 0
+	receipt = ""
+	order: i64 = 0
+	due: i64 = 0
+	group: string | null = null
+	deduplication: string | null = null
+	sequence: string | null = null
+	source: string | null = null
+}
+
+export class Place {
+	key = ""
+}
+
+export class Seen {
+	id = ""
+	sequence: string | null = null
+	at: i64 = 0
+}
+
+/// A FIFO receive of a ReceiveRequestAttemptId.
+export class Attempt {
+	at: i64 = 0
+	ids: string[] = []
+	receipts: string[] = []
+	until: i64 = 0
+}
+
+/// A message move task, done when started.
+export class Task {
+	id = ""
+	started: i64 = 0
+	destination: string | null = null
+	rate: i32 | null = null
+	moved: i64 = 0
+	toMove: i64 = 0
+}
+
+export class Tables {
+	queues: Table[Queue]
+	/// By the queue's name, the instant it was deleted, as at.
+	deleted: Table[Seen]
+	/// By position: the queue's name, the instant it is due as 19 digits and its order as 19.
+	messages: Table[Message]
+	places: Table[Place]
+	/// By within(queue, scope), the scope the deduplication id, after its group's and a NUL if a queue's scope is its
+	/// groups'.
+	seen: Table[Seen]
+	attempts: Table[Attempt]
+	/// By within(source queue, the instant started as 19 digits, a NUL and the id).
+	tasks: Table[Task]
+
+	constructor(s: Store) {
+		this.queues = new Table[Queue](s, "sqs/queues")
+		this.deleted = new Table[Seen](s, "sqs/deleted")
+		this.messages = new Table[Message](s, "sqs/messages")
+		this.places = new Table[Place](s, "sqs/places")
+		this.seen = new Table[Seen](s, "sqs/seen")
+		this.attempts = new Table[Attempt](s, "sqs/attempts")
+		this.tasks = new Table[Task](s, "sqs/tasks")
+	}
+}
+
+export function within(owner: string, name: string): string { return `${owner}\x00${name}` }
+
+export function position(queue: string, due: i64, order: i64): string {
+	return within(queue, `${digits(due)}\x00${digits(order)}`)
+}
+
+/// n ≥ 0 as 19 digits, so that keys sort by it.
+export function digits(n: i64): string {
+	const s = `${n}`
+	return "0000000000000000000".slice(0, 19 - s.length) + s
+}
