@@ -48,6 +48,7 @@ import * as eventsApi from "../events/api"
 import * as kinesisApi from "../kinesis/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
+import { actAs, passRole } from "../sts/sts"
 import { Fault } from "../../core/fault"
 import * as json from "../../core/protocol/json"
 import { Caller, requestTags, resourceTags } from "../../core/service"
@@ -1046,13 +1047,15 @@ class Host {
 		}
 		const callback = ".waitForTaskToken"
 		const waits = endsWith(resource, callback)
-		const c = this.caller.internal(principal, this.arn, [])
-		c.source = ""
-		const role = split(this.e.role, "/")
-		c.arn = `arn:aws:sts::${this.caller.account}:assumed-role/${role[role.length - 1]}/${this.e.name}`
-		c.userId = `${role[role.length - 1]}:${this.e.name}`
+		let c: Caller | null = null
 		try {
-			const out = this.handler.task(c,
+			c = actAs(this.caller, principal, this.e.role, this.arn, [], this.e.name)
+		} catch (f: Fault) {} // no session, as of a role not there
+		if (c == null) {
+			throw new asl.Failure("States.TaskFailed", untrusted)
+		}
+		try {
+			const out = this.handler.task(c!,
 				if (waits) resource.slice(0, resource.length - callback.length) else resource, parameters)
 			if (waits) {
 				this.e.waiting = n
@@ -1157,8 +1160,8 @@ function token(arn: string, n: i32, secret: string): string {
 	return base64.encode(`${arn}#${n}#${secret}`, "url", "raw")
 }
 
-/// Throws unless role is a role's ARN of the caller's account that the caller may pass to Step Functions, and the
-/// caller may perform actions on resource, of the context keys context.
+/// Throws unless role is a role's ARN of the caller's account that the caller may pass to Step Functions and that
+/// trusts it, and the caller may perform actions on resource, of the context keys context.
 function passed(caller: Caller, role: string, resource: string, actions: string[],
 	context: [string, string | string[]][]) throws Fault {
 	const parts = split(role, ":")
@@ -1171,9 +1174,14 @@ function passed(caller: Caller, role: string, resource: string, actions: string[
 	}
 	caller.actions = actions
 	caller.allow(resource, null, context)
-	caller.actions = ["iam:PassRole"]
-	caller.allow(role, null, [["iam:PassedToService", principal]])
+	passRole(caller, role, principal)
+	if (actAs(caller, principal, role, resource, [], "") == null) {
+		throw new Fault(400, "AccessDeniedException", untrusted)
+	}
 }
+
+const untrusted = "Neither the global service principal states.amazonaws.com, nor the regional one is authorized to "
+	+ "assume the provided role."
 
 /// Throws InvalidName unless name is a name Step Functions takes: of 1 to 80 characters, none of them white space,
 /// brackets, wildcards, special characters or control characters.

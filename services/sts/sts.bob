@@ -123,6 +123,50 @@ export class Handler {
 	}
 }
 
+/// The session that the service of principal, as logs.amazonaws.com, acts as for caller in the role of the ARN role,
+/// on behalf of its resource of the ARN source, to perform actions, named session: as AssumeRole gives one, whose
+/// policies are the role's; null if the role is not there or its trust policy does not let the service assume it, with
+/// aws:SourceArn and aws:SourceAccount.
+export function actAs(caller: Caller, principal: string, role: string, source: string, actions: string[],
+	session: string): Caller | null throws Fault {
+	if (!startsWith(role, "arn:aws:iam::") || indexOf(role, ":role/") != 25) {
+		return null
+	}
+	const account = role.slice(13, 25)
+	const r = new Tables(caller.tree(account)).roles.get(key(role.slice(lastIndexOf(role, "/") + 1, role.length)))
+	if (r == null || arn(account, "role", r.path, r.name) != role) {
+		return null
+	}
+	try {
+		caller.internal(principal, source, ["sts:AssumeRole"]).allow(role, r.trust)
+	} catch (f: Fault) {
+		return null
+	}
+	const c = caller.internal(principal, source, actions)
+	c.account = account
+	c.arn = `arn:aws:sts::${account}:assumed-role/${r.name}/${session}`
+	c.userId = `${r.id}:${session}`
+	c.source = ""
+	return c
+}
+
+/// Throws the caller's access denied unless it may pass the role of the ARN role to the service of principal, as
+/// iam:PassRole with iam:PassedToService.
+export function passRole(caller: Caller, role: string, principal: string) throws Fault {
+	const actions = caller.actions
+	caller.actions = ["iam:PassRole"]
+	let denied: Fault | null = null
+	try {
+		caller.allow(role, null, [["iam:PassedToService", principal]])
+	} catch (f: Fault) {
+		denied = f
+	}
+	caller.actions = actions
+	if (denied != null) {
+		throw denied!
+	}
+}
+
 /// Adds to context the keys of the session tags requested: aws:RequestTag/<key> and aws:TagKeys.
 function requested(context: Context, tags: Tag[]) {
 	for (const t of tags) {

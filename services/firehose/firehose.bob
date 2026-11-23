@@ -4,9 +4,10 @@
 //! - Nothing runs between requests, nor is anything buffered. A delivery stream is ACTIVE at once and gone at once
 //!   when deleted, where AWS takes seconds in CREATING or DELETING; its encryption is ENABLED or DISABLED at once.
 //!   Each PutRecord and PutRecordBatch writes its records' data, concatenated, as one S3 object within the request,
-//!   whatever the buffering hints, by calling the S3 handler directly as a session of the destination's role, whose
-//!   trust policy is not consulted; an object that S3 refuses is lost, unreported, as AWS's failed deliveries are but
-//!   for their retries and their error logs, whose wording AWS does not document, so none is written. A
+//!   whatever the buffering hints, by calling the S3 handler directly as a session of the destination's role, which
+//!   must trust firehose.amazonaws.com; an object that S3 or the role refuses is lost, unreported, as AWS's failed
+//!   deliveries are but for their retries and their error logs, whose wording AWS does not document, so none is
+//!   written. A
 //!   KinesisStreamAsSource, MSKAsSource or DatabaseAsSource stream is stored, but nothing reads its source.
 //! - Only S3 destinations deliver. The others, Redshift, OpenSearch, Elasticsearch, Splunk, HTTP endpoints,
 //!   Snowflake and Iceberg, are stored, updated and described as AWS shapes them, a VPC's id empty and secrets left
@@ -24,6 +25,7 @@ import { Fault } from "../../core/fault"
 import * as protocol from "../../core/protocol/json"
 import { Caller, requestTags, resourceTags } from "../../core/service"
 import { keyArn } from "../kms/kms"
+import { actAs, passRole } from "../sts/sts"
 import * as s3Api from "../s3/api"
 import * as s3 from "../s3/s3"
 import * as api from "./api"
@@ -99,10 +101,10 @@ export class Handler {
 		caller.actions = passed
 		if (passed.length > 0) {
 			if (source != null) {
-				caller.allow(source!.RoleARN)
+				passRole(caller, source!.RoleARN, "firehose.amazonaws.com")
 			}
 			if (d.role != "") {
-				caller.allow(d.role)
+				passRole(caller, d.role, "firehose.amazonaws.com")
 			}
 		}
 		const db = streams(caller.regional())
@@ -230,7 +232,7 @@ export class Handler {
 		prefixes(d)
 		if (passed.length > 0 && role != null) {
 			caller.actions = passed
-			caller.allow(role!)
+			passRole(caller, role!, "firehose.amazonaws.com")
 		}
 		s.version += 1
 		s.updated = now()
@@ -597,18 +599,13 @@ function described(d: Destination): api.DestinationDescription throws Fault {
 }
 
 /// The caller that Firehose is in a session of the role of the ARN role, on behalf of the delivery stream of the ARN
-/// source; the role's trust policy is not consulted.
-function assumed(caller: Caller, role: string, source: string): Caller {
-	const c = caller.internal("firehose.amazonaws.com", source, ["s3:PutObject"])
-	const p = split(role, ":")
-	const path = split(p[p.length - 1], "/")
-	if (p.length == 6) {
-		c.account = p[4]
+/// source; a fault if the role does not let it, as the delivery then fails.
+function assumed(caller: Caller, role: string, source: string): Caller throws Fault {
+	const c = actAs(caller, "firehose.amazonaws.com", role, source, ["s3:PutObject"], caller.requestId)
+	if (c == null) {
+		throw new Fault(403, "AccessDenied", `firehose.amazonaws.com may not assume ${role}`)
 	}
-	c.arn = `arn:aws:sts::${c.account}:assumed-role/${path[path.length - 1]}/${caller.requestId}`
-	c.userId = c.arn
-	c.source = ""
-	return c
+	return c!
 }
 
 function random(n: i32): string throws Fault {

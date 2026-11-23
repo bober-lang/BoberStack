@@ -2,7 +2,8 @@
 //! an event pattern or a schedule; their targets; and PutEvents, which matches each event against the rules of its bus
 //! and delivers it, as its targets' Input, InputPath or InputTransformer make it, within the request, by calling the
 //! other services' handlers directly: to an SQS queue or SNS topic as their policies allow EventBridge; to a Kinesis
-//! stream as a session of the target's role, which it must have, keyed by its PartitionKeyPath or the event's id; to a
+//! stream as a session of the target's role, which it must have and which must trust EventBridge,
+//! keyed by its PartitionKeyPath or the event's id; to a
 //! Firehose delivery stream as a session of the target's role, which it must have; to a CloudWatch Logs log group, in a stream named by the event's id, as the account's resource policies allow
 //! EventBridge; or to another bus of the account and region, as its policy allows EventBridge or the target's role
 //! allows events:PutEvents, whose rules it is matched against in turn, a bus it has passed through not again. The
@@ -31,6 +32,7 @@ import * as kinesisApi from "../kinesis/api"
 import * as logsApi from "../logs/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
+import { actAs, passRole } from "../sts/sts"
 import { endsWith, indexOf, startsWith } from "std/algo"
 import { isDigit, lbrace, lbracket } from "std/ascii"
 import { bytes } from "std/crypto/random"
@@ -208,9 +210,12 @@ export class Handler {
 		r.bus = name
 		const arn = ruleArn(caller.region, caller.account, r)
 		const tags = tagged([], input.Tags ?? [])
-		// iam:PassRole is authorized of a role passed, which nothing here assumes; TagResource of a rule made with tags.
+		// TagResource is authorized of a rule made with tags.
 		caller.actions = if (tags.length == 0) ["events:PutRule"] else ["events:PutRule", "events:TagResource"]
 		const context = requestTags(tags)
+		if (input.RoleArn != null) {
+			passRole(caller, input.RoleArn!, principal)
+		}
 		if (input.EventPattern != null) {
 			const source = member(input.EventPattern!, "source")
 			const detailType = member(input.EventPattern!, "detail-type")
@@ -337,9 +342,13 @@ export class Handler {
 	}
 
 	putTargets(caller: Caller, input: api.PutTargetsRequest): api.PutTargetsResponse throws Fault {
-		// iam:PassRole is authorized of a target's role, which nothing here assumes.
 		caller.actions = ["events:PutTargets"]
 		const r = allowed(caller, input.Rule, input.EventBusName, [["events:TargetArn", input.Targets.map(t => t.Arn)]])
+		for (const t of input.Targets) {
+			if (t.RoleArn != null) {
+				passRole(caller, t.RoleArn!, principal)
+			}
+		}
 		const db = tables(caller)
 		const k = within(r.bus, r.name)
 		const ids = all(db.targets, within(k, "")).map(e => e[1].id)
@@ -765,18 +774,13 @@ function checkTarget(t: api.Target) throws Fault {
 }
 
 /// The caller that EventBridge is in a session of the role of the ARN role, on behalf of the rule of the ARN source,
-/// to perform actions; the role's trust policy is not consulted.
-function assumed(caller: Caller, role: string, source: string, actions: string[]): Caller {
-	const c = caller.internal(principal, source, actions)
-	const p = split(role, ":")
-	const path = split(p[p.length - 1], "/")
-	if (p.length == 6) {
-		c.account = p[4]
+/// to perform actions; a fault if the role does not let it, as the invocation then fails.
+function assumed(caller: Caller, role: string, source: string, actions: string[]): Caller throws Fault {
+	const c = actAs(caller, principal, role, source, actions, caller.requestId)
+	if (c == null) {
+		throw new Fault(403, "AccessDenied", `${principal} may not assume ${role}`)
 	}
-	c.arn = `arn:aws:sts::${c.account}:assumed-role/${path[path.length - 1]}/${caller.requestId}`
-	c.userId = c.arn
-	c.source = ""
-	return c
+	return c!
 }
 
 /// The service, region, account and resource of the ARN a.

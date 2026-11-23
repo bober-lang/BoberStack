@@ -1037,6 +1037,45 @@ test "a subscription filter tries its Kinesis stream as its role, then puts matc
 	g.close()
 }
 
+test "a role is passed only as the caller may pass it, and acted as only as it trusts the service" {
+	const g = gateway()
+	const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+	role(g, "toKinesis", "logs.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	role(g, "elsewhere", "events.amazonaws.com", policy([statement("Allow", `"kinesis:PutRecord"`, stream)]))
+	assert json11Of(g, "kinesis", "CreateStream", `{"StreamName":"s","ShardCount":1}`).status == 200
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	const filter = (role: string, k: Key) => {
+		const body = `{"logGroupName":"/g","filterName":"f","filterPattern":"","destinationArn":"${stream}",`
+			+ `"roleArn":"arn:aws:iam::000000000000:role/${role}"}`
+		const req = new Request("POST", "http://localhost:4566/", body)
+		req.headers.set("content-type", "application/x-amz-json-1.1")
+		req.headers.set("x-amz-target", "Logs_20140328.PutSubscriptionFilter")
+		sign(req, body, "logs", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+		return g.handle(req)
+	}
+	assert fails(filter("elsewhere", root()), 400, "InvalidParameterException",
+		"Could not deliver test message to specified Kinesis stream.")
+	const k = user(g, "u", policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*")]))
+	assert fails(filter("toKinesis", k), 400, "AccessDeniedException",
+		"User: arn:aws:iam::000000000000:user/u is not authorized to perform: iam:PassRole on resource: "
+		+ "arn:aws:iam::000000000000:role/toKinesis")
+	assert query(g, "iam",
+		[["Action", "PutUserPolicy"], ["UserName", "u"], ["PolicyName", "p"],
+		["PolicyDocument",
+		policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*"),
+		statement("Allow", `"iam:PassRole"`, "*", "",
+		`{"StringEquals":{"iam:PassedToService":"events.amazonaws.com"}}`)])]]).status == 200
+	assert fails(filter("toKinesis", k), 400, "AccessDeniedException", "iam:PassRole")
+	assert query(g, "iam",
+		[["Action", "PutUserPolicy"], ["UserName", "u"], ["PolicyName", "p"],
+		["PolicyDocument",
+		policy([statement("Allow", `"logs:PutSubscriptionFilter"`, "*"),
+		statement("Allow", `"iam:PassRole"`, "*", "",
+		`{"StringEquals":{"iam:PassedToService":"logs.amazonaws.com"}}`)])]]).status == 200
+	assert filter("toKinesis", k).status == 200
+	g.close()
+}
+
 test "EventBridge targets: a Kinesis stream and a bus as the target's role, a log group as the account's policy allows" {
 	const g = gateway()
 	role(g, "put", "events.amazonaws.com",

@@ -1,14 +1,18 @@
-import { sign } from "../../core/client"
+import { request, sign } from "../../core/client"
 import { Fault } from "../../core/fault"
 import { Gateway } from "../../core/gateway"
 import * as protocol from "../../core/protocol/json"
 import { Caller } from "../../core/service"
+import * as iamApi from "../iam/api"
+import { Catalog } from "../iam/catalog"
+import * as iam from "../iam/iam"
 import * as kinesisApi from "../kinesis/api"
 import * as api from "./api"
 import { Handler } from "./logs"
 import { indexOf } from "std/algo"
 import { Request, Response } from "std/http"
 import { Decodable } from "std/types"
+import { escape } from "std/url"
 
 /// now() of a test, in ms; and a day, in ms.
 const t: i64 = 1435327200000
@@ -28,6 +32,8 @@ function gateway(): Gateway {
 	const h = new Handler()
 	h.kinesis = new Sink()
 	g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+	const catalog = new Catalog(0, 0)
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(new iam.Handler(catalog), caller, req))
 	return g
 }
 
@@ -182,6 +188,10 @@ test "streams ordered by name or last event, and deleting streams and groups" {
 
 test "subscription filters: stored, two a group, and resource policies" {
 	const g = made([])
+	const trust = escape(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":`
+		+ `{"Service":"logs.amazonaws.com"},"Action":"sts:AssumeRole"}]}`, "component")
+	assert g.handle(request("iam", "test", "test",
+		`Action=CreateRole&Version=2010-05-08&RoleName=r&AssumeRolePolicyDocument=${trust}`)).status == 200
 	const sub = (name: string) => call(g, "PutSubscriptionFilter",
 		`{"logGroupName":"/g","filterName":"${name}",`
 		+ `"filterPattern":"","destinationArn":"arn:aws:kinesis:us-east-1:000000000000:stream/s",`
