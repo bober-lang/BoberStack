@@ -160,6 +160,16 @@ function assumable(caller: Caller, a: string): Role | null throws Fault {
 		maxSession: 43200 }
 }
 
+/// Credentials for the session actAs gives, issued as AssumeRole issues them, for seconds; null where actAs is.
+export function session(caller: Caller, principal: string, role: string, source: string, name: string,
+	seconds: i32): Credentials | null throws Fault {
+	const c = actAs(caller, principal, role, source, [], name)
+	if (c == null) {
+		return null
+	}
+	return issue(caller, issued(c!.account, c!.arn, c!.userId, seconds, "role", null, null, []))
+}
+
 /// Throws access denied unless caller may pass role to the service: iam:PassRole with iam:PassedToService.
 export function passRole(caller: Caller, role: string, principal: string) throws Fault {
 	const actions = caller.actions

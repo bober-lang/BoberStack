@@ -1,12 +1,18 @@
+import { AppleContainers } from "./core/container/apple"
+import { ContainerError, Containers } from "./core/container/container"
+import { DockerContainers } from "./core/container/docker"
 import { Gateway } from "./core/gateway"
 import { Fault } from "./core/fault"
+import { uuid } from "./core/random"
+import { Runner } from "./services/lambda/runner"
 import { Catalog } from "./services/iam/catalog"
 import { stack } from "./stack"
 import { decode, help, Name, Short } from "std/encoding/optarg"
 import { readFile } from "std/fs"
 import { Server } from "std/http"
 import { stderr } from "std/io"
-import { name } from "std/process"
+import { os } from "std/os"
+import { env, name } from "std/process"
 import { ParseError } from "std/string"
 import * as tls from "std/tls"
 import { second, sleep } from "std/time"
@@ -26,6 +32,10 @@ class Options {
 	httpsPort: u16 @Name["https-port"] = 4567
 	/// Refuse no request for lack of permission or trust: a role looked up only to check either need not exist.
 	lenient: bool = false
+	/// What runs Lambda's functions: docker, apple or none; if empty, Docker if its daemon answers, else Apple's on macOS.
+	containers = ""
+	/// The seconds a function's environment is kept once idle.
+	idle: u32 = 300
 	/// Print this help.
 	help: bool @Short["h"] = false
 }
@@ -44,6 +54,10 @@ function main(): i32 {
 	if (o.help) {
 		print(usage(program))
 		return 0
+	}
+	if (!["", "docker", "apple", "none"].includes(o.containers)) {
+		complain(program, `--containers takes docker, apple or none, not ${o.containers}\n${usage(program)}`)
+		return 2
 	}
 	let catalog: Catalog | null = null
 	try {
@@ -72,7 +86,8 @@ function main(): i32 {
 		}
 		servers.push(secure)
 	}
-	const g = stack(catalog!)
+	const runner = runnerOf(o)
+	const g = stack(catalog!, runner)
 	g.lenient = o.lenient
 	let at = plain.addr
 	try {
@@ -80,6 +95,7 @@ function main(): i32 {
 			at = s.addr
 			s.listen()
 		}
+		runner.sweep()
 		// The line LocalStack prints once it serves, which the tools that start it wait for.
 		print("Ready.")
 		const ticking = async tick(program, g)
@@ -101,6 +117,45 @@ function tick(program: string, g: Gateway) {
 			complain(program, `tick: ${f.code}: ${f.message}`)
 		}
 	}
+}
+
+/// What runs functions in the containers o names, else in the first that answers; in none if none does, which
+/// invocations then answer with what was looked for.
+function runnerOf(o: Options): Runner {
+	let c: Containers | null = null
+	let host = ""
+	const tried: string[] = []
+	if (o.containers == "" || o.containers == "docker") {
+		const d = new DockerContainers()
+		try {
+			host = d.host()
+			c = d
+		} catch (e: ContainerError) {
+			tried.push(`Docker's daemon at ${d.daemon}: ${e.message}`)
+		}
+	}
+	if (c == null && (o.containers == "apple" || (o.containers == "" && os == "macos"))) {
+		const a = new AppleContainers()
+		try {
+			host = a.host()
+			c = a
+		} catch (e: ContainerError) {
+			tried.push(`Apple's container daemon: ${e.message}`)
+		}
+	}
+	const missing = if (o.containers == "none") "This server runs no functions: --containers is none."
+		else `No container runtime answered: ${tried.join("; ")}.`
+	let generation = ""
+	try {
+		generation = uuid()
+	} catch (f: Fault) {} // no randomness to draw: runs then share a generation
+	const r = new Runner(c, missing, generation)
+	r.endpoint = `http://${host}:${o.port}`
+	r.label = `${o.port}`
+	r.idle = (o.idle as i64) * second
+	const cache = env("XDG_CACHE_HOME") ?? `${env("HOME") ?? "/tmp"}/.cache`
+	r.cache = `${cache}/boberstack/lambda`
+	return r
 }
 
 function usage(program: string): string { return `usage: ${program} [options]\n${help[Options]()}` }

@@ -1,0 +1,856 @@
+//! What runs Lambda's functions: environments, each a container of its runtime's public image whose runtime takes
+//! invocations from a Runtime API server of the environment's own, and the invocations in flight and done. They are
+//! process state beside the store, which a restart loses. Under the gateway's lock only what never parks is called:
+//! submitting, finding and counting invocations, and marking environments; containers start, are waited on and stop
+//! on fibers of their own, and each change that a held request or the tick waits for pokes the gateway.
+//!
+//! A version's zip is unzipped once, under the cache directory by its SHA-256, and mounted read-only at /var/task; its
+//! layers, merged in order, at /opt. An environment serves one invocation at a time, and is stopped once idle too long,
+//! retired, timed out, or exited.
+
+import { Fault } from "../../core/fault"
+import { pick } from "../../core/random"
+import { Blob } from "../../core/state/store"
+import { Arch, ContainerError, Containers, Mount, Spec } from "../../core/container/container"
+import { Entry, Zip } from "../../core/zip"
+import { Credentials } from "../sts/api"
+import { Signal } from "builtin/fiber"
+import { lastIndexOf, startsWith } from "std/algo"
+import { HashMap } from "std/collections/hashmap"
+import { CryptoError } from "std/crypto/error"
+import { sha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { FileInfo, lstat, mkdir, mkdirAll, remove, removeAll, rename, writeFile } from "std/fs"
+import { Request, Response, Server } from "std/http"
+import { quoted } from "std/encoding/json"
+import { ParseError, split } from "std/string"
+import { hour, millisecond, minute, rfc3339, second, sleep } from "std/time"
+import { chmod } from "sys/stat.h"
+import { symlink } from "unistd.h"
+
+/// What an environment is made of: invocations of the same key share environments.
+export class Config {
+	/// The account, region, function, version and its revision, which changes with anything here.
+	key = ""
+	account = ""
+	region = ""
+	name = ""
+	version = "$LATEST"
+	image = ""
+	arch: Arch = "x86_64"
+	handler = ""
+	memory: i32 = 128
+	timeout: i32 = 3
+	role = ""
+	/// The function's variables and Lambda's, but for the credentials and what is the environment's own.
+	env: [string, string][] = []
+	code: Blob | null = null
+	sha = ""
+	/// The layers' zips in order, each with its CodeSha256.
+	layers: [string, Blob][] = []
+	group = ""
+	json = false
+}
+
+export class Job {
+	id = ""
+	/// The ARN the function was invoked by, its qualifier as given.
+	arn = ""
+	trace = ""
+	config: Config = new Config()
+	payload = "{}"
+	/// The client context as JSON, and the Cognito identity, if given.
+	context: string | null = null
+	identity: string | null = null
+}
+
+export type State = "pending" | "running" | "done"
+
+export class Result {
+	payload = ""
+	/// Unhandled for a function's error, null for its success.
+	error: string | null = null
+	/// The invocation's lines, START to REPORT, as LogType Tail answers their end.
+	log = ""
+}
+
+export class Invocation {
+	key = ""
+	job: Job
+	state: State = "pending"
+	result: Result | null = null
+	/// When the runtime took it, 0 before.
+	started: i64 = 0
+	/// When it was last found: one done is forgotten 2 minutes after.
+	touched = now()
+	/// Its log lines while it runs, which its result then takes the end of.
+	lines = ""
+
+	constructor(key: string, job: Job) {
+		this.key = key
+		this.job = job
+	}
+}
+
+/// Log events of an environment's for the tick to put in CloudWatch Logs, as the function's role.
+export class Logged {
+	config: Config
+	stream: string
+	events: [i64, string][] = []
+
+	constructor(config: Config, stream: string) {
+		this.config = config
+		this.stream = stream
+	}
+}
+
+type Phase = "credentials" | "starting" | "running" | "gone"
+
+class Environment {
+	id: string
+	config: Config
+	phase: Phase = "credentials"
+	current: Invocation | null = null
+	delivered = false
+	finishing = false
+	retired = false
+	/// Woken when an invocation is bound to it or it is stopping, for a runtime waiting on next.
+	bound = new Signal()
+	server = new Server()
+	credentials: Credentials | null = null
+	container: string | null = null
+	created = now()
+	/// When its container started, and how long until its runtime first asked for an invocation, once it has.
+	started: i64 = 0
+	init: i64 | null = null
+	reported = false
+	used = now()
+	/// Of the container's output, the bytes already logged.
+	read = 0
+	logged: Logged
+
+	constructor(id: string, config: Config) {
+		this.id = id
+		this.config = config
+		const day = rfc3339(now()).slice(0, 10)
+		this.logged = new Logged(config, `${split(day, "-").join("/")}/[${config.version}]${id}`)
+	}
+}
+
+export class Runner {
+	/// null when none answered, as missing says.
+	containers: Containers | null
+	missing: string
+	/// BoberStack's endpoint as a container reaches it, given to functions as AWS_ENDPOINT_URL.
+	endpoint = ""
+	/// Where code is unzipped.
+	cache = ""
+	/// How long an environment may idle before it is stopped.
+	idle: i64 = 10 * minute
+	/// The value of the label boberstack.lambda on this server's containers: those of a run that crashed bear it too.
+	label = ""
+	/// Has the gateway tick, which runs the requests held and applies what is done; called on a fiber of its own.
+	poke: () => void = () => {}
+	/// Of this run of the server: queued invocations dispatched by another are dispatched again.
+	generation: string
+	private invocations = new HashMap[string, Invocation]()
+	private environments: Environment[] = []
+	private host: string | null = null
+	private unpacking = 0
+	private poking = false
+
+	constructor(containers: Containers | null, missing: string = "", generation: string = "") {
+		this.containers = containers
+		this.missing = missing
+		this.generation = generation
+	}
+
+	/// The invocation of key, if it is still known.
+	find(key: string): Invocation | null {
+		const i = this.invocations.get(key)
+		if (i != null) {
+			i!.touched = now()
+		}
+		return i
+	}
+
+	/// Starts job as the invocation of key, in an idle environment of its config's, else a new one.
+	submit(key: string, job: Job): Invocation throws Fault {
+		const inv = new Invocation(key, job)
+		this.invocations.set(key, inv)
+		for (const e of this.environments) {
+			if (e.config.key == job.config.key && e.phase == "running" && e.current == null && !e.retired) {
+				e.current = inv
+				e.delivered = false
+				e.bound.wake()
+				return inv
+			}
+		}
+		const e = new Environment(pick(32, "0123456789abcdef"), job.config)
+		e.current = inv
+		this.environments.push(e)
+		this.nudge()
+		return inv
+	}
+
+	/// The invocations of the function not done yet, for its reserved concurrency.
+	active(account: string, region: string, name: string): i32 {
+		const prefix = `${account}/${region}/${name}:`
+		let n = 0
+		for (const i of this.invocations.values()) {
+			if (i.state != "done" && startsWith(i.job.config.key, prefix)) {
+				n++
+			}
+		}
+		return n
+	}
+
+	/// The environments of the account's region waiting for credentials, by id.
+	wanting(account: string, region: string): [string, Config][] {
+		const out: [string, Config][] = []
+		for (const e of this.environments) {
+			if (e.phase == "credentials" && e.config.account == account && e.config.region == region) {
+				out.push([e.id, e.config])
+			}
+		}
+		return out
+	}
+
+	/// Starts the environment of id with credentials, or fails its invocation as why says if there are none.
+	provide(id: string, credentials: Credentials | null, why: string) {
+		for (const e of this.environments) {
+			if (e.id == id && e.phase == "credentials") {
+				if (credentials == null) {
+					this.fail(e, why)
+				} else {
+					e.credentials = credentials
+					e.phase = "starting"
+					const launching = async this.launch(e)
+				}
+			}
+		}
+	}
+
+	/// The log events of the account's region not yet put, which it hands over.
+	drain(account: string, region: string): Logged[] {
+		const out: Logged[] = []
+		for (const e of this.environments) {
+			if (e.logged.events.length > 0 && e.config.account == account && e.config.region == region) {
+				const l = new Logged(e.config, e.logged.stream)
+				l.events = e.logged.events
+				e.logged.events = []
+				out.push(l)
+			}
+		}
+		return out
+	}
+
+	/// Stops the environments of the function once they are idle, as for a change of its code or configuration.
+	retire(account: string, region: string, name: string) {
+		const prefix = `${account}/${region}/${name}:`
+		for (const e of this.environments) {
+			if (startsWith(e.config.key, prefix)) {
+				e.retired = true
+				if (e.phase == "running" && e.current == null && !e.finishing) {
+					this.discard(e)
+				}
+			}
+		}
+	}
+
+	/// Stops environments idle past the limit, or for 2 hours since they started; forgets what is done and long
+	/// unasked for, and environments gone with nothing left to log.
+	reap(t: i64) {
+		const kept: Environment[] = []
+		for (const e of this.environments) {
+			const idle = e.phase == "running" && e.current == null && !e.finishing
+			if (idle && (e.retired || e.used + this.idle < t || e.created + 2 * hour < t)) {
+				this.discard(e)
+			}
+			if (e.phase != "gone" || e.logged.events.length > 0 || e.container != null) {
+				kept.push(e)
+			}
+		}
+		this.environments = kept
+		const old: string[] = []
+		for (const i of this.invocations.values()) {
+			if (i.state == "done" && i.touched + 2 * minute < t) {
+				old.push(i.key)
+			}
+		}
+		for (const k of old) {
+			this.invocations.delete(k)
+		}
+	}
+
+	/// Stops what a server of the same label left running, as when it crashed.
+	sweep() {
+		if (this.containers == null) {
+			return
+		}
+		try {
+			for (const id of this.containers!.list(["boberstack.lambda", this.label])) {
+				this.containers!.stop(id)
+			}
+		} catch (e: ContainerError) {} // the next run sweeps again
+	}
+
+	/// Pokes once for what changed since the last poke began.
+	private nudge() {
+		if (this.poking) {
+			return
+		}
+		this.poking = true
+		const poked = async this.pokeNow()
+	}
+
+	private pokeNow() {
+		this.poking = false
+		this.poke()
+	}
+
+	/// Unzips the code, pulls the image and starts the container, whose runtime then asks for the invocation.
+	private launch(e: Environment) {
+		const c = this.containers
+		if (c == null) {
+			this.fail(e, this.missing)
+			return
+		}
+		let why = ""
+		try {
+			if (this.host == null) {
+				this.host = c!.host()
+			}
+			e.server.addr = `${this.host}:0`
+			e.server.listen()
+			const serving = async this.serve(e)
+			const spec = new Spec()
+			spec.image = e.config.image
+			spec.arch = e.config.arch
+			spec.memoryMb = e.config.memory
+			spec.command = ["/lambda-entrypoint.sh", e.config.handler]
+			spec.labels = [["boberstack.lambda", this.label]]
+			spec.mounts.push({ ...new Mount(), host: this.unpacked(e.config), path: "/var/task" })
+			if (e.config.layers.length > 0) {
+				spec.mounts.push({ ...new Mount(), host: this.layered(e.config), path: "/opt" })
+			}
+			const port = e.server.addr.slice(lastIndexOf(e.server.addr, ":") + 1, e.server.addr.length)
+			const k = e.credentials!
+			spec.env = [...e.config.env, ["AWS_ACCESS_KEY_ID", k.AccessKeyId], ["AWS_ACCESS_KEY", k.AccessKeyId],
+				["AWS_SECRET_ACCESS_KEY", k.SecretAccessKey], ["AWS_SESSION_TOKEN", k.SessionToken],
+				["AWS_LAMBDA_LOG_STREAM_NAME", e.logged.stream], ["AWS_LAMBDA_RUNTIME_API", `${this.host}:${port}`]]
+			c!.pull(spec.image, spec.arch)
+			if (e.phase == "gone") {
+				return
+			}
+			e.started = now()
+			e.container = c!.start(spec)
+			if (e.phase == "gone") {
+				const stopping = async this.halt(e)
+				return
+			}
+			const watching = async this.watch(e)
+			const limiting = async this.limit(e, e.started)
+			return
+		} catch (x: ContainerError | IoError | ParseError | CryptoError) {
+			why = if (x instanceof ContainerError) `${x.kind}: ${x.message}`
+				else if (x instanceof ParseError) `The code is not a zip this server reads, at byte ${x.at}`
+				else `The code cannot be unpacked here: ${x}`
+		}
+		this.fail(e, why)
+	}
+
+	private serve(e: Environment) {
+		try {
+			e.server.serve(req => this.api(e, req))
+		} catch (x: IoError | ParseError) {
+			this.fail(e, "The Runtime API stopped serving")
+		}
+	}
+
+	/// The Runtime API, as the runtime in e's container calls it.
+	private api(e: Environment, req: Request): Response throws IoError {
+		const path = req.url.path
+		const root = "/2018-06-01/runtime/"
+		if (!startsWith(path, root)) {
+			return answer(404, "UnknownResource", `No such path ${path}`)
+		}
+		const parts = split(path.slice(root.length, path.length), "/")
+		if (req.method == "GET" && parts.length == 2 && parts[0] == "invocation" && parts[1] == "next") {
+			return this.next(e)
+		}
+		if (req.method == "POST" && parts.length == 2 && parts[0] == "init" && parts[1] == "error") {
+			const body = req.body.text(1 << 20)
+			const inv = e.current
+			if (inv != null) {
+				this.finish(e, inv!, errorOf(body, req.headers.get("lambda-runtime-function-error-type")), "Unhandled",
+					"error")
+			}
+			this.discard(e)
+			return new Response(202, `{"status":"OK"}`)
+		}
+		if (req.method == "POST" && parts.length == 3 && parts[0] == "invocation") {
+			const inv = e.current
+			if (inv == null || !e.delivered || inv!.job.id != parts[1] || e.finishing) {
+				return answer(400, "InvalidRequestID", "Invalid request ID")
+			}
+			if (parts[2] == "response") {
+				let body = ""
+				try {
+					body = req.body.text(limit)
+				} catch (x: IoError) {
+					this.finish(e, inv!,
+						`{"errorMessage":"Response payload size exceeded maximum allowed payload size `
+						+ `(${limit} bytes).","errorType":"Function.ResponseSizeTooLarge"}`, "Unhandled", "error")
+					return answer(413, "RequestEntityTooLarge", "The response is too large")
+				}
+				this.finish(e, inv!, body, null, "success")
+				return new Response(202, `{"status":"OK"}`)
+			}
+			if (parts[2] == "error") {
+				const body = req.body.text(1 << 20)
+				this.finish(e, inv!, errorOf(body, req.headers.get("lambda-runtime-function-error-type")), "Unhandled",
+					"error")
+				return new Response(202, `{"status":"OK"}`)
+			}
+		}
+		return answer(404, "UnknownResource", `No such path ${path}`)
+	}
+
+	/// The next invocation, once one is bound to e.
+	private next(e: Environment): Response {
+		if (e.phase == "starting") {
+			e.init = now() - e.started
+			e.phase = "running"
+			this.collect(e)
+		}
+		while (e.phase != "gone" && (e.current == null || e.delivered || e.finishing)) {
+			e.bound.wait()
+		}
+		if (e.phase == "gone") {
+			return answer(410, "EnvironmentStopped", "The environment is stopping")
+		}
+		const inv = e.current!
+		const j = inv.job
+		e.delivered = true
+		inv.state = "running"
+		inv.started = now()
+		const deadline = inv.started + (j.config.timeout as i64) * second
+		this.platform(e, inv, "start", "", null)
+		const r = new Response(200, j.payload)
+		r.headers.set("Content-Type", "application/json")
+		r.headers.set("Lambda-Runtime-Aws-Request-Id", j.id)
+		r.headers.set("Lambda-Runtime-Deadline-Ms", `${deadline / millisecond}`)
+		r.headers.set("Lambda-Runtime-Invoked-Function-Arn", j.arn)
+		r.headers.set("Lambda-Runtime-Trace-Id", j.trace)
+		if (j.context != null) {
+			r.headers.set("Lambda-Runtime-Client-Context", j.context!)
+		}
+		if (j.identity != null) {
+			r.headers.set("Lambda-Runtime-Cognito-Identity", j.identity!)
+		}
+		const expiring = async this.expire(e, inv, deadline)
+		return r
+	}
+
+	/// Ends inv on e with what it answered: once, by the first of the runtime, its timeout and its exit to end it.
+	private finish(e: Environment, inv: Invocation, payload: string, error: string | null, status: string,
+		kind: string = "") {
+		if (e.current != inv || e.finishing || inv.state == "done") {
+			return
+		}
+		e.finishing = true
+		const ended = now()
+		this.collect(e)
+		if (status == "timeout") {
+			this.line(e,
+				`${rfc3339(ended - ended % millisecond)} ${inv.job.id} Task timed out after `
+				+ `${seconds(ended - inv.started)} seconds`)
+		}
+		if (inv.started > 0) {
+			this.platform(e, inv, "end", status, kind)
+			this.platform(e, inv, "report", status, kind, ended - inv.started)
+		}
+		const r = new Result()
+		r.payload = payload
+		r.error = error
+		r.log = this.tail(inv)
+		inv.result = r
+		inv.state = "done"
+		e.current = null
+		e.delivered = false
+		e.finishing = false
+		e.used = now()
+		if (e.retired) {
+			this.discard(e)
+		}
+		this.nudge()
+	}
+
+	/// Fails e's invocation, if it has one not done, as e could not start; then stops it.
+	private fail(e: Environment, why: string) {
+		const inv = e.current
+		if (inv != null && inv!.state != "done" && !e.finishing) {
+			const r = new Result()
+			r.payload = `{"errorMessage":${quoted(why)},"errorType":"Runtime.Unavailable"}`
+			r.error = "Unhandled"
+			inv!.result = r
+			inv!.state = "done"
+			e.current = null
+			this.nudge()
+		}
+		this.discard(e)
+	}
+
+	/// Times inv out at deadline if it is still running then; its environment then goes.
+	private expire(e: Environment, inv: Invocation, deadline: i64) {
+		sleep(deadline - now())
+		if (e.current == inv && inv.state == "running" && !e.finishing) {
+			const id = inv.job.id
+			const took = seconds(now() - inv.started)
+			this.finish(e, inv,
+				`{"errorMessage":"RequestId: ${id} Error: Task timed out after ${took} seconds",`
+				+ `"errorType":"Sandbox.Timedout"}`, "Unhandled", "timeout")
+			this.discard(e)
+		}
+	}
+
+	/// Fails a start that takes longer than AWS's 10 seconds of init and the invocation's own timeout after them.
+	private limit(e: Environment, started: i64) {
+		sleep(initLimit + (e.config.timeout as i64) * second)
+		if (e.phase == "starting" && e.started == started) {
+			const inv = e.current
+			if (inv != null) {
+				this.finish(e, inv!,
+					`{"errorMessage":"RequestId: ${inv!.job.id} Error: Task timed out after `
+					+ `${seconds(now() - started)} seconds","errorType":"Sandbox.Timedout"}`, "Unhandled", "timeout")
+			}
+			this.discard(e)
+		}
+	}
+
+	/// Waits for e's container to exit, which fails its invocation unless it was stopped.
+	private watch(e: Environment) {
+		let why = ""
+		try {
+			why = `Runtime exited with error: exit status ${this.containers!.wait(e.container!)}`
+		} catch (x: ContainerError) {
+			why = `Runtime exited with error: ${x.message}`
+		}
+		if (e.phase == "gone") {
+			return
+		}
+		const inv = e.current
+		if (inv != null) {
+			this.finish(e, inv!,
+				`{"errorMessage":"RequestId: ${inv!.job.id} Error: ${why}",` + `"errorType":"Runtime.ExitError"}`,
+				"Unhandled", "error", "Runtime.ExitError")
+		}
+		this.discard(e)
+	}
+
+	private discard(e: Environment) {
+		if (e.phase == "gone") {
+			return
+		}
+		e.phase = "gone"
+		e.bound.wake()
+		const halting = async this.halt(e)
+	}
+
+	/// Logs what e's container wrote last, closes its Runtime API and stops its container.
+	private halt(e: Environment) {
+		if (e.container != null) {
+			this.collect(e, true)
+		}
+		e.server.close()
+		if (e.container != null && this.containers != null) {
+			try {
+				this.containers!.stop(e.container!)
+			} catch (x: ContainerError) {} // gone already, or left for the next start's sweep
+			e.container = null
+		}
+	}
+
+	/// Logs the lines e's container wrote since last asked, the last unended one too if all.
+	private collect(e: Environment, all: bool = false) {
+		if (e.container == null || this.containers == null) {
+			return
+		}
+		let out = ""
+		try {
+			out = this.containers!.output(e.container!)
+		} catch (x: ContainerError) {
+			return
+		}
+		if (out.length <= e.read) {
+			return
+		}
+		let end = out.length
+		if (!all) {
+			end = lastIndexOf(out, "\n") + 1
+			if (end <= e.read) {
+				return
+			}
+		}
+		const fresh = out.slice(e.read, end)
+		e.read = end
+		const lines = split(fresh, "\n")
+		if (lines.length > 0 && lines[lines.length - 1] == "") {
+			lines.pop()
+		}
+		for (const l of lines) {
+			this.line(e, l)
+		}
+	}
+
+	private line(e: Environment, text: string) {
+		e.logged.events.push([now() / millisecond, text])
+		if (e.current != null) {
+			e.current!.lines += text + "\n"
+		}
+	}
+
+	/// START, END and REPORT, as AWS words them, in text or in JSON as the function's LoggingConfig asks.
+	private platform(e: Environment, inv: Invocation, which: string, status: string, kind: string | null,
+		took: i64 = 0) {
+		const id = inv.job.id
+		const c = e.config
+		const init = if (e.reported || e.init == null) null else e.init
+		if (which == "report") {
+			e.reported = true
+		}
+		if (c.json) {
+			const t = now()
+			const at = `{"time":${quoted(rfc3339(t - t % millisecond))},`
+			if (which == "start") {
+				this.line(e,
+					`${at}"type":"platform.start","record":{"requestId":${quoted(id)},`
+					+ `"version":${quoted(c.version)}}}`)
+			} else if (which == "end") {
+				this.line(e,
+					`${at}"type":"platform.runtimeDone","record":{"requestId":${quoted(id)},`
+					+ `"status":${quoted(status)}}}`)
+			} else {
+				const initMs = if (init == null) "" else `,"initDurationMs":${milliseconds(init!)}`
+				this.line(e,
+					`${at}"type":"platform.report","record":{"requestId":${quoted(id)},"metrics":{`
+					+ `"durationMs":${milliseconds(took)},"billedDurationMs":${billed(took)},`
+					+ `"memorySizeMB":${c.memory}${initMs}},"status":${quoted(status)}}}`)
+			}
+			return
+		}
+		if (which == "start") {
+			this.line(e, `START RequestId: ${id} Version: ${c.version}`)
+		} else if (which == "end") {
+			this.line(e, `END RequestId: ${id}`)
+		} else {
+			let s = `REPORT RequestId: ${id}\tDuration: ${milliseconds(took)} ms\tBilled Duration: ${billed(took)} ms\t`
+				+ `Memory Size: ${c.memory} MB\t`
+			if (init != null) {
+				s += `Init Duration: ${milliseconds(init!)} ms\t`
+			}
+			// A function's own error, which its runtime reports, leaves the line as a success's.
+			if (status != "success" && (status != "error" || (kind != null && kind! != ""))) {
+				s += `Status: ${status}\t`
+			}
+			if (kind != null && kind! != "") {
+				s += `Error Type: ${kind!}\t`
+			}
+			this.line(e, s)
+		}
+	}
+
+	/// The last 4 KB of inv's lines.
+	private tail(inv: Invocation): string {
+		const all = inv.lines
+		inv.lines = ""
+		return if (all.length > 4096) all.slice(all.length - 4096, all.length) else all
+	}
+
+	/// The directory c's code is unzipped in, unzipping it if no run did before.
+	private unpacked(c: Config): string throws IoError | ParseError | CryptoError {
+		const dir = `${this.cache}/code/${hex.encode(decoded(c.sha))}`
+		this.unpack(if (c.code == null) [] else [c.code!], dir)
+		return dir
+	}
+
+	/// The directory c's layers are merged in, in order, merging them if no run did before.
+	private layered(c: Config): string throws IoError | ParseError | CryptoError {
+		const dir = `${this.cache}/opt/${hex.encode(sha256(c.layers.map(l => l[0]).join(",")))}`
+		this.unpack(c.layers.map(l => l[1]), dir)
+		return dir
+	}
+
+	/// Unzips zips one over the other in a directory of its own, renamed dir once whole; nothing if dir is there.
+	private unpack(zips: Blob[], dir: string) throws IoError | ParseError {
+		if (present(dir) != null) {
+			return
+		}
+		this.unpacking++
+		const part = `${dir}.${this.unpacking}.part`
+		if (present(part) != null) {
+			removeAll(part)
+		}
+		mkdirAll(part)
+		try {
+			for (const z of zips) {
+				extract(new Zip(z.read()), part)
+			}
+			try {
+				rename(part, dir)
+			} catch (x: IoError) {
+				// Another start unzipped the same code meanwhile.
+				if (present(dir) == null) {
+					throw x
+				}
+				removeAll(part)
+			}
+		} catch (x: IoError | ParseError) {
+			try {
+				removeAll(part)
+			} catch (y: IoError) {}
+			throw x
+		}
+	}
+}
+
+/// How much of a response the Runtime API takes, as AWS's error names it.
+const limit: i64 = 6291556
+const initLimit: i64 = 10 * second
+
+/// The public image of a runtime for arch, as public.ecr.aws/lambda/python:3.12; null if there is none, and why.
+export function image(runtime: string, arch: Arch): [string | null, string] {
+	const x86 = ["nodejs10.x", "java8", "python2.7", "python3.6", "python3.7", "dotnetcore2.1", "ruby2.5", "provided",
+		"go1.x"]
+	let tag: string | null = null
+	if (startsWith(runtime, "nodejs") && runtime.length > 8
+		&& runtime.slice(runtime.length - 2, runtime.length) == ".x") {
+		tag = "nodejs:" + runtime.slice(6, runtime.length - 2)
+	} else if (startsWith(runtime, "python3.") || runtime == "python2.7") {
+		tag = "python:" + runtime.slice(6, runtime.length)
+	} else if (startsWith(runtime, "java")) {
+		tag = "java:" + runtime.slice(4, runtime.length)
+	} else if (startsWith(runtime, "dotnetcore") && runtime != "dotnetcore1.0" && runtime != "dotnetcore2.0") {
+		tag = "dotnet:core" + runtime.slice(10, runtime.length)
+	} else if (startsWith(runtime, "dotnet") && !startsWith(runtime, "dotnetcore")) {
+		tag = "dotnet:" + runtime.slice(6, runtime.length)
+	} else if (startsWith(runtime, "ruby")) {
+		tag = "ruby:" + runtime.slice(4, runtime.length)
+	} else if (runtime == "provided") {
+		tag = "provided:alami"
+	} else if (startsWith(runtime, "provided.")) {
+		tag = "provided:" + runtime.slice(9, runtime.length)
+	} else if (runtime == "go1.x") {
+		tag = "go:1"
+	}
+	if (tag == null) {
+		return [null, `The runtime ${runtime} has no image to run it in.`]
+	}
+	if (arch == "arm64" && x86.includes(runtime)) {
+		return [null, `The runtime ${runtime} has no image for arm64.`]
+	}
+	return [`public.ecr.aws/lambda/${tag!}`, ""]
+}
+
+/// The runtime's error as the invocation's payload: its body, else one of the type it named.
+function errorOf(body: string, kind: string | null): string {
+	if (body != "") {
+		return body
+	}
+	return `{"errorMessage":"","errorType":${quoted(kind ?? "Runtime.Unknown")}}`
+}
+
+function answer(status: i32, kind: string, message: string): Response {
+	const r = new Response(status, `{"errorMessage":${quoted(message)},"errorType":${quoted(kind)}}`)
+	r.headers.set("Content-Type", "application/json")
+	return r
+}
+
+function present(path: string): FileInfo | null {
+	try {
+		return lstat(path)
+	} catch (x: IoError) {
+		return null
+	}
+}
+
+/// Writes z's entries under root with their modes and links, over what is there; refuses one whose name leaves root or
+/// whose way goes through a link.
+function extract(z: Zip, root: string) throws IoError | ParseError {
+	for (const e of z.entries) {
+		const names = split(e.name, "/").filter(n => n != "" && n != ".")
+		if (startsWith(e.name, "/") || names.includes("..")) {
+			throw new ParseError("syntax", e.at)
+		}
+		if (names.length == 0) {
+			continue
+		}
+		let at = root
+		for (let i = 0; i < names.length - 1; i++) {
+			at += "/" + names[i]
+			directory(at, e)
+		}
+		const path = at + "/" + names[names.length - 1]
+		if (e.kind == "directory") {
+			directory(path, e)
+			continue
+		}
+		const there = present(path)
+		if (there != null) {
+			if (there!.isDirectory) {
+				removeAll(path)
+			} else {
+				remove(path)
+			}
+		}
+		const bytes = z.read(e)
+		if (e.kind == "link") {
+			if (symlink(bytes, path) != 0) {
+				throw new IoError("Other", "symlink", path)
+			}
+			continue
+		}
+		writeFile(path, bytes)
+		if (chmod(path, if (e.mode == 0) 0o644 else e.mode) != 0) {
+			throw new IoError("Other", "chmod", path)
+		}
+	}
+}
+
+/// Makes path a directory unless it is one; one that is a link, which could lead out, refuses the entry.
+function directory(path: string, e: Entry) throws IoError | ParseError {
+	const there = present(path)
+	if (there != null && there!.isSymlink) {
+		throw new ParseError("syntax", e.at)
+	}
+	if (there != null && there!.isDirectory) {
+		return
+	}
+	if (there != null) {
+		remove(path)
+	}
+	mkdir(path)
+}
+
+function decoded(sha: string): string {
+	try {
+		return base64.decode(sha)
+	} catch (x: ParseError) {
+		return sha
+	}
+}
+
+/// d as AWS's durations are, in milliseconds to two places.
+function milliseconds(d: i64): string {
+	const c = if (d < 0) 0 else d / (10 * 1000)
+	return `${c / 100}.${if (c % 100 < 10) "0" else ""}${c % 100}`
+}
+
+function seconds(d: i64): string {
+	const c = if (d < 0) 0 else d / (10 * millisecond)
+	return `${c / 100}.${if (c % 100 < 10) "0" else ""}${c % 100}`
+}
+
+function billed(d: i64): i64 { return (d + millisecond - 1) / millisecond }

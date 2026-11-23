@@ -1,32 +1,56 @@
-//! AWS Lambda's control plane: functions, versions, aliases, policies, concurrency, event source mappings and layers.
+//! AWS Lambda: functions, versions, aliases, policies, concurrency, event source mappings and layers, and invocations
+//! of zip functions run by ./runner in containers of Lambda's public images.
 //!
-//! Nothing runs a function or polls a mapping's source. Invoke answers 200 with X-Amz-Function-Error: Unhandled and
-//! errorType NotImplemented, which SDKs hand back as is where a 5xx would be retried. Functions, mappings and
-//! provisioned concurrency are ready at once. Unlike AWS: an image's URI is not checked and its CodeSha256 is the
-//! URI's; a function URL serves nothing; layers are of the function's account and region; code signing is never set.
+//! A synchronous Invoke holds its request until the function answers, the gateway running it again after each change;
+//! the run that finds the invocation done answers it. An asynchronous one is queued in the store and run at the tick,
+//! retried after one and then two minutes up to MaximumRetryAttempts, and dropped once older than
+//! MaximumEventAgeInSeconds; its record then goes to the destination of its outcome, and a failure to the dead-letter
+//! queue, as the function's role. An environment gets its role's credentials at the tick, as STS issues them to Lambda.
+//!
+//! Where AWS differs:
+//!
+//! - AWS_ENDPOINT_URL is set to this server, so that the SDKs and the CLI in a function call it, not AWS.
+//! - A function of a container image answers its error, NotImplemented; so does every invocation when no container
+//!   runtime answered at start, with Runtime.Unavailable. An image's URI is not checked and its CodeSha256 is the URI's.
+//! - What is in flight is the process's, not the store's: a restart loses running invocations and environments. A
+//!   queued invocation that was running is run again.
+//! - A synchronous invocation made at the tick, as by a state machine a schedule started, cannot be held, and fails
+//!   with ServiceException.
+//! - REPORT has no Max Memory Used. A function's logs are put at the tick, as its role, a second or so late.
+//! - The init phase may take 10 seconds plus the function's timeout. A throttled asynchronous invocation is tried again
+//!   after a second, doubling to five minutes. Only reserved concurrency throttles.
+//! - Functions, mappings and provisioned concurrency are ready at once, and a mapping polls nothing. A function URL
+//!   serves nothing, and responses do not stream. The Extensions and Telemetry APIs are not served, and SnapStart is
+//!   stored only. Layers are of the function's account and region; code signing is never set.
 
 import { Fault } from "../../core/fault"
-import { uuid } from "../../core/random"
+import { random, uuid } from "../../core/random"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Blob, Table } from "../../core/state/store"
+import * as eventsApi from "../events/api"
+import * as logsApi from "../logs/api"
 import * as s3Api from "../s3/api"
 import * as s3 from "../s3/s3"
 import * as kinesisApi from "../kinesis/api"
 import * as kinesis from "../kinesis/kinesis"
 import * as streamsApi from "../dynamodbstreams/api"
 import * as streams from "../dynamodbstreams/dynamodbstreams"
+import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import * as sqs from "../sqs/sqs"
-import { actAs, passRole } from "../sts/sts"
+import { Credentials } from "../sts/api"
+import { actAs, passRole, session } from "../sts/sts"
 import * as api from "./api"
+import * as running from "./runner"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
 import { sha256 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
 import { EncodeError } from "std/encoding/json"
-import { ParseError, replace, split } from "std/string"
-import { millisecond, rfc3339 } from "std/time"
+import { formatInt, ParseError, replace, split } from "std/string"
+import { millisecond, minute, rfc3339, second } from "std/time"
 import { Decodable } from "std/types"
 
 class Function {
@@ -136,6 +160,23 @@ class Alias {
 	revision = ""
 }
 
+/// An asynchronous invocation, until it succeeds or its retries or age run out.
+class Queued {
+	id = ""
+	name = ""
+	qualifier: string | null = null
+	payload = ""
+	context: string | null = null
+	enqueued: i64 = 0
+	/// The attempts started, and when the next is due.
+	attempts: i32 = 0
+	due: i64 = 0
+	/// The generation of the runner its attempt runs in, "" while none does: one of a server since restarted runs again.
+	running = ""
+	/// How long its concurrency last held it back, doubled each time.
+	backoff: i64 = 0
+}
+
 class Policy {
 	statements: [string, string][] = []
 	revision = ""
@@ -156,6 +197,8 @@ class Tables {
 	/// Layers by name; their versions by the layer's name, a colon and the version's key.
 	layers: Table[LayerName]
 	layerVersions: Table[LayerVersion]
+	/// By the instant enqueued and the id.
+	queue: Table[Queued]
 
 	constructor(caller: Caller) throws Fault {
 		const s = caller.regional()
@@ -169,6 +212,7 @@ class Tables {
 		this.invoking = new Table[Invoking](s, "lambda.invoking")
 		this.layers = new Table[LayerName](s, "lambda.layers")
 		this.layerVersions = new Table[LayerVersion](s, "lambda.layerVersions")
+		this.queue = new Table[Queued](s, "lambda.queue")
 	}
 }
 
@@ -184,6 +228,11 @@ export class Handler {
 	sqs: sqs.Handler | null = null
 	kinesis: kinesis.Handler | null = null
 	streams: streams.Handler | null = null
+	logs: logsApi.CloudWatchLogs | null = null
+	sns: snsApi.SNS | null = null
+	events: eventsApi.EventBridge | null = null
+	/// What runs functions; null runs none, as each invocation then answers.
+	runner: running.Runner | null = null
 
 	createFunction(caller: Caller, input: api.CreateFunctionRequest): api.FunctionConfiguration throws Fault {
 		const t = target(caller, input.FunctionName, null)
@@ -293,6 +342,7 @@ export class Handler {
 			return configuration(caller, v)
 		}
 		code(db, v, zip, input.ImageUri)
+		this.runner?.retire(caller.account, caller.region, t.name)
 		if (input.Publish) {
 			return configuration(caller, publish(caller, db, db.functions.get(t.name)!, v, ""))
 		}
@@ -330,6 +380,7 @@ export class Handler {
 		v.logging = input.LoggingConfig ?? v.logging
 		v.kms = input.KMSKeyArn ?? v.kms
 		changed(db, v)
+		this.runner?.retire(caller.account, caller.region, t.name)
 		return configuration(caller, v)
 	}
 
@@ -338,6 +389,7 @@ export class Handler {
 		const db = new Tables(caller)
 		allowed(caller, db, t)
 		const r = { ...new api.DeleteFunctionResponse(), StatusCode: 204 }
+		this.runner?.retire(caller.account, caller.region, t.name)
 		if (t.qualifier != null) {
 			if (t.qualifier == "$LATEST") {
 				throw invalid("$LATEST version cannot be deleted without deleting the function.")
@@ -1071,6 +1123,8 @@ export class Handler {
 		return r
 	}
 
+	/// A synchronous invocation holds the request until the runner has its result, which a run of it after finds by the
+	/// request and the number of the call; an asynchronous one is queued for the tick.
 	invoke(caller: Caller, input: api.InvocationRequest): api.InvocationResponse throws Fault {
 		const t = target(caller, input.FunctionName, input.Qualifier)
 		const db = new Tables(caller)
@@ -1081,12 +1135,376 @@ export class Handler {
 			r.StatusCode = 204
 			return r
 		}
-		r.StatusCode = 200
-		r.ExecutedVersion = v.version
-		r.FunctionError = "Unhandled"
-		r.Payload = `{"errorMessage":"This server does not run Lambda functions: ${arn(caller, t.name, t.qualifier)} `
-			+ `was not invoked.","errorType":"NotImplemented"}`
-		return r
+		const event = input.InvocationType == "Event"
+		const payload = if (input.Payload == null || input.Payload! == "") "{}" else input.Payload!
+		const most: i64 = if (event) 1048576 else 6291456
+		if ((payload.length as i64) > most) {
+			throw api.requestTooLargeException(`Request must be smaller than ${most} bytes for the InvokeFunction operation`,
+				{ ...new api.RequestTooLargeException(), Type: "User" })
+		}
+		const context = contextOf(input.ClientContext)
+		if (event) {
+			enqueue(caller, db, t, payload, context)
+			r.StatusCode = 202
+			return r
+		}
+		const k = `${caller.requestId}#${caller.call()}`
+		const found = this.runner?.find(k) ?? null
+		if (found != null) {
+			if (found!.state != "done") {
+				caller.hold(now() + minute)
+				throw pending()
+			}
+			return answered(found!, input.LogType)
+		}
+		if (caller.holding()) {
+			throw pending()
+		}
+		const chosen = routed(caller, db, t, v)
+		r.ExecutedVersion = chosen.version
+		const refused = this.refused(caller, db, chosen)
+		if (refused != null) {
+			r.StatusCode = 200
+			r.FunctionError = "Unhandled"
+			r.Payload = refused!
+			return r
+		}
+		if (!caller.rerun) {
+			throw api.serviceException("A synchronous invocation cannot wait for its function here: it was made between "
+				+ "requests, which are not run again.")
+		}
+		const j = this.job(caller, db, t, chosen, payload, context)
+		j.id = if (k == `${caller.requestId}#1`) caller.requestId else uuid()
+		this.runner!.submit(k, j)
+		caller.hold(now() + minute)
+		throw pending()
+	}
+
+	invokeAsync(caller: Caller, input: api.InvokeAsyncRequest): api.InvokeAsyncResponse throws Fault {
+		const t = target(caller, input.FunctionName, null)
+		const db = new Tables(caller)
+		allowed(caller, db, t)
+		version(caller, db, t)
+		enqueue(caller, db, t, if (input.InvokeArgs == "") "{}" else input.InvokeArgs, null)
+		return { ...new api.InvokeAsyncResponse(), Status: 202 }
+	}
+
+	/// Gives the environments waiting the role's credentials, puts what functions logged, and runs the invocations
+	/// queued that are due by t: each apart, as one that fails must not drop the tick's other work.
+	tick(caller: Caller, t: i64) throws Fault {
+		const runner = this.runner
+		if (runner == null) {
+			return
+		}
+		for (const [id, c] of runner!.wanting(caller.account, caller.region)) {
+			let k: Credentials | null = null
+			try {
+				k = session(caller, "lambda.amazonaws.com", c.role, arn(caller, c.name, null), c.name, 43200)
+			} catch (f: Fault) {}
+			runner!.provide(id, k, "The role defined for the function cannot be assumed by Lambda.")
+		}
+		for (const l of runner!.drain(caller.account, caller.region)) {
+			try {
+				this.flush(caller, l)
+			} catch (f: Fault) {} // dropped, as AWS drops what a role may not log
+		}
+		const db = new Tables(caller)
+		for (const [k, q] of db.queue.scan(null, 100000)) {
+			try {
+				this.advance(caller, db, runner!, k, q, t)
+			} catch (f: Fault) {
+				db.queue.delete(k)
+			}
+		}
+		runner!.reap(t)
+	}
+
+	/// Why v answers an invocation without running, as its payload, or null if it runs.
+	private refused(caller: Caller, db: Tables, v: Version): string | null throws Fault {
+		if (v.packaged == "Image") {
+			return `{"errorMessage":"This server does not run functions of container images: ${v.image ?? ""} was not `
+				+ `run.","errorType":"NotImplemented"}`
+		}
+		const [img, why] = running.image(v.runtime ?? "", v.architectures[0])
+		if (img == null) {
+			throw api.invalidRuntimeException(why, { ...new api.InvalidRuntimeException(), Type: "User" })
+		}
+		if (this.runner == null || this.runner!.containers == null) {
+			const missing = if (this.runner == null) "This server runs no functions." else this.runner!.missing
+			return `{"errorMessage":${json.quoted(missing)},"errorType":"Runtime.Unavailable"}`
+		}
+		const f = db.functions.get(v.name)!
+		if (f.reserved != null && this.runner!.active(caller.account, caller.region, v.name) >= f.reserved!) {
+			throw api.tooManyRequestsException("Rate Exceeded.",
+				{ ...new api.TooManyRequestsException(), Type: "User",
+				Reason: "ReservedFunctionConcurrentInvocationLimitExceeded" })
+		}
+		return null
+	}
+
+	/// The invocation of v that t names with payload, its environment's config and the variables Lambda sets.
+	private job(caller: Caller, db: Tables, t: Target, v: Version, payload: string,
+		context: string | null): running.Job throws Fault {
+		const c = new running.Config()
+		c.key = `${caller.account}/${caller.region}/${v.name}:${v.version}:${v.revision}`
+		c.account = caller.account
+		c.region = caller.region
+		c.name = v.name
+		c.version = v.version
+		c.image = running.image(v.runtime ?? "", v.architectures[0])[0] ?? ""
+		c.arch = v.architectures[0]
+		c.handler = v.handler ?? ""
+		c.memory = v.memory
+		c.timeout = v.timeout
+		c.role = v.role
+		c.code = db.versions.blob(`${v.name}:${key(v.version)}`)
+		c.sha = v.sha
+		for (const [a, _] of v.layers) {
+			const parts = split(a, ":")
+			const k = `${parts[6]}:${key(parts[7])}`
+			const l = db.layerVersions.get(k)
+			const b = db.layerVersions.blob(k)
+			if (l != null && b != null) {
+				c.layers.push([l!.sha, b!])
+			}
+		}
+		c.group = v.logging?.LogGroup ?? `/aws/lambda/${v.name}`
+		c.json = v.logging?.LogFormat == "JSON"
+		const runtime = v.runtime ?? ""
+		c.env = [...(v.environment ?? []), ["_HANDLER", c.handler], ["AWS_REGION", caller.region],
+			["AWS_DEFAULT_REGION", caller.region], ["AWS_LAMBDA_FUNCTION_NAME", v.name],
+			["AWS_LAMBDA_FUNCTION_VERSION", v.version], ["AWS_LAMBDA_FUNCTION_MEMORY_SIZE", `${v.memory}`],
+			["AWS_LAMBDA_LOG_GROUP_NAME", c.group], ["AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand"],
+			["LAMBDA_TASK_ROOT", "/var/task"], ["LAMBDA_RUNTIME_DIR", "/var/runtime"], ["TZ", ":UTC"],
+			["AWS_ENDPOINT_URL", this.runner!.endpoint]]
+		if (!startsWith(runtime, "provided")) {
+			c.env.push(["AWS_EXECUTION_ENV", `AWS_Lambda_${runtime}`])
+		}
+		if (c.json) {
+			c.env.push(["AWS_LAMBDA_LOG_FORMAT", "JSON"])
+		}
+		const j = new running.Job()
+		j.arn = arn(caller, t.name, t.qualifier)
+		j.config = c
+		j.payload = payload
+		j.context = context
+		j.trace = `Root=1-${formatInt(now() / second, 16)}-${hex.encode(random(12))};Parent=${hex.encode(random(8))};`
+			+ "Sampled=0"
+		return j
+	}
+
+	/// Moves q on: settles the attempt done, else starts one due.
+	private advance(caller: Caller, db: Tables, runner: running.Runner, k: string, q: Queued, t: i64) throws Fault {
+		if (q.running != "" && q.running == runner.generation) {
+			const inv = runner.find(`q:${q.id}#${q.attempts}`)
+			if (inv == null) {
+				q.running = ""
+				db.queue.put(k, q)
+			} else if (inv!.state == "done") {
+				this.settle(caller, db, k, q, inv!.job.config.version, inv!.result!.payload, inv!.result!.error, t)
+			}
+			return
+		}
+		if (q.due > t) {
+			return
+		}
+		const f = db.functions.get(q.name)
+		if (f == null) {
+			db.queue.delete(k)
+			return
+		}
+		const target = { ...new Target(), name: q.name, qualifier: q.qualifier }
+		const v = routed(caller, db, target, version(caller, db, target))
+		const settings = db.invoking.get(`${q.name}:${q.qualifier ?? "$LATEST"}`)
+		if (t - q.enqueued > ((settings?.age ?? 21600) as i64) * second) {
+			this.deliver(caller, db, q, v, "EventAgeExceeded", null, null)
+			db.queue.delete(k)
+			return
+		}
+		let refused: string | null = null
+		try {
+			refused = this.refused(caller, db, v)
+		} catch (x: Fault) {
+			if (x.status == 429) {
+				q.backoff = if (q.backoff == 0) second
+					else if (q.backoff * 2 > 5 * minute) 5 * minute
+					else q.backoff * 2
+				q.due = t + q.backoff
+				q.running = ""
+				db.queue.put(k, q)
+				return
+			}
+			refused = `{"errorMessage":${json.quoted(x.message)},"errorType":${json.quoted(x.code)}}`
+		}
+		q.attempts++
+		q.backoff = 0
+		if (refused != null) {
+			this.settle(caller, db, k, q, v.version, refused!, "Unhandled", t)
+			return
+		}
+		const j = this.job(caller, db, target, v, q.payload, q.context)
+		j.id = q.id
+		q.running = runner.generation
+		db.queue.put(k, q)
+		if (runner.find(`q:${q.id}#${q.attempts}`) == null) {
+			runner.submit(`q:${q.id}#${q.attempts}`, j)
+		}
+	}
+
+	/// Ends an attempt that answered payload: retries it if it failed and may, else delivers its record.
+	private settle(caller: Caller, db: Tables, k: string, q: Queued, executed: string, payload: string,
+		error: string | null, t: i64) throws Fault {
+		const settings = db.invoking.get(`${q.name}:${q.qualifier ?? "$LATEST"}`)
+		if (error != null && q.attempts <= (settings?.retries ?? 2)) {
+			q.running = ""
+			q.due = t + (if (q.attempts == 1) minute else 2 * minute)
+			db.queue.put(k, q)
+			return
+		}
+		db.queue.delete(k)
+		const v = db.versions.get(`${q.name}:${key(executed)}`)
+		if (v != null) {
+			this.deliver(caller, db, q, v!, if (error == null) "Success" else "RetriesExhausted", payload, error)
+		}
+	}
+
+	/// Sends q's invocation record to the destination its condition goes to, and a failure to the dead-letter queue,
+	/// as the function's role: what either refuses is dropped, as by AWS.
+	private deliver(caller: Caller, db: Tables, q: Queued, v: Version, condition: string, response: string | null,
+		error: string | null) throws Fault {
+		const fn = arn(caller, v.name, v.version)
+		const settings = db.invoking.get(`${q.name}:${q.qualifier ?? "$LATEST"}`)
+		const success = condition == "Success"
+		const to = if (success) settings?.destination?.OnSuccess?.Destination
+			else settings?.destination?.OnFailure?.Destination
+		const t = now()
+		let record = `{"version":"1.0","timestamp":${json.quoted(rfc3339(t - t % millisecond))},"requestContext":{`
+			+ `"requestId":${json.quoted(q.id)},"functionArn":${json.quoted(fn)},"condition":${json.quoted(condition)},`
+			+ `"approximateInvokeCount":${q.attempts}},"requestPayload":${embedded(q.payload)}`
+		if (response != null) {
+			const failed = if (error == null) "" else `,"functionError":${json.quoted(error!)}`
+			record += `,"responseContext":{"statusCode":200,"executedVersion":${json.quoted(v.version)}${failed}},`
+				+ `"responsePayload":${embedded(response!)}`
+		}
+		record += "}"
+		if (to != null) {
+			try {
+				this.send(caller, v, to!, record, success, [])
+			} catch (f: Fault) {}
+		}
+		if (!success && v.deadLetter != null) {
+			const message = if (response == null) "Event age exceeded" else messageOf(response!)
+			try {
+				this.send(caller, v, v.deadLetter!, q.payload, false,
+					[["RequestID", q.id], ["ErrorCode", "200"], ["ErrorMessage", message]])
+			} catch (f: Fault) {}
+		}
+	}
+
+	/// Sends body to the queue, topic, function or event bus of ARN to as v's role.
+	private send(caller: Caller, v: Version, to: string, body: string, success: bool,
+		attributes: [string, string][]) throws Fault {
+		const parts = split(to, ":")
+		if (parts.length < 6) {
+			return
+		}
+		const service = parts[2]
+		const action = if (service == "sqs") "sqs:SendMessage"
+			else if (service == "sns") "sns:Publish"
+			else if (service == "lambda") "lambda:InvokeFunction"
+			else "events:PutEvents"
+		const c = actAs(caller, "lambda.amazonaws.com", v.role, arn(caller, v.name, null), [action], v.name)
+		if (c == null) {
+			return
+		}
+		c!.region = parts[3]
+		if (service == "sqs" && this.sqs != null) {
+			const m = new sqsApi.SendMessageRequest()
+			m.QueueUrl = `${caller.endpoint}/${parts[4]}/${parts[5]}`
+			m.MessageBody = body
+			m.MessageAttributes = if (attributes.length == 0) null else attributes.map(a => {
+				const x = new sqsApi.MessageAttributeValue()
+				x.DataType = "String"
+				x.StringValue = a[1]
+				return [a[0], x]
+			})
+			this.sqs!.sendMessage(c!, m)
+		} else if (service == "sns" && this.sns != null) {
+			const m = new snsApi.PublishInput()
+			m.TopicArn = to
+			m.Message = body
+			m.MessageAttributes = if (attributes.length == 0) null else attributes.map(a => {
+				const x = new snsApi.MessageAttributeValue()
+				x.DataType = "String"
+				x.StringValue = a[1]
+				return [a[0], x]
+			})
+			this.sns!.publish(c!, m)
+		} else if (service == "lambda") {
+			const m = new api.InvocationRequest()
+			m.FunctionName = to
+			m.InvocationType = "Event"
+			m.Payload = body
+			this.invoke(c!, m)
+		} else if (service == "events" && this.events != null) {
+			const e = new eventsApi.PutEventsRequestEntry()
+			e.EventBusName = to
+			e.Source = "lambda"
+			e.DetailType = `Lambda Function Invocation Result - ${if (success) "Success" else "Failure"}`
+			e.Detail = body
+			e.Resources = [arn(caller, v.name, v.version)]
+			this.events!.putEvents(c!, { ...new eventsApi.PutEventsRequest(), Entries: [e] })
+		}
+	}
+
+	/// Puts l's events in the function's log group, in its environment's stream, as its role, making either if missing.
+	private flush(caller: Caller, l: running.Logged) throws Fault {
+		if (this.logs == null) {
+			return
+		}
+		const c = l.config
+		const as = actAs(caller, "lambda.amazonaws.com", c.role, arn(caller, c.name, null), [], c.name)
+		if (as == null) {
+			return
+		}
+		for (let i = 0; i < l.events.length; i += 1000) {
+			const m = new logsApi.PutLogEventsRequest()
+			m.logGroupName = c.group
+			m.logStreamName = l.stream
+			m.logEvents = l.events.slice(i, if (i + 1000 > l.events.length) l.events.length else i + 1000).map(e => {
+				const x = new logsApi.InputLogEvent()
+				x.timestamp = e[0]
+				x.message = if (e[1] == "") " " else e[1]
+				return x
+			})
+			try {
+				as!.actions = ["logs:PutLogEvents"]
+				this.logs!.putLogEvents(as!, m)
+			} catch (f: Fault) {
+				if (f.code != "ResourceNotFoundException") {
+					throw f
+				}
+				try {
+					as!.actions = ["logs:CreateLogGroup"]
+					this.logs!.createLogGroup(as!, { ...new logsApi.CreateLogGroupRequest(), logGroupName: c.group })
+				} catch (g: Fault) {
+					if (g.code != "ResourceAlreadyExistsException") {
+						throw g
+					}
+				}
+				try {
+					as!.actions = ["logs:CreateLogStream"]
+					this.logs!.createLogStream(as!,
+						{ ...new logsApi.CreateLogStreamRequest(), logGroupName: c.group, logStreamName: l.stream })
+				} catch (g: Fault) {
+					if (g.code != "ResourceAlreadyExistsException") {
+						throw g
+					}
+				}
+				as!.actions = ["logs:PutLogEvents"]
+				this.logs!.putLogEvents(as!, m)
+			}
+		}
 	}
 }
 
@@ -1693,4 +2111,89 @@ function conflict(): api.ResourceConflictException { return { ...new api.Resourc
 function stamp(): string {
 	const t = now()
 	return replace(rfc3339(t - t % millisecond), "Z", "+0000")
+}
+
+/// Queues payload for t as an asynchronous invocation: one the request makes first takes its id.
+function enqueue(caller: Caller, db: Tables, t: Target, payload: string, context: string | null) throws Fault {
+	const q = new Queued()
+	q.id = if (caller.call() == 1) caller.requestId else uuid()
+	q.name = t.name
+	q.qualifier = t.qualifier
+	q.payload = payload
+	q.context = context
+	q.enqueued = now()
+	q.due = q.enqueued
+	db.queue.put(`${q.enqueued}:${q.id}`, q)
+}
+
+/// What a request held answers, which the gateway does not send unless the hold runs out.
+function pending(): Fault { return api.serviceException("The function has not answered yet.") }
+
+function answered(inv: running.Invocation, log: api.LogType | null): api.InvocationResponse {
+	const r = new api.InvocationResponse()
+	r.StatusCode = 200
+	r.ExecutedVersion = inv.job.config.version
+	r.Payload = inv.result!.payload
+	r.FunctionError = inv.result!.error
+	if (log == "Tail") {
+		r.LogResult = base64.encode(inv.result!.log)
+	}
+	return r
+}
+
+/// The version an alias with weights routes this invocation to, by chance; v for any other target.
+function routed(caller: Caller, db: Tables, t: Target, v: Version): Version throws Fault {
+	const q = t.qualifier
+	if (q == null || q! == "$LATEST" || numeric(q!)) {
+		return v
+	}
+	const a = alias(caller, db, t.name, q!)
+	if (a.weights == null) {
+		return v
+	}
+	const b = random(4)
+	let roll = (((b[0] as u32) << 24 | (b[1] as u32) << 16 | (b[2] as u32) << 8 | (b[3] as u32)) as f64) / 4294967296.0
+	for (const [w, weight] of a.weights!) {
+		if (roll < weight) {
+			return db.versions.get(`${t.name}:${key(w)}`) ?? v
+		}
+		roll -= weight
+	}
+	return v
+}
+
+/// The client context given, base64 of JSON, decoded.
+function contextOf(given: string | null): string | null throws Fault {
+	if (given == null) {
+		return null
+	}
+	try {
+		return base64.decode(given!)
+	} catch (e: ParseError) {
+		throw api.invalidRequestContentException("Client context must be a valid Base64-encoded JSON object.",
+			{ ...new api.InvalidRequestContentException(), Type: "User" })
+	}
+}
+
+/// s as a JSON value in a record: itself if it is one, else a string.
+function embedded(s: string): string {
+	try {
+		json.decode[json.Raw](s)
+		return s
+	} catch (e: ParseError) {
+		return json.quoted(s)
+	}
+}
+
+/// The errorMessage of a function's error, else the whole of it.
+function messageOf(payload: string): string {
+	try {
+		return json.decode[ErrorPayload](payload).errorMessage ?? payload
+	} catch (e: ParseError) {
+		return payload
+	}
+}
+
+class ErrorPayload {
+	errorMessage: string | null = null
 }

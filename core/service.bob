@@ -42,11 +42,16 @@ export class Caller {
 	lenient = false
 	/// The instant hold was given, if it was.
 	held: i64 | null = null
+	/// Whether the gateway runs the request again once held: a tick's callers it does not.
+	rerun = true
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
 	/// The trees committed, by account, which the gateway does not change while the request runs.
 	private committed: HashMap[string, Store]
+	/// The caller internal made this one of, which takes its holds and numbers its calls.
+	private outer: Caller | null = null
+	private calls = 0
 
 	constructor(account: string, region: string, arn: string, requestId: string, userId: string = account,
 		committed: HashMap[string, Store] = new HashMap[string, Store]()) {
@@ -74,7 +79,25 @@ export class Caller {
 
 	/// Tells the gateway that the request has nothing to answer before instant until: it drops what the request did
 	/// and runs it again from its start, after the next request that commits or the next tick. Its answer is not sent.
-	hold(until: i64) { this.held = until }
+	hold(until: i64) {
+		this.held = until
+		if (this.outer != null) {
+			this.outer!.hold(until)
+		}
+	}
+
+	/// Whether the request is held, by any caller of it.
+	holding(): bool { return if (this.outer != null) this.outer!.holding() else this.held != null }
+
+	/// The next number, from 1, of the calls the request makes in this run that outlive it, as a function invoked: the
+	/// same in each run, so that a run finds what the one before it started.
+	call(): i32 {
+		if (this.outer != null) {
+			return this.outer!.call()
+		}
+		this.calls++
+		return this.calls
+	}
 
 	/// Throws the service's access denied unless IAM's evaluation lets the caller perform each of the operation's actions
 	/// on resource, given the resource's own policy (sts:AssumeRole's is the role's trust policy). The resource is of the
@@ -143,6 +166,8 @@ export class Caller {
 		c.lenient = this.lenient
 		c.arrived = this.arrived
 		c.opened = this.opened
+		c.rerun = this.rerun
+		c.outer = this
 		return c
 	}
 

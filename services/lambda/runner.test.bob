@@ -1,0 +1,366 @@
+import { Config, image, Invocation, Job, Runner } from "./runner"
+import { Arch, ContainerError, Spec } from "../../core/container/container"
+import { Blob } from "../../core/state/store"
+import { Credentials } from "../sts/api"
+import { Signal } from "builtin/fiber"
+import { indexOf } from "std/algo"
+import { sha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import { exists, lstat, makeTempDir, readFile, readLink } from "std/fs"
+import { Request, send } from "std/http"
+import { ParseError, replace } from "std/string"
+import { millisecond, minute, second, sleep } from "std/time"
+
+const account = "123456789012"
+const region = "us-east-1"
+
+/// Info-ZIP's: an executable bootstrap, lib/, lib/app.py and link.py, a symbolic link to it.
+export const unix = base64.decode("UEsDBAoAAAAAAAWAd10vOtrpEgAAABIAAAAJAAAAYm9vdHN0cmFwIyEvYmluL3NoCmVjaG8gaGkKUEsDBAoAAAAAAAWAd10AAAAAAAAAAAAAAAAEAAAAbGli"
+	+ "L1BLAwQKAAAAAAAFgHddl5liMCAAAAAgAAAACgAAAGxpYi9hcHAucHlkZWYgaGFuZGxlcihlLCBjKToKICAgIHJldHVybiBlClBLAwQKAAAAAAAFgHdd"
+	+ "7BLaFgoAAAAKAAAABwAAAGxpbmsucHlsaWIvYXBwLnB5UEsBAh4DCgAAAAAABYB3XS862ukSAAAAEgAAAAkAAAAAAAAAAQAAAO2BAAAAAGJvb3RzdHJh"
+	+ "cFBLAQIeAwoAAAAAAAWAd10AAAAAAAAAAAAAAAAEAAAAAAAAAAAAEAD9QTkAAABsaWIvUEsBAh4DCgAAAAAABYB3XZeZYjAgAAAAIAAAAAoAAAAAAAAA"
+	+ "AQAAAKSBWwAAAGxpYi9hcHAucHlQSwECHgMKAAAAAAAFgHdd7BLaFgoAAAAKAAAABwAAAAAAAAAAAAAA/6GjAAAAbGluay5weVBLBQYAAAAABAAEANYA"
+	+ "AADSAAAAAAA=")
+
+/// A container of the fake: its runtime is a fiber that does as the handler, its command's second word, says.
+class Box {
+	id: string
+	spec: Spec
+	output = ""
+	exit: i32 | null = null
+	done = new Signal()
+	/// What the runtime was told of each invocation, and the status of a second answer to it.
+	heard: string[] = []
+	payloads: string[] = []
+	late: i32 = 0
+
+	constructor(id: string, spec: Spec) {
+		this.id = id
+		this.spec = spec
+	}
+}
+
+/// Containers whose runtimes are fibers here, calling the Runtime API on the simulated network.
+export class Fake {
+	boxes: Box[] = []
+	pulled: string[] = []
+	stopped: string[] = []
+	/// What list answers, and the labels it was asked for.
+	left: string[] = []
+	asked: [string, string][] = []
+
+	pull(image: string, arch: Arch) throws ContainerError { this.pulled.push(`${image} ${arch}`) }
+
+	start(spec: Spec): string throws ContainerError {
+		const b = new Box(`c${this.boxes.length + 1}`, spec)
+		this.boxes.push(b)
+		const running = async runtime(b)
+		return b.id
+	}
+
+	host(): string throws ContainerError { return "127.0.0.1" }
+	output(id: string): string throws ContainerError { return this.box(id).output }
+
+	wait(id: string): i32 throws ContainerError {
+		const b = this.box(id)
+		while (b.exit == null) {
+			b.done.wait()
+		}
+		return b.exit!
+	}
+
+	stop(id: string) throws ContainerError {
+		this.stopped.push(id)
+		for (const b of this.boxes) {
+			if (b.id == id && b.exit == null) {
+				b.exit = 137
+				b.done.wake()
+			}
+		}
+	}
+
+	list(label: [string, string]): string[] throws ContainerError {
+		this.asked.push(label)
+		return this.left
+	}
+
+	private box(id: string): Box throws ContainerError {
+		for (const b of this.boxes) {
+			if (b.id == id) {
+				return b
+			}
+		}
+		throw new ContainerError("NotFound", id)
+	}
+}
+
+function variable(spec: Spec, name: string): string | null {
+	for (const [k, v] of spec.env) {
+		if (k == name) {
+			return v
+		}
+	}
+	return null
+}
+
+/// echo answers the payload, fail its error, hang nothing, exit exits with 3, init fails its init.
+function runtime(b: Box) {
+	const api = `http://${variable(b.spec, "AWS_LAMBDA_RUNTIME_API") ?? ""}/2018-06-01/runtime`
+	const handler = b.spec.command[1]
+	try {
+		if (handler == "init") {
+			post(`${api}/init/error`,
+				`{"errorMessage":"No module named 'app'","errorType":"Runtime.ImportModuleError"}`,
+				"Runtime.ImportModuleError")
+			return
+		}
+		while (b.exit == null) {
+			const res = send(new Request("GET", `${api}/invocation/next`))
+			if (res.status != 200) {
+				return
+			}
+			const id = res.headers.get("lambda-runtime-aws-request-id") ?? ""
+			const payload = res.body.text()
+			const deadline = res.headers.get("lambda-runtime-deadline-ms") ?? ""
+			b.heard.push(`${id} ${res.headers.get("lambda-runtime-invoked-function-arn") ?? ""} `
+				+ `${res.headers.get("lambda-runtime-trace-id") ?? ""} ${res.headers.get("lambda-runtime-client-context") ?? "-"} `
+				+ `${deadline.length == 13}`)
+			b.payloads.push(payload)
+			b.output += `log of ${id}\n`
+			if (handler == "echo") {
+				post(`${api}/invocation/${id}/response`, payload, null)
+				b.late = post(`${api}/invocation/${id}/response`, payload, null)
+			} else if (handler == "fail") {
+				post(`${api}/invocation/${id}/error`, `{"errorMessage":"boom","errorType":"ValueError"}`, "Unhandled")
+			} else if (handler == "exit") {
+				b.exit = 3
+				b.done.wake()
+				return
+			} else {
+				while (b.exit == null) {
+					b.done.wait()
+				}
+			}
+		}
+	} catch (x: IoError | ParseError) {
+		b.output += `runtime failed: ${x}\n`
+	}
+}
+
+function post(url: string, body: string, kind: string | null): i32 throws IoError | ParseError {
+	const req = new Request("POST", url, body)
+	if (kind != null) {
+		req.headers.set("Lambda-Runtime-Function-Error-Type", kind!)
+	}
+	return send(req).status
+}
+
+export function runner(f: Fake): Runner throws IoError {
+	const r = new Runner(f, "", "g")
+	r.cache = makeTempDir("lambda")
+	r.endpoint = "http://127.0.0.1:4566"
+	r.label = "4566"
+	return r
+}
+
+function config(handler: string, code = unix): Config {
+	const c = new Config()
+	c.key = `${account}/${region}/f:$LATEST:1`
+	c.account = account
+	c.region = region
+	c.name = "f"
+	c.image = "public.ecr.aws/lambda/python:3.12"
+	c.handler = handler
+	c.timeout = 3
+	c.role = `arn:aws:iam::${account}:role/r`
+	c.env = [["A", "1"]]
+	c.code = Blob.of(code)
+	c.sha = base64.encode(sha256(code))
+	c.group = "/aws/lambda/f"
+	return c
+}
+
+function job(c: Config, id: string, payload: string): Job {
+	const j = new Job()
+	j.id = id
+	j.arn = `arn:aws:lambda:${region}:${account}:function:f`
+	j.trace = "Root=1-00000000-000000000000000000000000;Parent=0000000000000000;Sampled=0"
+	j.config = c
+	j.payload = payload
+	return j
+}
+
+function credentials(): Credentials {
+	const k = new Credentials()
+	k.AccessKeyId = "ASIAFAKE"
+	k.SecretAccessKey = "secret"
+	k.SessionToken = "token"
+	return k
+}
+
+/// Gives the environments waiting credentials, as the tick does, until inv is done or 5 seconds pass.
+function settled(r: Runner, inv: Invocation): bool {
+	const until = now() + 5 * second
+	while (now() < until) {
+		for (const [id, _] of r.wanting(account, region)) {
+			r.provide(id, credentials(), "unused")
+		}
+		if (inv.state == "done") {
+			return true
+		}
+		sleep(5 * millisecond)
+	}
+	return false
+}
+
+function has(s: string, part: string): bool { return indexOf(s, part) >= 0 }
+
+test "a runtime's image is Lambda's public one for its architecture, if it has one" {
+	assert image("python3.12", "x86_64") == ["public.ecr.aws/lambda/python:3.12", ""]
+	assert image("nodejs22.x", "arm64") == ["public.ecr.aws/lambda/nodejs:22", ""]
+	assert image("java21", "x86_64")[0] == "public.ecr.aws/lambda/java:21"
+	assert image("dotnet8", "x86_64")[0] == "public.ecr.aws/lambda/dotnet:8"
+	assert image("ruby3.3", "x86_64")[0] == "public.ecr.aws/lambda/ruby:3.3"
+	assert image("provided.al2023", "arm64")[0] == "public.ecr.aws/lambda/provided:al2023"
+	assert image("go1.x", "x86_64")[0] == "public.ecr.aws/lambda/go:1"
+	assert image("python2.7", "arm64") == [null, "The runtime python2.7 has no image for arm64."]
+	assert image("cobol", "x86_64") == [null, "The runtime cobol has no image to run it in."]
+}
+
+test "an invocation starts an environment whose runtime takes it from the Runtime API; the next finds it warm" {
+	const f = new Fake()
+	const r = runner(f)
+	const c = config("echo")
+	c.layers = [["sha", Blob.of(unix)]]
+	const first = job(c, "id-1", `{"a":1}`)
+	first.context = `{"custom":{"x":"y"}}`
+	const inv = r.submit("k1", first)
+	assert r.wanting(account, region).length == 1 && r.active(account, region, "f") == 1
+	assert settled(r, inv)
+	assert inv.result!.payload == `{"a":1}` && inv.result!.error == null
+	assert f.pulled == ["public.ecr.aws/lambda/python:3.12 x86_64"] && f.boxes.length == 1
+	const b = f.boxes[0]
+	assert b.heard == [`id-1 ${first.arn} ${first.trace} {"custom":{"x":"y"}} true`]
+	assert b.late == 400
+	assert b.spec.command == ["/lambda-entrypoint.sh", "echo"] && b.spec.labels == [["boberstack.lambda", "4566"]]
+	assert b.spec.mounts.map(m => `${m.path} ${m.readOnly}`) == ["/var/task true", "/opt true"]
+	assert variable(b.spec, "A") == "1" && variable(b.spec, "AWS_ACCESS_KEY_ID") == "ASIAFAKE"
+	assert variable(b.spec, "AWS_SESSION_TOKEN") == "token"
+	const stream = variable(b.spec, "AWS_LAMBDA_LOG_STREAM_NAME") ?? ""
+	assert stream.length == 52 && stream.slice(10, 20) == "/[$LATEST]"
+	const task = b.spec.mounts[0].host
+	assert lstat(`${task}/bootstrap`).mode == 0o755 && lstat(`${task}/lib/app.py`).mode == 0o644
+	assert readLink(`${task}/link.py`) == "lib/app.py"
+		&& readFile(`${task}/lib/app.py`) == "def handler(e, c):\n    return e\n"
+	assert readFile(`${b.spec.mounts[1].host}/bootstrap`) == "#!/bin/sh\necho hi\n"
+	const log = inv.result!.log
+	assert has(log,
+		"START RequestId: id-1 Version: $LATEST\nlog of id-1\nEND RequestId: id-1\nREPORT RequestId: id-1\t")
+	assert has(log, "\tInit Duration: ") && has(log, "\tMemory Size: 128 MB\t") && !has(log, "Status:")
+	const second = r.submit("k2", job(c, "id-2", "2"))
+	assert r.wanting(account, region).length == 0
+	assert settled(r, second)
+	assert second.result!.payload == "2" && f.boxes.length == 1 && !has(second.result!.log, "Init Duration")
+	assert r.find("k1") == inv && r.active(account, region, "f") == 0
+	const logged = r.drain(account, region)
+	assert logged.length == 1 && logged[0].stream == stream && r.drain(account, region).length == 0
+	assert logged[0].events.filter(e => has(e[1], "START RequestId")).length == 2
+	r.retire(account, region, "f")
+	sleep(10 * millisecond)
+	assert f.stopped == ["c1"]
+}
+
+test "two invocations at once run in two environments" {
+	const f = new Fake()
+	const r = runner(f)
+	const c = config("echo")
+	const one = r.submit("k1", job(c, "id-1", "1"))
+	const two = r.submit("k2", job(c, "id-2", "2"))
+	assert r.active(account, region, "f") == 2
+	assert settled(r, one) && settled(r, two)
+	assert one.result!.payload == "1" && two.result!.payload == "2" && f.boxes.length == 2
+}
+
+test "a function's error is Unhandled with what its runtime posted, and REPORT has no status" {
+	const f = new Fake()
+	const r = runner(f)
+	const c = config("fail")
+	c.json = true
+	const inv = r.submit("k1", job(c, "id-1", "{}"))
+	assert settled(r, inv)
+	assert inv.result!.payload == `{"errorMessage":"boom","errorType":"ValueError"}` && inv.result!.error == "Unhandled"
+	const log = inv.result!.log
+	assert has(log, `"type":"platform.start","record":{"requestId":"id-1","version":"$LATEST"}}`)
+	assert has(log, `"type":"platform.runtimeDone","record":{"requestId":"id-1","status":"error"}}`)
+}
+
+test "an invocation past its timeout is Sandbox.Timedout, and its environment goes" {
+	const f = new Fake()
+	const r = runner(f)
+	const c = config("hang")
+	c.timeout = 1
+	const inv = r.submit("k1", job(c, "id-1", "{}"))
+	assert settled(r, inv)
+	assert inv.result!.payload
+		== `{"errorMessage":"RequestId: id-1 Error: Task timed out after 1.00 seconds","errorType":"Sandbox.Timedout"}`
+	assert has(inv.result!.log, " id-1 Task timed out after 1.00 seconds\n")
+		&& has(inv.result!.log, "\tStatus: timeout\t")
+	sleep(10 * millisecond)
+	assert f.stopped == ["c1"]
+	r.submit("k2", job(c, "id-2", "{}"))
+	assert r.wanting(account, region).length == 1
+}
+
+test "a runtime that exits fails its invocation with Runtime.ExitError" {
+	const f = new Fake()
+	const r = runner(f)
+	const inv = r.submit("k1", job(config("exit"), "id-1", "{}"))
+	assert settled(r, inv)
+	assert inv.result!.payload
+		== `{"errorMessage":"RequestId: id-1 Error: Runtime exited with error: exit status 3",`
+		+ `"errorType":"Runtime.ExitError"}`
+	assert has(inv.result!.log, "\tStatus: error\tError Type: Runtime.ExitError\t")
+}
+
+test "an init error fails the invocation with what the runtime posted, and the environment goes" {
+	const f = new Fake()
+	const r = runner(f)
+	const inv = r.submit("k1", job(config("init"), "id-1", "{}"))
+	assert settled(r, inv)
+	assert inv.result!.payload == `{"errorMessage":"No module named 'app'","errorType":"Runtime.ImportModuleError"}`
+	sleep(10 * millisecond)
+	assert f.stopped == ["c1"]
+}
+
+test "no credentials, or code that would leave its directory, fail the invocation before a container starts" {
+	const f = new Fake()
+	const r = runner(f)
+	const inv = r.submit("k1", job(config("echo"), "id-1", "{}"))
+	for (const [id, _] of r.wanting(account, region)) {
+		r.provide(id, null, "The role defined for the function cannot be assumed by Lambda.")
+	}
+	assert inv.state == "done"
+	assert inv.result!.payload
+		== `{"errorMessage":"The role defined for the function cannot be assumed by Lambda.","errorType":"Runtime.Unavailable"}`
+	const escaping = r.submit("k2", job(config("echo", replace(unix, "link.py", "../a.py")), "id-2", "{}"))
+	assert settled(r, escaping)
+	assert has(escaping.result!.payload, `"errorMessage":"The code is not a zip this server reads, at byte `)
+	assert f.boxes.length == 0 && !exists(`${r.cache}/code/a.py`)
+}
+
+test "an environment idle too long is stopped, and what a crashed run left is swept" {
+	const f = new Fake()
+	const r = runner(f)
+	const inv = r.submit("k1", job(config("echo"), "id-1", "{}"))
+	assert settled(r, inv)
+	r.reap(now())
+	assert f.stopped.length == 0
+	r.reap(now() + r.idle + second)
+	sleep(10 * millisecond)
+	assert f.stopped == ["c1"]
+	r.reap(now() + 3 * minute)
+	assert r.find("k1") == null
+	f.left = ["old"]
+	r.sweep()
+	assert f.asked == [["boberstack.lambda", "4566"]] && f.stopped == ["c1", "old"]
+}

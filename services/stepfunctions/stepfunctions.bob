@@ -15,7 +15,10 @@
 //!   kinesis:putRecord and lambda:invoke. Their results are without AWS's SdkHttpMetadata and SdkResponseMetadata. A
 //!   failed call is named of the service and the fault's code with Exception after it, as
 //!   SQS.QueueDoesNotExistException.
-//! - No Lambda function runs here, so every function that exists answers its error, NotImplemented.
+//! - A synchronous lambda:invoke holds the request that runs the machine, StartExecution or SendTaskSuccess, until
+//!   the function answers; the run is then made again from its start and finds the answers it waited for. A state
+//!   machine started by a tick (a schedule or a rule) cannot be held, so its lambda:invoke fails with
+//!   Lambda.ServiceException.
 //! - Heartbeats are accepted and change nothing; no task times out.
 //! - An alias of two versions does not pick at random: of each 100 executions it starts in a row, exactly as many as
 //!   the first's weight run the first version, spread evenly. DescribeStateMachine refuses an alias's ARN.
@@ -1140,6 +1143,10 @@ export class Handler {
 			c.actions = ["lambda:InvokeFunction"]
 			out = this.lambda!.invoke(c, r)
 		} catch (f: Fault) {
+			if (c.holding()) {
+				// The run is dropped and made again once the function answers; no Retry or Catch may call it again.
+				throw new asl.Failure("States.Runtime", f.message)
+			}
 			const parts = split(f.code, ".")
 			const last = parts[parts.length - 1]
 			const code = if (endsWith(last, "Exception")) last else `${last}Exception`

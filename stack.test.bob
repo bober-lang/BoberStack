@@ -4,6 +4,7 @@ import { Fault } from "./core/fault"
 import { Gateway } from "./core/gateway"
 import * as protocol from "./core/protocol/json"
 import { Catalog } from "./services/iam/catalog"
+import { Fake, runner, unix } from "./services/lambda/runner.test"
 import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
 import { indexOf, startsWith } from "std/algo"
@@ -14,7 +15,7 @@ import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
 import { Request, Response } from "std/http"
 import { ParseError } from "std/string"
-import { millisecond, minute, rfc3339, second } from "std/time"
+import { millisecond, minute, rfc3339, second, sleep } from "std/time"
 import { escape } from "std/url"
 
 const account = "000000000000"
@@ -757,7 +758,7 @@ function refused(res: Response, status: i32, code: string, message = ""): bool {
 		&& (message == "" || indexOf(res.body.whole ?? "", `essage":"${message}"`) >= 0)
 }
 
-test "Lambda: a function of a role Lambda may assume, its versions, aliases, policy and mappings; Invoke runs nothing" {
+test "Lambda: a function of a role Lambda may assume, its versions, aliases, policy and mappings; with no container runtime, Invoke answers Runtime.Unavailable" {
 	const g = gateway()
 	role(g, "other", "states.amazonaws.com")
 	role(g, "fn", "lambda.amazonaws.com")
@@ -813,7 +814,7 @@ test "Lambda: a function of a role Lambda may assume, its versions, aliases, pol
 		`\\"Service\\":\\"s3.amazonaws.com\\"`) > 0
 	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", `{"a":1}`)
 	assert res.status == 200 && res.headers.get("x-amz-function-error") == "Unhandled"
-	assert indexOf(res.body.whole ?? "", `"errorType":"NotImplemented"`) > 0
+	assert res.body.whole == `{"errorMessage":"This server runs no functions.","errorType":"Runtime.Unavailable"}`
 	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/g/invocations", "{}"), 404, "ResourceNotFoundException")
 	const bob = user(g, "bob")
 	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob), 403,
@@ -2080,4 +2081,153 @@ test "lenient, no request is refused for lack of permission or trust, and a role
 
 test "by default, a queue of no policy takes nothing, a role not there is refused, a private object is not read" {
 	assert ungranted(false) == [0, 400, 0, 400, 403, 403]
+}
+
+function invoked(g: Gateway, name: string, body: string, headers: [string, string][] = []): Response {
+	const req = new Request("POST", `http://localhost:4566/2015-03-31/functions/${name}/invocations`, body)
+	for (const [k, v] of headers) {
+		req.headers.set(k, v)
+	}
+	sign(req, body, "lambda", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// Ticks g, as main does each second, until done or 5 seconds pass.
+function ticked(g: Gateway, done: () => bool): bool {
+	const until = now() + 5 * second
+	while (now() < until) {
+		g.tick(now())
+		if (done()) {
+			return true
+		}
+		sleep(10 * millisecond)
+	}
+	return false
+}
+
+/// A gateway whose Lambda runs functions in f's containers, with the zip functions named, of handlers as named.
+function running(f: Fake, functions: string[]): Gateway {
+	const g = stack(new Catalog(""), runner(f))
+	role(g, "fn", "lambda.amazonaws.com",
+		policy([statement("Allow",
+		`["sqs:SendMessage","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"]`, "*")]))
+	for (const name of functions) {
+		assert lambdaCall(g, "POST", "/2015-03-31/functions",
+			`{"FunctionName":"${name}","Runtime":"python3.12","Handler":"${name}",`
+			+ `"Role":"arn:aws:iam::${account}:role/fn","Code":{"ZipFile":"${base64.encode(unix)}"}}`).status == 201
+	}
+	return g
+}
+
+test "Lambda runs a function: Invoke holds its request until the function answers, and its logs reach CloudWatch" {
+	const f = new Fake()
+	const g = running(f, ["echo", "fail"])
+	let res = invoked(g, "echo", `{"a":1}`, [["X-Amz-Log-Type", "Tail"]])
+	assert res.status == 200 && res.body.whole == `{"a":1}` && res.headers.get("x-amz-executed-version") == "$LATEST"
+	const tail = base64.decode(res.headers.get("x-amz-log-result") ?? "")
+	assert startsWith(tail, "START RequestId: ") && indexOf(tail, "\nREPORT RequestId: ") > 0
+	const env = f.boxes[0].spec.env
+	assert env.some(e => e[0] == "AWS_ENDPOINT_URL" && e[1] == "http://127.0.0.1:4566")
+	assert env.some(e => e[0] == "AWS_LAMBDA_FUNCTION_NAME" && e[1] == "echo")
+	assert env.some(e => e[0] == "AWS_ACCESS_KEY_ID" && startsWith(e[1], "ASIA"))
+	res = invoked(g, "fail", "{}")
+	assert res.status == 200 && res.headers.get("x-amz-function-error") == "Unhandled"
+	assert res.body.whole == `{"errorMessage":"boom","errorType":"ValueError"}`
+	assert ticked(g,
+		() => indexOf(json11Of(g, "logs", "FilterLogEvents", `{"logGroupName":"/aws/lambda/echo"}`).body.whole ?? "",
+		"START RequestId: ") > 0)
+	assert lambdaCall(g, "PUT", "/2017-10-31/functions/echo/concurrency", `{"ReservedConcurrentExecutions":0}`).status
+		== 200
+	res = invoked(g, "echo", "{}")
+	assert res.status == 429 && member(res, "Reason") == "ReservedFunctionConcurrentInvocationLimitExceeded"
+	assert f.boxes.length == 2
+}
+
+test "Lambda queues an Event invocation, and sends a failure past its retries to the OnFailure destination" {
+	const f = new Fake()
+	const g = running(f, ["fail"])
+	queue(g, "failed")
+	assert lambdaCall(g, "PUT", "/2019-09-25/functions/fail/event-invoke-config",
+		`{"MaximumRetryAttempts":0,"DestinationConfig":{"OnFailure":{"Destination":"${queueArn("failed")}"}}}`).status
+		== 200
+	assert invoked(g, "fail", `{"n":1}`, [["X-Amz-Invocation-Type", "Event"]]).status == 202
+	let got: string[] = []
+	assert ticked(g, () => {
+		got = bodies(g, "failed")
+		return got.length > 0
+	})
+	assert indexOf(got[0], `"condition":"RetriesExhausted","approximateInvokeCount":1},"requestPayload":{"n":1}`) > 0
+	assert indexOf(got[0],
+		`"functionError":"Unhandled"},"responsePayload":{"errorMessage":"boom","errorType":"ValueError"}}`) > 0
+}
+
+test "SNS invokes a function subscribed that lets it, and a state machine invokes functions task after task" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	const t = topicArn("t")
+	topic(g, "t")
+	const fn = `arn:aws:lambda:us-east-1:${account}:function:echo`
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"sns","Action":"lambda:InvokeFunction","Principal":"sns.amazonaws.com","SourceArn":"${t}"}`).status
+		== 201
+	assert query(g, "sns", [["Action", "Subscribe"], ["TopicArn", t], ["Protocol", "lambda"], ["Endpoint", fn]]).status
+		== 200
+	assert publish(g, t, "hello").status == 200
+	assert ticked(g, () => f.boxes.length > 0 && f.boxes[0].payloads.length > 0)
+	const event = f.boxes[0].payloads[0]
+	assert indexOf(event, `"EventSource":"aws:sns"`) > 0 && indexOf(event, `"Message":"hello"`) > 0
+	role(g, "machine", "states.amazonaws.com", policy([statement("Allow", `"lambda:InvokeFunction"`, "*")]))
+	const task = (next: string) => `{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke",`
+		+ `"Parameters":{"FunctionName":"echo","Payload.$":"$"},"OutputPath":"$.Payload",${next}}`
+	const definition = `{"StartAt":"A","States":{"A":${task(`"Next":"B"`)},"B":${task(`"End":true`)}}}`
+	const sm = json11Of(g, "states", "CreateStateMachine",
+		`{"name":"m","roleArn":"arn:aws:iam::${account}:role/machine","definition":${json.quoted(definition)}}`)
+	assert sm.status == 200
+	const started = json11Of(g, "states", "StartExecution",
+		`{"stateMachineArn":"${member(sm, "stateMachineArn")}","input":"{\\"n\\":2}"}`)
+	assert started.status == 200
+	const described = json11Of(g, "states", "DescribeExecution",
+		`{"executionArn":"${member(started, "executionArn")}"}`)
+	assert member(described, "status") == "SUCCEEDED"
+	assert indexOf(described.body.whole ?? "", `"output":"{\\"n\\":2}"`) > 0
+	assert f.boxes.length == 1 && f.boxes[0].payloads.length == 3
+}
+
+test "EventBridge and a log group's subscription filter invoke a function that lets them" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	const fn = `arn:aws:lambda:us-east-1:${account}:function:echo`
+	const rule = `arn:aws:events:us-east-1:${account}:rule/r`
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"events","Action":"lambda:InvokeFunction","Principal":"events.amazonaws.com","SourceArn":"${rule}"}`).status
+		== 201
+	assert call(g, "events", "PutRule", `{"Name":"r","EventPattern":"{\\"source\\":[\\"app\\"]}"}`).status == 200
+	assert call(g, "events", "PutTargets", `{"Rule":"r","Targets":[{"Id":"f","Arn":"${fn}"}]}`).status == 200
+	assert call(g, "events", "PutEvents", `{"Entries":[{"Source":"app","DetailType":"t","Detail":"{}"}]}`).status == 200
+	assert ticked(g, () => f.boxes.length > 0 && f.boxes[0].payloads.length > 0)
+	assert indexOf(f.boxes[0].payloads[0], `"source":"app"`) > 0
+	assert json11Of(g, "logs", "CreateLogGroup", `{"logGroupName":"/g"}`).status == 200
+	assert json11Of(g, "logs", "CreateLogStream", `{"logGroupName":"/g","logStreamName":"l"}`).status == 200
+	const filter = `{"logGroupName":"/g","filterName":"f","filterPattern":"","destinationArn":"${fn}"}`
+	assert json11Of(g, "logs", "PutSubscriptionFilter", filter).status == 400
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"logs","Action":"lambda:InvokeFunction","Principal":"logs.amazonaws.com",`
+		+ `"SourceArn":"arn:aws:logs:us-east-1:${account}:log-group:/g:*"}`).status == 201
+	assert json11Of(g, "logs", "PutSubscriptionFilter", filter).status == 200
+	assert json11Of(g, "logs", "PutLogEvents",
+		`{"logGroupName":"/g","logStreamName":"l","logEvents":[{"timestamp":${now() / millisecond},"message":"hi"}]}`).status
+		== 200
+	assert ticked(g, () => f.boxes[0].payloads.length > 1)
+	const data = json.decode[Awslogs](f.boxes[0].payloads[1]).awslogs.data
+	const logged = gunzip(base64.decode(data))
+	assert startsWith(logged, `{"messageType":"DATA_MESSAGE","owner":"${account}","logGroup":"/g","logStream":"l",`)
+	assert indexOf(logged, `"message":"hi"`) > 0
+}
+
+class Awslogs {
+	awslogs: ...AwslogsData
+}
+
+class AwslogsData {
+	data = ""
 }
