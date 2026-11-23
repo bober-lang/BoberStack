@@ -6,6 +6,14 @@
 //! is signed for, where AWS would redirect it. Bodies are whole in memory as the gateway reads them, up to its limit
 //! for S3, a PutObject's 5 GiB. A checksum given is checked, and an object put without one has S3's CRC64NVME. Nothing
 //! runs between requests: lifecycle rules expire nothing, and multipart uploads are not aborted by age.
+//!
+//! An object is encrypted as its write asks, else as its bucket's default rule: SSE-S3, SSE-KMS and DSSE-KMS, or a
+//! customer's key (SSE-C) where the rule does not block it, as it does by default. Under KMS the writer needs
+//! kms:GenerateDataKey and the reader kms:Decrypt, as themselves through S3, of a data key KMS seals with the object's
+//! ARN as context (the bucket's of a bucket key); KMS's faults are answered as S3 does. Bodies themselves are stored
+//! as they come, never encrypted: blobs are shared and mapped, and encrypting them would buy nothing here. Where AWS
+//! differs: the ETag of an object under KMS or SSE-C is its MD5 still; a bucket key is only a different context, with
+//! KMS called for each object; HeadObject of an SSE-C object without its key is answered with S3's error body.
 
 import { Fault } from "../../core/fault"
 import { parse } from "../../core/auth/policy"
@@ -15,9 +23,10 @@ import { Caller, Context, Unit } from "../../core/service"
 import { crc32c } from "../../core/hash/crc32c"
 import { crc64nvme } from "../../core/hash/crc64nvme"
 import { Blob, Table } from "../../core/state/store"
+import { decryptAs, encryptAs, sealer } from "../kms/kms"
 import * as api from "./api"
 import { arn, authorize, bucketPolicy, Found, found, member, noSuchBucket, noSuchKey, owner } from "./common"
-import { acl, Config, exposed, forget, mfaDelete, preflight, publicPolicy, versioned } from "./config"
+import { acl, Config, exposed, forget, mfaDelete, preflight, publicPolicy, settings, versioned } from "./config"
 
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
 	version, Version } from "./records"
@@ -29,6 +38,7 @@ import { md5, sha1, sha256 } from "std/crypto/hash"
 import { bytes } from "std/crypto/random"
 import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
 import { crc32 } from "std/hash/crc32"
 import { Body, Request, Response } from "std/http"
 import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
@@ -220,11 +230,14 @@ export class Handler {
 		v.tags = tagging(input.Tagging)
 		v.algorithm = algorithm
 		v.checksum = sum
+		encrypt(caller, f, v, input)
 		const k = write(caller, f, v, data)
 		this.notify(caller, f, "ObjectCreated:Put", v)
 		const r = new api.PutObjectOutput()
 		r.ETag = v.etag
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, v)
+		keyed(r, v)
+		r.SSEKMSEncryptionContext = v.context
 		r.VersionId = if (v.id == "null") null else v.id
 		set(r, algorithm, sum)
 		r.ChecksumType = "FULL_OBJECT"
@@ -236,6 +249,8 @@ export class Handler {
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const v = object(f, input.Key, input.VersionId)
 		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
+		decrypt(caller, input.Bucket, v, input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
+			true)
 		const k = version(input.Bucket, v.key, v.order)
 		const r = new api.GetObjectOutput()
 		described(r, f.bucket, v)
@@ -268,6 +283,8 @@ export class Handler {
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const v = object(f, input.Key, input.VersionId)
 		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
+		decrypt(caller, input.Bucket, v, input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
+			false)
 		const r = new api.HeadObjectOutput()
 		described(r, f.bucket, v)
 		const range = this.selected(r, v, input.Range, input.PartNumber)
@@ -399,6 +416,8 @@ export class Handler {
 		const s = object(from, sk, sv)
 		copyConditions(s, input.CopySourceIfMatch, input.CopySourceIfNoneMatch, input.CopySourceIfModifiedSince,
 			input.CopySourceIfUnmodifiedSince)
+		decrypt(caller, sb, s, input.CopySourceSSECustomerAlgorithm, input.CopySourceSSECustomerKey,
+			input.CopySourceSSECustomerKeyMD5, true)
 		caller.actions = ["s3:PutObject"]
 		if (input.TaggingDirective == "REPLACE" && input.Tagging != null) {
 			caller.actions.push("s3:PutObjectTagging")
@@ -439,6 +458,7 @@ export class Handler {
 			v.metadata = input.Metadata ?? []
 		}
 		v.redirect = input.WebsiteRedirectLocation ?? (if (replace) null else s.redirect)
+		encrypt(caller, f, v, input)
 		if (s.parts > 0) {
 			// a copy is one part, its ETag its bytes' MD5
 			v.etag = `"${hex.encode(hash(md5, read(from.db, "s3/versions", version(sb, sk, s.order))))}"`
@@ -465,7 +485,9 @@ export class Handler {
 		}
 		r.CopySourceVersionId = if (from.bucket.versioning == "") null else s.id
 		r.VersionId = versionOf(f.bucket, v)
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, v)
+		keyed(r, v)
+		r.SSEKMSEncryptionContext = v.context
 		return r
 	}
 
@@ -498,13 +520,16 @@ export class Handler {
 		v.metadata = input.Metadata ?? []
 		v.tags = tagging(input.Tagging)
 		v.algorithm = if (input.ChecksumAlgorithm == null) "" else `${input.ChecksumAlgorithm!}`
+		encrypt(caller, f, v, input)
 		put(f.db.uploads, `${path(input.Bucket, input.Key)}\x00${`${1000000000000 + u.order}`.slice(1, 13)}`, u)
 		this.typed = ""
 		const r = new api.CreateMultipartUploadOutput()
 		r.Bucket = input.Bucket
 		r.Key = input.Key
 		r.UploadId = u.id
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, v)
+		keyed(r, v)
+		r.SSEKMSEncryptionContext = v.context
 		r.ChecksumAlgorithm = input.ChecksumAlgorithm
 		r.ChecksumType = if (input.ChecksumAlgorithm == null) null else "COMPOSITE"
 		return r
@@ -515,6 +540,8 @@ export class Handler {
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const [_, u] = upload(f.db, input.Bucket, input.Key, input.UploadId)
 		numbered(input.PartNumber)
+		decrypt(caller, input.Bucket, u.object, input.SSECustomerAlgorithm, input.SSECustomerKey,
+			input.SSECustomerKeyMD5, true)
 		const data = input.Body
 		digest(input.ContentMD5, data)
 		const named = input.ChecksumAlgorithm ?? u.object.algorithm
@@ -535,7 +562,8 @@ export class Handler {
 		save(f.db, f.db.parts, "s3/parts", k, p, data)
 		const r = new api.UploadPartOutput()
 		r.ETag = p.etag
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, u.object)
+		keyed(r, u.object)
 		set(r, algorithm, sum)
 		return r
 	}
@@ -547,10 +575,14 @@ export class Handler {
 		const s = object(from, sk, sv)
 		copyConditions(s, input.CopySourceIfMatch, input.CopySourceIfNoneMatch, input.CopySourceIfModifiedSince,
 			input.CopySourceIfUnmodifiedSince)
+		decrypt(caller, sb, s, input.CopySourceSSECustomerAlgorithm, input.CopySourceSSECustomerKey,
+			input.CopySourceSSECustomerKeyMD5, true)
 		caller.actions = ["s3:PutObject"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
 		const [_, u] = upload(f.db, input.Bucket, input.Key, input.UploadId)
 		numbered(input.PartNumber)
+		decrypt(caller, input.Bucket, u.object, input.SSECustomerAlgorithm, input.SSECustomerKey,
+			input.SSECustomerKeyMD5, true)
 		let [at, n] = [0 as i64, s.size]
 		if (input.CopySourceRange != null) {
 			const spec = split(replace(input.CopySourceRange!, "bytes=", ""), "-")
@@ -584,7 +616,8 @@ export class Handler {
 		const r = new api.UploadPartCopyOutput()
 		r.CopySourceVersionId = if (from.bucket.versioning == "") null else s.id
 		r.CopyPartResult = { ...new api.CopyPartResult(), ETag: p.etag, LastModified: p.modified }
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, u.object)
+		keyed(r, u.object)
 		return r
 	}
 
@@ -596,10 +629,13 @@ export class Handler {
 		const before = uploadOf(f.db, input.Bucket, input.Key, input.UploadId)
 		if (before != null && before![1].state == "completed") {
 			// S3 answers completing it again as it did, but for the checksum
-			return { ...new api.CompleteMultipartUploadOutput(), Location: location, Bucket: input.Bucket,
-				Key: input.Key, ETag: before![1].object.etag, ServerSideEncryption: "AES256" }
+			const again = { ...new api.CompleteMultipartUploadOutput(), Location: location, Bucket: input.Bucket,
+				Key: input.Key, ETag: before![1].object.etag }
+			encrypted(again, before![1].object)
+			return again
 		}
 		const [uk, u] = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		unseal(caller, input.Bucket, u.object)
 		const given = input.MultipartUpload?.Parts ?? []
 		if (given.length == 0) {
 			throw new Fault(400, "MalformedXML",
@@ -683,7 +719,7 @@ export class Handler {
 		r.Bucket = input.Bucket
 		r.Key = input.Key
 		r.ETag = v.etag
-		r.ServerSideEncryption = "AES256"
+		encrypted(r, v)
 		r.VersionId = versionOf(f.bucket, v)
 		set(r, v.algorithm, v.checksum)
 		r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
@@ -1638,6 +1674,10 @@ interface Described {
 	Expires: string | null
 	WebsiteRedirectLocation: string | null
 	ServerSideEncryption: string | null
+	SSEKMSKeyId: string | null
+	BucketKeyEnabled: bool | null
+	SSECustomerAlgorithm: string | null
+	SSECustomerKeyMD5: string | null
 	Metadata: [string, string][] | null
 	ContentRange: string | null
 	PartsCount: i32 | null
@@ -1669,7 +1709,8 @@ function described(r: Described, b: Bucket, v: Version) {
 	r.ContentType = v.type
 	r.Expires = v.expires
 	r.WebsiteRedirectLocation = v.redirect
-	r.ServerSideEncryption = "AES256"
+	encrypted(r, v)
+	keyed(r, v)
 	r.Metadata = if (v.metadata.length == 0) null else v.metadata
 	r.TagCount = if (v.tags.length == 0) null else v.tags.length
 }
@@ -1781,4 +1822,215 @@ function contents(vs: Version[], of: string | null, url: bool): api.Object[] thr
 
 function prefixes(ps: string[], url: bool): api.CommonPrefix[] | null {
 	return if (ps.length == 0) null else ps.map(p => ({ ...new api.CommonPrefix(), Prefix: encoded(p, url) }))
+}
+
+/// The encryption a write asks for by its headers.
+interface Asked {
+	ServerSideEncryption: string | null
+	SSEKMSKeyId: string | null
+	SSEKMSEncryptionContext: string | null
+	BucketKeyEnabled: bool | null
+	SSECustomerAlgorithm: string | null
+	SSECustomerKey: string | null
+	SSECustomerKeyMD5: string | null
+}
+
+/// What tells an object's encryption in an answer.
+interface Encrypted {
+	ServerSideEncryption: string | null
+	SSEKMSKeyId: string | null
+	BucketKeyEnabled: bool | null
+}
+
+/// What tells an object's customer key (SSE-C) in an answer.
+interface Keyed {
+	SSECustomerAlgorithm: string | null
+	SSECustomerKeyMD5: string | null
+}
+
+/// An encryption context, as the header gives it: a JSON object of strings.
+class Pairs {
+	pairs: [string, string][] @json.Mapping = []
+}
+
+/// Encrypts v, written by the caller to the bucket of f, as asked, else by the bucket's default rule: S3's checks of
+/// the headers, its refusal of SSE-C where the bucket blocks it, and of SSE-KMS a data key that KMS seals as the caller
+/// may through S3, by kms:GenerateDataKey.
+function encrypt(caller: Caller, f: Found, v: Version, asked: Asked) throws Fault {
+	const sse = asked.ServerSideEncryption
+	if (sse != null && sse! != "AES256" && sse! != "aws:kms" && sse! != "aws:kms:dsse") {
+		throw argument("The encryption method specified is not supported", sse!)
+	}
+	const sum = customer(asked.SSECustomerAlgorithm, asked.SSECustomerKey, asked.SSECustomerKeyMD5)
+	if (sum != null && sse != null) {
+		throw argument("Server Side Encryption with Customer provided key is incompatible with the encryption method "
+			+ "specified", sse!)
+	}
+	const kms = sse != null && startsWith(sse!, "aws:kms")
+	if (!kms && (asked.SSEKMSKeyId != null || asked.SSEKMSEncryptionContext != null)) {
+		throw argument("Server Side Encryption with AWS KMS managed key requires HTTP header "
+			+ "x-amz-server-side-encryption : aws:kms", sse ?? "")
+	}
+	const given = if (asked.SSEKMSEncryptionContext == null) [] else pairs(asked.SSEKMSEncryptionContext!)
+	const rules = settings(f).encryption
+	const rule = if (rules == null || rules!.length == 0) null else rules![0]
+	v.customerKey = sum
+	v.kmsKey = null
+	v.context = null
+	v.bucketKey = false
+	v.dataKey = ""
+	if (sum != null) {
+		if (rule == null || (rule!.BlockedEncryptionTypes?.EncryptionType ?? []).includes("SSE-C")) {
+			throw new Fault(403, "AccessDenied",
+				`User: ${caller.arn} is not authorized to perform: s3:PutObject on resource: "${arn(f.bucket.name, v.key)}" `
+				+ "because this bucket has blocked upload requests that specify Server Side Encryption with Customer "
+				+ "provided keys (SSE-C). Please specify a different server-side encryption type.")
+		}
+		v.sse = ""
+		return
+	}
+	const by = rule?.ApplyServerSideEncryptionByDefault
+	v.sse = sse ?? by?.SSEAlgorithm ?? "AES256"
+	if (v.sse == "AES256") {
+		return
+	}
+	v.bucketKey = v.sse == "aws:kms" && (asked.BucketKeyEnabled ?? rule?.BucketKeyEnabled ?? false)
+	v.context = asked.SSEKMSEncryptionContext
+	const id = asked.SSEKMSKeyId ?? (if (sse == null) by?.KMSMasterKeyID else null) ?? "alias/aws/s3"
+	try {
+		const blob = encryptAs(caller, "s3", id, random(32), [...scope(f.bucket.name, v), ...given],
+			"kms:GenerateDataKey")
+		v.dataKey = base64.encode(blob)
+		v.kmsKey = sealer(blob)
+	} catch (e: Fault) {
+		throw failure(e)
+	}
+}
+
+/// Throws unless the caller may read v of bucket, as a read of it or of a copy's source gives a customer's key as
+/// algorithm, key and its MD5: of SSE-C the same key, of none no key; of SSE-KMS, if unsealed, kms:Decrypt of its key
+/// through S3.
+function decrypt(caller: Caller, bucket: string, v: Version, algorithm: string | null, key: string | null,
+	given: string | null, unsealed: bool) throws Fault {
+	const sum = customer(algorithm, key, given)
+	if (v.customerKey == null && sum != null) {
+		throw new Fault(400, "InvalidRequest", "The encryption parameters are not applicable to this object.")
+	}
+	if (v.customerKey != null && sum == null) {
+		throw new Fault(400, "InvalidRequest",
+			"The object was stored using a form of Server Side Encryption. The "
+			+ "correct parameters must be provided to retrieve the object.")
+	}
+	if (v.customerKey != null && sum! != v.customerKey!) {
+		throw new Fault(403, "AccessDenied",
+			"Requests specifying Server Side Encryption with Customer provided keys must provide the correct secret key.")
+	}
+	if (unsealed) {
+		unseal(caller, bucket, v)
+	}
+}
+
+/// Throws unless the caller may decrypt the data key of v of bucket, of SSE-KMS, by kms:Decrypt through S3.
+function unseal(caller: Caller, bucket: string, v: Version) throws Fault {
+	if (v.kmsKey == null) {
+		return
+	}
+	let blob = ""
+	try {
+		blob = base64.decode(v.dataKey)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalError", "An object's data key does not decode")
+	}
+	const extra = if (v.context == null) [] else pairs(v.context!)
+	try {
+		decryptAs(caller, "s3", blob, [...scope(bucket, v), ...extra])
+	} catch (e: Fault) {
+		throw failure(e)
+	}
+}
+
+/// The MD5 in base64 of the customer's key that a request gives as algorithm, key and its MD5, null if it gives none;
+/// else S3's fault.
+function customer(algorithm: string | null, key: string | null, given: string | null): string | null throws Fault {
+	if (algorithm == null && key == null && given == null) {
+		return null
+	}
+	if (algorithm == null) {
+		throw argument("Requests specifying Server Side Encryption with Customer provided keys must provide a valid "
+			+ "encryption algorithm.", "null")
+	}
+	if (algorithm! != "AES256") {
+		throw new Fault(400, "InvalidEncryptionAlgorithmError",
+			"The Encryption request you specified is not valid. Supported value: AES256.", true,
+			member("ArgumentName", "x-amz-server-side-encryption") + member("ArgumentValue", algorithm!))
+	}
+	if (key == null) {
+		throw new Fault(400, "InvalidArgument",
+			"Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key.")
+	}
+	let raw = ""
+	try {
+		raw = base64.decode(key!)
+	} catch (e: ParseError) {}
+	if (raw.length != 32) {
+		throw new Fault(400, "InvalidArgument", "The secret key was invalid for the specified algorithm.")
+	}
+	const sum = base64.encode(hash(md5, raw))
+	if (given == null) {
+		throw new Fault(400, "InvalidArgument",
+			"Requests specifying Server Side Encryption with Customer provided keys "
+			+ "must provide the client calculated MD5 of the secret key.")
+	}
+	if (given! != sum) {
+		throw new Fault(400, "InvalidArgument",
+			"The calculated MD5 hash of the key did not match the hash that was provided.")
+	}
+	return sum
+}
+
+/// The pairs of an encryption context header, base64 of a JSON object of strings; else S3's fault.
+function pairs(header: string): [string, string][] throws Fault {
+	try {
+		return json.decode[Pairs](`{"pairs":${base64.decode(header)}}`).pairs
+	} catch (e: ParseError) {
+		throw new Fault(400, "InvalidArgument",
+			"The header 'x-amz-server-side-encryption-context' shall be "
+			+ "Base64-encoded UTF-8 string holding JSON which represents a string-string map", true,
+			member("ArgumentName", "x-amz-server-side-encryption-context") + member("ArgumentValue", header))
+	}
+}
+
+/// The encryption context S3 gives KMS of v in bucket: the object's ARN, or the bucket's of a bucket key.
+function scope(bucket: string, v: Version): [string, string][] {
+	return [["aws:s3:arn", if (v.bucketKey) arn(bucket) else arn(bucket, v.key)]]
+}
+
+/// S3's InvalidArgument of the x-amz-server-side-encryption header's value.
+function argument(message: string, value: string): Fault {
+	return new Fault(400, "InvalidArgument", message, true,
+		member("ArgumentName", "x-amz-server-side-encryption") + member("ArgumentValue", value))
+}
+
+/// S3's fault for KMS's f: KMS's message, as AccessDenied if access is denied, else under KMS's code after "KMS.".
+function failure(f: Fault): Fault {
+	if (f.status >= 500) {
+		return f
+	}
+	if (startsWith(f.code, "AccessDenied")) {
+		return new Fault(403, "AccessDenied", f.message)
+	}
+	return new Fault(400, `KMS.${f.code}`, f.message)
+}
+
+/// Sets on r the encryption of v.
+function encrypted(r: Encrypted, v: Version) {
+	r.ServerSideEncryption = if (v.sse == "") null else v.sse
+	r.SSEKMSKeyId = v.kmsKey
+	r.BucketKeyEnabled = if (v.bucketKey) true else null
+}
+
+/// Sets on r the customer's key of v, if it has one.
+function keyed(r: Keyed, v: Version) {
+	r.SSECustomerAlgorithm = if (v.customerKey == null) null else "AES256"
+	r.SSECustomerKeyMD5 = v.customerKey
 }

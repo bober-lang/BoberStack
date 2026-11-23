@@ -5,7 +5,7 @@ import * as protocol from "./core/protocol/json"
 import { Catalog } from "./services/iam/catalog"
 import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
-import { indexOf } from "std/algo"
+import { indexOf, startsWith } from "std/algo"
 import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
 import { Request, Response } from "std/http"
@@ -728,5 +728,174 @@ test "Lambda routes and authenticates a request, and answers NotImplemented in r
 	forged.secret = "wrong"
 	res = lambdaGet(g, "/2015-03-31/functions", forged)
 	assert res.status == 403 && res.headers.get("x-amzn-errortype") == "SignatureDoesNotMatch"
+	g.close()
+}
+
+/// The answer of g to an S3 request of method to path, of the headers and body, signed by k.
+function s3as(g: Gateway, method: string, path: string, headers: [string, string][], k: Key, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	for (const [n, v] of headers) {
+		req.headers.set(n, v)
+	}
+	sign(req, body, "s3", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "S3 encrypts under a KMS key as the writer may generate a data key and the reader decrypt it" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const arn = `arn:aws:kms:us-east-1:000000000000:key/${key}`
+	const writer = user(g, "writer", policy([statement("Allow", `["s3:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const reader = user(g, "reader", policy([statement("Allow", `"s3:*"`, "*")]))
+	assert s3(g, "PUT", "/bkt").status == 200
+	const kms: [string,
+		string][] = [["x-amz-server-side-encryption", "aws:kms"], ["x-amz-server-side-encryption-aws-kms-key-id", key]]
+	let res = s3as(g, "PUT", "/bkt/a", kms, writer, "ab")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption") == "aws:kms"
+	assert res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	res = s3as(g, "PUT", "/bkt/b", kms, reader, "ab")
+	assert fails(res, 403, "AccessDenied")
+		&& startsWith(text(res, "Message") ?? "",
+		`User: arn:aws:iam::000000000000:user/reader is not authorized to perform: kms:GenerateDataKey on resource: ${arn} `
+		+ "because no identity-based policy allows the kms:GenerateDataKey action. Go to")
+	assert fails(s3as(g, "GET", "/bkt/a", [], reader), 403, "AccessDenied")
+	res = s3as(g, "HEAD", "/bkt/a", [], reader)
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	assert s3(g, "GET", "/bkt/a").body.whole == "ab"
+	assert fails(s3as(g, "PUT", "/bkt/b",
+		[["x-amz-server-side-encryption", "aws:kms"], ["x-amz-server-side-encryption-aws-kms-key-id", "alias/none"]],
+		writer, "ab"), 400, "KMS.NotFoundException")
+	assert fails(s3as(g, "PUT", "/bkt/b", [["x-amz-server-side-encryption", "AES257"]], writer, "ab"), 400,
+		"InvalidArgument", "The encryption method specified is not supported")
+	assert fails(s3as(g, "PUT", "/bkt/b", [["x-amz-server-side-encryption-aws-kms-key-id", key]], writer, "ab"), 400,
+		"InvalidArgument")
+	// The AWS managed key lets any principal of the account use it through S3.
+	res = s3as(g, "PUT", "/bkt/m", [["x-amz-server-side-encryption", "aws:kms"]], reader, "m")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") != arn
+	assert s3as(g, "GET", "/bkt/m", [], reader).body.whole == "m"
+	// A bucket's default rule encrypts what is written without asking.
+	const rule = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+		+ `<SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>${key}</KMSMasterKeyID>`
+		+ "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule>"
+		+ "</ServerSideEncryptionConfiguration>"
+	assert s3(g, "PUT", "/bkt?encryption", rule).status == 200
+	res = s3as(g, "PUT", "/bkt/d", [], writer, "d")
+	assert res.headers.get("x-amz-server-side-encryption-aws-kms-key-id") == arn
+	assert res.headers.get("x-amz-server-side-encryption-bucket-key-enabled") == "true"
+	assert s3as(g, "PUT", "/bkt/c", [["x-amz-copy-source", "/bkt/a"]], writer).status == 200
+	assert fails(s3as(g, "PUT", "/bkt/e", [["x-amz-copy-source", "/bkt/a"]], reader), 403, "AccessDenied")
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(s3(g, "GET", "/bkt/a"), 400, "KMS.DisabledException")
+	g.close()
+}
+
+test "S3 refuses a customer's key (SSE-C) unless the bucket allows it, then reads only with that key" {
+	const g = gateway()
+	assert s3(g, "PUT", "/bkt").status == 200
+	const mine: [string, string][] = [["x-amz-server-side-encryption-customer-algorithm", "AES256"],
+		["x-amz-server-side-encryption-customer-key", "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="],
+		["x-amz-server-side-encryption-customer-key-MD5", "mT2HRsMGJ5IX5C+0rreZ8Q=="]]
+	const theirs: [string, string][] = [["x-amz-server-side-encryption-customer-algorithm", "AES256"],
+		["x-amz-server-side-encryption-customer-key", "ampqampqampqampqampqampqampqampqampqampqamo="],
+		["x-amz-server-side-encryption-customer-key-MD5", "i6qJOqb8EmJKrlLOjo18Fg=="]]
+	assert fails(s3as(g, "PUT", "/bkt/a", mine, root(), "ab"), 403, "AccessDenied",
+		"User: arn:aws:iam::000000000000:root is not authorized to perform: s3:PutObject on resource: "
+		+ "\"arn:aws:s3:::bkt/a\" because this bucket has blocked upload requests that specify Server Side Encryption "
+		+ "with Customer provided keys (SSE-C). Please specify a different server-side encryption type.")
+	const rule = "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>"
+		+ "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+		+ "<BlockedEncryptionTypes><EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>"
+		+ "</ServerSideEncryptionConfiguration>"
+	assert s3(g, "PUT", "/bkt?encryption", rule).status == 200
+	let res = s3as(g, "PUT", "/bkt/a", mine, root(), "ab")
+	assert res.status == 200 && res.headers.get("x-amz-server-side-encryption") == null
+	assert res.headers.get("x-amz-server-side-encryption-customer-key-MD5") == "mT2HRsMGJ5IX5C+0rreZ8Q=="
+	assert fails(s3(g, "GET", "/bkt/a"), 400, "InvalidRequest",
+		"The object was stored using a form of Server Side Encryption. The correct parameters must be provided to "
+		+ "retrieve the object.")
+	assert fails(s3as(g, "GET", "/bkt/a", theirs, root()), 403, "AccessDenied")
+	assert s3as(g, "GET", "/bkt/a", mine, root()).body.whole == "ab"
+	assert s3(g, "PUT", "/bkt/p", "p").status == 200
+	assert fails(s3as(g, "GET", "/bkt/p", mine, root()), 400, "InvalidRequest",
+		"The encryption parameters are not applicable to this object.")
+	const wrong: [string, string][] = [mine[0], mine[1], theirs[2]]
+	assert fails(s3as(g, "PUT", "/bkt/b", wrong, root(), "ab"), 400, "InvalidArgument",
+		"The calculated MD5 hash of the key did not match the hash that was provided.")
+	g.close()
+}
+
+test "SQS: a queue under a KMS key takes a sender's message as it may generate a data key, gives it as it may decrypt" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const sender = user(g, "sender", policy([statement("Allow", `["sqs:*","kms:GenerateDataKey"]`, "*")]))
+	const both = user(g, "both", policy([statement("Allow", `["sqs:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const bare = user(g, "bare", policy([statement("Allow", `"sqs:*"`, "*")]))
+	assert fails(call(g, "sqs", "CreateQueue",
+		`{"QueueName":"x","Attributes":{"KmsMasterKeyId":"${key}","SqsManagedSseEnabled":"true"}}`), 400,
+		"InvalidAttributeName")
+	queue(g, "q", "", `"KmsMasterKeyId":"${key}"`)
+	const res = call(g, "sqs", "GetQueueAttributes", `{"QueueUrl":"${queueUrl("q")}","AttributeNames":["All"]}`)
+	const body = res.body.whole ?? ""
+	assert indexOf(body, `"SqsManagedSseEnabled":"false"`) > 0
+	assert indexOf(body, `"KmsDataKeyReusePeriodSeconds":"300"`) > 0
+	const send = `{"QueueUrl":"${queueUrl("q")}","MessageBody":"m"}`
+	assert fails(call(g, "sqs", "SendMessage", send, bare), 400, "KmsAccessDenied", "kms:GenerateDataKey")
+	assert call(g, "sqs", "SendMessage", send, sender).status == 200
+	const receive = `{"QueueUrl":"${queueUrl("q")}"}`
+	assert fails(call(g, "sqs", "ReceiveMessage", receive, sender), 400, "KmsAccessDenied", "kms:Decrypt")
+	assert indexOf(call(g, "sqs", "ReceiveMessage", receive, both).body.whole ?? "", `"Body":"m"`) > 0
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(call(g, "sqs", "SendMessage", send, both), 400, "KmsDisabled")
+	// SNS delivers only as the key's policy lets SNS use it, which the AWS managed key's does not.
+	const t = topicArn("t")
+	topic(g, "t")
+	const open = kmsKey(g,
+		policy([statement("Allow", `"kms:*"`, "*", `{"AWS":"arn:aws:iam::000000000000:root"}`),
+		statement("Allow", `["kms:GenerateDataKey","kms:Decrypt"]`, "*", `{"Service":"sns.amazonaws.com"}`)]))
+	queue(g, "open", sendable("open", "sns.amazonaws.com", t), `"KmsMasterKeyId":"${open}"`)
+	queue(g, "closed", sendable("closed", "sns.amazonaws.com", t), `"KmsMasterKeyId":"alias/aws/sqs"`)
+	subscribe(g, t, queueArn("open"))
+	subscribe(g, t, queueArn("closed"))
+	assert publish(g, t, "hello").status == 200
+	assert bodies(g, "open").length == 1 && bodies(g, "closed") == []
+	g.close()
+}
+
+test "SNS: a publish to a topic under a KMS key needs kms:GenerateDataKey and kms:Decrypt of the publisher" {
+	const g = gateway()
+	const key = kmsKey(g)
+	const half = user(g, "half", policy([statement("Allow", `["sns:*","kms:GenerateDataKey"]`, "*")]))
+	const both = user(g, "both", policy([statement("Allow", `["sns:*","kms:GenerateDataKey","kms:Decrypt"]`, "*")]))
+	const t = topicArn("t")
+	topic(g, "t", "", [["KmsMasterKeyId", key]])
+	const denied = publish(g, t, "m", "", half)
+	assert fails(denied, 400, "KMSAccessDenied") && indexOf(text(denied, "Message") ?? "", "kms:Decrypt") > 0
+	assert publish(g, t, "m", "", both).status == 200
+	assert json11(g, "kms", "DisableKey", `{"KeyId":"${key}"}`).status == 200
+	assert fails(publish(g, t, "m", "", both), 400, "KMSDisabled")
+	topic(g, "gone", "", [["KmsMasterKeyId", "alias/none"]])
+	assert fails(publish(g, topicArn("gone"), "m", "", both), 400, "KMSNotFound")
+	g.close()
+}
+
+function table(g: Gateway, name: string, sse: string): Response {
+	return call(g, "dynamodb", "CreateTable",
+		`{"TableName":"${name}","AttributeDefinitions":[{"AttributeName":"k","AttributeType":"S"}],`
+		+ `"KeySchema":[{"AttributeName":"k","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"${sse}}`)
+}
+
+test "DynamoDB: a table under a KMS key describes it; under a key AWS owns, nothing" {
+	const g = gateway()
+	const key = kmsKey(g)
+	let res = table(g, "owned", "")
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "SSEDescription") < 0
+	res = table(g, "mine", `,"SSESpecification":{"Enabled":true,"SSEType":"KMS","KMSMasterKeyId":"${key}"}`)
+	assert res.status == 200 && indexOf(member(res, "KMSMasterKeyArn"), `:key/${key}`) > 0
+	res = table(g, "managed", `,"SSESpecification":{"Enabled":true}`)
+	assert res.status == 200 && indexOf(member(res, "KMSMasterKeyArn"), ":key/") > 0
+	assert fails(table(g, "none", `,"SSESpecification":{"Enabled":true,"KMSMasterKeyId":"alias/none"}`), 400,
+		"ValidationException")
+	res = call(g, "dynamodb", "UpdateTable", `{"TableName":"mine","SSESpecification":{"Enabled":false}}`)
+	assert res.status == 200 && indexOf(res.body.whole ?? "", "SSEDescription") < 0
 	g.close()
 }

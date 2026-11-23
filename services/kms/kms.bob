@@ -643,7 +643,7 @@ export function keyArn(caller: Caller, service: string, id: string): string thro
 	caller.actions = ["kms:DescribeKey"]
 	try {
 		const f = resolve(caller, id, true)
-		authorize(caller, f, via(caller, service))
+		onBehalf(caller, f, via(caller, service))
 		return f.key.arn
 	} finally {
 		caller.actions = actions
@@ -660,7 +660,7 @@ export function encryptAs(caller: Caller, service: string, id: string, plain: st
 	caller.actions = [action]
 	try {
 		const f = resolve(caller, id, true)
-		authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		onBehalf(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
 		encrypting(f.key, "Encrypt", null)
 		return sealed(f.key, plain, context)
 	} finally {
@@ -676,11 +676,28 @@ export function decryptAs(caller: Caller, service: string, blob: string,
 	caller.actions = ["kms:Decrypt"]
 	try {
 		const [f, b] = sealedBy(caller, blob, null)
-		authorize(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
+		onBehalf(caller, f, [...via(caller, service), ...crypto(context, "SYMMETRIC_DEFAULT")])
 		encrypting(f.key, "Decrypt", null)
 		return [opened(f.key, b, context)[0], f.key.arn]
 	} finally {
 		caller.actions = actions
+	}
+}
+
+/// The ARN of the key that sealed the ciphertext blob, null if it is none of KMS's.
+export function sealer(blob: string): string | null {
+	const b = parse(blob)
+	return if (b == null) null else `arn:aws:kms:${b!.region}:${b!.account}:key/${b!.key}`
+}
+
+/// Authorizes the caller of another service to use the key of f, of context, as authorize, denied as KMS denies.
+function onBehalf(caller: Caller, f: Found, context: Context) throws Fault {
+	const denied = caller.denied
+	caller.denied = [400, "AccessDeniedException", "linked"]
+	try {
+		authorize(caller, f, context)
+	} finally {
+		caller.denied = denied
 	}
 }
 
@@ -842,12 +859,15 @@ function principals(caller: Caller): string[] {
 	return out
 }
 
-/// The context keys of every request: kms:CallerAccount.
-function base(caller: Caller): Context { return [["kms:CallerAccount", caller.account]] }
+/// The context keys of every request: kms:CallerAccount, which a service principal, of no account, has not.
+function base(caller: Caller): Context {
+	return if (caller.source != "") [] else [["kms:CallerAccount", caller.account]]
+}
 
-/// The context key of a request that service, by its signing name, makes for the caller: kms:ViaService.
+/// The context key of a request that service, by its signing name, makes for the caller: kms:ViaService; none if the
+/// caller is a service principal, which calls KMS itself.
 function via(caller: Caller, service: string): Context {
-	return [["kms:ViaService", `${service}.${caller.region}.amazonaws.com`]]
+	return if (caller.source != "") [] else [["kms:ViaService", `${service}.${caller.region}.amazonaws.com`]]
 }
 
 /// The context keys of the encryption context and of the algorithm, if given.

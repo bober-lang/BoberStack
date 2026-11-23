@@ -6,10 +6,17 @@
 //! is checked and an empty queue answers at once. A message move task is instantaneous: it moves every message
 //! visible in the dead-letter queue within its request, ignoring its rate, and is listed as completed, never to be
 //! cancelled.
+//!
+//! A queue is encrypted by SQS's own keys (SSE-SQS, a new queue's default) or by a KMS key (SSE-KMS): a sender then
+//! needs kms:GenerateDataKey and a receiver kms:Decrypt on it, as themselves through SQS, and SNS and EventBridge
+//! need the key's policy to let their service principal use it. Bodies are stored as they come. Where AWS differs:
+//! the key is used on every send and on every receive that takes a message, not once per data key reuse period, and
+//! a receive decrypts the queue's latest data key, not the one each message was sent under.
 
 import { Fault } from "../../core/fault"
 import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
+import { decryptAs, encryptAs } from "../kms/kms"
 import * as api from "./api"
 import { Attempt, Attribute, digits, Message, Place, position, Queue, save, Seen, Tables } from "./records"
 import { Task, within } from "./records"
@@ -90,6 +97,7 @@ export class Handler {
 		for (const [k, v] of input.Attributes) {
 			set(caller, f.db, f.queue, k, v, false)
 		}
+		settle(f.queue, input.Attributes)
 		f.queue.modified = now()
 		save(f.db.queues, f.queue.name, f.queue)
 		return new Unit()
@@ -374,6 +382,7 @@ export function create(caller: Caller, input: api.CreateQueueRequest, now: i64):
 	for (const [k, v] of given) {
 		set(caller, db, q, k, v, true)
 	}
+	settle(q, given)
 	q.tags = tagged([], tags, name)
 	const r = new api.CreateQueueResult()
 	r.QueueUrl = url(caller, caller.account, name)
@@ -431,6 +440,69 @@ function set(caller: Caller, db: Tables, q: Queue, k: api.QueueAttributeName, v:
 			}
 			q.throughputLimit = v
 		default: throw unknownAttribute(k)
+	}
+}
+
+/// Settles q's encryption after the attributes given set it: SSE-KMS or SSE-SQS, the one set last, as AWS, which
+/// refuses both at once.
+function settle(q: Queue, given: [api.QueueAttributeName, string][]) throws Fault {
+	const kms = given.some(a => a[0] == "KmsMasterKeyId" && a[1] != "")
+	const managed = given.some(a => a[0] == "SqsManagedSseEnabled" && a[1] == "true")
+	if (kms && managed) {
+		throw api.invalidAttributeName("You can use one type of server-side encryption (SSE) at one time. You can "
+			+ "either enable KMS SSE or SQS SSE.")
+	}
+	if (kms) {
+		q.sse = false
+	}
+	if (managed) {
+		q.kmsKey = null
+	}
+}
+
+/// Throws unless the caller may use the KMS key of the queue of f, if it has one, through SQS, with the queue's ARN
+/// as context: on sending, kms:GenerateDataKey; on receiving, kms:Decrypt of the data key it generated.
+function sealing(caller: Caller, f: Found, sending: bool) throws Fault {
+	const q = f.queue
+	if (q.kmsKey == null) {
+		return
+	}
+	const k = q.kmsKey!
+	const id = if (startsWith(k, "arn:") || f.account == caller.account) k
+		else `arn:aws:kms:${caller.region}:${f.account}:${if (startsWith(k, "alias/")) k else `key/${k}`}`
+	const context: [string, string][] = [["aws:sqs:arn", f.arn]]
+	try {
+		if (sending || q.dataKey == "") {
+			q.dataKey = base64.encode(encryptAs(caller, "sqs", id, token(), context, "kms:GenerateDataKey"))
+		}
+		if (!sending) {
+			decryptAs(caller, "sqs", sealed(q.dataKey), context)
+		}
+	} catch (e: Fault) {
+		throw if (e.status >= 500) e else kmsFault(e)
+	}
+}
+
+/// The bytes of a data key in base64.
+function sealed(b: string): string throws Fault {
+	try {
+		return base64.decode(b)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalFailure", "A queue's data key does not decode")
+	}
+}
+
+/// SQS's fault for KMS's f, of KMS's message.
+function kmsFault(f: Fault): Fault {
+	if (startsWith(f.code, "AccessDenied")) {
+		return api.kmsAccessDenied(f.message)
+	}
+	return switch (f.code) {
+		case "DisabledException": api.kmsDisabled(f.message)
+		case "NotFoundException": api.kmsNotFound(f.message)
+		case "KMSInvalidStateException": api.kmsInvalidState(f.message)
+		case "InvalidKeyUsageException": api.kmsInvalidKeyUsage(f.message)
+		default: f
 	}
 }
 
@@ -931,6 +1003,7 @@ function enqueue(caller: Caller, f: Found, input: api.SendMessageRequest,
 		throw invalid(input.MessageDeduplicationId!, "MessageDeduplicationId",
 			"The request includes a parameter that is not valid for this queue type.")
 	}
+	sealing(caller, f, true)
 	const r = new api.SendMessageResult()
 	r.MD5OfMessageBody = hex.encode(digest(md5, body))
 	r.MD5OfMessageAttributes = digested(attributes)
@@ -1168,6 +1241,9 @@ export function receive(caller: Caller, input: api.ReceiveMessageRequest,
 		}
 		return true
 	})
+	if (taken.length > 0) {
+		sealing(caller, f, false)
+	}
 	for (const m of gone) {
 		unplace(f.db, q.name, m)
 		if (!expired(q, m, now)) {

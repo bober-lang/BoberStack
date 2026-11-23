@@ -9,6 +9,13 @@
 //! for the same reason: tables and indexes are ACTIVE at once, time to live is ENABLED or DISABLED at once and may
 //! change again within the hour, and point-in-time recovery is stored but nothing can be restored. Scan, and a SELECT,
 //! which is one, return items in the order of their keys' encoding.
+//!
+//! Encryption at rest: SSESpecification Enabled puts a table under a KMS key, its KMSMasterKeyId or
+//! alias/aws/dynamodb, which CreateTable and UpdateTable check exists and the caller may describe through DynamoDB,
+//! and its description then names; Enabled false puts it back under a key AWS owns, which the description does not
+//! name. Items are stored as they come and no request on them uses the key, so disabling or deleting it later does
+//! not make the table INACCESSIBLE_ENCRYPTION_CREDENTIALS as AWS's would. The ValidationException wording of a key
+//! refused rests on the documentation alone.
 
 import { Fault } from "../../core/fault"
 import { result } from "../../core/protocol/json"
@@ -28,6 +35,7 @@ import { joined, statement, Statement, Term } from "./partiql"
 import { attribute, Change, Definition, entries, Index, indexKeyOf, items, Key, keyNames, keyOf, parsed, projected,
 	sizeOf, stored, Stream, streamKey, Tables, Token, typeOf } from "./records"
 
+import { keyArn } from "../kms/kms"
 import { id } from "../../core/auth/credentials"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as b64 from "std/encoding/base64"
@@ -101,6 +109,7 @@ export class Handler {
 		d.onDemandSince = if (d.billing == "PAY_PER_REQUEST") d.created else 0
 		d.tableClass = input.TableClass ?? "STANDARD"
 		d.deletionProtection = input.DeletionProtectionEnabled ?? false
+		encryption(caller, d, input.SSESpecification)
 		d.tags = tagged([], input.Tags ?? [])
 		stream(db, d, input.StreamSpecification, false)
 		db.save(d)
@@ -212,6 +221,7 @@ export class Handler {
 		stream(db, d, input.StreamSpecification, true)
 		d.tableClass = input.TableClass ?? d.tableClass
 		d.deletionProtection = input.DeletionProtectionEnabled ?? d.deletionProtection
+		encryption(caller, d, input.SSESpecification)
 		db.save(d)
 		const r = new api.UpdateTableOutput()
 		r.TableDescription = describe(caller, d, "ACTIVE")
@@ -1657,6 +1667,29 @@ function named(name: string, m: string) throws Fault {
 }
 
 /// The fault "One or more parameter values were invalid: why".
+/// The encryption at rest spec asks of d, null to keep it: SSE-KMS under its key, alias/aws/dynamodb if none, as the
+/// caller may describe it through DynamoDB, when enabled; a key AWS owns otherwise.
+function encryption(caller: Caller, d: Definition, spec: api.SSESpecification | null) throws Fault {
+	if (spec == null) {
+		return
+	}
+	if (spec!.Enabled != true) {
+		d.kmsKey = null
+		return
+	}
+	if (spec!.SSEType == "AES256") {
+		throw validation("One or more parameter values were invalid: SSEType AES256 is not supported")
+	}
+	try {
+		d.kmsKey = keyArn(caller, "dynamodb", spec!.KMSMasterKeyId ?? "alias/aws/dynamodb")
+	} catch (e: Fault) {
+		if (e.status >= 500 || startsWith(e.code, "AccessDenied")) {
+			throw e
+		}
+		throw validation(e.message)
+	}
+}
+
 function invalidParameters(why: string): Fault {
 	return validation(`One or more parameter values were invalid: ${why}`)
 }
@@ -1906,6 +1939,13 @@ function describe(caller: Caller, d: Definition, status: api.TableStatus): api.T
 	t.TableClassSummary = if (d.tableClass == "STANDARD") null
 		else ({ ...new api.TableClassSummary(), TableClass: d.tableClass as api.TableClass })
 	t.DeletionProtectionEnabled = d.deletionProtection
+	if (d.kmsKey != null) {
+		const e = new api.SSEDescription()
+		e.Status = "ENABLED"
+		e.SSEType = "KMS"
+		e.KMSMasterKeyArn = d.kmsKey
+		t.SSEDescription = e
+	}
 	return t
 }
 

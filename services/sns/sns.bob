@@ -10,6 +10,9 @@
 //!   it has one, else is dropped, without the attributes AWS adds to it there.
 //! - Notifications are not signed: their Signature is random, their SigningCertURL names no certificate, and their
 //!   UnsubscribeURL is of the endpoint the publish came to.
+//! - A topic's KmsMasterKeyId is not checked when set; a publish to it needs kms:GenerateDataKey and kms:Decrypt on
+//!   the key, as the publisher through SNS, as AWS, but uses the key for each message, as if no data key were reused.
+//!   Messages are stored as they come.
 //! - Publishing to a phone number or a platform endpoint, platform applications, SMS and data protection policies are
 //!   not implemented.
 
@@ -17,6 +20,7 @@ import { secret } from "../../core/auth/credentials"
 import { Fault } from "../../core/fault"
 import { Caller, Context, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
+import { decryptAs, encryptAs } from "../kms/kms"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
 import { matches, parse } from "./filter"
@@ -376,6 +380,7 @@ export class Handler {
 		if (m.message.length + size(m.attributes) > 262144) {
 			throw invalid("Message too long")
 		}
+		sealing(caller, p, t)
 		const [id, seq] = this.send(caller, p, t, m)
 		const r = new api.PublishResponse()
 		r.MessageId = id
@@ -423,6 +428,7 @@ export class Handler {
 			m.group = e.MessageGroupId
 			try {
 				checked(m, t)
+				sealing(caller, p, t)
 				const [id, seq] = this.send(caller, p, t, m)
 				ok.push({ ...new api.PublishBatchResultEntry(), Id: e.Id, MessageId: id, SequenceNumber: seq })
 			} catch (f: Fault) {
@@ -632,6 +638,34 @@ function topic(caller: Caller, a: string, m: string, context: Context = []): [Pl
 		throw api.notFoundException("Topic does not exist")
 	}
 	return [p, t!]
+}
+
+/// Throws unless the caller may use the KMS key of t at p, if it has one, through SNS, as a publish does: generate a
+/// data key and decrypt it, with the topic's ARN as context; else SNS's fault.
+function sealing(caller: Caller, p: Place, t: Topic) throws Fault {
+	const k = attribute(t.attributes, "KmsMasterKeyId") ?? ""
+	if (k == "") {
+		return
+	}
+	const id = if (startsWith(k, "arn:") || p.account == caller.account) k
+		else `arn:aws:kms:${caller.region}:${p.account}:${if (startsWith(k, "alias/")) k else `key/${k}`}`
+	const context: [string, string][] = [["aws:sns:topicArn", p.arn]]
+	try {
+		decryptAs(caller, "sns", encryptAs(caller, "sns", id, random(32), context, "kms:GenerateDataKey"), context)
+	} catch (f: Fault) {
+		if (f.status >= 500) {
+			throw f
+		}
+		if (startsWith(f.code, "AccessDenied")) {
+			throw api.kmsAccessDeniedException(f.message)
+		}
+		throw switch (f.code) {
+			case "DisabledException": api.kmsDisabledException(f.message)
+			case "NotFoundException": api.kmsNotFoundException(f.message)
+			case "KMSInvalidStateException": api.kmsInvalidStateException(f.message)
+			default: f
+		}
+	}
 }
 
 /// The topic of the ARN a of a resource, and its place, once the caller is allowed it.
