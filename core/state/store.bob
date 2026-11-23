@@ -1,20 +1,26 @@
 //! Service state: an ordered map of byte strings off the collector's heap, on a copy-on-write B-tree (store.c), so that
-//! a snapshot, a branch or a transaction is a clone in O(1). Typed tables sit on top, their values as JSON.
+//! a snapshot, a branch or a transaction is a clone in O(1). Typed tables sit on top, their values as JSON. An entry
+//! may also hold a blob: bytes too large to copy, as an S3 object's, which store.c knows only by a handle. A small blob
+//! is a string on the heap, a larger one a mapping of a temporary file, removed as soon as it is open.
 
 import { Fault } from "../fault"
 import { indexOf } from "std/algo"
 import { EncodeError, decode, encode } from "std/encoding/json"
+import { HashMap } from "std/collections/hashmap"
+import { makeTempDir, open, removeAll } from "std/fs"
+import { Body } from "std/http"
+import { File } from "std/io"
 import { ParseError } from "std/string"
 import { Decodable } from "std/types"
 
-import { store_bytes, store_clone, store_count, store_delete, store_fail, store_free, store_get, store_new, store_put,
-	store_records, store_scan, store_trees } from "./store.c"
+import { store_bytes, store_clone, store_count, store_delete, store_fail, store_free, store_get, store_live, store_new,
+	store_put, store_released, store_scan } from "./store.c" @Deterministic
 
 /// Keys and values are any bytes. Its memory is C's, freed by close, after which every call traps. A call that cannot
 /// allocate throws an InternalFailure and leaves the store as it was.
 export class Store {
 	private h: u64
-	private out = new u64[](2)
+	private out = new u64[](3)
 
 	/// An empty store, or a copy of of.
 	constructor(of: Store | null = null) throws Fault {
@@ -28,6 +34,7 @@ export class Store {
 	close() {
 		store_free(this.handle())
 		this.h = 0
+		unheld()
 	}
 
 	get(key: string): string | null {
@@ -35,24 +42,44 @@ export class Store {
 		return if (found) fromBytes(this.out[0], this.out[1]) else null
 	}
 
-	put(key: string, value: string) throws Fault {
-		memory(store_put(this.handle(), key, key.length as u64, value, value.length as u64) == 0)
+	put(key: string, value: string, blob: Blob | null = null) throws Fault {
+		let id: u64 = 0
+		if (blob != null) {
+			ids++
+			id = ids
+			held.set(id, blob!)
+		}
+		const ok = store_put(this.handle(), key, key.length as u64, value, value.length as u64, id) == 0
+		if (!ok && id != 0) {
+			held.delete(id)
+		}
+		unheld()
+		memory(ok)
+	}
+
+	blob(key: string): Blob | null {
+		const found = store_get(this.handle(), key, key.length as u64, this.out) == 1
+		return if (found && this.out[2] != 0) held.get(this.out[2])! else null
 	}
 
 	/// Whether key was there.
 	delete(key: string): bool throws Fault {
 		const r = store_delete(this.handle(), key, key.length as u64)
+		unheld()
 		memory(r >= 0)
 		return r == 1
 	}
 
 	/// A page, copied: up to limit entries whose keys start with prefix and, unless after is null, come after it, in
-	/// byte order. The next page is after the last key.
-	scan(prefix: string, after: string | null = null, limit = 1000): [string, string][] {
+	/// byte order, or before it in the reverse order if descending. The next page is past the last key.
+	scan(prefix: string, after: string | null = null, limit = 1000, descending = false): [string, string][] {
 		const n = if (limit < this.count()) limit else this.count()
 		const out = new u64[](4 * n)
-		const got = store_scan(this.handle(), prefix, prefix.length as u64, after ?? (0 as u64),
-			(after ?? "").length as u64, n as u64, out) as i32
+		const bound = if (descending) above(prefix) else null
+		// Descending, the scan starts below the least key past the prefix's.
+		const from = if (descending && (after == null || bound != null && after! > bound!)) bound else after
+		const got = store_scan(this.handle(), prefix, prefix.length as u64, from ?? (0 as u64),
+			(from ?? "").length as u64, descending as i32, n as u64, out) as i32
 		const page: [string, string][] = []
 		for (const i of 0 ... got - 1) {
 			page.push([fromBytes(out[4 * i], out[4 * i + 1]), fromBytes(out[4 * i + 2], out[4 * i + 3])])
@@ -62,7 +89,7 @@ export class Store {
 
 	/// The number of entries.
 	count(): i32 { return store_count(this.handle()) as i32 }
-	/// The bytes of the keys and values held.
+	/// The bytes of the keys and values held, not of their blobs.
 	bytes(): i64 { return store_bytes(this.handle()) as i64 }
 
 	private handle(): u64 {
@@ -72,11 +99,189 @@ export class Store {
 	}
 }
 
-/// For tests, which cannot import store.c, as each import compiles a copy: the records and the stores not yet freed in
-/// the process.
-export function live(): [i64, i64] { return [store_records(), store_trees()] }
+/// The least key above every key that starts with prefix, null if there is none.
+function above(prefix: string): string | null {
+	let n = prefix.length
+	while (n > 0 && prefix[n - 1] == 0xff) {
+		n--
+	}
+	return if (n == 0) null else prefix.slice(0, n - 1) + fromBytes([(prefix[n - 1] + 1) as u8])
+}
+
+/// The blobs that records hold, by the handle each put gave its record: one entry per put, which C reports released
+/// once the record is freed in whichever store frees it last. As module state, it is this isolate's alone.
+let held = new HashMap[u64, Blob]()
+let ids: u64 = 0
+let released = new u64[](64)
+
+/// Forgets the blobs of the records C freed since; after every call that may free records.
+function unheld() {
+	while (true) {
+		const n = store_released(released, released.length as u64) as i32
+		for (const i of 0 ... n - 1) {
+			assert held.has(released[i])
+			held.delete(released[i])
+		}
+		if (n < released.length) {
+			return
+		}
+		// Each call walks the rest of C's list: a larger buffer keeps closing a store of many blobs from being quadratic.
+		released = new u64[](2 * released.length)
+	}
+}
+
+/// Immutable bytes, as pieces that joined blobs share: strings on the heap, or mappings of files already removed, which
+/// the collector unmaps once no blob or slice reaches them.
+export class Blob {
+	private pieces: string[]
+	/// Where each piece starts.
+	private starts: i64[] = []
+	private length: i64 = 0
+
+	private constructor(pieces: string[]) {
+		this.pieces = pieces
+		for (const p of pieces) {
+			this.starts.push(this.length)
+			this.length += p.length as i64
+		}
+	}
+
+	/// The blob of bytes, which it copies. Throws an InternalFailure if a file of them cannot be written.
+	static of(bytes: string): Blob throws Fault {
+		if (bytes.length < spillAt) {
+			return new Blob([bytes.copy()])
+		}
+		try {
+			return new Blob([mapped(bytes)])
+		} catch (e: IoError) {
+			throw new Fault(500, "InternalFailure", `A blob cannot be written: ${e.message()}`)
+		}
+	}
+
+	/// The blob of parts one after the other, copying none.
+	static join(parts: Blob[]): Blob {
+		const pieces: string[] = []
+		for (const p of parts) {
+			pieces.push(...p.pieces)
+		}
+		return new Blob(pieces)
+	}
+
+	read(at: i64 = 0, n: i64 = 9223372036854775807): string {
+		assert at >= 0 && at <= this.size()
+		const end = if (n < this.size() - at) at + n else this.size()
+		if (at == end) {
+			return ""
+		}
+		let s = this.piece(at, end)
+		let i = at + (s.length as i64)
+		while (i < end) {
+			const p = this.piece(i, end)
+			s += p
+			i += p.length as i64
+		}
+		return s
+	}
+
+	/// A body of its bytes from at, up to n.
+	body(at: i64 = 0, n: i64 = 9223372036854775807): Body {
+		assert at >= 0 && at <= this.size()
+		const r = new Reader(this, at, if (n < this.size() - at) at + n else this.size())
+		return new Body(r, r.end - r.at)
+	}
+
+	size(): i64 { return this.length }
+
+	/// The bytes from at, below end, that one piece holds: a slice, which shares a long piece's bytes.
+	piece(at: i64, end: i64): string {
+		let lo = 0
+		let hi = this.pieces.length
+		while (hi - lo > 1) {
+			const mid = (lo + hi) / 2
+			if (this.starts[mid] <= at) {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		const p = this.pieces[lo]
+		const from = (at - this.starts[lo]) as i32
+		const left = (p.length - from) as i64
+		const n = if (end - at < left) (end - at) as i32 else p.length - from
+		return p.slice(from, from + n)
+	}
+}
+
+class Reader {
+	blob: Blob
+	at: i64
+	end: i64
+
+	constructor(blob: Blob, at: i64, end: i64) {
+		this.blob = blob
+		this.at = at
+		this.end = end
+	}
+
+	read(n: i32): string | null {
+		if (this.at >= this.end) {
+			return null
+		}
+		const s = this.blob.piece(this.at, if ((n as i64) < this.end - this.at) this.at + (n as i64) else this.end)
+		this.at += s.length as i64
+		return s
+	}
+}
+
+/// A blob of fewer bytes is a string on the heap, of more a mapping: few blobs may be mappings, as each costs two of the
+/// kernel's areas, of which a process has 65530.
+const spillAt: i32 = 1 << 20
+
+/// The bytes in a file with no name, mapped: its directory is removed once it is open, so nothing is left on disk
+/// however the process ends, and the file goes with its mapping.
+function mapped(bytes: string): string throws IoError {
+	const dir = makeTempDir("boberstack-")
+	let f: File | null = null
+	try {
+		disk()
+		f = open(`${dir}/blob`, "x+")
+	} finally {
+		removeAll(dir)
+	}
+	try {
+		disk()
+		f!.write(bytes)
+		disk()
+		return f!.map()
+	} finally {
+		f!.close()
+	}
+}
+
+let failing = 0
+
+/// For tests: fails the nth file operation of a blob's from now with an IoError, as a full disk would; none for 0.
+function failDisk(n: i32) { failing = n }
+
+function disk() throws IoError {
+	if (failing > 0) {
+		failing--
+		if (failing == 0) {
+			throw new IoError("Other", "write", "a full disk, for a test")
+		}
+	}
+}
+
+/// For tests, which cannot import store.c, as each import compiles a copy: the records and stores not yet freed in the
+/// process, and the blobs that records hold, one per put.
+function live(): [i64, i64, i64] {
+	const out = new i64[](2)
+	store_live(out)
+	return [out[0], out[1], held.size as i64]
+}
+
 /// For tests: fails the stores' nth allocation from now.
-export function failAllocation(n: i32) { store_fail(n as i64) }
+function failAllocation(n: i32) { store_fail(n as i64) }
 
 /// Throws unless ok, as C is out of memory.
 function memory(ok: bool) throws Fault {
@@ -102,14 +307,25 @@ export class Table[V extends Decodable] {
 		return if (s == null) null else value[V](s)
 	}
 
-	/// Throws for a NaN or infinite float, which JSON cannot hold.
-	put(key: string, v: V) throws EncodeError | Fault { this.store.put(this.prefix + key, encode(v)) }
+	/// Throws an InternalFailure for a NaN or infinite float, which JSON cannot hold.
+	put(key: string, v: V, blob: Blob | null = null) throws Fault {
+		let s = ""
+		try {
+			s = encode(v)
+		} catch (e: EncodeError) {
+			throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+		}
+		this.store.put(this.prefix + key, s, blob)
+	}
+
+	blob(key: string): Blob | null { return this.store.blob(this.prefix + key) }
 	/// Whether key was there.
 	delete(key: string): bool throws Fault { return this.store.delete(this.prefix + key) }
 
 	/// A page as Store.scan's of the table's entries whose keys start with prefix.
-	scan(after: string | null = null, limit = 1000, prefix = ""): [string, V][] {
-		const page = this.store.scan(this.prefix + prefix, if (after == null) null else this.prefix + after, limit)
+	scan(after: string | null = null, limit = 1000, prefix = "", descending = false): [string, V][] {
+		const page = this.store.scan(this.prefix + prefix, if (after == null) null else this.prefix + after, limit,
+			descending)
 		return page.map(e => [e[0].slice(this.prefix.length, e[0].length), value[V](e[1])])
 	}
 }

@@ -1,5 +1,5 @@
 import { Fault } from "../fault"
-import { Store, Table, failAllocation, live } from "./store"
+import { Blob, Store, Table, failAllocation, failDisk, live, spillAt } from "./store"
 import { indexOf } from "std/algo"
 
 /// The key of i, padded so that byte order is numeric order.
@@ -100,7 +100,7 @@ test "clones are isolated both ways" {
 }
 
 test "clones of clones free everything once closed" {
-	const [records, trees] = live()
+	const before = live()
 	const stores = [new Store()]
 	let seed: i64 = 1
 	const next = (n: i32) => {
@@ -117,14 +117,14 @@ test "clones of clones free everything once closed" {
 			s.put(k(next(3000)), `${i}`)
 		}
 	}
-	assert live()[1] == trees + (stores.length as i64) && live()[0] > records
+	assert live()[1] == before[1] + (stores.length as i64) && live()[0] > before[0]
 	while (stores.length > 0) {
 		const i = next(stores.length)
 		stores[i].close()
 		stores[i] = stores[stores.length - 1]
 		stores.pop()
 	}
-	assert live() == [records, trees]
+	assert live() == before
 }
 
 class Tag {
@@ -203,7 +203,7 @@ function fails[T](n: i32, f: () => T throws Fault): bool {
 }
 
 test "out of memory throws and changes nothing" {
-	const [records, trees] = live()
+	const before = live()
 	const a = new Store()
 	for (const i of 0 ... 999) {
 		a.put(k(i), "a")
@@ -219,5 +219,160 @@ test "out of memory throws and changes nothing" {
 	assert b.get("new") == "b" && a.get("new") == null
 	a.close()
 	b.close()
-	assert live() == [records, trees]
+	assert live() == before
+}
+
+test "a descending scan pages back through a prefix" {
+	const s = new Store()
+	for (const key of ["b", "a\xff", "a", "a\x00", "ab", "a/2", "a/10", "", "c", "\xff", "\xff\xff", "\xff\x00"]) {
+		s.put(key, `v${key}`)
+	}
+	assert s.scan("a", null, 1000, true).map(e => e[0]) == ["a\xff", "ab", "a/2", "a/10", "a\x00", "a"]
+	assert s.scan("a/", null, 1000, true).map(e => e[0]) == ["a/2", "a/10"] && s.scan("ba", null, 1000, true) == []
+	assert s.scan("", null, 2, true).map(e => e[0]) == ["\xff\xff", "\xff\x00"] && s.scan("", null, 0, true) == []
+	assert s.scan("\xff", null, 1000, true).map(e => e[0]) == ["\xff\xff", "\xff\x00", "\xff"]
+	assert s.scan("a", "ab", 2, true) == [["a/2", "va/2"], ["a/10", "va/10"]]
+	assert s.scan("a", "zz", 1000, true) == s.scan("a", null, 1000, true) && s.scan("a", "a", 1000, true) == []
+	assert s.scan("a", "\x00", 1000, true) == [] && s.scan("a", "a\xff\xff", 1, true)[0][0] == "a\xff"
+	let seen: string[] = []
+	let before: string | null = null
+	while (true) {
+		const page = s.scan("", before, 5, true)
+		seen = [...seen, ...page.map(e => e[0])]
+		if (page.length < 5) {
+			break
+		}
+		before = page[page.length - 1][0]
+	}
+	assert seen == s.scan("").map(e => e[0]).reverse()
+	const t = new Table[Limits](s, "t")
+	for (const key of ["x1", "x2", "y"]) {
+		t.put(key, new Limits())
+	}
+	assert t.scan(null, 1000, "x", true).map(e => e[0]) == ["x2", "x1"] && t.scan("y", 1, "", true)[0][0] == "x2"
+	s.close()
+}
+
+function bytes(size: i32): string {
+	const b: u8[] = []
+	for (const i of 0 ... size - 1) {
+		b.push((i % 251) as u8)
+	}
+	return fromBytes(b)
+}
+
+/// The blob of s, joined of blobs of n bytes each.
+function blob(s: string, n: i32 = 1000): Blob throws Fault {
+	const parts: Blob[] = []
+	for (let i = 0; i < s.length; i += n) {
+		parts.push(Blob.of(s.slice(i, if (i + n < s.length) i + n else s.length)))
+	}
+	return Blob.join(parts)
+}
+
+test "a blob on the heap or mapped, whole or of pieces, read in ranges" {
+	const before = live()
+	const s = bytes(9 << 20)
+	assert Blob.of(s.slice(0, spillAt - 1)).read() == s.slice(0, spillAt - 1)
+	assert Blob.of(s.slice(0, spillAt)).read() == s.slice(0, spillAt) && Blob.of(s).read() == s
+	const b = blob(s, 3000007)
+	assert live() == before
+	assert b.size() == (s.length as i64) && b.read() == s && b.read(5, 0) == ""
+	assert b.read(4194300, 10) == s.slice(4194300, 4194310) && b.read(300000, 20) == s.slice(300000, 300020)
+	assert b.read((s.length as i64) - 3) == s.slice(s.length - 3, s.length) && b.read(s.length as i64, 5) == ""
+	const body = b.body(4194000, 5000000)
+	let got = ""
+	while (true) {
+		const piece = body.read(1 << 20)
+		if (piece == null) {
+			break
+		}
+		assert piece.length <= 1 << 20
+		got += piece
+	}
+	assert body.length == 5000000 && got == s.slice(4194000, 9194000)
+	const empty = Blob.of("")
+	const nothing = empty.body()
+	assert empty.size() == 0 && empty.read() == "" && nothing.read(10) == null && nothing.length == 0
+}
+
+test "an entry holds its blob, which clones share and overwrites and deletes release" {
+	const before = live()
+	const a = new Store()
+	a.put("k", "meta", blob("hello"))
+	assert a.get("k") == "meta" && a.blob("missing") == null && live()[2] == before[2] + 1
+	a.put("plain", "v")
+	assert a.blob("plain") == null
+	const c = a.clone()
+	assert c.blob("k")!.read() == "hello"
+	c.put("k", "meta")
+	assert c.blob("k") == null && live()[2] == before[2] + 1
+	assert a.blob("k")!.read(1, 3) == "ell"
+	assert a.delete("k") && live()[2] == before[2]
+	c.put("other", "", blob("bye"))
+	c.put("other", "", c.blob("other"))
+	assert c.blob("other")!.read() == "bye" && live()[2] == before[2] + 1
+	c.close()
+	a.close()
+	assert live() == before
+}
+
+test "joined blobs and one held under two keys share their pieces" {
+	const before = live()
+	const s = new Store()
+	const parts = [blob("first,"), blob(bytes(5 << 20), 1 << 20), blob(""), blob("last")]
+	const whole = Blob.join(parts)
+	assert whole.size() == ((6 + (5 << 20) + 4) as i64)
+	assert whole.read() == "first," + bytes(5 << 20) + "last" && whole.read((5 << 20) + 6) == "last"
+	assert whole.read(5, 3) == "," + bytes(2)
+		&& whole.read((5 << 20) + 5, 2) == bytes(5 << 20).slice((5 << 20) - 1, 5 << 20) + "l"
+	s.put("a", "", whole)
+	s.put("b", "", whole)
+	assert s.blob("a") == s.blob("b") && live()[2] == before[2] + 2
+	assert s.delete("a") && s.blob("b")!.read(0, 6) == "first," && live()[2] == before[2] + 1
+	for (const i of 0 ... 199) {
+		s.put(k(i), "", whole)
+	}
+	assert live()[2] == before[2] + 201
+	s.close()
+	assert live() == before
+}
+
+test "out of memory storing a blob throws and holds nothing" {
+	const before = live()
+	const s = new Store()
+	for (const i of 0 ... 999) {
+		s.put(k(i), "")
+	}
+	const t = s.clone()
+	const b = blob("abc")
+	assert fails(1, () => t.put("k", "", b)) && fails(2, () => t.put("k", "", b)) && t.blob("k") == null
+	assert live()[2] == before[2]
+	t.put("k", "", b)
+	assert fails(1, () => t.put("j", "", b)) && live()[2] == before[2] + 1
+	assert fails(1, () => s.put(k(5), "", b)) && fails(1, () => t.delete("k")) && live()[2] == before[2] + 1
+	t.close()
+	assert live()[2] == before[2]
+	s.close()
+	assert live() == before
+}
+
+test "a failing disk while writing a blob throws; a short blob needs none" {
+	const s = bytes(spillAt)
+	// Opening the file, writing it and mapping it.
+	for (const n of 1 ... 3) {
+		failDisk(n)
+		try {
+			Blob.of(s)
+			assert false
+		} catch (e: Fault) {
+			assert e.status == 500 && e.code == "InternalFailure"
+		} finally {
+			failDisk(0)
+		}
+	}
+	failDisk(1)
+	assert Blob.of("short").read() == "short"
+	failDisk(0)
+	assert Blob.of(s).read() == s
 }
