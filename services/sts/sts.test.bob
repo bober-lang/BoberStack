@@ -1,0 +1,393 @@
+import { authenticate, Credential, credentials } from "../../core/auth/credentials"
+import * as sigv4 from "../../core/auth/sigv4"
+import * as client from "../../core/client"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import { live, Store } from "../../core/state/store"
+import * as iamApi from "../iam/api"
+import { Catalog } from "../iam/catalog"
+import * as iam from "../iam/iam"
+import { identify } from "../iam/identities"
+import { AssumeRoleRequest, AssumeRoleResponse, handle, signingName, STS } from "./api"
+import { Handler } from "./sts"
+import { Request, Response } from "std/http"
+import { second } from "std/time"
+import { escape } from "std/url"
+
+const ns = "https://sts.amazonaws.com/doc/2011-06-15/"
+const secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+
+function gateway(h: STS = new Handler()): Gateway {
+	const g = new Gateway()
+	g.services.set(signingName, (caller, req) => handle(h, caller, req))
+	const global = new Store()
+	const c = new Credential()
+	c.secret = secret
+	c.account = "111122223333"
+	c.arn = "arn:aws:iam::111122223333:root"
+	c.userId = c.account
+	credentials(global).put("AKIDEXAMPLE", c)
+	g.trees.set("", global)
+	return g
+}
+
+function request(accessKey: string, secret: string, body = "Action=GetCallerIdentity&Version=2011-06-15"): Request {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("host", "localhost:4566")
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.headers.set("x-amz-date", "20150626T140000Z")
+	const header = `AWS4-HMAC-SHA256 Credential=${accessKey}/20150626/us-east-1/sts/aws4_request, `
+		+ "SignedHeaders=content-type;host;x-amz-date, Signature="
+	req.headers.set("authorization", header + sigv4.signature(req, body, sigv4.parse(header + "0")!, secret))
+	return req
+}
+
+function identity(res: Response, account: string): string {
+	const id = res.headers.get("x-amzn-requestid")!
+	return `<GetCallerIdentityResponse xmlns="${ns}"><GetCallerIdentityResult><UserId>${account}</UserId>`
+		+ `<Account>${account}</Account><Arn>arn:aws:iam::${account}:root</Arn></GetCallerIdentityResult>`
+		+ `<ResponseMetadata><RequestId>${id}</RequestId></ResponseMetadata></GetCallerIdentityResponse>`
+}
+
+function error(res: Response, code: string, message: string, ns = "", receiver = false): string {
+	const id = res.headers.get("x-amzn-requestid")!
+	const who = if (receiver) "Receiver" else "Sender"
+	return `<ErrorResponse${if (ns == "") "" else ` xmlns="${ns}"`}><Error><Type>${who}</Type><Code>${code}</Code>`
+		+ `<Message>${message}</Message></Error><RequestId>${id}</RequestId></ErrorResponse>`
+}
+
+test "an unknown key is the root of the default account" {
+	const res = gateway().handle(request("test", "test"))
+	assert res.status == 200 && res.headers.get("content-type") == "text/xml"
+	assert res.body.whole == identity(res, "000000000000")
+}
+
+test "an unknown key of 12 digits is the root of that account" {
+	const res = gateway().handle(request("123456789012", "anything"))
+	assert res.body.whole == identity(res, "123456789012")
+}
+
+test "a known key signed right is the root of its account" {
+	const res = gateway().handle(request("AKIDEXAMPLE", secret))
+	assert res.status == 200 && res.body.whole == identity(res, "111122223333")
+}
+
+test "a known key signed wrong" {
+	const res = gateway().handle(request("AKIDEXAMPLE", "wrong"))
+	const why = "The request signature we calculated does not match the signature you provided. Check your AWS Secret "
+		+ "Access Key and signing method. Consult the service documentation for details."
+	assert res.status == 403
+	assert res.body.whole == error(res, "SignatureDoesNotMatch", why)
+}
+
+test "a known key's request dated past 15 minutes ago" {
+	const req = request("AKIDEXAMPLE", secret)
+	req.headers.set("x-amz-date", "20150626T134459Z")
+	const res = gateway().handle(req)
+	const why = "Signature expired: 20150626T134459Z is now earlier than 20150626T134500Z (20150626T140000Z - 15 min.)"
+	assert res.status == 403
+	assert res.body.whole == error(res, "SignatureDoesNotMatch", why)
+}
+
+test "an action STS does not have" {
+	const res = gateway().handle(request("test", "test", "Action=Frobnicate&Version=2011-06-15"))
+	const why = "Could not find operation Frobnicate for version 2011-06-15"
+	assert res.status == 400
+	assert res.body.whole == error(res, "InvalidAction", why, "http://webservices.amazon.com/AWSFault/2005-15-09")
+}
+
+test "no authorization" {
+	const req = request("test", "test")
+	req.headers.delete("authorization")
+	const res = gateway().handle(req)
+	assert res.status == 403
+	assert res.body.whole == error(res, "MissingAuthenticationToken", "Request is missing Authentication Token")
+}
+
+test "an unknown service" {
+	const req = request("test", "test")
+	const s3 = "AWS4-HMAC-SHA256 Credential=test/20150626/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0"
+	req.headers.set("authorization", s3)
+	assert gateway().handle(req).status == 501
+}
+
+test "an action not implemented" {
+	const res = gateway().handle(request("test", "test",
+		"Action=GetAccessKeyInfo&Version=2011-06-15&AccessKeyId=AKIAIOSFODNN7EXAMPLE"))
+	assert res.status == 501
+	assert res.body.whole == error(res, "NotImplemented", "The operation GetAccessKeyInfo is not implemented", ns, true)
+}
+
+/// The service, but AssumeRole answers whatever it is asked.
+class Lax {
+	...Handler
+
+	assumeRole(caller: Caller, input: AssumeRoleRequest): AssumeRoleResponse throws Fault {
+		return new AssumeRoleResponse()
+	}
+}
+
+test "a required parameter missing" {
+	const res = gateway(new Lax()).handle(request("test", "test",
+		"Action=AssumeRole&Version=2011-06-15&RoleSessionName=s1"))
+	const why = "1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null"
+	assert res.status == 400
+	assert res.body.whole == error(res, "ValidationError", why, ns)
+}
+
+/// A gateway of STS and IAM, where the key AKIDEXAMPLE is the root of 111122223333.
+function both(): Gateway {
+	const g = gateway()
+	const catalog = new Catalog(0, 0)
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(new iam.Handler(catalog), caller, req))
+	g.identify = identify(catalog)
+	return g
+}
+
+function call(g: Gateway, service: string, action: string, params: string, accessKey = "test", secret = "test",
+	token = ""): Response {
+	const version = if (service == "iam") "2010-05-08" else "2011-06-15"
+	return g.handle(client.request(service, accessKey, secret, `Action=${action}&Version=${version}${params}`, token))
+}
+
+function fails(res: Response, status: i32, code: string): bool {
+	return res.status == status && client.text(res, "Code") == code
+}
+
+function trusting(principal: string): string {
+	return `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"${principal}"},"Action":"sts:AssumeRole"}]}`
+}
+
+function policy(effect: string, actions: string, resources: string = `"*"`): string {
+	return escape(`{"Version":"2012-10-17","Statement":[{"Effect":"${effect}","Action":${actions},"Resource":${resources}}]}`,
+		"component")
+}
+
+test "a user's access key is the user's, while active, by its name now" {
+	const before = live()
+	const g = both()
+	const user = client.text(call(g, "iam", "CreateUser", "&UserName=bob"), "UserId")!
+	const own = policy("Allow", `"iam:CreateAccessKey"`, `"arn:aws:iam::000000000000:user/\${aws:username}"`)
+	call(g, "iam", "PutUserPolicy", `&UserName=bob&PolicyName=keys&PolicyDocument=${own}`)
+	let res = call(g, "iam", "CreateAccessKey", "&UserName=bob")
+	const key = client.text(res, "AccessKeyId")!
+	const secret = client.text(res, "SecretAccessKey")!
+	res = call(g, "sts", "GetCallerIdentity", "", key, secret)
+	assert res.status == 200 && client.text(res, "Arn") == "arn:aws:iam::000000000000:user/bob"
+	assert client.text(res, "UserId") == user && client.text(res, "Account") == "000000000000"
+	assert fails(call(g, "sts", "GetCallerIdentity", "", key, "wrong"), 403, "SignatureDoesNotMatch")
+	// A user makes keys for itself without naming itself.
+	res = call(g, "iam", "CreateAccessKey", "", key, secret)
+	assert res.status == 200 && client.text(res, "UserName") == "bob"
+	call(g, "iam", "DeleteAccessKey", `&UserName=bob&AccessKeyId=${client.text(res, "AccessKeyId")!}`)
+	call(g, "iam", "UpdateUser", "&UserName=bob&NewUserName=rob&NewPath=/ops/")
+	res = call(g, "sts", "GetCallerIdentity", "", key, secret)
+	assert client.text(res, "Arn") == "arn:aws:iam::000000000000:user/ops/rob" && client.text(res, "UserId") == user
+	call(g, "iam", "UpdateAccessKey", `&UserName=rob&AccessKeyId=${key}&Status=Inactive`)
+	assert fails(call(g, "sts", "GetCallerIdentity", "", key, secret), 403, "InvalidClientTokenId")
+	call(g, "iam", "UpdateAccessKey", `&UserName=rob&AccessKeyId=${key}&Status=Active`)
+	assert call(g, "sts", "GetCallerIdentity", "", key, secret).status == 200
+	call(g, "iam", "DeleteAccessKey", `&UserName=rob&AccessKeyId=${key}`)
+	assert fails(call(g, "sts", "GetCallerIdentity", "", key, secret), 403, "InvalidClientTokenId") // not unknown again
+	g.close()
+	assert live() == before
+}
+
+test "a root's own access key is the root, in its account" {
+	const g = both()
+	let res = call(g, "iam", "CreateAccessKey", "", "AKIDEXAMPLE", secret)
+	res = call(g, "sts", "GetCallerIdentity", "", client.text(res, "AccessKeyId")!,
+		client.text(res, "SecretAccessKey")!)
+	assert res.status == 200 && res.body.whole == identity(res, "111122223333")
+	g.close()
+}
+
+test "a role's credentials: with their token, until they expire" {
+	const before = live()
+	const g = both()
+	const trust = escape(trusting("000000000000"), "component")
+	const role = client.text(call(g, "iam", "CreateRole", `&RoleName=app&AssumeRolePolicyDocument=${trust}`), "RoleId")!
+	call(g, "iam", "PutRolePolicy",
+		`&RoleName=app&PolicyName=keys&PolicyDocument=${policy("Allow", `"iam:CreateAccessKey"`)}`)
+	const arn = "arn:aws:iam::000000000000:role/app"
+	let res = call(g, "sts", "AssumeRole", `&RoleArn=${arn}&RoleSessionName=s1&DurationSeconds=900`)
+	assert res.status == 200 && client.text(res, "AssumedRoleId") == `${role}:s1`
+	assert client.text(res, "Arn") == "arn:aws:sts::000000000000:assumed-role/app/s1"
+	const key = client.text(res, "AccessKeyId")!
+	const secret = client.text(res, "SecretAccessKey")!
+	const token = client.text(res, "SessionToken")!
+	assert key.slice(0, 4) == "ASIA" && key.length == 20 && client.text(res, "Expiration") == "2015-06-26T14:15:00Z"
+	res = call(g, "sts", "GetCallerIdentity", "", key, secret, token)
+	assert res.status == 200 && client.text(res, "Arn") == "arn:aws:sts::000000000000:assumed-role/app/s1"
+	assert client.text(res, "UserId") == `${role}:s1` && client.text(res, "Account") == "000000000000"
+	assert fails(call(g, "sts", "GetCallerIdentity", "", key, secret), 403, "InvalidClientTokenId")
+	assert fails(call(g, "sts", "GetCallerIdentity", "", key, secret, token + "x"), 403, "InvalidClientTokenId")
+	assert fails(call(g, "sts", "GetSessionToken", "", key, secret, token), 403, "AccessDenied")
+	assert fails(call(g, "iam", "CreateAccessKey", "", key, secret, token), 400, "ValidationError") // no user's
+	const c = credentials(g.trees.get("")!).get(key)!
+	const req = client.request("sts", key, secret, "Action=GetCallerIdentity&Version=2011-06-15", token)
+	const auth = sigv4.parse(req.headers.get("authorization")!)!
+	const body = "Action=GetCallerIdentity&Version=2011-06-15"
+	assert authenticate(c, req, body, auth, now() + 899 * second) == null
+	assert authenticate(c, req, body, auth, now() + 900 * second)?.code == "ExpiredToken"
+	g.close()
+	assert live() == before
+}
+
+test "assuming a role that is not there, or for too long" {
+	const g = both()
+	const trust = escape(trusting("000000000000"), "component")
+	call(g, "iam", "CreateRole", `&RoleName=app&Path=/x/&AssumeRolePolicyDocument=${trust}&MaxSessionDuration=7200`)
+	assert fails(call(g, "sts", "AssumeRole", "&RoleArn=arn:aws:iam::000000000000:role/nope&RoleSessionName=s"), 400,
+		"ValidationError") // too short a session name
+	assert fails(call(g, "sts", "AssumeRole", "&RoleArn=arn:aws:iam::000000000000:role/nope&RoleSessionName=s1"), 403,
+		"AccessDenied")
+	assert fails(call(g, "sts", "AssumeRole", "&RoleArn=arn:aws:iam::000000000000:role/app&RoleSessionName=s1"), 403,
+		"AccessDenied") // not its path
+	assert fails(call(g, "sts", "AssumeRole", "&RoleArn=app&RoleSessionName=s1"), 400, "ValidationError")
+	const arn = "&RoleArn=arn:aws:iam::000000000000:role/x/app&RoleSessionName=s1"
+	assert fails(call(g, "sts", "AssumeRole", arn + "&DurationSeconds=899"), 400, "ValidationError")
+	assert fails(call(g, "sts", "AssumeRole", arn + "&DurationSeconds=7201"), 400, "ValidationError")
+	const res = call(g, "sts", "AssumeRole", arn + "&DurationSeconds=7200")
+	assert res.status == 200 && client.text(res, "Expiration") == "2015-06-26T16:00:00Z"
+	assert client.text(call(g, "sts", "AssumeRole", arn), "Expiration") == "2015-06-26T15:00:00Z"
+	g.close()
+}
+
+test "a role of another account is assumed in that account" {
+	const g = both()
+	const trust = escape(trusting("000000000000"), "component")
+	call(g, "iam", "CreateRole", `&RoleName=shared&AssumeRolePolicyDocument=${trust}`, "AKIDEXAMPLE", secret)
+	let res = call(g, "sts", "AssumeRole", "&RoleArn=arn:aws:iam::111122223333:role/shared&RoleSessionName=s1")
+	res = call(g, "sts", "GetCallerIdentity", "", client.text(res, "AccessKeyId")!,
+		client.text(res, "SecretAccessKey")!, client.text(res, "SessionToken")!)
+	assert client.text(res, "Arn") == "arn:aws:sts::111122223333:assumed-role/shared/s1"
+	assert client.text(res, "Account") == "111122223333"
+	g.close()
+}
+
+test "a session token for a user, and for a root, whose lasts an hour at most" {
+	const g = both()
+	call(g, "iam", "CreateUser", "&UserName=bob")
+	let res = call(g, "iam", "CreateAccessKey", "&UserName=bob")
+	res = call(g, "sts", "GetSessionToken", "&DurationSeconds=1800", client.text(res, "AccessKeyId")!,
+		client.text(res, "SecretAccessKey")!)
+	assert res.status == 200 && client.text(res, "Expiration") == "2015-06-26T14:30:00Z"
+	res = call(g, "sts", "GetCallerIdentity", "", client.text(res, "AccessKeyId")!,
+		client.text(res, "SecretAccessKey")!, client.text(res, "SessionToken")!)
+	assert client.text(res, "Arn") == "arn:aws:iam::000000000000:user/bob"
+		&& client.text(res, "UserId")!.slice(0, 4) == "AIDA"
+	assert client.text(call(g, "sts", "GetSessionToken", ""), "Expiration") == "2015-06-26T15:00:00Z"
+	assert fails(call(g, "sts", "GetSessionToken", "&DurationSeconds=129601"), 400, "ValidationError")
+	g.close()
+}
+
+function keyOf(g: Gateway, name: string): [string, string] {
+	const res = call(g, "iam", "CreateAccessKey", `&UserName=${name}`)
+	return [client.text(res, "AccessKeyId")!, client.text(res, "SecretAccessKey")!]
+}
+
+function session(res: Response): [string, string, string] {
+	return [client.text(res, "AccessKeyId")!, client.text(res, "SecretAccessKey")!, client.text(res, "SessionToken")!]
+}
+
+function deniedAs(res: Response, message: string): bool {
+	const m = client.text(res, "Message") ?? ""
+	return res.status == 403 && client.text(res, "Code") == "AccessDenied"
+		&& m.slice(0, message.length + 8) == `${message}. Go to `
+}
+
+test "a user is allowed what its policies allow, and denied the rest" {
+	const g = both()
+	call(g, "iam", "CreateUser", "&UserName=bob&Path=/p/")
+	call(g, "iam", "CreateUser", "&UserName=eve")
+	const reads = policy("Allow", `["iam:GetUser", "iam:ListUsers", "iam:ListRoles"]`)
+	call(g, "iam", "PutUserPolicy", `&UserName=bob&PolicyName=reads&PolicyDocument=${reads}`)
+	const deny = policy("Deny", `"iam:ListRoles"`)
+	call(g, "iam", "PutUserPolicy", `&UserName=bob&PolicyName=deny&PolicyDocument=${deny}`)
+	const [key, secret] = keyOf(g, "bob")
+	assert call(g, "iam", "GetUser", "&UserName=eve", key, secret).status == 200
+	assert fails(call(g, "iam", "GetUser", "&UserName=none", key, secret), 404, "NoSuchEntity")
+	assert deniedAs(call(g, "iam", "GetRole", "&RoleName=none", key, secret),
+		"User: arn:aws:iam::000000000000:user/p/bob is not authorized to perform: iam:GetRole on resource: role none "
+		+ "because no identity-based policy allows the iam:GetRole action")
+	assert deniedAs(call(g, "iam", "ListRoles", "", key, secret),
+		"User: arn:aws:iam::000000000000:user/p/bob is not authorized to perform: iam:ListRoles on resource: "
+		+ "arn:aws:iam::000000000000:role/ with an explicit deny in an identity-based policy")
+	assert deniedAs(call(g, "iam", "CreateUser", "&UserName=x&Path=/q/", key, secret),
+		"User: arn:aws:iam::000000000000:user/p/bob is not authorized to perform: iam:CreateUser on resource: "
+		+ "arn:aws:iam::000000000000:user/q/x because no identity-based policy allows the iam:CreateUser action")
+	const [k2, s2] = keyOf(g, "eve")
+	assert client.text(call(g, "iam", "GetPolicy", "&PolicyArn=arn:aws:iam::aws:policy/ReadOnlyAccess", k2, s2),
+		"Message")
+		== "User: arn:aws:iam::000000000000:user/eve is not authorized to perform: iam:GetPolicy on resource: policy "
+		+ "arn:aws:iam::aws:policy/ReadOnlyAccess because no identity-based policy allows the iam:GetPolicy action"
+	const managed = client.text(call(g, "iam", "CreatePolicy",
+		`&PolicyName=roles&PolicyDocument=${policy("Allow", `"iam:ListRoles"`)}`), "Arn")!
+	call(g, "iam", "AttachUserPolicy", `&UserName=eve&PolicyArn=${managed}`)
+	assert call(g, "iam", "ListRoles", "", k2, s2).status == 200
+	g.close()
+}
+
+test "a role is assumed as its trust policy and the caller's policies allow, its session limited by its session policies" {
+	const g = both()
+	call(g, "iam", "CreateUser", "&UserName=bob")
+	call(g, "iam", "CreateUser", "&UserName=eve")
+	const [key, secret] = keyOf(g, "bob")
+	const [k2, s2] = keyOf(g, "eve")
+	const byName = escape(trusting("arn:aws:iam::000000000000:user/bob"), "component")
+	call(g, "iam", "CreateRole", `&RoleName=named&AssumeRolePolicyDocument=${byName}`)
+	const byAccount = escape(trusting("000000000000"), "component")
+	call(g, "iam", "CreateRole", `&RoleName=account&AssumeRolePolicyDocument=${byAccount}`)
+	call(g, "iam", "PutRolePolicy",
+		`&RoleName=named&PolicyName=p&PolicyDocument=${policy("Allow", `["iam:GetRole", "iam:ListUsers"]`)}`)
+	// Named by the trust policy, bob needs no policy of his own; named by its account, he does.
+	const named = "&RoleArn=arn:aws:iam::000000000000:role/named&RoleSessionName=s1"
+	const account = "&RoleArn=arn:aws:iam::000000000000:role/account&RoleSessionName=s1"
+	let res = call(g, "sts", "AssumeRole", named, key, secret)
+	assert res.status == 200
+	assert deniedAs(call(g, "sts", "AssumeRole", account, key, secret),
+		"User: arn:aws:iam::000000000000:user/bob is not authorized to perform: sts:AssumeRole on resource: "
+		+ "arn:aws:iam::000000000000:role/account")
+	assert client.text(call(g, "sts", "AssumeRole", "&RoleArn=arn:aws:iam::000000000000:role/none&RoleSessionName=s1",
+		key, secret), "Message")
+		== "User: arn:aws:iam::000000000000:user/bob is not authorized to perform: "
+		+ "sts:AssumeRole on resource: arn:aws:iam::000000000000:role/none"
+	assert fails(call(g, "sts", "AssumeRole", named, k2, s2), 403, "AccessDenied")
+	call(g, "iam", "PutUserPolicy", `&UserName=eve&PolicyName=p&PolicyDocument=${policy("Allow", `"sts:AssumeRole"`)}`)
+	assert call(g, "sts", "AssumeRole", account, k2, s2).status == 200
+	assert fails(call(g, "sts", "AssumeRole", named, k2, s2), 403, "AccessDenied")
+	let [k, s, t] = session(res)
+	assert call(g, "iam", "ListUsers", "", k, s, t).status == 200
+	assert deniedAs(call(g, "iam", "GetUser", "&UserName=bob", k, s, t),
+		"User: arn:aws:sts::000000000000:assumed-role/named/s1 is not authorized to perform: iam:GetUser on resource: "
+		+ "user bob because no identity-based policy allows the iam:GetUser action")
+	res = call(g, "sts", "AssumeRole", `${named}&Policy=${policy("Allow", `"iam:GetRole"`)}`, key, secret)
+	[k, s, t] = session(res)
+	assert call(g, "iam", "GetRole", "&RoleName=named", k, s, t).status == 200
+	assert deniedAs(call(g, "iam", "ListUsers", "", k, s, t),
+		"User: arn:aws:sts::000000000000:assumed-role/named/s1 is not authorized to perform: iam:ListUsers on resource: "
+		+ "arn:aws:iam::000000000000:user/ because no session policy allows the iam:ListUsers action")
+	g.close()
+}
+
+test "sessions of GetSessionToken and GetFederationToken" {
+	const g = both()
+	call(g, "iam", "CreateUser", "&UserName=bob")
+	call(g, "iam", "PutUserPolicy", `&UserName=bob&PolicyName=p&PolicyDocument=${policy("Allow", `"*"`)}`)
+	const [key, secret] = keyOf(g, "bob")
+	// Without MFA, a session token calls no IAM.
+	let [k, s, t] = session(call(g, "sts", "GetSessionToken", "", key, secret))
+	assert fails(call(g, "iam", "ListUsers", "", k, s, t), 403, "InvalidClientTokenId")
+	// A federated user has what both the user's and the session policies allow; none without the latter.
+	[k, s, t] = session(call(g, "sts", "GetFederationToken", "&Name=fed", key, secret))
+	assert fails(call(g, "iam", "ListUsers", "", k, s, t), 403, "AccessDenied")
+	const res = call(g, "sts", "GetFederationToken", `&Name=fed&Policy=${policy("Allow", `"iam:ListUsers"`)}`, key,
+		secret)
+	assert client.text(res, "Arn") == "arn:aws:sts::000000000000:federated-user/fed"
+	[k, s, t] = session(res)
+	assert call(g, "iam", "ListUsers", "", k, s, t).status == 200
+	assert fails(call(g, "iam", "ListRoles", "", k, s, t), 403, "AccessDenied")
+	g.close()
+}
