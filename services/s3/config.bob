@@ -60,8 +60,9 @@ export function isPublic(p: Policy): bool {
 		&& s.principals.some(n => n[0] == "*" || n[1] == "*"))
 }
 
-/// Throws S3's refusal of an ACL, acl, unless the bucket of f has ACLs enabled.
+/// Throws S3's refusal of an ACL, acl, unless it is a canned one and the bucket of f has ACLs enabled.
 export function acl(f: Found, acl: string | null) throws Fault {
+	canned(acl)
 	if (acl != null && settings(f).ownership == "BucketOwnerEnforced") {
 		throw aclsDisabled()
 	}
@@ -76,6 +77,9 @@ export function versioned(f: Found, input: api.PutBucketVersioningRequest) throw
 	const m = input.VersioningConfiguration.MFADelete
 	if (m == null) {
 		return
+	}
+	if (!among[api.MFADelete](m!)) {
+		throw malformed()
 	}
 	if (m! == "Enabled" && input.MFA == null) {
 		throw new Fault(403, "AccessDenied", "Mfa Authentication must be used for this request")
@@ -129,7 +133,7 @@ export class Config {
 		caller.actions = ["s3:PutBucketOwnershipControls"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
 		const rules = input.OwnershipControls.Rules
-		if (rules.length != 1) {
+		if (rules.length != 1 || !among[api.ObjectOwnership](rules[0].ObjectOwnership)) {
 			throw malformed()
 		}
 		const s = settings(f)
@@ -172,6 +176,7 @@ export class Config {
 	putBucketAcl(caller: Caller, input: api.PutBucketAclRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketAcl"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		canned(if (input.ACL == null) null else `${input.ACL!}`)
 		if (settings(f).ownership == "BucketOwnerEnforced") {
 			throw aclsDisabled()
 		}
@@ -191,6 +196,7 @@ export class Config {
 	putObjectAcl(caller: Caller, input: api.PutObjectAclRequest): api.PutObjectAclOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:PutObjectAcl" else "s3:PutObjectVersionAcl"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		canned(if (input.ACL == null) null else `${input.ACL!}`)
 		if (settings(f).ownership == "BucketOwnerEnforced") {
 			throw aclsDisabled()
 		}
@@ -201,7 +207,8 @@ export class Config {
 		caller.actions = ["s3:PutEncryptionConfiguration"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
 		const rules = input.ServerSideEncryptionConfiguration.Rules
-		if (rules.length != 1) {
+		const a = if (rules.length == 1) rules[0].ApplyServerSideEncryptionByDefault else null
+		if (rules.length != 1 || a != null && !among[api.ServerSideEncryption](a!.SSEAlgorithm)) {
 			throw malformed()
 		}
 		for (const r of rules) {
@@ -239,6 +246,14 @@ export class Config {
 	putBucketCors(caller: Caller, input: api.PutBucketCorsRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketCORS"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		for (const r of input.CORSConfiguration.CORSRules) {
+			for (const m of r.AllowedMethods) {
+				if (!["GET", "PUT", "POST", "DELETE", "HEAD"].includes(m)) {
+					throw new Fault(400, "InvalidRequest",
+						`Found unsupported HTTP method in CORS config. Unsupported method is ${m}`)
+				}
+			}
+		}
 		const s = settings(f)
 		s.cors = input.CORSConfiguration.CORSRules
 		save(f, s)
@@ -270,6 +285,13 @@ export class Config {
 		caller.actions = ["s3:PutLifecycleConfiguration"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
 		const rules = input.LifecycleConfiguration?.Rules ?? []
+		for (const r of rules) {
+			const classes = (r.Transitions ?? []).map(t => t.StorageClass ?? "GLACIER")
+			classes.append((r.NoncurrentVersionTransitions ?? []).map(t => t.StorageClass ?? "GLACIER"))
+			if (!among[api.ExpirationStatus](r.Status) || !classes.every(c => among[api.TransitionStorageClass](c))) {
+				throw malformed()
+			}
+		}
 		const ids: string[] = []
 		for (const r of rules) {
 			const days = r.Expiration?.Days
@@ -357,6 +379,9 @@ export class Config {
 	putBucketRequestPayment(caller: Caller, input: api.PutBucketRequestPaymentRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketRequestPayment"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (!among[api.Payer](input.RequestPaymentConfiguration.Payer)) {
+			throw malformed()
+		}
 		const s = settings(f)
 		s.payer = input.RequestPaymentConfiguration.Payer
 		save(f, s)
@@ -734,6 +759,13 @@ function among[T](s: string): bool {
 		}
 	}
 	return false
+}
+
+/// Throws S3's refusal of acl unless it is a canned ACL, or null.
+function canned(acl: string | null) throws Fault {
+	if (acl != null && !among[api.ObjectCannedACL](acl!)) {
+		throw argument("", "x-amz-acl", acl!)
+	}
 }
 
 function sseC(): api.BlockedEncryptionTypes {

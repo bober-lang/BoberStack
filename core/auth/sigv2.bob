@@ -3,8 +3,8 @@
 //! headers and resource.
 
 import { Fault } from "../fault"
-import { Authorization, iso } from "./sigv4"
-import { lastIndexOf, sortBy, startsWith } from "std/algo"
+import { Authorization, iso, mismatch } from "./sigv4"
+import { endsWith, lastIndexOf, sortBy, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
 import { equal, sha1 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
@@ -41,15 +41,13 @@ export function presigned(req: Request): Authorization | null throws Fault {
 
 /// Why req does not bear auth's SigV2 signature by secret at the instant now, as S3 words it; null if it does. Once
 /// its Expires has passed it is a 403 AccessDenied.
-export function verify(req: Request, auth: Authorization, secret: string,
-	now: i64): string | Fault | null throws CryptoError {
+export function verify(req: Request, auth: Authorization, secret: string, now: i64): Fault | null throws CryptoError {
 	if (now > auth.expires * second) {
 		const members = `<Expires>${iso(auth.expires * second)}</Expires><ServerTime>${iso(now)}</ServerTime>`
 		return new Fault(403, "AccessDenied", "Request has expired", true, members)
 	}
 	if (!equal(signature(req, auth, secret), auth.signature)) {
-		return "The request signature we calculated does not match the signature you provided. Check your key and "
-			+ "signing method."
+		return mismatch(auth, stringToSign(req, auth), [])
 	}
 	return null
 }
@@ -72,7 +70,7 @@ export function stringToSign(req: Request, auth: Authorization): string {
 	sortBy(amz, (a, b) => a[0] < b[0])
 	const raw = if (req.url.path == "") "/" else req.url.path
 	const path = split(raw, "/").map(s => escape(unescape(s, "path"), "component")).join("/")
-	const named = bucket(lower(split(req.headers.get("host") ?? req.url.host, ":")[0]))
+	const named = hosted(req)
 	const sub = req.url.query.entries.filter(e => subresources.includes(e[0]))
 	sortBy(sub, (a, b) => a[0] < b[0])
 	const query = sub.map(e => if (e[1] == "") e[0] else `${e[0]}=${e[1]}`).join("&")
@@ -81,15 +79,21 @@ export function stringToSign(req: Request, auth: Authorization): string {
 		(if (named == "") "" else `/${named}`) + path + (if (query == "") "" else `?${query}`)].join("\n")
 }
 
-/// The bucket a virtual-hosted request's host names, bucket.s3.<anything>, bucket.s3-<anything> or
-/// bucket.localhost…; "" if none.
-function bucket(host: string): string {
-	for (const at of [lastIndexOf(host, ".s3."), lastIndexOf(host, ".s3-"), lastIndexOf(host, ".localhost")]) {
-		if (at > 0) {
-			return host.slice(0, at)
-		}
+/// The bucket the host of a virtual-hosted request to S3, req, names: bucket.s3.<anything>, bucket.s3-<anything>,
+/// bucket.localhost or bucket.localhost.localstack.cloud; "" if none.
+export function hosted(req: Request): string {
+	const host = lower(split(req.headers.get("host") ?? req.url.host, ":")[0])
+	let bucket = ""
+	const at = lastIndexOf(host, ".s3.")
+	const dash = lastIndexOf(host, ".s3-")
+	if (at > 0 || dash > 0) {
+		bucket = host.slice(0, if (at > dash) at else dash)
+	} else if (endsWith(host, ".localhost.localstack.cloud")) {
+		bucket = host.slice(0, host.length - ".localhost.localstack.cloud".length)
+	} else if (endsWith(host, ".localhost")) {
+		bucket = host.slice(0, host.length - ".localhost".length)
 	}
-	return ""
+	return if (bucket == "s3" || startsWith(bucket, "s3.")) "" else bucket
 }
 
 /// The HMAC-SHA1 of message by key.

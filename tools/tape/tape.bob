@@ -49,9 +49,9 @@
 //!
 //! A replay compares the status, the headers in `headers`, and the body as a tree: of XML elements, or JSON members
 //! and items, matched by name, and the n-th of a name with the n-th, so that a list's order counts and a structure's
-//! does not. A captured value is expected where AWS's was, as is a volatile member, of the same form: its runs of
-//! letters, digits and +/= the same in number, between the same other characters; an ignored member need only be
-//! there; a `${name}` not yet bound, as `${owner}`, binds it to what is there; and the random id of an authorization
+//! does not, but for the elements a step names `unordered`, which AWS answers in an order of its own. A captured
+//! value is expected where AWS's was, as is a volatile member, of the same form: its runs of letters, digits and +/=
+//! the same in number, between the same other characters; an ignored member need only be there; a `${name}` not yet bound, as `${owner}`, binds it to what is there; and the random id of an authorization
 //! that IAM's denials link to is not compared. Of S3 it compares the headers in `s3Headers`, Content-Length only of an
 //! object's bytes or no body, and an object's bytes by their length and hash, which the tape holds instead. It sends
 //! S3's requests to s3.localhost.localstack.cloud:4566, a virtual-hosted one to the bucket's subdomain of it, signed
@@ -71,7 +71,7 @@ import { Request, Response } from "std/http"
 import { isAlphanumeric } from "std/ascii"
 import { CryptoError } from "std/crypto/error"
 import { sha256 } from "std/crypto/hash"
-import { indexOf, sort, startsWith, unique } from "std/algo"
+import { indexOf, sort, sortBy, startsWith, unique } from "std/algo"
 import { ParseError, parseInt, replace, split, trim } from "std/string"
 import { iso8601Basic, millisecond, second } from "std/time"
 import { escape } from "std/url"
@@ -140,6 +140,8 @@ export class Step {
 	capture: [string, string][] @Mapping @OmitEmpty = []
 	volatile: string[] @OmitEmpty = []
 	ignored: string[] @OmitEmpty = []
+	/// The elements of its answer compared whatever their order.
+	unordered: string[] @OmitEmpty = []
 	/// Whom it is sent as: by the values bound to <as>.key, <as>.secret and, of a session, <as>.token; the root if "".
 	as: string @OmitEmpty = ""
 	/// The status to retry for while recording, 0 for none.
@@ -529,7 +531,8 @@ function check(s: Step, res: Response, t: Tape, values: [string, string][]): str
 		}
 		return out
 	}
-	compare(tree(bodyOf(want)), tree(body), "", volatile, ignored, values, out)
+	compare(ordered(tree(bodyOf(want)), s.unordered), ordered(tree(body), s.unordered), "", volatile, ignored, values,
+		out)
 	return out
 }
 
@@ -604,6 +607,19 @@ class Tree {
 
 /// An item of a JSON array, an array of none if one, as std/encoding/json decodes any.
 type Item = i64 | f64 | string | bool | Keys | null | (i64 | f64 | string | bool | Keys | null)[]
+
+/// t with the children named one of names, at any depth, sorted by their texts, after the others.
+function ordered(t: Tree, names: string[]): Tree {
+	const rest = t.children.filter(c => !names.includes(c.name)).map(c => ordered(c, names))
+	const some = t.children.filter(c => names.includes(c.name)).map(c => ordered(c, names))
+	sortBy(some, (a, b) => flat(a) < flat(b))
+	rest.append(some)
+	t.children = rest
+	return t
+}
+
+/// The texts of t and those below it, in order.
+function flat(t: Tree): string { return t.text + t.children.map(flat).join("\n") }
 
 /// The tree of body: XML, JSON, or else a leaf of its text.
 function tree(body: string): Tree throws ParseError {

@@ -158,12 +158,16 @@ test "a request with no authentication reaches the service that takes them, or n
 	g.close()
 }
 
-test "a body longer than its service's limit is EntityTooLarge, before it is read" {
+test "a body longer than its service's limit is refused before it is read, by S3 as EntityTooLarge, else as a 413" {
 	const g = gateway()
 	assert g.limits.get("s3") == 5 << 30 && g.limits.get("test") == null
 	g.limits.set("test", 4)
 	const res = g.handle(request("test", "test", "test", "large"))
-	assert res.status == 400 && text(res, "Code") == "EntityTooLarge" && text(res, "MaxSizeAllowed") == "4"
+	assert res.status == 413 && res.body.text() == ""
 	assert g.handle(request("test", "test", "test", "four")).status == 200
+	g.services.set("s3", g.services.get("test")!)
+	g.limits.set("s3", 4)
+	const s3 = g.handle(request("s3", "s3", "s3", "large"))
+	assert s3.status == 400 && text(s3, "Code") == "EntityTooLarge" && text(s3, "MaxSizeAllowed") == "4"
 	g.close()
 }

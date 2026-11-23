@@ -3,6 +3,7 @@ import { Fault } from "../fault"
 import * as hex from "std/encoding/hex"
 import { second } from "std/time"
 import { hmacSha1, presigned, signature, stringToSign, verify } from "./sigv2"
+import { indexOf } from "std/algo"
 
 // The case is S3's documentation's of query string request authentication.
 const secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -30,7 +31,10 @@ test "a presigned URL's string to sign names the host's bucket, and its signatur
 	assert stringToSign(req, a) == "GET\n\n\n1175139620\n/johnsmith/photos/puppy.jpg"
 	assert signature(req, a, secret) == a.signature
 	assert verify(req, a, secret, 1175139600 * second) == null
-	assert verify(req, a, "other", 1175139600 * second) instanceof string
+	const wrong = verify(req, a, "other", 1175139600 * second)
+	assert wrong instanceof Fault && (wrong as Fault).code == "SignatureDoesNotMatch"
+	assert indexOf((wrong as Fault).members,
+		"<StringToSign>GET\n\n\n1175139620\n/johnsmith/photos/puppy.jpg</StringToSign>") > 0
 	const expired = verify(req, a, secret, 1175139621 * second)
 	assert expired instanceof Fault && (expired as Fault).code == "AccessDenied"
 }

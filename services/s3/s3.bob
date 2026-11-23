@@ -17,6 +17,7 @@
 
 import { Fault } from "../../core/fault"
 import { parse } from "../../core/auth/policy"
+import { hosted } from "../../core/auth/sigv2"
 import * as query from "../../core/protocol/query"
 import * as restxml from "../../core/protocol/restxml"
 import { Caller, Context, Unit } from "../../core/service"
@@ -31,7 +32,7 @@ import { acl, Config, exposed, forget, mfaDelete, preflight, publicPolicy, setti
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
 	version, Version } from "./records"
 
-import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import { endsWith, indexOf, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
 import { CryptoError } from "std/crypto/error"
 import { md5, sha1, sha256 } from "std/crypto/hash"
@@ -1204,21 +1205,10 @@ function screen(req: Request) throws Fault | IoError {
 	}
 }
 
-/// Rewrites req, if its host names its bucket, to name it in its path: bucket.s3.<anything>, bucket.s3-<anything>,
-/// bucket.localhost and bucket.localhost.localstack.cloud.
+/// Rewrites req, if its host names its bucket, to name it in its path.
 export function address(req: Request) {
-	const host = lower(split(req.headers.get("host") ?? req.url.host, ":")[0])
-	let bucket = ""
-	const at = lastIndexOf(host, ".s3.")
-	const dash = lastIndexOf(host, ".s3-")
-	if (at > 0 || dash > 0) {
-		bucket = host.slice(0, if (at > dash) at else dash)
-	} else if (endsWith(host, ".localhost.localstack.cloud")) {
-		bucket = host.slice(0, host.length - ".localhost.localstack.cloud".length)
-	} else if (endsWith(host, ".localhost")) {
-		bucket = host.slice(0, host.length - ".localhost".length)
-	}
-	if (bucket != "" && bucket != "s3" && !startsWith(bucket, "s3.")) {
+	const bucket = hosted(req)
+	if (bucket != "") {
 		req.url.path = `/${bucket}${req.url.path}`
 	}
 }

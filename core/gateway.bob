@@ -73,10 +73,7 @@ export class Gateway {
 		}
 		const limit = this.limits.get(name!) ?? (10 << 20)
 		if ((req.body.length ?? 0) > limit) {
-			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
-				`<ProposedSize>${req.body.length}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
-			const faulted = this.faults.get(name!)
-			return if (faulted == null) query.error(why, id) else faulted!(why, id)
+			return this.oversized(name!, req.body.length!, limit, id)
 		}
 		const body = req.body.text(limit)
 		req.body = new Body(body)
@@ -91,6 +88,23 @@ export class Gateway {
 		this.trees = new HashMap[string, Store]()
 		this.named = []
 		this.internal.close()
+	}
+
+	/// The answer to a body of size bytes, more than limit, to the service of signing name name, as AWS answers it: S3's
+	/// EntityTooLarge, CloudWatch's RequestEntityTooLarge, CloudWatch Logs' bare InternalFailure, and else a 413 of no
+	/// body, as the front ends of STS and Route 53 answer.
+	private oversized(name: string, size: i64, limit: i64, id: string): Response {
+		if (name == "s3") {
+			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
+				`<ProposedSize>${size}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
+			const faulted = this.faults.get(name)
+			return if (faulted == null) query.error(why, id) else faulted!(why, id)
+		}
+		if (name == "monitoring") {
+			const why = new Fault(413, "RequestEntityTooLarge", `Request size ${size} exceeded ${limit} bytes`, true)
+			return query.error(why, id, "http://monitoring.amazonaws.com/doc/2010-08-01/")
+		}
+		return new Response(if (name == "logs") 400 else 413, if (name == "logs") "<InternalFailure/>" else "")
 	}
 
 	/// What f answers, run holding the lock on the trees once the requests before it have let it go.

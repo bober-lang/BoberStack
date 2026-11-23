@@ -7,7 +7,7 @@ import { CryptoError } from "std/crypto/error"
 import { equal, hmacSha256, sha256 } from "std/crypto/hash"
 import * as hex from "std/encoding/hex"
 import { Request } from "std/http"
-import { ParseError, parseInt, split, trim } from "std/string"
+import { ParseError, parseInt, replace, split, trim } from "std/string"
 import { iso8601Basic, minute, parseIso8601Basic, second } from "std/time"
 import { escape, unescape } from "std/url"
 
@@ -143,6 +143,11 @@ export function verify(req: Request, body: string, auth: Authorization, secret: 
 	}
 	const ok = equal(signature(req, body, auth, secret), auth.signature)
 		|| auth.expires != 0 && equal(signature(req, body, auth, secret, hex.encode(sha256(body))), auth.signature)
+	if (!ok && auth.service == "s3") {
+		const canonical = canonicalRequest(req, payload(req, body, auth), auth)
+		return mismatch(auth, stringToSign(req, auth, canonical),
+			[["CanonicalRequest", canonical], ["CanonicalRequestBytes", bytesOf(canonical)]])
+	}
 	if (!ok) {
 		return "The request signature we calculated does not match the signature you provided. Check your AWS Secret "
 			+ "Access Key and signing method. Consult the service documentation for details."
@@ -150,13 +155,41 @@ export function verify(req: Request, body: string, auth: Authorization, secret: 
 	return null
 }
 
+/// S3's SignatureDoesNotMatch of a request under auth whose string to sign is signed: it names the key, the string to
+/// sign and the signature given, then more.
+export function mismatch(auth: Authorization, signed: string, more: [string, string][]): Fault {
+	const members: [string, string][] = [["AWSAccessKeyId", auth.accessKey], ["StringToSign", signed],
+		["SignatureProvided", auth.signature], ["StringToSignBytes", bytesOf(signed)]]
+	members.append(more)
+	const text = members.map(m => `<${m[0]}>${escaped(m[1])}</${m[0]}>`).join("")
+	return new Fault(403, "SignatureDoesNotMatch",
+		"The request signature we calculated does not match the signature you provided. Check your key and signing "
+		+ "method.", true, text)
+}
+
+/// s escaped as the text of an XML element.
+function escaped(s: string): string { return replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") }
+
+/// The bytes of s in hex, separated by spaces, as S3 shows what it signs.
+function bytesOf(s: string): string {
+	const out: string[] = []
+	for (let i = 0; i < s.length; i++) {
+		out.push(hex.encode(s.slice(i, i + 1)))
+	}
+	return out.join(" ")
+}
+
 /// The signature, in hex, of req with body by secret in auth's scope over auth's signed headers; of the payload
 /// given, its hash or what stands for it, else payload's.
 export function signature(req: Request, body: string, auth: Authorization, secret: string,
 	hash: string | null = null): string throws CryptoError {
-	const canonical = hex.encode(sha256(canonicalRequest(req, hash ?? payload(req, body, auth), auth)))
 	return hex.encode(hmacSha256(key(auth, secret),
-		`AWS4-HMAC-SHA256\n${stampOf(req, auth)}\n${scope(auth)}\n${canonical}`))
+		stringToSign(req, auth, canonicalRequest(req, hash ?? payload(req, body, auth), auth))))
+}
+
+/// What auth signs of req, whose canonical request is canonical.
+function stringToSign(req: Request, auth: Authorization, canonical: string): string throws CryptoError {
+	return `AWS4-HMAC-SHA256\n${stampOf(req, auth)}\n${scope(auth)}\n${hex.encode(sha256(canonical))}`
 }
 
 /// The key auth's scope derives from secret.
