@@ -7,7 +7,7 @@ import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
 import { indexOf, startsWith } from "std/algo"
 import { gunzip } from "std/compress/gzip"
-import { md5 } from "std/crypto/hash"
+import { md5, sha256 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
@@ -721,22 +721,97 @@ test "SSM encrypts a SecureString under its key, decrypting it only WithDecrypti
 }
 
 /// The answer of g to a GET of path from Lambda, signed by k.
-function lambdaGet(g: Gateway, path: string, k: Key = root()): Response {
-	const req = new Request("GET", `http://localhost:4566${path}`, "")
-	sign(req, "", "lambda", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+function lambdaGet(g: Gateway, path: string, k: Key = root()): Response { return lambdaCall(g, "GET", path, "", k) }
+
+/// The answer of g to a Lambda request of method to path with the JSON body, signed by k.
+function lambdaCall(g: Gateway, method: string, path: string, body: string, k: Key = root()): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	if (body != "") {
+		req.headers.set("content-type", "application/json")
+	}
+	sign(req, body, "lambda", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
 	return g.handle(req)
 }
 
 test "Lambda routes and authenticates a request, and answers NotImplemented in restJson1's error form" {
 	const g = gateway()
-	let res = lambdaGet(g, "/2015-03-31/functions")
+	let res = lambdaGet(g, "/2018-10-31/layers")
 	assert res.status == 501 && res.headers.get("x-amzn-errortype") == "NotImplemented"
 	assert res.headers.get("content-type") == "application/json"
-	assert res.body.whole == `{"message":"The operation ListFunctions is not implemented"}`
+	assert res.body.whole == `{"message":"The operation ListLayers is not implemented"}`
 	const forged = user(g, "bob")
 	forged.secret = "wrong"
 	res = lambdaGet(g, "/2015-03-31/functions", forged)
 	assert res.status == 403 && res.headers.get("x-amzn-errortype") == "SignatureDoesNotMatch"
+	g.close()
+}
+
+/// Whether res is restJson1's error of status and code, of message unless that is "".
+function refused(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && res.headers.get("x-amzn-errortype") == code
+		&& (message == "" || indexOf(res.body.whole ?? "", `essage":"${message}"`) >= 0)
+}
+
+test "Lambda: a function of a role Lambda may assume, its versions, aliases, policy and mappings; Invoke runs nothing" {
+	const g = gateway()
+	role(g, "other", "states.amazonaws.com")
+	role(g, "fn", "lambda.amazonaws.com")
+	const zip = base64.encode("PK\x03\x04 not really")
+	const create = (r: string) => lambdaCall(g, "POST", "/2015-03-31/functions",
+		`{"FunctionName":"f","Runtime":"python3.12","Handler":"h.h","Role":"arn:aws:iam::${account}:role/${r}",`
+		+ `"Code":{"ZipFile":"${zip}"}}`)
+	assert refused(create("other"), 400, "InvalidParameterValueException",
+		"The role defined for the function cannot be assumed by Lambda.")
+	assert refused(create("none"), 400, "InvalidParameterValueException")
+	let res = create("fn")
+	assert res.status == 201 && member(res, "State") == "Active" && member(res, "Version") == "$LATEST"
+	assert member(res, "CodeSha256") == base64.encode(sha256("PK\x03\x04 not really"))
+	assert refused(create("fn"), 409, "ResourceConflictException", "Function already exist: f")
+	assert refused(lambdaGet(g, "/2015-03-31/functions/g"), 404, "ResourceNotFoundException",
+		`Function not found: arn:aws:lambda:us-east-1:${account}:function:g`)
+	assert member(lambdaGet(g,
+		`/2015-03-31/functions/${escape(`arn:aws:lambda:us-east-1:${account}:function:f`)}/configuration`), "Handler")
+		== "h.h"
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}")
+	assert res.status == 201 && member(res, "Version") == "1"
+	assert member(lambdaCall(g, "POST", "/2015-03-31/functions/f/versions", "{}"), "Version") == "1"
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"live","FunctionVersion":"1"}`).status
+		== 201
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/aliases", `{"Name":"x","FunctionVersion":"7"}`), 404,
+		"ResourceNotFoundException")
+	assert member(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), "Version") == "1"
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"s3","Action":"lambda:InvokeFunction","Principal":"s3.amazonaws.com","SourceAccount":"${account}"}`)
+	assert res.status == 201
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"s3","Action":"lambda:InvokeFunction","Principal":"sns.amazonaws.com"}`), 409,
+		"ResourceConflictException")
+	assert indexOf(lambdaGet(g, "/2015-03-31/functions/f/policy").body.whole ?? "",
+		`\\"Service\\":\\"s3.amazonaws.com\\"`) > 0
+	res = lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", `{"a":1}`)
+	assert res.status == 200 && res.headers.get("x-amz-function-error") == "Unhandled"
+	assert indexOf(res.body.whole ?? "", `"errorType":"NotImplemented"`) > 0
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/g/invocations", "{}"), 404, "ResourceNotFoundException")
+	const bob = user(g, "bob")
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob), 403,
+		"AccessDeniedException")
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/policy",
+		`{"StatementId":"bob","Action":"lambda:InvokeFunction","Principal":"arn:aws:iam::${account}:user/bob"}`).status
+		== 201
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/f/invocations", "{}", bob).status == 200
+	res = lambdaCall(g, "POST", "/2015-03-31/event-source-mappings",
+		`{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`)
+	assert res.status == 202 && member(res, "State") == "Creating"
+	const id = member(res, "UUID")
+	assert member(lambdaGet(g, `/2015-03-31/event-source-mappings/${id}`), "State") == "Enabled"
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/event-source-mappings",
+		`{"FunctionName":"f:live","EventSourceArn":"arn:aws:sqs:us-east-1:${account}:q"}`), 409,
+		"ResourceConflictException")
+	assert lambdaCall(g, "DELETE", `/2015-03-31/event-source-mappings/${id}`, "").status == 202
+	res = lambdaCall(g, "POST", "/2021-10-31/functions/f/url", `{"AuthType":"NONE"}`)
+	assert res.status == 201 && indexOf(member(res, "FunctionUrl"), ".lambda-url.us-east-1.on.aws/") == 40
+	assert lambdaCall(g, "DELETE", "/2015-03-31/functions/f", "").status == 204
+	assert refused(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), 404, "ResourceNotFoundException")
 	g.close()
 }
 
