@@ -251,8 +251,7 @@ export class Handler {
 		return this.create(caller, db, s, input)
 	}
 
-	private create(caller: Caller, db: Stacks, s: Stack,
-		c: api.CreateStackInput): api.CreateStackOutput throws Fault {
+	private create(caller: Caller, db: Stacks, s: Stack, c: api.CreateStackInput): api.CreateStackOutput throws Fault {
 		const input = c
 		const body = this.fetched(caller, input.TemplateBody, input.TemplateURL)
 		const t = template(body, input.TemplateURL)
@@ -1941,25 +1940,12 @@ function stackId(caller: Caller, name: string): string throws Fault {
 	return `arn:aws:cloudformation:${caller.region}:${caller.account}:stack/${name}/${uuid()}`
 }
 
-function planned(db: Stacks, name: string, stack: string | null): [Stack, Planned] throws Fault {
-	let candidates: Stack[] = []
-	if (stack == null) {
-		candidates = db.each()
-	} else {
-		const byName = db.live(stack!)
-		const byId = db.get(stack!)
-		if (byName != null) {
-			candidates.push(byName!)
-		}
-		if (byId != null && (byName == null || byId!.id != byName!.id)) {
-			candidates.push(byId!)
-		}
-		sortBy(candidates, (a, b) => a.id < b.id)
-	}
-	for (const s of candidates) {
-		if (s.status != "DELETE_COMPLETE" && (stack == null || s.name == stack || s.id == stack)) {
+function planned(db: Stacks, name: string, of: string | null): [Stack, Planned] throws Fault {
+	const one = if (of == null) null else stack(db, of!)
+	for (const s of if (of == null) db.each() else if (one == null) [] else [one!]) {
+		if (s.status != "DELETE_COMPLETE") {
 			for (const p of s.changeSets) {
-				if (p.id == name || p.name == name && stack != null) {
+				if (p.id == name || p.name == name && of != null) {
 					return [s, p]
 				}
 			}
@@ -2058,7 +2044,6 @@ class Stacks {
 	}
 
 	get(id: string): Stack | null { return this.stacks.get(id) }
-
 	/// In order of id.
 	each(): Stack[] { return scanned(this.stacks, "").map(e => e[1]) }
 
@@ -2130,7 +2115,6 @@ class Stacks {
 	}
 }
 
-/// Every entry of t whose key starts with prefix, page by page.
 function scanned[V extends Decodable](t: Table[V], prefix: string): [string, V][] {
 	const out: [string, V][] = []
 	while (true) {
@@ -2140,7 +2124,6 @@ function scanned[V extends Decodable](t: Table[V], prefix: string): [string, V][
 			return out
 		}
 	}
-	return out
 }
 
 /// The stack of name, not deleted, or of its id, deleted or not.
