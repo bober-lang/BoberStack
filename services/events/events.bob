@@ -2,24 +2,30 @@
 //! an event pattern or a schedule; their targets; and PutEvents, which matches each event against the rules of its bus
 //! and delivers it, as its targets' Input, InputPath or InputTransformer make it, within the request, by calling the
 //! other services' handlers directly: to an SQS queue or SNS topic as their policies allow EventBridge; to a Kinesis
-//! stream as a session of the target's role, which it must have and which must trust EventBridge,
-//! keyed by its PartitionKeyPath or the event's id; to a
-//! Firehose delivery stream as a session of the target's role, which it must have; to a CloudWatch Logs log group, in a stream named by the event's id, as the account's resource policies allow
-//! EventBridge; or to another bus of the account and region, as its policy allows EventBridge or the target's role
-//! allows events:PutEvents, whose rules it is matched against in turn, a bus it has passed through not again. The
-//! events of AWS's own services, as S3's, are put on the default bus by emit, unauthorized. Where AWS differs:
+//! stream as a session of the target's role, which it must have, keyed by its PartitionKeyPath or the event's id; to a
+//! Firehose delivery stream as a session of the target's role, which it must have; to a Step Functions state machine,
+//! started as a session of the target's role of the event as its input; to a CloudWatch Logs log group, in a stream
+//! named by the event's id, as the account's resource policies allow EventBridge; or to another bus of the region, as
+//! its policy allows EventBridge or the target's role events:PutEvents, whose rules it is matched against in turn, a
+//! bus of the account it has passed through not again. A target's role must trust EventBridge, and whoever names it
+//! must be allowed to pass it. A delivery the target refuses goes to the target's dead-letter queue with AWS's
+//! ERROR_CODE, ERROR_MESSAGE, RULE_ARN and TARGET_ARN attributes, or is dropped. Archives keep the events put on their
+//! bus that match their pattern; a replay puts them again, with its replay-name, to the bus's rules. The events of
+//! AWS's own services, as S3's, are put on the default bus by emit, unauthorized. Where AWS differs:
 //!
-//! - Targets of any other kind (Lambda, Step Functions, API destinations, ...) are stored and listed but nothing is
-//!   delivered to them. A role is used without its trust policy being consulted.
+//! - Targets of any other kind (Lambda, ...) are stored and listed but nothing is delivered to them. Connections and
+//!   API destinations are state only, always AUTHORIZED and ACTIVE: there is no outbound HTTP, so an API destination
+//!   as a target is sent nothing, and a connection's secrets, kept by AWS in Secrets Manager, are not kept at all.
 //! - A log event is stamped with the time of delivery, not the event's time.
-//! - There are no timers: delivery is never retried (a target's RetryPolicy is stored only), and schedules are
-//!   validated and stored but never fire. A delivery the target refuses goes to the target's dead-letter queue, as
-//!   the event's input alone without AWS's error attributes, or is dropped.
-//! - Archives and replays, API destinations and connections, partner event sources, endpoints, Pipes and Scheduler
-//!   are not implemented.
+//! - There are no timers: delivery is never retried (a target's RetryPolicy is stored only), schedules are validated
+//!   and stored but never fire, and an archive keeps its events past its retention.
+//! - A replay is done within StartReplay's request, COMPLETED when described, and so can never be cancelled.
+//! - Partner event sources, endpoints, Pipes and Scheduler are not implemented.
 //! - A fault in an event pattern does not say where in the pattern it is.
 
-import { busArn, Bus, ruleArn, Rule, save, Tables, Target, within } from "./records"
+import { Archive, busArn, Bus, Connection, Destination, Replay, ruleArn, Rule, save, Tables, Target,
+	within } from "./records"
+
 import * as api from "./api"
 import { list, matches, member, members, str, validate } from "./pattern"
 import { Fault } from "../../core/fault"
@@ -33,6 +39,7 @@ import * as logsApi from "../logs/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import { actAs, passRole } from "../sts/sts"
+import * as sfnApi from "../stepfunctions/api"
 import { endsWith, indexOf, startsWith } from "std/algo"
 import { isDigit, lbrace, lbracket } from "std/ascii"
 import { bytes } from "std/crypto/random"
@@ -57,6 +64,7 @@ export class Handler {
 	kinesis: kinesisApi.Kinesis | null = null
 	firehose: firehoseApi.Firehose | null = null
 	logs: logsApi.CloudWatchLogs | null = null
+	states: sfnApi.SFN | null = null
 
 	constructor(sqs: sqsApi.SQS, sns: snsApi.SNS) {
 		this.sqs = sqs
@@ -433,6 +441,430 @@ export class Handler {
 		return out
 	}
 
+	createArchive(caller: Caller, input: api.CreateArchiveRequest): api.CreateArchiveResponse throws Fault {
+		const arn = archiveArn(caller, input.ArchiveName)
+		caller.allow(arn)
+		if (input.EventPattern != null) {
+			validate(input.EventPattern!)
+		}
+		const db = tables(caller)
+		const name = busName(caller, input.EventSourceArn)
+		bus(db, name)
+		if (db.archives.get(input.ArchiveName) != null) {
+			throw api.resourceAlreadyExistsException(`Archive ${input.ArchiveName} already exists.`)
+		}
+		const a = new Archive()
+		a.name = input.ArchiveName
+		a.bus = name
+		a.description = input.Description
+		a.pattern = input.EventPattern
+		a.retention = input.RetentionDays ?? 0
+		a.created = now()
+		save(db.archives, a.name, a)
+		const out = new api.CreateArchiveResponse()
+		out.ArchiveArn = arn
+		out.State = "ENABLED"
+		out.CreationTime = a.created
+		return out
+	}
+
+	describeArchive(caller: Caller, input: api.DescribeArchiveRequest): api.DescribeArchiveResponse throws Fault {
+		const a = archive(caller, input.ArchiveName)
+		const out = new api.DescribeArchiveResponse()
+		out.ArchiveArn = archiveArn(caller, a.name)
+		out.ArchiveName = a.name
+		out.EventSourceArn = busArn(caller.region, caller.account, a.bus)
+		out.Description = a.description
+		out.EventPattern = a.pattern
+		out.State = "ENABLED"
+		out.RetentionDays = a.retention
+		out.EventCount = a.events.length as i64
+		out.SizeBytes = sizeOf(a)
+		out.CreationTime = a.created
+		return out
+	}
+
+	listArchives(caller: Caller, input: api.ListArchivesRequest): api.ListArchivesResponse throws Fault {
+		caller.allow(archiveArn(caller, "*"))
+		const archives = all(tables(caller).archives, input.NamePrefix ?? "").map(e => e[1]).filter(a => (input.EventSourceArn
+			== null || busArn(caller.region, caller.account, a.bus) == input.EventSourceArn)
+			&& (input.State == null || input.State == "ENABLED"))
+		const [page, next] = part(archives, input.NextToken, input.Limit)
+		const out = new api.ListArchivesResponse()
+		out.Archives = page.map(a => {
+			const w = new api.Archive()
+			w.ArchiveName = a.name
+			w.EventSourceArn = busArn(caller.region, caller.account, a.bus)
+			w.State = "ENABLED"
+			w.RetentionDays = a.retention
+			w.EventCount = a.events.length as i64
+			w.SizeBytes = sizeOf(a)
+			w.CreationTime = a.created
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateArchive(caller: Caller, input: api.UpdateArchiveRequest): api.UpdateArchiveResponse throws Fault {
+		const a = archive(caller, input.ArchiveName)
+		if (input.EventPattern != null) {
+			validate(input.EventPattern!)
+			a.pattern = input.EventPattern
+		}
+		if (input.Description != null) {
+			a.description = input.Description
+		}
+		if (input.RetentionDays != null) {
+			a.retention = input.RetentionDays!
+		}
+		save(tables(caller).archives, a.name, a)
+		const out = new api.UpdateArchiveResponse()
+		out.ArchiveArn = archiveArn(caller, a.name)
+		out.State = "ENABLED"
+		out.CreationTime = a.created
+		return out
+	}
+
+	deleteArchive(caller: Caller, input: api.DeleteArchiveRequest): api.DeleteArchiveResponse throws Fault {
+		archive(caller, input.ArchiveName)
+		tables(caller).archives.delete(input.ArchiveName)
+		return new api.DeleteArchiveResponse()
+	}
+
+	startReplay(caller: Caller, input: api.StartReplayRequest): api.StartReplayResponse throws Fault {
+		caller.allow(replayArn(caller, input.ReplayName))
+		const db = tables(caller)
+		const prefix = archiveArn(caller, "")
+		const a = db.archives.get(if (startsWith(input.EventSourceArn,
+			prefix)) input.EventSourceArn.slice(prefix.length, input.EventSourceArn.length)
+			else "")
+		if (a == null) {
+			throw api.resourceNotFoundException(`Archive ${input.EventSourceArn} does not exist.`)
+		}
+		if (db.replays.get(input.ReplayName) != null) {
+			throw api.resourceAlreadyExistsException(`Replay ${input.ReplayName} already exists.`)
+		}
+		if (input.EventEndTime <= input.EventStartTime) {
+			throw validation("Parameter EventEndTime is not valid. Reason: EventStartTime must be before EventEndTime.")
+		}
+		if (input.Destination.Arn != busArn(caller.region, caller.account, a.bus)) {
+			throw validation("Parameter Destination.Arn is not valid. Reason: Cross event bus replay is not permitted.")
+		}
+		const p = new Replay()
+		p.name = input.ReplayName
+		p.archive = a.name
+		p.description = input.Description
+		p.start = input.EventStartTime
+		p.end = input.EventEndTime
+		p.destination = input.Destination.Arn
+		p.filters = input.Destination.FilterArns ?? []
+		p.started = now()
+		const name = `"replay-name":${std.quoted(p.name)},`
+		for (const [t, event] of a.events) {
+			if (t >= p.start && t < p.end) {
+				p.last = t
+				this.route(caller, db, a.bus, `{${name}${event.slice(1, event.length)}`, [], p.filters)
+			}
+		}
+		save(db.replays, p.name, p)
+		const out = new api.StartReplayResponse()
+		out.ReplayArn = replayArn(caller, p.name)
+		out.State = "STARTING"
+		out.ReplayStartTime = p.started
+		return out
+	}
+
+	describeReplay(caller: Caller, input: api.DescribeReplayRequest): api.DescribeReplayResponse throws Fault {
+		const p = replay(caller, input.ReplayName)
+		const out = new api.DescribeReplayResponse()
+		out.ReplayName = p.name
+		out.ReplayArn = replayArn(caller, p.name)
+		out.Description = p.description
+		out.State = "COMPLETED"
+		out.EventSourceArn = archiveArn(caller, p.archive)
+		const d = new api.ReplayDestination()
+		d.Arn = p.destination
+		d.FilterArns = if (p.filters.length == 0) null else p.filters
+		out.Destination = d
+		out.EventStartTime = p.start
+		out.EventEndTime = p.end
+		out.EventLastReplayedTime = p.last
+		out.ReplayStartTime = p.started
+		out.ReplayEndTime = p.started
+		return out
+	}
+
+	listReplays(caller: Caller, input: api.ListReplaysRequest): api.ListReplaysResponse throws Fault {
+		caller.allow(replayArn(caller, "*"))
+		const replays = all(tables(caller).replays, input.NamePrefix ?? "").map(e => e[1]).filter(p => (input.EventSourceArn
+			== null || archiveArn(caller, p.archive) == input.EventSourceArn)
+			&& (input.State == null || input.State == "COMPLETED"))
+		const [page, next] = part(replays, input.NextToken, input.Limit)
+		const out = new api.ListReplaysResponse()
+		out.Replays = page.map(p => {
+			const w = new api.Replay()
+			w.ReplayName = p.name
+			w.EventSourceArn = archiveArn(caller, p.archive)
+			w.State = "COMPLETED"
+			w.EventStartTime = p.start
+			w.EventEndTime = p.end
+			w.EventLastReplayedTime = p.last
+			w.ReplayStartTime = p.started
+			w.ReplayEndTime = p.started
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	cancelReplay(caller: Caller, input: api.CancelReplayRequest): api.CancelReplayResponse throws Fault {
+		replay(caller, input.ReplayName)
+		throw api.illegalStatusException(`Replay ${input.ReplayName} is not in a valid state for this operation.`)
+	}
+
+	createConnection(caller: Caller, input: api.CreateConnectionRequest): api.CreateConnectionResponse throws Fault {
+		const db = tables(caller)
+		const c = new Connection()
+		c.name = input.Name
+		c.id = uuid()
+		caller.allow(connectionArn(caller, c))
+		if (db.connections.get(c.name) != null) {
+			throw api.resourceAlreadyExistsException(`Connection ${c.name} already exists.`)
+		}
+		const a = input.AuthParameters
+		const p = new api.ConnectionAuthResponseParameters()
+		if (a.BasicAuthParameters != null) {
+			p.BasicAuthParameters = { ...new api.ConnectionBasicAuthResponseParameters(),
+				Username: a.BasicAuthParameters!.Username }
+		}
+		if (a.ApiKeyAuthParameters != null) {
+			p.ApiKeyAuthParameters = { ...new api.ConnectionApiKeyAuthResponseParameters(),
+				ApiKeyName: a.ApiKeyAuthParameters!.ApiKeyName }
+		}
+		if (a.OAuthParameters != null) {
+			const o = new api.ConnectionOAuthResponseParameters()
+			o.ClientParameters = { ...new api.ConnectionOAuthClientResponseParameters(),
+				ClientID: a.OAuthParameters!.ClientParameters.ClientID }
+			o.AuthorizationEndpoint = a.OAuthParameters!.AuthorizationEndpoint
+			o.HttpMethod = a.OAuthParameters!.HttpMethod
+			o.OAuthHttpParameters = unsecret(a.OAuthParameters!.OAuthHttpParameters)
+			p.OAuthParameters = o
+		}
+		p.InvocationHttpParameters = unsecret(a.InvocationHttpParameters)
+		const kinds: [api.ConnectionAuthorizationType, bool][] = [["BASIC", a.BasicAuthParameters != null],
+			["API_KEY", a.ApiKeyAuthParameters != null], ["OAUTH_CLIENT_CREDENTIALS", a.OAuthParameters != null]]
+		for (const [k, given] of kinds) {
+			if (given != (k == input.AuthorizationType)) {
+				throw validation(`Parameter(s) AuthParameters are not valid for AuthorizationType ${input.AuthorizationType}.`)
+			}
+		}
+		c.description = input.Description
+		c.kind = input.AuthorizationType
+		c.parameters = result(p)
+		c.created = now()
+		c.modified = c.created
+		save(db.connections, c.name, c)
+		const out = new api.CreateConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "AUTHORIZED"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		return out
+	}
+
+	describeConnection(caller: Caller,
+		input: api.DescribeConnectionRequest): api.DescribeConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		const out = new api.DescribeConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.Name = c.name
+		out.Description = c.description
+		out.ConnectionState = "AUTHORIZED"
+		out.AuthorizationType = authorization(c.kind)
+		out.AuthParameters = json.decode[api.ConnectionAuthResponseParameters](c.parameters, api.validation)
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	listConnections(caller: Caller, input: api.ListConnectionsRequest): api.ListConnectionsResponse throws Fault {
+		caller.allow(`arn:aws:events:${caller.region}:${caller.account}:connection/*`)
+		const found = all(tables(caller).connections, input.NamePrefix ?? "").map(e => e[1]).filter(c => input.ConnectionState
+			== null || input.ConnectionState == "AUTHORIZED")
+		const [page, next] = part(found, input.NextToken, input.Limit)
+		const out = new api.ListConnectionsResponse()
+		out.Connections = page.map(c => {
+			const w = new api.Connection()
+			w.ConnectionArn = connectionArn(caller, c)
+			w.Name = c.name
+			w.ConnectionState = "AUTHORIZED"
+			w.AuthorizationType = authorization(c.kind)
+			w.CreationTime = c.created
+			w.LastModifiedTime = c.modified
+			w.LastAuthorizedTime = c.modified
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateConnection(caller: Caller, input: api.UpdateConnectionRequest): api.UpdateConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		const p = json.decode[api.ConnectionAuthResponseParameters](c.parameters, api.validation)
+		const a = input.AuthParameters
+		if (a != null) {
+			if (a.BasicAuthParameters?.Username != null) {
+				p.BasicAuthParameters = { ...new api.ConnectionBasicAuthResponseParameters(),
+					Username: a.BasicAuthParameters!.Username }
+			}
+			if (a.ApiKeyAuthParameters?.ApiKeyName != null) {
+				p.ApiKeyAuthParameters = { ...new api.ConnectionApiKeyAuthResponseParameters(),
+					ApiKeyName: a.ApiKeyAuthParameters!.ApiKeyName }
+			}
+			if (a.OAuthParameters != null) {
+				const o = p.OAuthParameters ?? new api.ConnectionOAuthResponseParameters()
+				if (a.OAuthParameters!.ClientParameters?.ClientID != null) {
+					o.ClientParameters = { ...new api.ConnectionOAuthClientResponseParameters(),
+						ClientID: a.OAuthParameters!.ClientParameters!.ClientID }
+				}
+				o.AuthorizationEndpoint = a.OAuthParameters!.AuthorizationEndpoint ?? o.AuthorizationEndpoint
+				o.HttpMethod = a.OAuthParameters!.HttpMethod ?? o.HttpMethod
+				if (a.OAuthParameters!.OAuthHttpParameters != null) {
+					o.OAuthHttpParameters = unsecret(a.OAuthParameters!.OAuthHttpParameters)
+				}
+				p.OAuthParameters = o
+			}
+			if (a.InvocationHttpParameters != null) {
+				p.InvocationHttpParameters = unsecret(a.InvocationHttpParameters)
+			}
+		}
+		if (input.Description != null) {
+			c.description = input.Description
+		}
+		if (input.AuthorizationType != null) {
+			c.kind = input.AuthorizationType!
+		}
+		c.parameters = result(p)
+		c.modified = now()
+		save(tables(caller).connections, c.name, c)
+		const out = new api.UpdateConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "AUTHORIZED"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	deleteConnection(caller: Caller, input: api.DeleteConnectionRequest): api.DeleteConnectionResponse throws Fault {
+		const c = connection(caller, input.Name)
+		tables(caller).connections.delete(c.name)
+		const out = new api.DeleteConnectionResponse()
+		out.ConnectionArn = connectionArn(caller, c)
+		out.ConnectionState = "DELETING"
+		out.CreationTime = c.created
+		out.LastModifiedTime = c.modified
+		out.LastAuthorizedTime = c.modified
+		return out
+	}
+
+	createApiDestination(caller: Caller,
+		input: api.CreateApiDestinationRequest): api.CreateApiDestinationResponse throws Fault {
+		const db = tables(caller)
+		const d = new Destination()
+		d.name = input.Name
+		d.id = uuid()
+		caller.allow(destinationArn(caller, d))
+		if (db.destinations.get(d.name) != null) {
+			throw api.resourceAlreadyExistsException(`An api-destination ${d.name} already exists.`)
+		}
+		if (!db.connections.scan(null, 2147483647, "").some(e => connectionArn(caller, e[1]) == input.ConnectionArn)) {
+			throw api.resourceNotFoundException(`Connection ${input.ConnectionArn} does not exist.`)
+		}
+		d.description = input.Description
+		d.connection = input.ConnectionArn
+		d.endpoint = input.InvocationEndpoint
+		d.method = input.HttpMethod
+		d.rate = input.InvocationRateLimitPerSecond
+		d.created = now()
+		d.modified = d.created
+		save(db.destinations, d.name, d)
+		const out = new api.CreateApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.ApiDestinationState = "ACTIVE"
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	describeApiDestination(caller: Caller,
+		input: api.DescribeApiDestinationRequest): api.DescribeApiDestinationResponse throws Fault {
+		const d = destination(caller, input.Name)
+		const out = new api.DescribeApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.Name = d.name
+		out.Description = d.description
+		out.ApiDestinationState = "ACTIVE"
+		out.ConnectionArn = d.connection
+		out.InvocationEndpoint = d.endpoint
+		out.HttpMethod = method(d.method)
+		out.InvocationRateLimitPerSecond = d.rate ?? 300
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	listApiDestinations(caller: Caller,
+		input: api.ListApiDestinationsRequest): api.ListApiDestinationsResponse throws Fault {
+		caller.allow(`arn:aws:events:${caller.region}:${caller.account}:api-destination/*`)
+		const found = all(tables(caller).destinations, input.NamePrefix ?? "").map(e => e[1]).filter(d => input.ConnectionArn
+			== null || d.connection == input.ConnectionArn)
+		const [page, next] = part(found, input.NextToken, input.Limit)
+		const out = new api.ListApiDestinationsResponse()
+		out.ApiDestinations = page.map(d => {
+			const w = new api.ApiDestination()
+			w.ApiDestinationArn = destinationArn(caller, d)
+			w.Name = d.name
+			w.ApiDestinationState = "ACTIVE"
+			w.ConnectionArn = d.connection
+			w.InvocationEndpoint = d.endpoint
+			w.HttpMethod = method(d.method)
+			w.InvocationRateLimitPerSecond = d.rate ?? 300
+			w.CreationTime = d.created
+			w.LastModifiedTime = d.modified
+			return w
+		})
+		out.NextToken = next
+		return out
+	}
+
+	updateApiDestination(caller: Caller,
+		input: api.UpdateApiDestinationRequest): api.UpdateApiDestinationResponse throws Fault {
+		const d = destination(caller, input.Name)
+		d.description = input.Description ?? d.description
+		d.connection = input.ConnectionArn ?? d.connection
+		d.endpoint = input.InvocationEndpoint ?? d.endpoint
+		d.method = input.HttpMethod ?? d.method
+		d.rate = input.InvocationRateLimitPerSecond ?? d.rate
+		d.modified = now()
+		save(tables(caller).destinations, d.name, d)
+		const out = new api.UpdateApiDestinationResponse()
+		out.ApiDestinationArn = destinationArn(caller, d)
+		out.ApiDestinationState = "ACTIVE"
+		out.CreationTime = d.created
+		out.LastModifiedTime = d.modified
+		return out
+	}
+
+	deleteApiDestination(caller: Caller,
+		input: api.DeleteApiDestinationRequest): api.DeleteApiDestinationResponse throws Fault {
+		destination(caller, input.Name)
+		tables(caller).destinations.delete(input.Name)
+		return new api.DeleteApiDestinationResponse()
+	}
+
 	putEvents(caller: Caller, input: api.PutEventsRequest): api.PutEventsResponse throws Fault {
 		let size = 0
 		for (const e of input.Entries) {
@@ -520,12 +952,24 @@ export class Handler {
 			eventOf(caller, uuid(), now(), source, detailType, resources, detail), [])
 	}
 
-	/// Delivers event to the targets of the rules of the bus named name that it matches; visited holds the buses it has
-	/// passed through.
-	private route(caller: Caller, db: Tables, name: string, event: string, visited: string[]) throws Fault {
+	/// Delivers event to the targets of the rules of the bus named name that it matches, of the ARNs only if any;
+	/// visited holds the buses it has passed through. An event not replayed is kept by the bus's archives it matches.
+	private route(caller: Caller, db: Tables, name: string, event: string, visited: string[],
+		only: string[] = []) throws Fault {
 		visited.push(name)
+		if (member(event, "replay-name") == null) {
+			for (const [k, a] of all(db.archives, "")) {
+				if (a.bus == name && (a.pattern == null || matches(a.pattern!, event))) {
+					a.events.push([now(), event])
+					save(db.archives, k, a)
+				}
+			}
+		}
 		for (const [_, r] of all(db.rules, within(name, ""))) {
 			if (r.state == "DISABLED" || r.pattern == null || !matches(r.pattern!, event)) {
+				continue
+			}
+			if (only.length > 0 && !only.some(o => o == ruleArn(caller.region, caller.account, r))) {
 				continue
 			}
 			for (const [_, t] of all(db.targets, within(within(name, r.name), ""))) {
@@ -554,6 +998,24 @@ export class Handler {
 					}
 					this.route(caller, db, next, event, visited)
 				}
+			} else if (service == "events" && region == caller.region && startsWith(resource, "event-bus/")) {
+				const next = resource.slice(10, resource.length)
+				const c = if (t.RoleArn == null) caller.internal(principal, source, ["events:PutEvents"])
+					else assumed(caller, t.RoleArn!, source, ["events:PutEvents"])
+				const there = caller.internal(principal, source, [])
+				there.account = account
+				const far = tables(there)
+				const b = far.buses.get(next)
+				c.allow(t.Arn, b?.policy ?? null)
+				if (b == null) {
+					throw api.resourceNotFoundException(`Event bus ${next} does not exist.`)
+				}
+				this.route(there, far, next, event, [])
+			} else if (service == "states" && this.states != null) {
+				const m = new sfnApi.StartExecutionInput()
+				m.stateMachineArn = t.Arn
+				m.input = body
+				this.states!.startExecution(assumed(caller, t.RoleArn ?? "", source, ["states:StartExecution"]), m)
 			} else if (service == "kinesis" && this.kinesis != null) {
 				const m = new kinesisApi.PutRecordInput()
 				m.StreamARN = t.Arn
@@ -578,7 +1040,8 @@ export class Handler {
 				return
 			}
 			try {
-				this.send(caller, source, dlq!, body, null, idOf(event))
+				this.send(caller, source, dlq!, body, null, idOf(event),
+					[["ERROR_CODE", f.code], ["ERROR_MESSAGE", f.message], ["RULE_ARN", source], ["TARGET_ARN", t.Arn]])
 			} catch (g: Fault) {} // dropped, as by AWS when its dead-letter queue refuses it too
 		}
 	}
@@ -605,14 +1068,23 @@ export class Handler {
 	}
 
 	/// Sends body to the queue or topic of the ARN arn, on behalf of the rule of the ARN source, in the group of a
-	/// FIFO queue, deduplicated by the event's id; to anything else, nothing.
-	private send(caller: Caller, source: string, arn: string, body: string, group: string | null,
-		id: string) throws Fault {
+	/// FIFO queue, deduplicated by the event's id, a queue's message of the string attributes; to anything else,
+	/// nothing.
+	private send(caller: Caller, source: string, arn: string, body: string, group: string | null, id: string,
+		attributes: [string, string][] = []) throws Fault {
 		const [service, _, account, resource] = parts(arn)
 		if (service == "sqs") {
 			const m = new sqsApi.SendMessageRequest()
 			m.QueueUrl = `${caller.endpoint}/${account}/${resource}`
 			m.MessageBody = body
+			if (attributes.length > 0) {
+				m.MessageAttributes = attributes.map(a => {
+					const v = new sqsApi.MessageAttributeValue()
+					v.DataType = "String"
+					v.StringValue = a[1]
+					return [a[0], v]
+				})
+			}
 			if (endsWith(resource, ".fifo")) {
 				m.MessageGroupId = group
 				m.MessageDeduplicationId = id
@@ -635,6 +1107,115 @@ function eventOf(caller: Caller, id: string, t: i64, source: string, detailType:
 		+ `"source":${std.quoted(source)},"account":${std.quoted(caller.account)},`
 		+ `"time":${std.quoted(rfc3339(t - t % second))},"region":${std.quoted(caller.region)},`
 		+ `"resources":[${resources.map(r => std.quoted(r)).join(",")}],"detail":${detail}}`
+}
+
+/// The ARNs of the archive and replay named name of the caller's account and region.
+function archiveArn(caller: Caller, name: string): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:archive/${name}`
+}
+
+function replayArn(caller: Caller, name: string): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:replay/${name}`
+}
+
+/// The archive named name, which caller is allowed to act on.
+function archive(caller: Caller, name: string): Archive throws Fault {
+	caller.allow(archiveArn(caller, name))
+	const a = tables(caller).archives.get(name)
+	if (a == null) {
+		throw api.resourceNotFoundException(`Archive ${name} does not exist.`)
+	}
+	return a!
+}
+
+/// The replay named name, which caller is allowed to act on.
+function replay(caller: Caller, name: string): Replay throws Fault {
+	caller.allow(replayArn(caller, name))
+	const p = tables(caller).replays.get(name)
+	if (p == null) {
+		throw api.resourceNotFoundException(`Replay ${name} does not exist.`)
+	}
+	return p!
+}
+
+/// The ARNs of the connection c and API destination d of the caller's account and region.
+function connectionArn(caller: Caller, c: Connection): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:connection/${c.name}/${c.id}`
+}
+
+function destinationArn(caller: Caller, d: Destination): string {
+	return `arn:aws:events:${caller.region}:${caller.account}:api-destination/${d.name}/${d.id}`
+}
+
+/// The connection named name, which caller is allowed to act on.
+function connection(caller: Caller, name: string): Connection throws Fault {
+	caller.allow(`arn:aws:events:${caller.region}:${caller.account}:connection/${name}`)
+	const c = tables(caller).connections.get(name)
+	if (c == null) {
+		throw api.resourceNotFoundException(`Failed to describe the connection(s). Connection '${name}' does not exist.`)
+	}
+	return c!
+}
+
+/// The API destination named name, which caller is allowed to act on.
+function destination(caller: Caller, name: string): Destination throws Fault {
+	caller.allow(`arn:aws:events:${caller.region}:${caller.account}:api-destination/${name}`)
+	const d = tables(caller).destinations.get(name)
+	if (d == null) {
+		throw api.resourceNotFoundException(`Failed to describe the api-destination(s). An api-destination '${name}' does not exist.`)
+	}
+	return d!
+}
+
+/// p without the values of its secret parameters.
+function unsecret(p: api.ConnectionHttpParameters | null): api.ConnectionHttpParameters | null {
+	if (p == null) {
+		return null
+	}
+	for (const h of p.HeaderParameters ?? []) {
+		if (h.IsValueSecret) {
+			h.Value = null
+		}
+	}
+	for (const q of p.QueryStringParameters ?? []) {
+		if (q.IsValueSecret) {
+			q.Value = null
+		}
+	}
+	for (const b of p.BodyParameters ?? []) {
+		if (b.IsValueSecret) {
+			b.Value = null
+		}
+	}
+	return p
+}
+
+/// The authorization type and HTTP method s as the wire has them.
+function authorization(s: string): api.ConnectionAuthorizationType {
+	return if (s == "API_KEY") "API_KEY"
+		else if (s == "OAUTH_CLIENT_CREDENTIALS") "OAUTH_CLIENT_CREDENTIALS"
+		else "BASIC"
+}
+
+function method(s: string): api.ApiDestinationHttpMethod {
+	switch (s) {
+		case "GET": return "GET"
+		case "HEAD": return "HEAD"
+		case "OPTIONS": return "OPTIONS"
+		case "PUT": return "PUT"
+		case "PATCH": return "PATCH"
+		case "DELETE": return "DELETE"
+		default: return "POST"
+	}
+}
+
+/// The bytes of the events a keeps.
+function sizeOf(a: Archive): i64 {
+	let n: i64 = 0
+	for (const [_, e] of a.events) {
+		n += e.length as i64
+	}
+	return n
 }
 
 /// The ARN that names every rule of the bus named name, as a listing's access denied names it.
@@ -768,7 +1349,7 @@ function checkTarget(t: api.Target) throws Fault {
 	if (service == "sqs" && endsWith(resource, ".fifo") && t.SqsParameters?.MessageGroupId == null) {
 		throw validation(`Parameter(s) SqsParameters must be specified for target: ${t.Id}.`)
 	}
-	if ((service == "kinesis" || service == "firehose") && t.RoleArn == null) {
+	if ((service == "kinesis" || service == "firehose" || service == "states") && t.RoleArn == null) {
 		throw validation(`Parameter(s) RoleArn must be specified for target: ${t.Id}.`)
 	}
 }

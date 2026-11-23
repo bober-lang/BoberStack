@@ -1,5 +1,6 @@
 //! EventBridge's state in an account's regional tree: its event buses by name, their rules by the bus's name, a NUL
-//! and the rule's, and the rules' targets by the rule's key, a NUL and the target's id.
+//! and the rule's, the rules' targets by the rule's key, a NUL and the target's id, and archives, replays,
+//! connections and API destinations by name.
 
 import { Fault } from "../../core/fault"
 import { Store, Table } from "../../core/state/store"
@@ -36,16 +37,74 @@ export class Target {
 	given = ""
 }
 
+/// An archive of the events put on a bus that match its pattern, each with when it was put, in nanoseconds.
+export class Archive {
+	name = ""
+	bus = ""
+	description: string | null = null
+	pattern: string | null = null
+	retention = 0
+	created: i64 = 0
+	events: [i64, string][] = []
+}
+
+/// A replay of an archive's events put from start to end to the destination bus, to the rules of the ARNs filters or,
+/// if none, all; done when it was started.
+export class Replay {
+	name = ""
+	archive = ""
+	description: string | null = null
+	start: i64 = 0
+	end: i64 = 0
+	destination = ""
+	filters: string[] = []
+	started: i64 = 0
+	last: i64 | null = null
+}
+
+/// A connection: its authorization's parameters as DescribeConnection gives them, the JSON of the wire's
+/// ConnectionAuthResponseParameters, no secret among them; and the UUID its ARN ends in.
+export class Connection {
+	name = ""
+	description: string | null = null
+	kind = "BASIC"
+	parameters = ""
+	id = ""
+	created: i64 = 0
+	modified: i64 = 0
+}
+
+/// An API destination, of the UUID its ARN ends in.
+export class Destination {
+	name = ""
+	description: string | null = null
+	connection = ""
+	endpoint = ""
+	method = "POST"
+	rate: i32 | null = null
+	id = ""
+	created: i64 = 0
+	modified: i64 = 0
+}
+
 /// The tables of a regional tree.
 export class Tables {
 	buses: Table[Bus]
 	rules: Table[Rule]
 	targets: Table[Target]
+	archives: Table[Archive]
+	replays: Table[Replay]
+	connections: Table[Connection]
+	destinations: Table[Destination]
 
 	constructor(s: Store) {
+		this.connections = new Table[Connection](s, "events/connections")
+		this.destinations = new Table[Destination](s, "events/destinations")
 		this.buses = new Table[Bus](s, "events/buses")
 		this.rules = new Table[Rule](s, "events/rules")
 		this.targets = new Table[Target](s, "events/targets")
+		this.archives = new Table[Archive](s, "events/archives")
+		this.replays = new Table[Replay](s, "events/replays")
 	}
 }
 
