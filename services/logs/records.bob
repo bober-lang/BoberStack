@@ -1,0 +1,84 @@
+//! CloudWatch Logs' state in an account's regional tree: its log groups by name; their streams, filters and
+//! subscriptions by the group's name, a NUL and their own; each stream's events by the stream's key, a NUL and the
+//! event's id, which starts with its timestamp, so that a time range is a range of keys; and the resource policies.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { EncodeError } from "std/encoding/json"
+import { Decodable } from "std/types"
+
+export class Group {
+	name = ""
+	/// In ms, as are all times here.
+	created: i64 = 0
+	retention: i32 | null = null
+	kmsKey: string | null = null
+	class = "STANDARD"
+	tags: [string, string][] = []
+	protected = false
+}
+
+export class Stream {
+	name = ""
+	created: i64 = 0
+	/// The timestamps of its first and last events and when the last was put, 0 if it has none.
+	first: i64 = 0
+	last: i64 = 0
+	ingested: i64 = 0
+	/// The id of the last event put, "" if none.
+	token = ""
+}
+
+export class Event {
+	message = ""
+	ingested: i64 = 0
+}
+
+export class MetricFilter {
+	name = ""
+	pattern = ""
+	transformations: api.MetricTransformation[] = []
+	created: i64 = 0
+}
+
+export class Subscription {
+	name = ""
+	pattern = ""
+	destination = ""
+	role: string | null = null
+	distribution = "ByLogStream"
+	created: i64 = 0
+}
+
+export class Policy {
+	name = ""
+	document = ""
+	updated: i64 = 0
+}
+
+/// The last event id's sequence, which makes ids unique in the region.
+export class Sequence {
+	n: i64 = 0
+}
+
+export function groups(s: Store): Table[Group] { return new Table[Group](s, "logs/groups") }
+export function streams(s: Store): Table[Stream] { return new Table[Stream](s, "logs/streams") }
+export function events(s: Store): Table[Event] { return new Table[Event](s, "logs/events") }
+
+export function metricFilters(s: Store): Table[MetricFilter] {
+	return new Table[MetricFilter](s, "logs/metric-filters")
+}
+
+export function subscriptions(s: Store): Table[Subscription] { return new Table[Subscription](s, "logs/subscriptions") }
+export function policies(s: Store): Table[Policy] { return new Table[Policy](s, "logs/policies") }
+export function sequence(s: Store): Table[Sequence] { return new Table[Sequence](s, "logs/sequence") }
+
+/// Puts v in t at key; a record holds no float but a metric's default value, which JSON cannot encode if not finite.
+export function save[V extends Decodable](t: Table[V], key: string, v: V) throws Fault {
+	try {
+		t.put(key, v)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalFailure", `A record of ${e.value} cannot be stored`)
+	}
+}

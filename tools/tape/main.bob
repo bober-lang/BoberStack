@@ -80,7 +80,7 @@ class Recording {
 			normal = this.normal(body)
 			for (const v of volatiles(normal, names)) {
 				if (!this.captured.some(c => c[1] == v)) {
-					normal = replace(normal, v, form(v))
+					normal = masked(normal, v)
 				}
 			}
 			normal = this.held(normal)
@@ -288,6 +288,21 @@ function leaks(out: string, c: Caller, values: [string, string][], managed: stri
 		}
 	}
 	return ""
+}
+
+/// The body s with each v, a volatile member's value, as its form: quoted where it is a number of JSON, so that the
+/// body stays JSON.
+function masked(s: string, v: string): string {
+	let out = ""
+	let from = 0
+	for (let at = indexOf(s, v); at >= 0; at = indexOf(s, v, at + v.length)) {
+		const end = at + v.length
+		const bare = at > 0 && indexOf(":,[", s.slice(at - 1, at)) >= 0 && end < s.length
+			&& indexOf(",]}", s.slice(end, end + 1)) >= 0
+		out += s.slice(from, at) + (if (bare) `"${form(v)}"` else form(v))
+		from = end
+	}
+	return out + s.slice(from, s.length)
 }
 
 /// The error code in body, XML's Code or JSON's __type, "" if none.

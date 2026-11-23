@@ -1,0 +1,649 @@
+{
+	"volatile": [
+		"creationTime",
+		"firstEventTimestamp",
+		"lastEventTimestamp",
+		"lastIngestionTime",
+		"uploadSequenceToken",
+		"nextSequenceToken",
+		"timestamp",
+		"ingestionTime",
+		"eventId",
+		"nextForwardToken",
+		"nextBackwardToken",
+		"lastUpdatedTime",
+		"revisionId",
+		"UserId",
+		"CreateDate",
+		"RequestId"
+	],
+	"steps": [
+		{
+			"name": "create a group",
+			"service": "logs",
+			"target": "Logs_20140328.CreateLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "a metric filter",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "errors",
+				"filterPattern": "ERROR",
+				"metricTransformations": [
+					{
+						"metricName": "errors",
+						"metricNamespace": "${prefix}",
+						"metricValue": "1"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "another, of a value extracted",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "bytes",
+				"filterPattern": "[ip, user, size]",
+				"metricTransformations": [
+					{
+						"metricName": "bytes",
+						"metricNamespace": "${prefix}",
+						"metricValue": "$size",
+						"unit": "Bytes",
+						"dimensions": {
+							"user": "$user"
+						}
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "dimensions and a default value",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "bad",
+				"filterPattern": "",
+				"metricTransformations": [
+					{
+						"metricName": "bytes",
+						"metricNamespace": "${prefix}",
+						"metricValue": "1",
+						"defaultValue": 0,
+						"dimensions": {
+							"user": "$user"
+						}
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Invalid metric transformation: dimensions and default value are mutually exclusive properties"
+				}
+			}
+		},
+		{
+			"name": "replace the first",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "errors",
+				"filterPattern": "?ERROR ?FATAL",
+				"metricTransformations": [
+					{
+						"metricName": "errors",
+						"metricNamespace": "${prefix}",
+						"metricValue": "1"
+					}
+				]
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "a pattern not valid",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "bad",
+				"filterPattern": "{ $.a = ",
+				"metricTransformations": [
+					{
+						"metricName": "errors",
+						"metricNamespace": "${prefix}",
+						"metricValue": "1"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "If a filter pattern starts with '{' it must end with '}'"
+				}
+			}
+		},
+		{
+			"name": "in a group not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g9",
+				"filterName": "x",
+				"filterPattern": "",
+				"metricTransformations": [
+					{
+						"metricName": "errors",
+						"metricNamespace": "${prefix}",
+						"metricValue": "1"
+					}
+				]
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log group does not exist."
+				}
+			}
+		},
+		{
+			"name": "describe the group's",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeMetricFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"metricFilters": [
+						{
+							"applyOnTransformedLogs": false,
+							"creationTime": "x",
+							"filterName": "bytes",
+							"filterPattern": "[ip, user, size]",
+							"logGroupName": "/boberstack-ab-00000000/g",
+							"metricTransformations": [
+								{
+									"dimensions": {
+										"user": "$user"
+									},
+									"metricName": "bytes",
+									"metricNamespace": "boberstack-ab-00000000",
+									"metricValue": "$size",
+									"unit": "Bytes"
+								}
+							]
+						},
+						{
+							"applyOnTransformedLogs": false,
+							"creationTime": "x",
+							"filterName": "errors",
+							"filterPattern": "?ERROR ?FATAL",
+							"logGroupName": "/boberstack-ab-00000000/g",
+							"metricTransformations": [
+								{
+									"metricName": "errors",
+									"metricNamespace": "boberstack-ab-00000000",
+									"metricValue": "1"
+								}
+							]
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "by prefix",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeMetricFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterNamePrefix": "err"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"metricFilters": [
+						{
+							"applyOnTransformedLogs": false,
+							"creationTime": "x",
+							"filterName": "errors",
+							"filterPattern": "?ERROR ?FATAL",
+							"logGroupName": "/boberstack-ab-00000000/g",
+							"metricTransformations": [
+								{
+									"metricName": "errors",
+									"metricNamespace": "boberstack-ab-00000000",
+									"metricValue": "1"
+								}
+							]
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "by metric",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeMetricFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"metricName": "bytes",
+				"metricNamespace": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"metricFilters": [
+						{
+							"applyOnTransformedLogs": false,
+							"creationTime": "x",
+							"filterName": "bytes",
+							"filterPattern": "[ip, user, size]",
+							"logGroupName": "/boberstack-ab-00000000/g",
+							"metricTransformations": [
+								{
+									"dimensions": {
+										"user": "$user"
+									},
+									"metricName": "bytes",
+									"metricNamespace": "boberstack-ab-00000000",
+									"metricValue": "$size",
+									"unit": "Bytes"
+								}
+							]
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "by metric name alone",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeMetricFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"metricName": "bytes"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Describe Metric Filters request must contain both MetricName and MetricNamespace"
+				}
+			}
+		},
+		{
+			"name": "the group's count",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeLogGroups",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupNamePrefix": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"logGroups": [
+						{
+							"arn": "arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g:*",
+							"bearerTokenAuthenticationEnabled": false,
+							"creationTime": "x",
+							"deletionProtectionEnabled": false,
+							"logGroupArn": "arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/g",
+							"logGroupClass": "STANDARD",
+							"logGroupName": "/boberstack-ab-00000000/g",
+							"metricFilterCount": 2,
+							"storedBytes": 0
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "delete one",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "bytes"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "delete it again",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteMetricFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "bytes"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified metric filter does not exist."
+				}
+			}
+		},
+		{
+			"name": "a subscription to a function not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutSubscriptionFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "s",
+				"filterPattern": "",
+				"destinationArn": "arn:aws:lambda:us-east-1:${account}:function:${prefix}"
+			},
+			"differs": "BoberStack cannot try a destination: it stores the filter",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Could not execute the lambda function. Make sure you have given CloudWatch Logs permission to execute your function."
+				}
+			}
+		},
+		{
+			"name": "a subscription of a pattern not valid",
+			"service": "logs",
+			"target": "Logs_20140328.PutSubscriptionFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "s",
+				"filterPattern": "[a",
+				"destinationArn": "arn:aws:lambda:us-east-1:${account}:function:${prefix}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "If a filter pattern starts with '[' it must end with ']'"
+				}
+			}
+		},
+		{
+			"name": "a subscription in a group not there",
+			"service": "logs",
+			"target": "Logs_20140328.PutSubscriptionFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g9",
+				"filterName": "s",
+				"filterPattern": "",
+				"destinationArn": "arn:aws:lambda:us-east-1:${account}:function:${prefix}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log group does not exist."
+				}
+			}
+		},
+		{
+			"name": "describe subscriptions",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeSubscriptionFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"differs": "BoberStack stored the filter AWS refused",
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"subscriptionFilters": []
+				}
+			}
+		},
+		{
+			"name": "describe subscriptions of a group not there",
+			"service": "logs",
+			"target": "Logs_20140328.DescribeSubscriptionFilters",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g9"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified log group does not exist."
+				}
+			}
+		},
+		{
+			"name": "delete a subscription not there",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteSubscriptionFilter",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g",
+				"filterName": "s"
+			},
+			"differs": "BoberStack stored the filter AWS refused",
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "The specified subscription filter does not exist."
+				}
+			}
+		},
+		{
+			"name": "an account's resource policy",
+			"service": "logs",
+			"target": "Logs_20140328.PutResourcePolicy",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"policyName": "${prefix}",
+				"policyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"route53.amazonaws.com\"},\"Action\":\"logs:PutLogEvents\",\"Resource\":\"arn:aws:logs:us-east-1:${account}:log-group:/${prefix}/*\"}]}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"resourcePolicy": {
+						"lastUpdatedTime": "x",
+						"policyDocument": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"route53.amazonaws.com\"},\"Action\":\"logs:PutLogEvents\",\"Resource\":\"arn:aws:logs:us-east-1:000000000000:log-group:/boberstack-ab-00000000/*\"}]}",
+						"policyName": "boberstack-ab-00000000",
+						"policyScope": "ACCOUNT"
+					}
+				}
+			}
+		},
+		{
+			"name": "delete it",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteResourcePolicy",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"policyName": "${prefix}"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "delete it again",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteResourcePolicy",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"policyName": "${prefix}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "Policy with name [boberstack-ab-00000000] does not exist."
+				}
+			}
+		},
+		{
+			"name": "a policy not JSON",
+			"service": "logs",
+			"target": "Logs_20140328.PutResourcePolicy",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"policyName": "${prefix}",
+				"policyDocument": "nope"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "InvalidParameterException",
+					"message": "Error occurred while parsing accessPolicy. Please check if the accessPolicy has been constructed correctly using IAM grammar."
+				}
+			}
+		}
+	],
+	"cleanup": [
+		{
+			"name": "clean up the group",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteLogGroup",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"logGroupName": "/${prefix}/g"
+			},
+			"response": {
+				"status": 200,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				}
+			}
+		},
+		{
+			"name": "clean up the policy",
+			"service": "logs",
+			"target": "Logs_20140328.DeleteResourcePolicy",
+			"contentType": "application/x-amz-json-1.1",
+			"json": {
+				"policyName": "${prefix}"
+			},
+			"response": {
+				"status": 400,
+				"headers": {
+					"content-type": "application/x-amz-json-1.1"
+				},
+				"json": {
+					"__type": "ResourceNotFoundException",
+					"message": "Policy with name [boberstack-ab-00000000] does not exist."
+				}
+			}
+		}
+	]
+}

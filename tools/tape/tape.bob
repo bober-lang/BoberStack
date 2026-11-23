@@ -25,10 +25,12 @@
 //! path or a value is replaced by what name is bound to: `prefix` to `boberstack-ab-` and 8 random hex digits when
 //! recording, which name every resource made, `account` to the account and `region` to us-east-1, and the names that
 //! earlier steps `capture`, each the text at a path of its answer: segments separated by /, each the first element of
-//! XML, or member or index of JSON, of that name below the one before. Recording retries a step `until` its answer
-//! has that status, for what AWS makes eventually consistent, and runs `cleanup` even after a step failed. A step is
-//! sent as the scenario's caller unless `as` names others, whose access key, secret and session token, if any, earlier
-//! steps capture as `<as>.key`, `<as>.secret` and `<as>.token`; a tape holds them as captures, `${<as>.secret}`.
+//! XML, or member or index of JSON, of that name below the one before. A JSON string that is `${now}`, `${now-n}` or
+//! `${now+n}` whole is the number of the time in ms the recording, or replay, started at, less or plus n.
+//! Recording retries a step `until` its answer has that status, for what AWS makes eventually consistent, and runs
+//! `cleanup` even after a step failed. A step is sent as the scenario's caller unless `as` names others, whose access
+//! key, secret and session token, if any, earlier steps capture as `<as>.key`, `<as>.secret` and `<as>.token`; a tape
+//! holds them as captures, `${<as>.secret}`.
 //!
 //! S3's requests are REST: `path` is a bucket and key, `/${prefix}-b/a key`, which the tool encodes once, as S3
 //! signs it, and sends to the bucket's host, `<bucket>.s3.<region>.amazonaws.com`, if `virtual`; `params` is the URL's
@@ -70,8 +72,8 @@ import { isAlphanumeric } from "std/ascii"
 import { CryptoError } from "std/crypto/error"
 import { sha256 } from "std/crypto/hash"
 import { indexOf, sort, startsWith, unique } from "std/algo"
-import { ParseError, replace, split, trim } from "std/string"
-import { iso8601Basic, second } from "std/time"
+import { ParseError, parseInt, replace, split, trim } from "std/string"
+import { iso8601Basic, millisecond, second } from "std/time"
 import { escape } from "std/url"
 
 /// The headers of an answer that a tape holds.
@@ -179,7 +181,7 @@ export function request(s: Step, values: [string, string][], endpoint: string): 
 	let body = ""
 	let kind = s.contentType
 	if (s.json != null) {
-		body = fill(objectText(s.json!), values, true)
+		body = fill(timed(objectText(s.json!)), values, true)
 		kind = if (kind == "") "application/x-amz-json-1.0" else kind
 	} else if (s.query.length > 0) {
 		body = s.query.map(p => `${escape(p[0], "component")}=${escape(fill(p[1], values, false), "component")}`).join("&")
@@ -549,6 +551,25 @@ function fill(s: string, values: [string, string][], quoted: bool): string {
 	return out
 }
 
+/// When the program started, in ms: what `${now}` is.
+const started = now() / millisecond
+
+/// The JSON s with each string "${now}", "${now-n}" or "${now+n}" the number of started, less or plus n.
+function timed(s: string): string throws ParseError {
+	let out = s
+	for (let i = indexOf(out, "\"${now"); i >= 0; i = indexOf(out, "\"${now", i + 1)) {
+		const end = indexOf(out, "}\"", i)
+		const offset = out.slice(i + 6, end)
+		let t = started
+		if (offset != "") {
+			const n = parseInt[i64](offset.slice(1, offset.length))
+			t += if (offset[0] == 45) -n else n
+		}
+		out = out.slice(0, i) + `${t}` + out.slice(end + 2, out.length)
+	}
+	return out
+}
+
 /// The JSON object k holds.
 function objectText(k: Keys): string {
 	try {
@@ -580,9 +601,9 @@ function tree(body: string): Tree throws ParseError {
 	if (first == "{" || first == "[") {
 		return value(body, "")
 	}
-	const t = new Tree("")
-	t.text = body
-	return t
+	const leaf = new Tree("")
+	leaf.text = body
+	return leaf
 }
 
 /// The tree of the XML node n, named name: its attributes as leaves named @name, then its elements; or if it has
