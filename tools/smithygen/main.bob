@@ -58,6 +58,7 @@ class Traits {
 	pattern: string | null @json.Name["smithy.api#pattern"]
 	streaming: Mark | null @json.Name["smithy.api#streaming"]
 	sparse: Mark | null @json.Name["smithy.api#sparse"]
+	unwrapped: Mark | null @json.Name["aws.customizations#s3UnwrappedXmlOutput"]
 	error: string | null @json.Name["smithy.api#error"]
 	httpError: i32 | null @json.Name["smithy.api#httpError"]
 	queryError: QueryError | null @json.Name["aws.protocols#awsQueryError"]
@@ -223,6 +224,8 @@ class Generator {
 	/// The structures, unions and enums the operations reach.
 	structures: string[] = []
 	enums: string[] = []
+	/// The outputs of the operations whose output is unwrapped, as S3's GetBucketLocation's.
+	unwrapped: string[] = []
 	/// How the service answers a request breaking its model's constraints, null if they are not checked.
 	validation: [string, string, bool, bool] | null = null
 	/// The aliases of the constraints of shapes, by their ids; whether a tag of core/protocol/model is used; and the
@@ -297,6 +300,9 @@ class Generator {
 			errors.push(...op.errors.map(r => r.target))
 			const input = this.structure(op.input)
 			const output = this.structure(op.output)
+			if (op.traits.unwrapped != null && op.output != null) {
+				this.unwrapped.push(op.output!.target)
+			}
 			if (input == "Unit" || output == "Unit") {
 				unit = true
 			}
@@ -546,6 +552,9 @@ class Generator {
 		}
 		if (this.protocol == "restXml" && s.traits.xmlNamespace != null) {
 			tags += ` ${namespace(s.traits.xmlNamespace!)}`
+		}
+		if (this.unwrapped.includes(id)) {
+			tags += " @restxml.Unwrapped"
 		}
 		if (s.members.length == 0) {
 			return [new Decl("class", [`export class ${n}${tags} {}`])]

@@ -1,0 +1,325 @@
+import { sign, text, texts } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import { live } from "../../core/state/store"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { indexOf } from "std/algo"
+import { md5 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { Request, Response } from "std/http"
+import { replace } from "std/string"
+import { escape } from "std/url"
+
+const account = "000000000000"
+const other = "111111111111"
+
+/// An access key and its secret; an unknown one is its account's root.
+class Key {
+	id = "test"
+	secret = "test"
+}
+
+function rootOf(of: string): Key { return { ...new Key(), id: if (of == account) "test" else of } }
+
+/// The answer of g to method on path, with body and headers, signed by k for region; unsigned if k is null.
+function s3(g: Gateway, method: string, path: string, body = "", headers: [string, string][] = [],
+	k: Key | null = new Key(), region = "us-east-1", host = "localhost:4566"): Response {
+	const req = new Request(method, `http://${host}${path}`, body)
+	req.headers.set("host", host)
+	for (const [n, v] of headers) {
+		req.headers.set(n, v)
+	}
+	if (k != null) {
+		sign(req, body, "s3", region, k!.id, k!.secret, "", "20150626T140000Z")
+	}
+	return g.handle(req)
+}
+
+/// The whole body of res, read and closed.
+function all(res: Response): string {
+	if (res.body.whole != null) {
+		return res.body.whole!
+	}
+	let got = ""
+	while (true) {
+		const piece = res.body.read(1 << 20)
+		if (piece == null) {
+			break
+		}
+		got += piece!
+	}
+	res.body.close()
+	return got
+}
+
+/// Whether res is S3's error of status and code, of message unless "".
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+		&& text(res, "RequestId") != null && text(res, "HostId") != null
+}
+
+/// Makes the bucket name in us-east-1, as k.
+function bucket(g: Gateway, name: string, k: Key = new Key()) {
+	assert s3(g, "PUT", `/${name}`, "", [], k).status == 200
+}
+
+function quoted(s: string): string { return `"${hex.encode(md5(s))}"` }
+
+test "buckets: created by location constraint, found, listed, and deleted once empty" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	assert fails(s3(g, "PUT", "/Bad_Name"), 400, "InvalidBucketName", "The specified bucket is not valid.")
+	const eu = `<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>`
+	assert fails(s3(g, "PUT", "/one", "", [], new Key(), "eu-west-1"), 400, "IllegalLocationConstraintException",
+		"The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.")
+	assert s3(g, "PUT", "/one", eu, [], new Key(), "eu-west-1").status == 200
+	assert fails(s3(g, "PUT", "/one", eu, [], new Key(), "eu-west-1"), 409, "BucketAlreadyOwnedByYou")
+	assert fails(s3(g, "PUT", "/one", "", [], rootOf(other)), 409, "BucketAlreadyExists")
+	bucket(g, "two")
+	assert s3(g, "PUT", "/two").status == 200
+	assert text(s3(g, "GET", "/one?location"), "LocationConstraint") == "eu-west-1"
+	assert all(s3(g, "GET", "/two?location"))
+		== `<?xml version="1.0" encoding="UTF-8"?>\n`
+		+ `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`
+	const head = s3(g, "HEAD", "/one")
+	assert head.status == 200 && head.headers.get("x-amz-bucket-region") == "eu-west-1" && all(head) == ""
+	assert s3(g, "HEAD", "/nine").status == 404
+	assert texts(s3(g, "GET", "/"), "Name") == ["one", "two"]
+		&& texts(s3(g, "GET", "/", "", [], rootOf(other)), "Name") == []
+	assert s3(g, "PUT", "/one/k", "x").status == 200
+	assert fails(s3(g, "DELETE", "/one"), 409, "BucketNotEmpty", "The bucket you tried to delete is not empty")
+	assert s3(g, "DELETE", "/one/k").status == 204
+	assert s3(g, "DELETE", "/one").status == 204
+	assert fails(s3(g, "GET", "/one?location"), 404, "NoSuchBucket", "The specified bucket does not exist")
+	g.close()
+	assert live() == before
+}
+
+test "objects: headers and metadata, ranges, conditions, digests and checksums, inline and as blobs" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	const put = s3(g, "PUT", "/bkt/a%20key", "hello world",
+		[["content-type", "text/plain"], ["x-amz-meta-Colour", "blue"], ["cache-control", "no-cache"]])
+	assert put.status == 200 && put.headers.get("etag") == quoted("hello world")
+		&& put.headers.get("x-amz-server-side-encryption") == "AES256" && put.headers.get("x-amz-request-id") != null
+	const got = s3(g, "GET", "/bkt/a%20key")
+	assert got.status == 200 && all(got) == "hello world" && got.headers.get("content-type") == "text/plain"
+		&& got.headers.get("x-amz-meta-colour") == "blue" && got.headers.get("accept-ranges") == "bytes"
+		&& got.headers.get("cache-control") == "no-cache" && got.headers.get("etag") == quoted("hello world")
+		&& indexOf(got.headers.get("last-modified") ?? "", " GMT") > 0
+	const part = s3(g, "GET", "/bkt/a%20key", "", [["range", "bytes=6-"]])
+	assert part.status == 206 && all(part) == "world" && part.headers.get("content-range") == "bytes 6-10/11"
+	assert all(s3(g, "GET", "/bkt/a%20key", "", [["range", "bytes=-3"]])) == "rld"
+	assert fails(s3(g, "GET", "/bkt/a%20key", "", [["range", "bytes=20-"]]), 416, "InvalidRange")
+	assert s3(g, "GET", "/bkt/a%20key", "", [["if-none-match", quoted("hello world")]]).status == 304
+	assert fails(s3(g, "GET", "/bkt/a%20key", "", [["if-match", "\"nope\""]]), 412, "PreconditionFailed")
+	assert fails(s3(g, "GET", "/bkt/nothing"), 404, "NoSuchKey", "The specified key does not exist.")
+	assert fails(s3(g, "PUT", "/bkt/a%20key", "x", [["if-none-match", "*"]]), 412, "PreconditionFailed")
+	assert fails(s3(g, "PUT", "/bkt/k", "x", [["content-md5", base64.encode(md5("y"))]]), 400, "BadDigest")
+	assert fails(s3(g, "PUT", "/bkt/k", "x", [["content-md5", "abc"]]), 400, "InvalidDigest")
+	const crc = s3(g, "PUT", "/bkt/k", "hello world", [["x-amz-checksum-crc32", "DUoRhQ=="]])
+	assert crc.status == 200 && crc.headers.get("x-amz-checksum-crc32") == "DUoRhQ=="
+	assert fails(s3(g, "PUT", "/bkt/k", "hello", [["x-amz-checksum-crc32", "DUoRhQ=="]]), 400, "BadDigest")
+	assert s3(g, "HEAD", "/bkt/k", "", [["x-amz-checksum-mode", "ENABLED"]]).headers.get("x-amz-checksum-crc32")
+		== "DUoRhQ=="
+	let big = ""
+	for (let i = 0; i < 20000; i++) {
+		big += "0123456789"
+	}
+	assert s3(g, "PUT", "/bkt/big", big).status == 200
+	const whole = s3(g, "GET", "/bkt/big")
+	assert whole.body.whole == null && all(whole) == big
+	assert all(s3(g, "GET", "/bkt/big", "", [["range", "bytes=100000-100009"]])) == "0123456789"
+	const failed = s3(g, "GET", "/bkt/big", "", [["if-match", "\"nope\""]])
+	assert failed.status == 412
+	const head = s3(g, "HEAD", "/bkt/big")
+	assert head.status == 200 && head.headers.get("content-length") == "200000" && all(head) == ""
+	assert s3(g, "DELETE", "/bkt/big").status == 204 && s3(g, "HEAD", "/bkt/big").status == 404
+	g.close()
+	assert live() == before
+}
+
+test "listing: prefixes and delimiters, pages, start-after, url encoding, owners; and DeleteObjects" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	for (const k of ["a/1", "a/2", "b/1", "c", "d e"]) {
+		assert s3(g, "PUT", `/bkt/${escape(k, "path")}`, k).status == 200
+	}
+	const top = s3(g, "GET", "/bkt?list-type=2&delimiter=/")
+	assert texts(top, "Key") == ["c", "d e"] && texts(top, "Prefix") == ["", "a/", "b/"] && text(top, "KeyCount") == "4"
+	const one = s3(g, "GET", "/bkt?list-type=2&max-keys=2&fetch-owner=true")
+	assert texts(one, "Key") == ["a/1", "a/2"] && text(one, "IsTruncated") == "true" && text(one, "ID") != null
+	const next = s3(g, "GET",
+		`/bkt?list-type=2&continuation-token=${escape(text(one, "NextContinuationToken")!, "component")}`)
+	assert texts(next, "Key") == ["b/1", "c", "d e"] && text(next, "IsTruncated") == "false"
+	assert texts(s3(g, "GET", "/bkt?list-type=2&start-after=b/1&encoding-type=url"), "Key") == ["c", "d%20e"]
+	assert texts(s3(g, "GET", "/bkt?prefix=a/&marker=a/1"), "Key") == ["a/2"]
+	const del = `<Delete><Object><Key>a/1</Key></Object><Object><Key>zz</Key></Object></Delete>`
+	const deleted = s3(g, "POST", "/bkt?delete", del, [["content-md5", base64.encode(md5(del))]])
+	assert deleted.status == 200 && texts(deleted, "Key") == ["a/1", "zz"]
+	assert texts(s3(g, "GET", "/bkt?list-type=2"), "Key") == ["a/2", "b/1", "c", "d e"]
+	g.close()
+	assert live() == before
+}
+
+test "CopyObject: metadata copied or replaced, conditions, and a copy to itself refused" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	bucket(g, "dst")
+	assert s3(g, "PUT", "/bkt/src", "data", [["x-amz-meta-a", "1"], ["content-type", "text/plain"]]).status == 200
+	const copied = s3(g, "PUT", "/dst/dst", "", [["x-amz-copy-source", "/bkt/src"]])
+	assert copied.status == 200 && text(copied, "ETag") == quoted("data")
+	const got = s3(g, "GET", "/dst/dst")
+	assert all(got) == "data" && got.headers.get("x-amz-meta-a") == "1"
+		&& got.headers.get("content-type") == "text/plain"
+	assert s3(g, "PUT", "/dst/dst", "",
+		[["x-amz-copy-source", "bkt/src"], ["x-amz-metadata-directive", "REPLACE"], ["x-amz-meta-b", "2"]]).status
+		== 200
+	const replaced = s3(g, "HEAD", "/dst/dst")
+	assert replaced.headers.get("x-amz-meta-a") == null && replaced.headers.get("x-amz-meta-b") == "2"
+		&& replaced.headers.get("content-type") == "binary/octet-stream"
+	assert fails(s3(g, "PUT", "/bkt/src", "", [["x-amz-copy-source", "/bkt/src"]]), 400, "InvalidRequest")
+	assert fails(s3(g, "PUT", "/dst/x", "",
+		[["x-amz-copy-source", "/bkt/src"], ["x-amz-copy-source-if-match", "\"no\""]]), 412, "PreconditionFailed")
+	assert fails(s3(g, "PUT", "/dst/x", "", [["x-amz-copy-source", "/bkt/none"]]), 404, "NoSuchKey")
+	g.close()
+	assert live() == before
+}
+
+test "multipart: parts joined in order, the ETag of their MD5s, sizes checked, aborted, listed" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	const id = text(s3(g, "POST", "/bkt/m?uploads", "", [["content-type", "text/plain"]]), "UploadId")!
+	let mib = "0123456789abcdef"
+	while (mib.length < 1 << 20) {
+		mib += mib
+	}
+	const five = mib + mib + mib + mib + mib
+	const e1 = s3(g, "PUT", `/bkt/m?partNumber=1&uploadId=${id}`, five).headers.get("etag")!
+	const e2 = s3(g, "PUT", `/bkt/m?partNumber=2&uploadId=${id}`, "tail").headers.get("etag")!
+	assert texts(s3(g, "GET", `/bkt/m?uploadId=${id}`), "PartNumber") == ["1", "2"]
+	assert texts(s3(g, "GET", "/bkt?uploads"), "UploadId") == [id]
+	const wrong = `<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part>`
+		+ `<Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part></CompleteMultipartUpload>`
+	assert fails(s3(g, "POST", `/bkt/m?uploadId=${id}`, wrong), 400, "InvalidPartOrder")
+	const right = `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${e1}</ETag></Part>`
+		+ `<Part><PartNumber>2</PartNumber><ETag>${e2}</ETag></Part></CompleteMultipartUpload>`
+	const done = s3(g, "POST", `/bkt/m?uploadId=${id}`, right)
+	const etag = `"${hex.encode(md5(md5(five) + md5("tail")))}-2"`
+	assert done.status == 200 && text(done, "ETag") == etag
+	const got = s3(g, "GET", "/bkt/m")
+	assert got.headers.get("etag") == etag && got.headers.get("content-type") == "text/plain"
+		&& got.headers.get("x-amz-mp-parts-count") == "2" && all(got) == five + "tail"
+	assert fails(s3(g, "GET", `/bkt/m?uploadId=${id}`), 404, "NoSuchUpload")
+	const small = text(s3(g, "POST", "/bkt/s?uploads"), "UploadId")!
+	const s1 = s3(g, "PUT", `/bkt/s?partNumber=1&uploadId=${small}`, "a").headers.get("etag")!
+	const s2 = s3(g, "PUT", `/bkt/s?partNumber=2&uploadId=${small}`, "b").headers.get("etag")!
+	assert fails(s3(g, "POST", `/bkt/s?uploadId=${small}`,
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>`
+		+ `<ETag>${s1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${s2}</ETag></Part></CompleteMultipartUpload>`),
+		400, "EntityTooSmall")
+	const copied = s3(g, "PUT", `/bkt/s?partNumber=3&uploadId=${small}`, "",
+		[["x-amz-copy-source", "/bkt/m"], ["x-amz-copy-source-range", "bytes=0-9"]])
+	assert copied.status == 200 && text(copied, "ETag") == quoted(five.slice(0, 10))
+	assert s3(g, "DELETE", `/bkt/s?uploadId=${small}`).status == 204
+	assert texts(s3(g, "GET", "/bkt?uploads"), "UploadId") == []
+	g.close()
+	assert live() == before
+}
+
+test "virtual-hosted requests name their bucket in the host" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "vbk")
+	assert s3(g, "PUT", "/k", "v", [], new Key(), "us-east-1",
+		"vbk.s3.us-east-1.localhost.localstack.cloud:4566").status == 200
+	assert all(s3(g, "GET", "/k", "", [], new Key(), "us-east-1", "vbk.localhost:4566")) == "v"
+	assert all(s3(g, "GET", "/vbk/k", "", [], new Key(), "us-east-1", "s3.localhost.localstack.cloud:4566")) == "v"
+	assert texts(s3(g, "GET", "/?list-type=2", "", [], new Key(), "us-east-1", "vbk.s3.amazonaws.com"), "Key") == ["k"]
+	g.close()
+	assert live() == before
+}
+
+test "access: bucket policies allow others and anyone; others are denied plainly; ExpectedBucketOwner" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	assert s3(g, "PUT", "/bkt/k", "v").status == 200
+	assert fails(s3(g, "GET", "/bkt/k", "", [], null), 403, "AccessDenied", "Access Denied")
+	assert fails(s3(g, "GET", "/bkt/k", "", [], rootOf(other)), 403, "AccessDenied", "Access Denied")
+	assert fails(s3(g, "GET", "/bkt?policy"), 404, "NoSuchBucketPolicy", "The bucket policy does not exist")
+	assert fails(s3(g, "PUT", "/bkt?policy", "nope"), 400, "MalformedPolicy")
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",`
+		+ `"Resource":"arn:aws:s3:::bkt/*"}]}`
+	assert s3(g, "PUT", "/bkt?policy", p).status == 204
+	assert all(s3(g, "GET", "/bkt?policy")) == p
+	assert text(s3(g, "GET", "/bkt?policyStatus"), "IsPublic") == "true"
+	assert all(s3(g, "GET", "/bkt/k", "", [], null)) == "v"
+	assert fails(s3(g, "PUT", "/bkt/k", "w", [], null), 403, "AccessDenied", "Access Denied")
+	// another account's root needs its own account's grant too, which a root has
+	assert all(s3(g, "GET", "/bkt/k", "", [], rootOf(other))) == "v"
+	assert fails(s3(g, "GET", "/bkt/k", "", [["x-amz-expected-bucket-owner", other]]), 403, "AccessDenied")
+	assert s3(g, "GET", "/bkt/k", "", [["x-amz-expected-bucket-owner", account]]).status == 200
+	assert s3(g, "DELETE", "/bkt?policy").status == 204
+	assert fails(s3(g, "GET", "/bkt/k", "", [], null), 403, "AccessDenied")
+	g.close()
+	assert live() == before
+}
+
+test "versioning: version ids, delete markers, versions read and deleted, the null version once suspended" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	assert s3(g, "PUT", "/bkt/k", "v0").headers.get("x-amz-version-id") == null
+	assert text(s3(g, "GET", "/bkt?versioning"), "Status") == null
+	const on = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+	assert s3(g, "PUT", "/bkt?versioning", on).status == 200
+	assert text(s3(g, "GET", "/bkt?versioning"), "Status") == "Enabled"
+	const v1 = s3(g, "PUT", "/bkt/k", "v1").headers.get("x-amz-version-id")!
+	const v2 = s3(g, "PUT", "/bkt/k", "v2").headers.get("x-amz-version-id")!
+	assert v1.length == 32 && v1 != v2
+	assert all(s3(g, "GET", `/bkt/k?versionId=${v1}`)) == "v1" && all(s3(g, "GET", "/bkt/k?versionId=null")) == "v0"
+	const gone = s3(g, "DELETE", "/bkt/k")
+	const marker = gone.headers.get("x-amz-version-id")!
+	assert gone.status == 204 && gone.headers.get("x-amz-delete-marker") == "true"
+	assert fails(s3(g, "GET", "/bkt/k"), 404, "NoSuchKey")
+	assert fails(s3(g, "GET", `/bkt/k?versionId=${marker}`), 405, "MethodNotAllowed")
+	assert fails(s3(g, "GET", "/bkt/k?versionId=0123456789abcdef0123456789abcdef"), 404, "NoSuchVersion")
+	assert texts(s3(g, "GET", "/bkt?list-type=2"), "Key") == []
+	const listed = s3(g, "GET", "/bkt?versions")
+	assert texts(listed, "VersionId") == [v2, v1, "null", marker]
+		&& texts(listed, "IsLatest") == ["false", "false", "false", "true"]
+	assert s3(g, "DELETE", `/bkt/k?versionId=${marker}`).status == 204 && all(s3(g, "GET", "/bkt/k")) == "v2"
+	assert s3(g, "PUT", "/bkt?versioning", replace(on, "Enabled", "Suspended")).status == 200
+	assert s3(g, "PUT", "/bkt/k", "v3").headers.get("x-amz-version-id") == "null"
+	assert texts(s3(g, "GET", "/bkt?versions"), "VersionId") == ["null", v2, v1]
+	const page = s3(g, "GET", "/bkt?versions&max-keys=1")
+	assert text(page, "NextVersionIdMarker") == "null"
+	assert texts(s3(g, "GET", "/bkt?versions&key-marker=k&version-id-marker=null"), "VersionId") == [v2, v1]
+	g.close()
+	assert live() == before
+}
+
+test "tagging: of objects, given with the object or after; of buckets" {
+	const before = live()
+	const g = stack(new Catalog(0, 0))
+	bucket(g, "bkt")
+	assert s3(g, "PUT", "/bkt/k", "v", [["x-amz-tagging", "a=1&b=2"]]).status == 200
+	assert s3(g, "HEAD", "/bkt/k").headers.get("x-amz-tagging-count") == "2"
+	assert texts(s3(g, "GET", "/bkt/k?tagging"), "Key") == ["a", "b"]
+	const set = "<Tagging><TagSet><Tag><Key>c</Key><Value>3</Value></Tag></TagSet></Tagging>"
+	assert s3(g, "PUT", "/bkt/k?tagging", set).status == 200
+	assert texts(s3(g, "GET", "/bkt/k?tagging"), "Value") == ["3"]
+	assert s3(g, "DELETE", "/bkt/k?tagging").status == 204 && texts(s3(g, "GET", "/bkt/k?tagging"), "Key") == []
+	assert fails(s3(g, "GET", "/bkt?tagging"), 404, "NoSuchTagSet")
+	assert s3(g, "PUT", "/bkt?tagging", set).status == 204
+	assert texts(s3(g, "GET", "/bkt?tagging"), "Key") == ["c"]
+	assert s3(g, "DELETE", "/bkt?tagging").status == 204 && fails(s3(g, "GET", "/bkt?tagging"), 404, "NoSuchTagSet")
+	g.close()
+	assert live() == before
+}

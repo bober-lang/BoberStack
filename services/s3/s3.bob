@@ -1,0 +1,1543 @@
+//! Amazon S3: buckets, objects and their versions, multipart uploads, bucket policies, tagging.
+//!
+//! A request names its bucket in the path or in the host, as bucket.s3.<region>.amazonaws.com or bucket.localhost,
+//! and is answered as if it named it in the path. Bucket names are global: the global tree maps each to its owner and
+//! region, and its objects are in the owner's tree of that region. A request reaches a bucket whatever the region it
+//! is signed for, where AWS would redirect it. Bodies are whole in memory as the gateway reads them, so an object is at
+//! most the gateway's 10 MiB at once, larger only by a multipart upload; CRC32C and CRC64NVME, which std does not
+//! compute, are kept as given, unchecked, and no object has a checksum it was not given. Nothing runs between
+//! requests: lifecycle rules expire nothing, and multipart uploads are not aborted by age.
+
+import { Fault } from "../../core/fault"
+import { parse } from "../../core/auth/policy"
+import { Caller, Context, Unit } from "../../core/service"
+import { Blob, Table } from "../../core/state/store"
+import * as api from "./api"
+
+import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, put, read, save, share, Tables, Upload,
+	version, Version } from "./records"
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import { isDigit } from "std/ascii"
+import { CryptoError } from "std/crypto/error"
+import { md5, sha1, sha256 } from "std/crypto/hash"
+import { bytes } from "std/crypto/random"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { crc32 } from "std/hash/crc32"
+import { Body, Request, Response } from "std/http"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { second } from "std/time"
+import { escape, Query, unescape } from "std/url"
+
+/// The smallest part of a multipart upload but its last.
+const smallest: i64 = 5242880
+
+/// The service, of the operations implemented.
+export class Handler {
+	...api.Unimplemented
+
+	/// The body of the GetObject being answered when it streams a blob, which serve sends in place of the output's.
+	streamed: Body | null = null
+	/// Whether the GetObject being answered is of a range, which serve answers 206, as S3's model has no member for.
+	partial = false
+
+	createBucket(caller: Caller, input: api.CreateBucketRequest): api.CreateBucketOutput throws Fault {
+		const name = input.Bucket
+		valid(name)
+		caller.actions = ["s3:CreateBucket"]
+		if (input.ObjectOwnership != null) {
+			caller.actions.push("s3:PutBucketOwnershipControls")
+		}
+		caller.allow(arn(name), null, [], `"${arn(name)}"`)
+		const constraint = input.CreateBucketConfiguration?.LocationConstraint
+		const given = if (constraint == null) null else if (constraint! == "EU") "eu-west-1" else `${constraint!}`
+		if (caller.region != "us-east-1" && given != caller.region) {
+			const which = if (given == null) "unspecified" else given!
+			throw new Fault(400, "IllegalLocationConstraintException",
+				`The ${which} location constraint is incompatible for the region specific endpoint this request was sent to.`)
+		}
+		const region = given ?? "us-east-1"
+		const all = places(caller.global())
+		const there = all.get(name)
+		if (there != null) {
+			if (there.account != caller.account) {
+				throw new Fault(409, "BucketAlreadyExists",
+					"The requested bucket name is not available. The bucket namespace is shared by all users of the system. "
+					+ "Please select a different name and try again.", true, member("BucketName", name))
+			}
+			if (caller.region != "us-east-1" || there.region != "us-east-1") {
+				throw new Fault(409, "BucketAlreadyOwnedByYou",
+					"Your previous request to create the named bucket succeeded and you already own it.", true,
+					member("BucketName", name))
+			}
+		} else {
+			const t = now()
+			put(all, name, { ...new Place(), account: caller.account, region: region, created: t - t % second })
+			const b = { ...new Bucket(), name: name, owner: caller.account, region: region, created: t - t % second }
+			put(new Tables(caller.tree(`${caller.account}/${region}`)).buckets, name, b)
+		}
+		const r = new api.CreateBucketOutput()
+		r.Location = if (region == "us-east-1") `/${name}` else `http://${name}.s3.amazonaws.com/`
+		r.BucketArn = arn(name)
+		return r
+	}
+
+	headBucket(caller: Caller, input: api.HeadBucketRequest): api.HeadBucketOutput throws Fault {
+		caller.actions = ["s3:ListBucket"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const r = new api.HeadBucketOutput()
+		r.BucketRegion = f.bucket.region
+		r.BucketArn = arn(input.Bucket)
+		r.AccessPointAlias = false
+		return r
+	}
+
+	deleteBucket(caller: Caller, input: api.DeleteBucketRequest): Unit throws Fault {
+		caller.actions = ["s3:DeleteBucket"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (f.db.versions.scan(null, 1, `${input.Bucket}/`).length > 0) {
+			throw new Fault(409, "BucketNotEmpty", "The bucket you tried to delete is not empty", true,
+				member("BucketName", input.Bucket))
+		}
+		for (const [k, u] of f.db.uploads.scan(null, 10000, `${input.Bucket}/`)) {
+			abort(f.db, k, u)
+		}
+		f.db.buckets.delete(input.Bucket)
+		places(caller.global()).delete(input.Bucket)
+		return new Unit()
+	}
+
+	listBuckets(caller: Caller, input: api.ListBucketsRequest): api.ListBucketsOutput throws Fault {
+		caller.actions = ["s3:ListAllMyBuckets"]
+		caller.allow("arn:aws:s3:::*")
+		const limit = input.MaxBuckets ?? 10000
+		const prefix = input.Prefix ?? ""
+		const out: api.Bucket[] = []
+		let next: string | null = null
+		let after = token(input.ContinuationToken)
+		for (const [name, p] of places(caller.global()).scan(after, 100000, prefix)) {
+			if (p.account != caller.account || input.BucketRegion != null && p.region != input.BucketRegion) {
+				continue
+			}
+			if (out.length == limit) {
+				next = base64.encode(out[out.length - 1].Name!)
+				break
+			}
+			out.push({ ...new api.Bucket(), Name: name, CreationDate: p.created, BucketRegion: p.region,
+				BucketArn: arn(name) })
+		}
+		const r = new api.ListBucketsOutput()
+		r.Buckets = out
+		r.Owner = owner(caller.account)
+		r.ContinuationToken = next
+		r.Prefix = input.Prefix
+		return r
+	}
+
+	getBucketLocation(caller: Caller, input: api.GetBucketLocationRequest): api.GetBucketLocationOutput throws Fault {
+		caller.actions = ["s3:GetBucketLocation"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const r = new api.GetBucketLocationOutput()
+		if (f.bucket.region != "us-east-1") {
+			r.LocationConstraint = f.bucket.region as api.BucketLocationConstraint
+		}
+		return r
+	}
+
+	putObject(caller: Caller, input: api.PutObjectRequest): api.PutObjectOutput throws Fault {
+		caller.actions = ["s3:PutObject"]
+		if (input.Tagging != null) {
+			caller.actions.push("s3:PutObjectTagging")
+		}
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const data = input.Body
+		digest(input.ContentMD5, data)
+		const [algorithm, sum] = checksum(algorithmOf(input.ChecksumAlgorithm),
+			sums(input.ChecksumCRC32, input.ChecksumCRC32C, input.ChecksumCRC64NVME, input.ChecksumSHA1,
+			input.ChecksumSHA256), data)
+		const current = f.db.objects.get(path(input.Bucket, input.Key))
+		if (input.IfNoneMatch != null) {
+			if (input.IfNoneMatch! != "*") {
+				throw new Fault(501, "NotImplemented",
+					"A header you provided implies functionality that is not implemented", true,
+					member("Header", "If-None-Match"))
+			}
+			if (current != null) {
+				throw precondition("If-None-Match")
+			}
+		}
+		if (input.IfMatch != null && (current == null || !matches(input.IfMatch!, current.etag))) {
+			if (current == null) {
+				throw noSuchKey(input.Key)
+			}
+			throw precondition("If-Match")
+		}
+		const v = new Version()
+		v.key = input.Key
+		v.etag = `"${hex.encode(hash(md5, data))}"`
+		v.size = data.length as i64
+		v.type = input.ContentType ?? "binary/octet-stream"
+		v.cacheControl = input.CacheControl
+		v.disposition = input.ContentDisposition
+		v.encoding = input.ContentEncoding
+		v.language = input.ContentLanguage
+		v.expires = input.Expires
+		v.redirect = input.WebsiteRedirectLocation
+		v.metadata = input.Metadata ?? []
+		v.tags = tagging(input.Tagging)
+		v.algorithm = algorithm
+		v.checksum = sum
+		const k = write(caller, f, v, data)
+		const r = new api.PutObjectOutput()
+		r.ETag = v.etag
+		r.ServerSideEncryption = "AES256"
+		r.VersionId = versionOf(f.bucket, v)
+		set(r, algorithm, sum)
+		r.ChecksumType = if (algorithm == "") null else "FULL_OBJECT"
+		return r
+	}
+
+	getObject(caller: Caller, input: api.GetObjectRequest): api.GetObjectOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:GetObject" else "s3:GetObjectVersion"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const v = object(f, input.Key, input.VersionId)
+		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
+		const k = version(input.Bucket, v.key, v.order)
+		const r = new api.GetObjectOutput()
+		described(r, f.bucket, v)
+		const range = ranged(input.Range, v.size)
+		const [at, n] = range ?? [0 as i64, v.size]
+		if (range != null) {
+			r.ContentRange = `bytes ${at}-${at + n - 1}/${v.size}`
+			this.partial = true
+		} else if (input.ChecksumMode != null) {
+			set(r, v.algorithm, v.checksum)
+			r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
+		}
+		r.ContentLength = n
+		r.CacheControl = input.ResponseCacheControl ?? r.CacheControl
+		r.ContentDisposition = input.ResponseContentDisposition ?? r.ContentDisposition
+		r.ContentEncoding = input.ResponseContentEncoding ?? r.ContentEncoding
+		r.ContentLanguage = input.ResponseContentLanguage ?? r.ContentLanguage
+		r.ContentType = input.ResponseContentType ?? r.ContentType
+		const b = body(f.db, "s3/versions", k, at, n)
+		if (b.whole != null) {
+			r.Body = b.whole!
+		} else {
+			this.streamed = b
+		}
+		return r
+	}
+
+	headObject(caller: Caller, input: api.HeadObjectRequest): api.HeadObjectOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:GetObject" else "s3:GetObjectVersion"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const v = object(f, input.Key, input.VersionId)
+		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
+		const r = new api.HeadObjectOutput()
+		described(r, f.bucket, v)
+		const range = ranged(input.Range, v.size)
+		const [at, n] = range ?? [0 as i64, v.size]
+		if (range != null) {
+			r.ContentRange = `bytes ${at}-${at + n - 1}/${v.size}`
+		} else if (input.ChecksumMode != null) {
+			set(r, v.algorithm, v.checksum)
+			r.ChecksumType = if (v.algorithm == "") null else "FULL_OBJECT"
+		}
+		r.ContentLength = n
+		return r
+	}
+
+	deleteObject(caller: Caller, input: api.DeleteObjectRequest): api.DeleteObjectOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:DeleteObject" else "s3:DeleteObjectVersion"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const [id, marker] = remove(caller, f, input.Key, input.VersionId)
+		const r = new api.DeleteObjectOutput()
+		r.VersionId = id
+		r.DeleteMarker = if (marker) true else null
+		return r
+	}
+
+	deleteObjects(caller: Caller, input: api.DeleteObjectsRequest): api.DeleteObjectsOutput throws Fault {
+		caller.actions = []
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (input.Delete.Objects.length > 1000) {
+			throw new Fault(400, "MalformedXML",
+				"The XML you provided was not well-formed or did not validate against our published schema")
+		}
+		const deleted: api.DeletedObject[] = []
+		const errors: api.Error[] = []
+		for (const o of input.Delete.Objects) {
+			caller.actions = [if (o.VersionId == null) "s3:DeleteObject" else "s3:DeleteObjectVersion"]
+			try {
+				authorize(caller, f.bucket, arn(input.Bucket, o.Key))
+				const [id, marker] = remove(caller, f, o.Key, o.VersionId)
+				if (input.Delete.Quiet != true) {
+					deleted.push({ ...new api.DeletedObject(), Key: o.Key, VersionId: o.VersionId,
+						DeleteMarker: if (marker) true else null,
+						DeleteMarkerVersionId: if (marker && o.VersionId == null) id else null })
+				}
+			} catch (e: Fault) {
+				errors.push({ ...new api.Error(), Key: o.Key, VersionId: o.VersionId, Code: e.code,
+					Message: e.message })
+			}
+		}
+		const r = new api.DeleteObjectsOutput()
+		r.Deleted = if (deleted.length == 0) null else deleted
+		r.Errors = if (errors.length == 0) null else errors
+		return r
+	}
+
+	listObjectsV2(caller: Caller, input: api.ListObjectsV2Request): api.ListObjectsV2Output throws Fault {
+		caller.actions = ["s3:ListBucket"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, null,
+			listing(input.Prefix, input.Delimiter, input.MaxKeys))
+		const max = keys(input.MaxKeys)
+		const after = token(input.ContinuationToken) ?? input.StartAfter
+		const l = list(f.db, input.Bucket, input.Prefix ?? "", input.Delimiter ?? "", after, max)
+		const url = input.EncodingType != null
+		const r = new api.ListObjectsV2Output()
+		r.IsTruncated = l.truncated
+		r.Contents = contents(l.objects, if (input.FetchOwner == true) f.bucket.owner else null, url)
+		r.Name = input.Bucket
+		r.Prefix = encoded(input.Prefix ?? "", url)
+		r.Delimiter = if (input.Delimiter == null) null else encoded(input.Delimiter!, url)
+		r.MaxKeys = max
+		r.CommonPrefixes = prefixes(l.prefixes, url)
+		r.EncodingType = input.EncodingType
+		r.KeyCount = l.objects.length + l.prefixes.length
+		r.ContinuationToken = input.ContinuationToken
+		r.NextContinuationToken = if (l.truncated) base64.encode(l.last) else null
+		r.StartAfter = if (input.StartAfter == null) null else encoded(input.StartAfter!, url)
+		return r
+	}
+
+	listObjects(caller: Caller, input: api.ListObjectsRequest): api.ListObjectsOutput throws Fault {
+		caller.actions = ["s3:ListBucket"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, null,
+			listing(input.Prefix, input.Delimiter, input.MaxKeys))
+		const max = keys(input.MaxKeys)
+		const l = list(f.db, input.Bucket, input.Prefix ?? "", input.Delimiter ?? "", input.Marker, max)
+		const url = input.EncodingType != null
+		const r = new api.ListObjectsOutput()
+		r.IsTruncated = l.truncated
+		r.Marker = encoded(input.Marker ?? "", url)
+		r.NextMarker = if (l.truncated && input.Delimiter != null) encoded(l.last, url) else null
+		r.Contents = contents(l.objects, f.bucket.owner, url)
+		r.Name = input.Bucket
+		r.Prefix = encoded(input.Prefix ?? "", url)
+		r.Delimiter = if (input.Delimiter == null) null else encoded(input.Delimiter!, url)
+		r.MaxKeys = max
+		r.CommonPrefixes = prefixes(l.prefixes, url)
+		r.EncodingType = input.EncodingType
+		return r
+	}
+
+	copyObject(caller: Caller, input: api.CopyObjectRequest): api.CopyObjectOutput throws Fault {
+		const [sb, sk, sv] = source(input.CopySource)
+		caller.actions = [if (sv == null) "s3:GetObject" else "s3:GetObjectVersion"]
+		const from = found(caller, sb, input.ExpectedSourceBucketOwner, arn(sb, sk))
+		const s = object(from, sk, sv)
+		copyConditions(s, input.CopySourceIfMatch, input.CopySourceIfNoneMatch, input.CopySourceIfModifiedSince,
+			input.CopySourceIfUnmodifiedSince)
+		caller.actions = ["s3:PutObject"]
+		if (input.TaggingDirective == "REPLACE" && input.Tagging != null) {
+			caller.actions.push("s3:PutObjectTagging")
+		}
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const replace = input.MetadataDirective == "REPLACE"
+		if (sb == input.Bucket && sk == input.Key && sv == null && !replace && input.StorageClass == null
+			&& input.WebsiteRedirectLocation == null && input.ServerSideEncryption == null) {
+			throw new Fault(400, "InvalidRequest",
+				"This copy request is illegal because it is trying to copy an object to itself without changing the "
+				+ "object's metadata, storage class, website redirect location or encryption attributes.")
+		}
+		const current = f.db.objects.get(path(input.Bucket, input.Key))
+		if (input.IfNoneMatch == "*" && current != null) {
+			throw precondition("If-None-Match")
+		}
+		if (input.IfMatch != null && (current == null || !matches(input.IfMatch!, current.etag))) {
+			throw if (current == null) noSuchKey(input.Key) else precondition("If-Match")
+		}
+		const v = { ...s, key: input.Key, id: "null", marker: false, parts: 0 }
+		v.tags = if (input.TaggingDirective == "REPLACE") tagging(input.Tagging) else s.tags
+		if (replace) {
+			v.type = input.ContentType ?? "binary/octet-stream"
+			v.cacheControl = input.CacheControl
+			v.disposition = input.ContentDisposition
+			v.encoding = input.ContentEncoding
+			v.language = input.ContentLanguage
+			v.expires = input.Expires
+			v.metadata = input.Metadata ?? []
+		}
+		v.redirect = input.WebsiteRedirectLocation ?? (if (replace) null else s.redirect)
+		if (s.parts > 0) {
+			// a copy is one part, its ETag its bytes' MD5
+			v.etag = `"${hex.encode(hash(md5, read(from.db, "s3/versions", version(sb, sk, s.order))))}"`
+		}
+		const t = now()
+		v.modified = t - t % second
+		v.owner = f.bucket.owner
+		v.order = f.bucket.next
+		f.bucket.next++
+		v.id = fresh(f.bucket)
+		if (v.id == "null") {
+			dropNull(f.db, input.Bucket, input.Key)
+		}
+		put(f.db.buckets, input.Bucket, f.bucket)
+		share(f.db, "s3/versions", version(sb, sk, s.order), f.db.versions, "s3/versions",
+			version(input.Bucket, input.Key, v.order), v)
+		restore(f.db, input.Bucket, input.Key)
+		const r = new api.CopyObjectOutput()
+		r.CopyObjectResult = { ...new api.CopyObjectResult(), ETag: v.etag, LastModified: v.modified }
+		if (v.algorithm != "") {
+			set(r.CopyObjectResult!, v.algorithm, v.checksum)
+		}
+		r.CopySourceVersionId = if (from.bucket.versioning == "") null else s.id
+		r.VersionId = versionOf(f.bucket, v)
+		r.ServerSideEncryption = "AES256"
+		return r
+	}
+
+	createMultipartUpload(caller: Caller,
+		input: api.CreateMultipartUploadRequest): api.CreateMultipartUploadOutput throws Fault {
+		caller.actions = ["s3:PutObject"]
+		if (input.Tagging != null) {
+			caller.actions.push("s3:PutObjectTagging")
+		}
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = new Upload()
+		u.id = random(64)
+		u.key = input.Key
+		const t = now()
+		u.initiated = t - t % second
+		u.owner = f.bucket.owner
+		u.initiator = caller.arn
+		const v = u.object
+		v.key = input.Key
+		v.type = input.ContentType ?? "binary/octet-stream"
+		v.cacheControl = input.CacheControl
+		v.disposition = input.ContentDisposition
+		v.encoding = input.ContentEncoding
+		v.language = input.ContentLanguage
+		v.expires = input.Expires
+		v.redirect = input.WebsiteRedirectLocation
+		v.metadata = input.Metadata ?? []
+		v.tags = tagging(input.Tagging)
+		v.algorithm = if (input.ChecksumAlgorithm == null) "" else `${input.ChecksumAlgorithm!}`
+		put(f.db.uploads, `${path(input.Bucket, input.Key)}\x00${u.id}`, u)
+		const r = new api.CreateMultipartUploadOutput()
+		r.Bucket = input.Bucket
+		r.Key = input.Key
+		r.UploadId = u.id
+		r.ServerSideEncryption = "AES256"
+		r.ChecksumAlgorithm = input.ChecksumAlgorithm
+		r.ChecksumType = if (input.ChecksumAlgorithm == null) null else "COMPOSITE"
+		return r
+	}
+
+	uploadPart(caller: Caller, input: api.UploadPartRequest): api.UploadPartOutput throws Fault {
+		caller.actions = ["s3:PutObject"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		numbered(input.PartNumber)
+		const data = input.Body
+		digest(input.ContentMD5, data)
+		const named = if (input.ChecksumAlgorithm == null) u.object.algorithm else algorithmOf(input.ChecksumAlgorithm)
+		const [algorithm, sum] = checksum(named,
+			sums(input.ChecksumCRC32, input.ChecksumCRC32C, input.ChecksumCRC64NVME, input.ChecksumSHA1,
+			input.ChecksumSHA256), data)
+		const p = new Part()
+		p.number = input.PartNumber
+		p.md5 = hex.encode(hash(md5, data))
+		p.etag = `"${p.md5}"`
+		p.size = data.length as i64
+		const t = now()
+		p.modified = t - t % second
+		p.algorithm = algorithm
+		p.checksum = sum
+		const k = part(u.id, p.number)
+		drop(f.db, f.db.parts, "s3/parts", k)
+		save(f.db, f.db.parts, "s3/parts", k, p, data)
+		const r = new api.UploadPartOutput()
+		r.ETag = p.etag
+		r.ServerSideEncryption = "AES256"
+		set(r, algorithm, sum)
+		return r
+	}
+
+	uploadPartCopy(caller: Caller, input: api.UploadPartCopyRequest): api.UploadPartCopyOutput throws Fault {
+		const [sb, sk, sv] = source(input.CopySource)
+		caller.actions = [if (sv == null) "s3:GetObject" else "s3:GetObjectVersion"]
+		const from = found(caller, sb, input.ExpectedSourceBucketOwner, arn(sb, sk))
+		const s = object(from, sk, sv)
+		copyConditions(s, input.CopySourceIfMatch, input.CopySourceIfNoneMatch, input.CopySourceIfModifiedSince,
+			input.CopySourceIfUnmodifiedSince)
+		caller.actions = ["s3:PutObject"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		numbered(input.PartNumber)
+		let [at, n] = [0 as i64, s.size]
+		if (input.CopySourceRange != null) {
+			const r = bounds(input.CopySourceRange!, s.size)
+			if (r == null || r![1] < r![0] || r![1] >= s.size) {
+				throw new Fault(400, "InvalidArgument",
+					`Range specified is not valid for source object of size: ${s.size}`, true,
+					member("ArgumentName", "x-amz-copy-source-range") + member("ArgumentValue", input.CopySourceRange!))
+			}
+			at = r![0]
+			n = r![1] - r![0] + 1
+		}
+		const data = read(from.db, "s3/versions", version(sb, sk, s.order), at, n)
+		const p = new Part()
+		p.number = input.PartNumber
+		p.md5 = hex.encode(hash(md5, data))
+		p.etag = `"${p.md5}"`
+		p.size = n
+		const t = now()
+		p.modified = t - t % second
+		const k = part(u.id, p.number)
+		drop(f.db, f.db.parts, "s3/parts", k)
+		save(f.db, f.db.parts, "s3/parts", k, p, data)
+		const r = new api.UploadPartCopyOutput()
+		r.CopySourceVersionId = if (from.bucket.versioning == "") null else s.id
+		r.CopyPartResult = { ...new api.CopyPartResult(), ETag: p.etag, LastModified: p.modified }
+		r.ServerSideEncryption = "AES256"
+		return r
+	}
+
+	completeMultipartUpload(caller: Caller,
+		input: api.CompleteMultipartUploadRequest): api.CompleteMultipartUploadOutput throws Fault {
+		caller.actions = ["s3:PutObject"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		const given = input.MultipartUpload?.Parts ?? []
+		if (given.length == 0) {
+			throw new Fault(400, "MalformedXML",
+				"The XML you provided was not well-formed or did not validate against our published schema")
+		}
+		const parts: Part[] = []
+		for (let i = 0; i < given.length; i++) {
+			const g = given[i]
+			const n = g.PartNumber ?? 0
+			if (i > 0 && n <= parts[i - 1].number) {
+				throw new Fault(400, "InvalidPartOrder",
+					"The list of parts was not in ascending order. Parts must be ordered by part number.", true,
+					member("UploadId", u.id))
+			}
+			const p = f.db.parts.get(part(u.id, n))
+			if (p == null || g.ETag == null || !matches(g.ETag!, p.etag)) {
+				throw new Fault(400, "InvalidPart",
+					"One or more of the specified parts could not be found.  The part may not have been uploaded, or the "
+					+ "specified entity tag may not match the part's entity tag.", true,
+					member("UploadId", u.id) + member("PartNumber", `${n}`) + member("ETag", g.ETag ?? ""))
+			}
+			parts.push(p!)
+		}
+		for (let i = 0; i + 1 < parts.length; i++) {
+			if (parts[i].size < smallest) {
+				throw new Fault(400, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed size",
+					true,
+					member("ProposedSize", `${parts[i].size}`) + member("MinSizeAllowed", `${smallest}`)
+					+ member("PartNumber", `${parts[i].number}`) + member("ETag", parts[i].md5))
+			}
+		}
+		const current = f.db.objects.get(path(input.Bucket, input.Key))
+		if (input.IfNoneMatch == "*" && current != null) {
+			throw precondition("If-None-Match")
+		}
+		if (input.IfMatch != null && (current == null || !matches(input.IfMatch!, current.etag))) {
+			throw if (current == null) noSuchKey(input.Key) else precondition("If-Match")
+		}
+		let digests = ""
+		try {
+			for (const p of parts) {
+				digests += hex.decode(p.md5)
+			}
+		} catch (e: ParseError) {
+			throw new Fault(500, "InternalError", "A part's MD5 is not hex")
+		}
+		const v = u.object
+		v.etag = `"${hex.encode(hash(md5, digests))}-${parts.length}"`
+		v.parts = parts.length
+		v.algorithm = ""
+		v.checksum = ""
+		const blobs: Blob[] = []
+		try {
+			for (const p of parts) {
+				blobs.push(blob(f.db, "s3/parts", part(u.id, p.number)))
+				v.size += p.size
+			}
+			const whole = Blob.join(blobs)
+			blobs.push(whole)
+			stamp(f, v)
+			keep(f.db, f.db.versions, "s3/versions", version(input.Bucket, input.Key, v.order), v, whole)
+		} finally {
+			for (const b of blobs) {
+				b.close()
+			}
+		}
+		restore(f.db, input.Bucket, input.Key)
+		abort(f.db, `${path(input.Bucket, input.Key)}\x00${u.id}`, u)
+		const r = new api.CompleteMultipartUploadOutput()
+		r.Location = `${caller.endpoint}/${input.Bucket}/${escape(input.Key, "path")}`
+		r.Bucket = input.Bucket
+		r.Key = input.Key
+		r.ETag = v.etag
+		r.ServerSideEncryption = "AES256"
+		r.VersionId = versionOf(f.bucket, v)
+		return r
+	}
+
+	abortMultipartUpload(caller: Caller,
+		input: api.AbortMultipartUploadRequest): api.AbortMultipartUploadOutput throws Fault {
+		caller.actions = ["s3:AbortMultipartUpload"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		abort(f.db, `${path(input.Bucket, input.Key)}\x00${u.id}`, u)
+		return new api.AbortMultipartUploadOutput()
+	}
+
+	listParts(caller: Caller, input: api.ListPartsRequest): api.ListPartsOutput throws Fault {
+		caller.actions = ["s3:ListMultipartUploadParts"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const u = upload(f.db, input.Bucket, input.Key, input.UploadId)
+		const max = input.MaxParts ?? 1000
+		let marker = 0
+		try {
+			marker = parseInt[i32](input.PartNumberMarker ?? "0")
+		} catch (e: ParseError) {
+			throw new Fault(400, "InvalidArgument",
+				"Provided part-number-marker not an integer or within integer range")
+		}
+		const page = f.db.parts.scan(if (marker > 0) part(u.id, marker) else null, max + 1, `${u.id}\x00`)
+		const shown = page.slice(0, if (page.length > max) max else page.length)
+		const r = new api.ListPartsOutput()
+		r.Bucket = input.Bucket
+		r.Key = input.Key
+		r.UploadId = u.id
+		r.PartNumberMarker = `${marker}`
+		r.NextPartNumberMarker = if (shown.length == 0) null else `${shown[shown.length - 1][1].number}`
+		r.MaxParts = max
+		r.IsTruncated = page.length > max
+		r.Parts = shown.map(e => {
+			const p = e[1]
+			const out = { ...new api.Part(), PartNumber: p.number, LastModified: p.modified, ETag: p.etag,
+				Size: p.size }
+			set(out, p.algorithm, p.checksum)
+			return out
+		})
+		r.Initiator = { ...new api.Initiator(), ID: u.initiator }
+		r.Owner = owner(u.owner)
+		r.StorageClass = "STANDARD"
+		r.ChecksumAlgorithm = if (u.object.algorithm == "") null else u.object.algorithm as api.ChecksumAlgorithm
+		return r
+	}
+
+	listMultipartUploads(caller: Caller,
+		input: api.ListMultipartUploadsRequest): api.ListMultipartUploadsOutput throws Fault {
+		caller.actions = ["s3:ListBucketMultipartUploads"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const max = keys(input.MaxUploads)
+		const prefix = input.Prefix ?? ""
+		const delimiter = input.Delimiter ?? ""
+		let after: string | null = null
+		if (input.KeyMarker != null) {
+			after = `${path(input.Bucket, input.KeyMarker!)}\x00${input.UploadIdMarker ?? fromBytes([0xff as u8])}`
+		}
+		const uploads: api.MultipartUpload[] = []
+		const common: string[] = []
+		let truncated = false
+		let last: [string, string] = ["", ""]
+		const start = path(input.Bucket, "")
+		for (const [k, u] of f.db.uploads.scan(after, 100000, path(input.Bucket, prefix))) {
+			const rest = u.key.slice(prefix.length, u.key.length)
+			const d = if (delimiter == "") -1 else indexOf(rest, delimiter)
+			const cp = if (d < 0) "" else prefix + rest.slice(0, d + delimiter.length)
+			if (cp != "" && common.length > 0 && common[common.length - 1] == cp) {
+				continue
+			}
+			if (uploads.length + common.length == max) {
+				truncated = true
+				break
+			}
+			if (cp != "") {
+				common.push(cp)
+				last = [cp, ""]
+			} else {
+				uploads.push({ ...new api.MultipartUpload(), UploadId: u.id, Key: u.key, Initiated: u.initiated,
+					StorageClass: "STANDARD", Owner: owner(u.owner),
+					Initiator: { ...new api.Initiator(), ID: u.initiator },
+					ChecksumAlgorithm: if (u.object.algorithm == "") null
+					else u.object.algorithm as api.ChecksumAlgorithm })
+				last = [u.key, u.id]
+			}
+		}
+		const r = new api.ListMultipartUploadsOutput()
+		r.Bucket = input.Bucket
+		r.KeyMarker = input.KeyMarker ?? ""
+		r.UploadIdMarker = input.UploadIdMarker ?? ""
+		r.NextKeyMarker = if (truncated) last[0] else null
+		r.NextUploadIdMarker = if (truncated) last[1] else null
+		r.Prefix = input.Prefix
+		r.Delimiter = input.Delimiter
+		r.MaxUploads = max
+		r.IsTruncated = truncated
+		r.Uploads = uploads
+		r.CommonPrefixes = prefixes(common, false)
+		r.EncodingType = input.EncodingType
+		return r
+	}
+
+	putBucketPolicy(caller: Caller, input: api.PutBucketPolicyRequest): Unit throws Fault {
+		caller.actions = ["s3:PutBucketPolicy"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (!startsWith(trim(input.Policy), "{")) {
+			throw malformedPolicy("Policies must be valid JSON and the first byte must be '{'")
+		}
+		try {
+			parse(input.Policy, "resource")
+		} catch (e: Fault) {
+			throw malformedPolicy(e.message)
+		}
+		f.bucket.policy = input.Policy
+		put(f.db.buckets, input.Bucket, f.bucket)
+		return new Unit()
+	}
+
+	getBucketPolicy(caller: Caller, input: api.GetBucketPolicyRequest): api.GetBucketPolicyOutput throws Fault {
+		caller.actions = ["s3:GetBucketPolicy"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (f.bucket.policy == null) {
+			throw noPolicy(input.Bucket)
+		}
+		return { ...new api.GetBucketPolicyOutput(), Policy: f.bucket.policy }
+	}
+
+	deleteBucketPolicy(caller: Caller, input: api.DeleteBucketPolicyRequest): Unit throws Fault {
+		caller.actions = ["s3:DeleteBucketPolicy"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		f.bucket.policy = null
+		put(f.db.buckets, input.Bucket, f.bucket)
+		return new Unit()
+	}
+
+	getBucketPolicyStatus(caller: Caller,
+		input: api.GetBucketPolicyStatusRequest): api.GetBucketPolicyStatusOutput throws Fault {
+		caller.actions = ["s3:GetBucketPolicyStatus"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (f.bucket.policy == null) {
+			throw noPolicy(input.Bucket)
+		}
+		const p = parse(f.bucket.policy!, "resource")
+		const public = p.statements.some(s => s.allow && s.conditions.length == 0
+			&& s.principals.some(n => n[0] == "*" || n[1] == "*"))
+		return { ...new api.GetBucketPolicyStatusOutput(),
+			PolicyStatus: { ...new api.PolicyStatus(), IsPublic: public } }
+	}
+
+	putObjectTagging(caller: Caller, input: api.PutObjectTaggingRequest): api.PutObjectTaggingOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:PutObjectTagging" else "s3:PutObjectVersionTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const v = object(f, input.Key, input.VersionId)
+		v.tags = tags(input.Tagging.TagSet)
+		retag(f, v)
+		return { ...new api.PutObjectTaggingOutput(), VersionId: versionOf(f.bucket, v) }
+	}
+
+	getObjectTagging(caller: Caller, input: api.GetObjectTaggingRequest): api.GetObjectTaggingOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:GetObjectTagging" else "s3:GetObjectVersionTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const v = object(f, input.Key, input.VersionId)
+		return { ...new api.GetObjectTaggingOutput(), VersionId: versionOf(f.bucket, v), TagSet: tagSet(v.tags) }
+	}
+
+	deleteObjectTagging(caller: Caller,
+		input: api.DeleteObjectTaggingRequest): api.DeleteObjectTaggingOutput throws Fault {
+		caller.actions = [if (input.VersionId == null) "s3:DeleteObjectTagging" else "s3:DeleteObjectVersionTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const v = object(f, input.Key, input.VersionId)
+		v.tags = []
+		retag(f, v)
+		return { ...new api.DeleteObjectTaggingOutput(), VersionId: versionOf(f.bucket, v) }
+	}
+
+	putBucketTagging(caller: Caller, input: api.PutBucketTaggingRequest): Unit throws Fault {
+		caller.actions = ["s3:PutBucketTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		f.bucket.tags = tags(input.Tagging.TagSet)
+		put(f.db.buckets, input.Bucket, f.bucket)
+		return new Unit()
+	}
+
+	getBucketTagging(caller: Caller, input: api.GetBucketTaggingRequest): api.GetBucketTaggingOutput throws Fault {
+		caller.actions = ["s3:GetBucketTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		if (f.bucket.tags == null) {
+			throw new Fault(404, "NoSuchTagSet", "The TagSet does not exist", true, member("BucketName", input.Bucket))
+		}
+		return { ...new api.GetBucketTaggingOutput(), TagSet: tagSet(f.bucket.tags!) }
+	}
+
+	deleteBucketTagging(caller: Caller, input: api.DeleteBucketTaggingRequest): Unit throws Fault {
+		caller.actions = ["s3:PutBucketTagging"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		f.bucket.tags = null
+		put(f.db.buckets, input.Bucket, f.bucket)
+		return new Unit()
+	}
+
+	putBucketVersioning(caller: Caller, input: api.PutBucketVersioningRequest): Unit throws Fault {
+		caller.actions = ["s3:PutBucketVersioning"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const s = input.VersioningConfiguration.Status
+		if (s == null) {
+			throw new Fault(400, "MalformedXML",
+				"The XML you provided was not well-formed or did not validate against our published schema")
+		}
+		f.bucket.versioning = `${s!}`
+		put(f.db.buckets, input.Bucket, f.bucket)
+		return new Unit()
+	}
+
+	getBucketVersioning(caller: Caller,
+		input: api.GetBucketVersioningRequest): api.GetBucketVersioningOutput throws Fault {
+		caller.actions = ["s3:GetBucketVersioning"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
+		const r = new api.GetBucketVersioningOutput()
+		if (f.bucket.versioning != "") {
+			r.Status = f.bucket.versioning as api.BucketVersioningStatus
+		}
+		return r
+	}
+
+	listObjectVersions(caller: Caller,
+		input: api.ListObjectVersionsRequest): api.ListObjectVersionsOutput throws Fault {
+		caller.actions = ["s3:ListBucketVersions"]
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, null,
+			listing(input.Prefix, input.Delimiter, input.MaxKeys))
+		const max = keys(input.MaxKeys)
+		const prefix = input.Prefix ?? ""
+		const delimiter = input.Delimiter ?? ""
+		const url = input.EncodingType != null
+		let after: string | null = null
+		if (input.KeyMarker != null) {
+			after = `${path(input.Bucket, input.KeyMarker!)}\x00${fromBytes([0xff as u8])}`
+			if (input.VersionIdMarker != null) {
+				for (const [k, v] of f.db.versions.scan(null, 100000, `${path(input.Bucket, input.KeyMarker!)}\x00`)) {
+					if (v.id == input.VersionIdMarker!) {
+						after = k
+					}
+				}
+			}
+		}
+		const versions: api.ObjectVersion[] = []
+		const markers: api.DeleteMarkerEntry[] = []
+		const common: string[] = []
+		let truncated = false
+		let last: [string, string] = ["", ""]
+		let previous = if (input.VersionIdMarker == null) "" else input.KeyMarker ?? ""
+		for (const [_, v] of f.db.versions.scan(after, 100000, path(input.Bucket, prefix))) {
+			const latest = v.key != previous
+			previous = v.key
+			const rest = v.key.slice(prefix.length, v.key.length)
+			const d = if (delimiter == "") -1 else indexOf(rest, delimiter)
+			const cp = if (d < 0) "" else prefix + rest.slice(0, d + delimiter.length)
+			if (cp != "" && common.length > 0 && common[common.length - 1] == cp) {
+				continue
+			}
+			if (versions.length + markers.length + common.length == max) {
+				truncated = true
+				break
+			}
+			if (cp != "") {
+				common.push(cp)
+				last = [cp, ""]
+				continue
+			}
+			last = [v.key, v.id]
+			if (v.marker) {
+				markers.push({ ...new api.DeleteMarkerEntry(), Owner: owner(v.owner), Key: encoded(v.key, url),
+					VersionId: v.id, IsLatest: latest, LastModified: v.modified })
+			} else {
+				const o = { ...new api.ObjectVersion(), ETag: v.etag, Size: v.size,
+					StorageClass: "STANDARD" as api.ObjectVersionStorageClass, Key: encoded(v.key, url),
+					VersionId: v.id, IsLatest: latest, LastModified: v.modified, Owner: owner(v.owner) }
+				if (v.algorithm != "") {
+					o.ChecksumAlgorithm = [v.algorithm as api.ChecksumAlgorithm]
+					o.ChecksumType = "FULL_OBJECT"
+				}
+				versions.push(o)
+			}
+		}
+		const r = new api.ListObjectVersionsOutput()
+		r.IsTruncated = truncated
+		r.KeyMarker = encoded(input.KeyMarker ?? "", url)
+		r.VersionIdMarker = input.VersionIdMarker ?? ""
+		r.NextKeyMarker = if (truncated) encoded(last[0], url) else null
+		r.NextVersionIdMarker = if (truncated && last[1] != "") last[1] else null
+		r.Versions = if (versions.length == 0) null else versions
+		r.DeleteMarkers = if (markers.length == 0) null else markers
+		r.Name = input.Bucket
+		r.Prefix = encoded(prefix, url)
+		r.Delimiter = if (input.Delimiter == null) null else encoded(input.Delimiter!, url)
+		r.MaxKeys = max
+		r.CommonPrefixes = prefixes(common, url)
+		r.EncodingType = input.EncodingType
+		return r
+	}
+}
+
+/// Stores v, whose tags have changed, in place, and as its key's current version if it is.
+function retag(f: Found, v: Version) throws Fault {
+	put(f.db.versions, version(f.bucket.name, v.key, v.order), v)
+	restore(f.db, f.bucket.name, v.key)
+}
+
+/// The tags of a tag set, unless more than 50 or of a key twice.
+function tags(set: api.Tag[]): [string, string][] throws Fault {
+	const out: [string, string][] = []
+	for (const t of set) {
+		if (out.some(o => o[0] == t.Key)) {
+			throw new Fault(400, "InvalidTag", "Cannot provide multiple Tags with the same key", true,
+				member("TagKey", t.Key))
+		}
+		out.push([t.Key, t.Value])
+	}
+	if (out.length > 50) {
+		throw new Fault(400, "BadRequest", "Object tags cannot be greater than 50")
+	}
+	return out
+}
+
+function tagSet(tags: [string, string][]): api.Tag[] {
+	return tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+}
+
+/// The answer to req by h: of a virtual-hosted request as if of its path, and of a GetObject that streams a blob, with
+/// that body.
+export function serve(h: Handler, caller: Caller, req: Request): Response throws IoError {
+	address(req)
+	// S3 takes x-amz-checksum-mode in any case, as the AWS CLI sends it
+	const mode = req.headers.get("x-amz-checksum-mode")
+	if (mode != null && lower(mode!) == "enabled") {
+		req.headers.set("x-amz-checksum-mode", "ENABLED")
+	}
+	const res = api.handle(h, caller, req)
+	const b = h.streamed
+	h.streamed = null
+	if (h.partial && res.status == 200) {
+		res.status = 206
+	}
+	// S3 answers PutBucketPolicy and PutBucketTagging 204, as its model does not say
+	const q = req.url.query
+	if (req.method == "PUT" && res.status == 200
+		&& (q.has("policy") || q.has("tagging") && indexOf(req.url.path.slice(1, req.url.path.length), "/") < 0)) {
+		res.status = 204
+	}
+	h.partial = false
+	if (b != null) {
+		if (res.status < 300) {
+			res.body = b!
+		} else {
+			b!.close()
+		}
+	}
+	return res
+}
+
+/// Rewrites req, if its host names its bucket, to name it in its path: bucket.s3.<anything>, bucket.s3-<anything>,
+/// bucket.localhost and bucket.localhost.localstack.cloud.
+export function address(req: Request) {
+	const host = lower(split(req.headers.get("host") ?? req.url.host, ":")[0])
+	let bucket = ""
+	const at = lastIndexOf(host, ".s3.")
+	const dash = lastIndexOf(host, ".s3-")
+	if (at > 0 || dash > 0) {
+		bucket = host.slice(0, if (at > dash) at else dash)
+	} else if (endsWith(host, ".localhost.localstack.cloud")) {
+		bucket = host.slice(0, host.length - ".localhost.localstack.cloud".length)
+	} else if (endsWith(host, ".localhost")) {
+		bucket = host.slice(0, host.length - ".localhost".length)
+	}
+	if (bucket != "" && bucket != "s3" && !startsWith(bucket, "s3.")) {
+		req.url.path = `/${bucket}${req.url.path}`
+	}
+}
+
+/// A bucket a request is of: the tables of its owner's tree of its region, and its record.
+class Found {
+	db: Tables
+	bucket: Bucket
+
+	constructor(db: Tables, bucket: Bucket) {
+		this.db = db
+		this.bucket = bucket
+	}
+}
+
+/// The bucket named name, once the caller is allowed its actions on resource, the bucket's ARN if null, of the
+/// context keys of context; a bucket of an account other than expected is denied.
+function found(caller: Caller, name: string, expected: string | null, resource: string | null = null,
+	context: Context = []): Found throws Fault {
+	const g = caller.existing("")
+	const p = if (g == null) null else places(g!).get(name)
+	if (p == null) {
+		throw noSuchBucket(name)
+	}
+	const db = new Tables(caller.tree(`${p.account}/${p.region}`))
+	const b = db.buckets.get(name)!
+	authorize(caller, b, resource ?? arn(name), context)
+	if (expected != null && expected! != b.owner) {
+		throw new Fault(403, "AccessDenied", "Access Denied")
+	}
+	return new Found(db, b)
+}
+
+/// Throws S3's access denied unless the caller may perform its actions on resource of the bucket b: of the reason to
+/// a caller of b's account, else of none.
+function authorize(caller: Caller, b: Bucket, resource: string, context: Context = []) throws Fault {
+	try {
+		caller.allow(resource, b.policy, context, `"${resource}"`, b.owner)
+	} catch (f: Fault) {
+		if (f.code == "AccessDenied" && caller.account != b.owner) {
+			throw new Fault(403, "AccessDenied", "Access Denied")
+		}
+		throw f
+	}
+}
+
+/// The context keys of a listing.
+function listing(prefix: string | null, delimiter: string | null, max: i32 | null): Context {
+	const c: Context = [["s3:prefix", prefix ?? ""]]
+	if (delimiter != null) {
+		c.push(["s3:delimiter", delimiter!])
+	}
+	c.push(["s3:max-keys", `${max ?? 1000}`])
+	return c
+}
+
+/// The ARN of a bucket, or of an object in it.
+function arn(bucket: string, key: string | null = null): string {
+	return if (key == null) `arn:aws:s3:::${bucket}` else `arn:aws:s3:::${bucket}/${key!}`
+}
+
+/// Throws InvalidBucketName unless name is a bucket's: 3 to 63 lower-case letters, digits, dots and hyphens, starting
+/// and ending with a letter or digit, without two dots together, not an IP address, nor of a prefix or suffix S3
+/// keeps.
+function valid(name: string) throws Fault {
+	let ok = name.length >= 3 && name.length <= 63
+	for (let i = 0; ok && i < name.length; i++) {
+		const c = name[i]
+		const edge = i == 0 || i == name.length - 1
+		ok = c >= 0x61 && c <= 0x7a || isDigit(c) || !edge && (c == 0x2e || c == 0x2d)
+	}
+	const parts = split(name, ".")
+	ok = ok && indexOf(name, "..") < 0 && !(parts.length == 4 && parts.every(p => p.length > 0 && p.every(isDigit)))
+		&& !startsWith(name, "xn--") && !startsWith(name, "sthree-") && !endsWith(name, "-s3alias")
+		&& !endsWith(name, "--ol-s3") && !endsWith(name, ".mrap") && !endsWith(name, "--x-s3")
+	if (!ok) {
+		throw new Fault(400, "InvalidBucketName", "The specified bucket is not valid.", true,
+			member("BucketName", name))
+	}
+}
+
+/// The element named n of the text s, escaped, as an error's member.
+function member(n: string, s: string): string {
+	return `<${n}>${replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")}</${n}>`
+}
+
+function noSuchBucket(name: string): Fault {
+	return new Fault(404, "NoSuchBucket", "The specified bucket does not exist", true, member("BucketName", name))
+}
+
+function noSuchKey(key: string): Fault {
+	return new Fault(404, "NoSuchKey", "The specified key does not exist.", true, member("Key", key))
+}
+
+function noPolicy(bucket: string): Fault {
+	return new Fault(404, "NoSuchBucketPolicy", "The bucket policy does not exist", true, member("BucketName", bucket))
+}
+
+function malformedPolicy(message: string): Fault { return new Fault(400, "MalformedPolicy", message) }
+
+function precondition(condition: string): Fault {
+	return new Fault(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", true,
+		member("Condition", condition))
+}
+
+/// The owner as S3 names one: by a canonical id, made of the account.
+function owner(account: string): api.Owner throws Fault {
+	return { ...new api.Owner(), ID: hex.encode(hash(sha256, `canonical ${account}`)) }
+}
+
+/// The digest by f of s.
+function hash(f: (s: string) => string throws CryptoError, s: string): string throws Fault {
+	try {
+		return f(s)
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalError", e.what)
+	}
+}
+
+/// n random letters and digits.
+function random(n: i32): string throws Fault {
+	let b = ""
+	try {
+		b = bytes(n)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalError", `No random bytes: ${e}`)
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	const out: u8[] = []
+	for (let i = 0; i < n; i++) {
+		out.push(alphabet[(b[i] as i32) % alphabet.length])
+	}
+	return fromBytes(out)
+}
+
+/// The id of a version written now to b: "null" unless versioning is enabled.
+function fresh(b: Bucket): string throws Fault { return if (b.versioning == "Enabled") random(32) else "null" }
+/// The version id an answer names of v: none in a bucket never versioned.
+function versionOf(b: Bucket, v: Version): string | null { return if (b.versioning == "") null else v.id }
+
+/// Gives v its order and id in the bucket of f, and the instant, and drops the null version it replaces.
+function stamp(f: Found, v: Version) throws Fault {
+	const t = now()
+	v.modified = t - t % second
+	v.owner = f.bucket.owner
+	v.order = f.bucket.next
+	f.bucket.next++
+	v.id = fresh(f.bucket)
+	if (v.id == "null") {
+		dropNull(f.db, f.bucket.name, v.key)
+	}
+	put(f.db.buckets, f.bucket.name, f.bucket)
+}
+
+/// Writes v with the bytes data as the newest version of its key; its key of the versions.
+function write(caller: Caller, f: Found, v: Version, data: string): string throws Fault {
+	stamp(f, v)
+	const k = version(f.bucket.name, v.key, v.order)
+	save(f.db, f.db.versions, "s3/versions", k, v, data)
+	restore(f.db, f.bucket.name, v.key)
+	return k
+}
+
+/// Drops the version "null" of key, if any.
+function dropNull(db: Tables, bucket: string, key: string) throws Fault {
+	for (const [k, v] of db.versions.scan(null, 100000, `${path(bucket, key)}\x00`)) {
+		if (v.id == "null") {
+			drop(db, db.versions, "s3/versions", k)
+		}
+	}
+}
+
+/// Makes the newest version of key its current one, none if it is a delete marker.
+function restore(db: Tables, bucket: string, key: string) throws Fault {
+	const newest = db.versions.scan(null, 1, `${path(bucket, key)}\x00`)
+	if (newest.length == 0 || newest[0][1].marker) {
+		db.objects.delete(path(bucket, key))
+	} else {
+		put(db.objects, path(bucket, key), newest[0][1])
+	}
+}
+
+/// The version of key named id, the current one if null.
+function object(f: Found, key: string, id: string | null): Version throws Fault {
+	if (id == null) {
+		const v = f.db.objects.get(path(f.bucket.name, key))
+		if (v == null) {
+			throw noSuchKey(key)
+		}
+		return v!
+	}
+	for (const [_, v] of f.db.versions.scan(null, 100000, `${path(f.bucket.name, key)}\x00`)) {
+		if (v.id == id!) {
+			if (v.marker) {
+				throw new Fault(405, "MethodNotAllowed", "The specified method is not allowed against this resource.",
+					true, member("Method", "GET") + member("ResourceType", "DeleteMarker"))
+			}
+			return v
+		}
+	}
+	if (id! != "null" && id!.length != 32) {
+		throw new Fault(400, "InvalidArgument", "Invalid version id specified", true,
+			member("ArgumentName", "versionId") + member("ArgumentValue", id!))
+	}
+	throw new Fault(404, "NoSuchVersion", "The specified version does not exist.", true,
+		member("Key", key) + member("VersionId", id!))
+}
+
+/// Deletes key's version id, or the key itself if null: by a delete marker in a versioned bucket. Its version id, if
+/// the bucket is versioned, and whether it is, or was, a delete marker.
+function remove(caller: Caller, f: Found, key: string, id: string | null): [string | null, bool] throws Fault {
+	const b = f.bucket
+	if (id != null) {
+		for (const [k, v] of f.db.versions.scan(null, 100000, `${path(b.name, key)}\x00`)) {
+			if (v.id == id!) {
+				drop(f.db, f.db.versions, "s3/versions", k)
+				restore(f.db, b.name, key)
+				return [id, v.marker]
+			}
+		}
+		return [id, false]
+	}
+	if (b.versioning == "") {
+		dropNull(f.db, b.name, key)
+		restore(f.db, b.name, key)
+		return [null, false]
+	}
+	const marker = { ...new Version(), key: key, marker: true }
+	write(caller, f, marker, "")
+	return [marker.id, true]
+}
+
+/// The upload id of key in bucket, or NoSuchUpload.
+function upload(db: Tables, bucket: string, key: string, id: string): Upload throws Fault {
+	const u = db.uploads.get(`${path(bucket, key)}\x00${id}`)
+	if (u == null) {
+		throw new Fault(404, "NoSuchUpload",
+			"The specified upload does not exist. The upload ID may be invalid, or the "
+			+ "upload may have been aborted or completed.", true, member("UploadId", id))
+	}
+	return u!
+}
+
+/// Drops the upload u, under k, and its parts.
+function abort(db: Tables, k: string, u: Upload) throws Fault {
+	for (const [pk, _] of db.parts.scan(null, 100000, `${u.id}\x00`)) {
+		drop(db, db.parts, "s3/parts", pk)
+	}
+	db.uploads.delete(k)
+}
+
+/// Throws unless n is a part's number.
+function numbered(n: i32) throws Fault {
+	if (n < 1 || n > 10000) {
+		throw new Fault(400, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive", true,
+			member("ArgumentName", "partNumber") + member("ArgumentValue", `${n}`))
+	}
+}
+
+/// The bucket, key and version id of an x-amz-copy-source, escaped, with or without a leading slash.
+function source(s: string): [string, string, string | null] throws Fault {
+	let rest = if (startsWith(s, "/")) s.slice(1, s.length) else s
+	let id: string | null = null
+	const q = indexOf(rest, "?")
+	if (q >= 0) {
+		id = Query.parse(rest.slice(q + 1, rest.length)).get("versionId")
+		rest = rest.slice(0, q)
+	}
+	rest = unescape(rest, "path")
+	const slash = indexOf(rest, "/")
+	if (slash <= 0 || slash == rest.length - 1) {
+		throw new Fault(400, "InvalidArgument", "Invalid copy source object key", true,
+			member("ArgumentName", "x-amz-copy-source") + member("ArgumentValue", s))
+	}
+	return [rest.slice(0, slash), rest.slice(slash + 1, rest.length), id]
+}
+
+/// The tags of an x-amz-tagging header, a query string, null for none.
+function tagging(header: string | null): [string, string][] {
+	return if (header == null) [] else Query.parse(header!).entries
+}
+
+/// Whether the ETag that a condition names, quoted or not, or "*", is etag.
+function matches(named: string, etag: string): bool {
+	for (const n of split(named, ",")) {
+		const t = trim(n)
+		if (t == "*" || t == etag || `"${t}"` == etag) {
+			return true
+		}
+	}
+	return false
+}
+
+/// Throws as S3 answers a GetObject or HeadObject of v under its conditions: PreconditionFailed if If-Match or else
+/// If-Unmodified-Since fails, NotModified if If-None-Match or else If-Modified-Since does.
+function conditions(v: Version, ifMatch: string | null, ifNoneMatch: string | null, modifiedSince: i64 | null,
+	unmodifiedSince: i64 | null) throws Fault {
+	if (ifMatch != null && !matches(ifMatch!, v.etag)) {
+		throw precondition("If-Match")
+	}
+	if (ifMatch == null && unmodifiedSince != null && v.modified > unmodifiedSince!) {
+		throw precondition("If-Unmodified-Since")
+	}
+	if (ifNoneMatch != null && matches(ifNoneMatch!, v.etag)
+		|| ifNoneMatch == null && modifiedSince != null && v.modified <= modifiedSince!) {
+		throw new Fault(304, "NotModified", "Not Modified")
+	}
+}
+
+/// Throws PreconditionFailed unless the source v of a copy meets the x-amz-copy-source-if-* conditions.
+function copyConditions(v: Version, ifMatch: string | null, ifNoneMatch: string | null, modifiedSince: i64 | null,
+	unmodifiedSince: i64 | null) throws Fault {
+	if (ifMatch != null && !matches(ifMatch!, v.etag)) {
+		throw precondition("x-amz-copy-source-If-Match")
+	}
+	if (ifMatch == null && unmodifiedSince != null && v.modified > unmodifiedSince!) {
+		throw precondition("x-amz-copy-source-If-Unmodified-Since")
+	}
+	if (ifNoneMatch != null && matches(ifNoneMatch!, v.etag)) {
+		throw precondition("x-amz-copy-source-If-None-Match")
+	}
+	if (ifNoneMatch == null && modifiedSince != null && v.modified <= modifiedSince!) {
+		throw precondition("x-amz-copy-source-If-Modified-Since")
+	}
+}
+
+/// The first byte and the last of a Range of one range, bytes=a-b, a- or -n, of an object of size bytes, the last
+/// past the end unless clamped, as a- is; null if it is not one, as S3 then ignores it.
+function bounds(range: string, size: i64): [i64, i64] | null {
+	if (!startsWith(range, "bytes=") || indexOf(range, ",") >= 0) {
+		return null
+	}
+	const spec = trim(range.slice(6, range.length))
+	const dash = indexOf(spec, "-")
+	if (dash < 0) {
+		return null
+	}
+	try {
+		if (dash == 0) {
+			const n = parseInt[i64](spec.slice(1, spec.length))
+			return [if (n > size) 0 as i64 else size - n, size - 1]
+		}
+		const a = parseInt[i64](spec.slice(0, dash))
+		if (dash == spec.length - 1) {
+			return [a, if (a >= size) a else size - 1]
+		}
+		const b = parseInt[i64](spec.slice(dash + 1, spec.length))
+		return if (b < a) null else [a, b]
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The first byte and the count that a Range header selects of an object of size bytes, null for the whole; throws
+/// InvalidRange if it is past the end.
+function ranged(range: string | null, size: i64): [i64, i64] | null throws Fault {
+	if (range == null) {
+		return null
+	}
+	const r = bounds(range!, size)
+	if (r == null) {
+		return null
+	}
+	if (r![0] >= size || r![1] < r![0]) {
+		throw new Fault(416, "InvalidRange", "The requested range is not satisfiable", true,
+			member("RangeRequested", range!) + member("ActualObjectSize", `${size}`))
+	}
+	const last = if (r![1] >= size) size - 1 else r![1]
+	return [r![0], last - r![0] + 1]
+}
+
+/// Throws unless the Content-MD5 given, if any, is data's.
+function digest(given: string | null, data: string) throws Fault {
+	if (given == null) {
+		return
+	}
+	let raw = ""
+	try {
+		raw = base64.decode(given!)
+	} catch (e: ParseError) {}
+	if (raw.length != 16) {
+		throw new Fault(400, "InvalidDigest", "The Content-MD5 you specified was invalid.", true,
+			member("Content-MD5", given!))
+	}
+	const computed = hash(md5, data)
+	if (raw != computed) {
+		throw new Fault(400, "BadDigest", "The Content-MD5 you specified did not match what we received.", true,
+			member("ExpectedDigest", hex.encode(raw)) + member("CalculatedDigest", base64.encode(computed)))
+	}
+}
+
+/// The x-amz-checksum-* headers given, by algorithm.
+function sums(crc32: string | null, crc32c: string | null, crc64: string | null, sha1: string | null,
+	sha256: string | null): [string, string][] {
+	const out: [string, string][] = []
+	const all: [string, string | null][] = [["CRC32", crc32], ["CRC32C", crc32c], ["CRC64NVME", crc64], ["SHA1", sha1],
+		["SHA256", sha256]]
+	for (const [a, v] of all) {
+		if (v != null) {
+			out.push([a, v!])
+		}
+	}
+	return out
+}
+
+/// The algorithm and checksum in base64 of data, as the x-amz-checksum-* header given, or the algorithm named, asks;
+/// ["", ""] for none. Throws if the one given is not data's. CRC32C and CRC64NVME are kept as given.
+function checksum(named: string, given: [string, string][], data: string): [string, string] throws Fault {
+	if (given.length > 1) {
+		throw new Fault(400, "InvalidRequest",
+			"Expecting a single x-amz-checksum- header. Multiple checksum Types are not " + "allowed.")
+	}
+	const algorithm = if (given.length == 1) given[0][0] else named
+	let sum = ""
+	switch (algorithm) {
+		case "": return ["", ""]
+		case "CRC32":
+			const c = crc32(data)
+			sum = base64.encode(fromBytes([(c >> 24) as u8, (c >> 16 & 0xff) as u8, (c >> 8 & 0xff) as u8,
+				(c & 0xff) as u8]))
+		case "SHA1": sum = base64.encode(hash(sha1, data))
+		case "SHA256": sum = base64.encode(hash(sha256, data))
+		case "CRC32C", "CRC64NVME":
+			if (given.length == 0) {
+				throw new Fault(501, "NotImplemented", `The ${algorithm} checksum is not implemented`)
+			}
+			return [algorithm, given[0][1]]
+		default: throw new Fault(400, "InvalidRequest", `Checksum algorithm ${algorithm} is not supported`)
+	}
+	if (given.length == 1 && given[0][1] != sum) {
+		throw new Fault(400, "BadDigest", `The ${algorithm} you specified did not match the calculated checksum.`)
+	}
+	return [algorithm, sum]
+}
+
+/// The name of a ChecksumAlgorithm, "" of none.
+function algorithmOf(a: api.ChecksumAlgorithm | null): string { return if (a == null) "" else `${a!}` }
+
+/// What has the checksum members of an answer.
+interface Sums {
+	ChecksumCRC32: string | null
+	ChecksumCRC32C: string | null
+	ChecksumCRC64NVME: string | null
+	ChecksumSHA1: string | null
+	ChecksumSHA256: string | null
+}
+
+/// What describes an object in a GetObject's or HeadObject's answer.
+interface Described {
+	AcceptRanges: string | null
+	LastModified: i64 | null
+	ETag: string | null
+	VersionId: string | null
+	CacheControl: string | null
+	ContentDisposition: string | null
+	ContentEncoding: string | null
+	ContentLanguage: string | null
+	ContentType: string | null
+	Expires: string | null
+	WebsiteRedirectLocation: string | null
+	ServerSideEncryption: api.ServerSideEncryption | null
+	Metadata: [string, string][] | null
+	PartsCount: i32 | null
+	TagCount: i32 | null
+}
+
+/// Sets on out the checksum of algorithm.
+function set(out: Sums, algorithm: string, sum: string) {
+	switch (algorithm) {
+		case "CRC32": out.ChecksumCRC32 = sum
+		case "CRC32C": out.ChecksumCRC32C = sum
+		case "CRC64NVME": out.ChecksumCRC64NVME = sum
+		case "SHA1": out.ChecksumSHA1 = sum
+		case "SHA256": out.ChecksumSHA256 = sum
+		default: {}
+	}
+}
+
+/// Sets on r what describes v in the bucket b.
+function described(r: Described, b: Bucket, v: Version) {
+	r.AcceptRanges = "bytes"
+	r.LastModified = v.modified
+	r.ETag = v.etag
+	r.VersionId = versionOf(b, v)
+	r.CacheControl = v.cacheControl
+	r.ContentDisposition = v.disposition
+	r.ContentEncoding = v.encoding
+	r.ContentLanguage = v.language
+	r.ContentType = v.type
+	r.Expires = v.expires
+	r.WebsiteRedirectLocation = v.redirect
+	r.ServerSideEncryption = "AES256"
+	r.Metadata = if (v.metadata.length == 0) null else v.metadata
+	r.PartsCount = if (v.parts == 0) null else v.parts
+	r.TagCount = if (v.tags.length == 0) null else v.tags.length
+}
+
+/// max-keys, 1000 at most and by default.
+function keys(max: i32 | null): i32 { return if (max == null || max! > 1000) 1000 else max! }
+
+/// The key a continuation token stands for, null for none.
+function token(t: string | null): string | null throws Fault {
+	if (t == null) {
+		return null
+	}
+	try {
+		return base64.decode(t!)
+	} catch (e: ParseError) {
+		throw new Fault(400, "InvalidArgument", "The continuation token provided is incorrect", true,
+			member("ArgumentName", "continuation-token"))
+	}
+}
+
+/// A page of a listing: the current versions, the common prefixes, whether there are more, and the last key or
+/// prefix shown.
+class Listed {
+	objects: Version[] = []
+	prefixes: string[] = []
+	truncated = false
+	last = ""
+}
+
+/// Up to max keys of bucket and common prefixes after after, of keys that start with prefix, grouped at delimiter
+/// unless "".
+function list(db: Tables, bucket: string, prefix: string, delimiter: string, after: string | null, max: i32): Listed {
+	const l = new Listed()
+	let from = if (after == null) null else path(bucket, after!)
+	while (true) {
+		const page = db.objects.scan(from, 1000, path(bucket, prefix))
+		for (const [k, v] of page) {
+			from = k
+			const rest = v.key.slice(prefix.length, v.key.length)
+			const d = if (delimiter == "") -1 else indexOf(rest, delimiter)
+			const cp = if (d < 0) "" else prefix + rest.slice(0, d + delimiter.length)
+			if (cp != "" && cp == l.last) {
+				continue
+			}
+			if (l.objects.length + l.prefixes.length >= max) {
+				l.truncated = true
+				return l
+			}
+			if (cp != "") {
+				l.prefixes.push(cp)
+				l.last = cp
+				// past every key of the prefix
+				from = path(bucket, cp) + fromBytes([0xff as u8])
+				break
+			}
+			l.objects.push(v)
+			l.last = v.key
+		}
+		if (page.length == 0) {
+			return l
+		}
+	}
+}
+
+/// s as an answer of encoding-type url has it, if url.
+function encoded(s: string, url: bool): string { return if (url) replace(escape(s, "path"), "%2F", "/") else s }
+
+/// A listing's Contents of the versions vs, with their owner if not null.
+function contents(vs: Version[], of: string | null, url: bool): api.Object[] throws Fault {
+	return vs.map(v => {
+		const o = { ...new api.Object(), Key: encoded(v.key, url), LastModified: v.modified, ETag: v.etag, Size: v.size,
+			StorageClass: "STANDARD" as api.ObjectStorageClass }
+		if (v.algorithm != "") {
+			o.ChecksumAlgorithm = [v.algorithm as api.ChecksumAlgorithm]
+			o.ChecksumType = "FULL_OBJECT"
+		}
+		if (of != null) {
+			o.Owner = owner(of!)
+		}
+		return o
+	})
+}
+
+function prefixes(ps: string[], url: bool): api.CommonPrefix[] | null {
+	return if (ps.length == 0) null else ps.map(p => ({ ...new api.CommonPrefix(), Prefix: encoded(p, url) }))
+}

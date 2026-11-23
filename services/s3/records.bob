@@ -1,0 +1,229 @@
+//! S3's state. The global tree maps a bucket's name to where it is; its owner's regional tree holds the bucket, the
+//! versions of its objects, each key's current one, and its multipart uploads with their parts. A body under 64 KiB is
+//! held in the tree under a key of its own; a larger one is a blob that its record holds.
+
+import { Fault } from "../../core/fault"
+import { Blob, BlobWriter, Store, Table } from "../../core/state/store"
+import { EncodeError } from "std/encoding/json"
+import { Body } from "std/http"
+import { Decodable } from "std/types"
+
+/// The bytes from which a body is a blob.
+export const inline = 65536
+
+/// Where a bucket is: its owner's account and region; and when it was made.
+export class Place {
+	account = ""
+	region = ""
+	created: i64 = 0
+}
+
+export class Bucket {
+	name = ""
+	owner = ""
+	region = ""
+	created: i64 = 0
+	/// "" if never set, else Enabled or Suspended.
+	versioning = ""
+	/// The order of the next version written, which sorts a key's versions newest first.
+	next: i64 = 0
+	policy: string | null = null
+	tags: [string, string][] | null = null
+}
+
+/// A version of an object, or a delete marker.
+export class Version {
+	key = ""
+	/// "null" for one written while the bucket was not versioned, or suspended.
+	id = "null"
+	/// Its place among the bucket's versions of the key, as Bucket.next.
+	order: i64 = 0
+	marker = false
+	/// Quoted, as S3 answers it.
+	etag = ""
+	size: i64 = 0
+	modified: i64 = 0
+	owner = ""
+	type = "binary/octet-stream"
+	cacheControl: string | null = null
+	disposition: string | null = null
+	encoding: string | null = null
+	language: string | null = null
+	expires: string | null = null
+	redirect: string | null = null
+	metadata: [string, string][] = []
+	tags: [string, string][] = []
+	/// The checksum's algorithm, "" for none, and its value in base64.
+	algorithm = ""
+	checksum = ""
+	/// The parts it was uploaded in, 0 if not by a multipart upload.
+	parts = 0
+}
+
+/// A multipart upload, of what its object will have.
+export class Upload {
+	id = ""
+	key = ""
+	initiated: i64 = 0
+	owner = ""
+	/// The initiator's ARN.
+	initiator = ""
+	object = new Version()
+}
+
+export class Part {
+	number = 0
+	etag = ""
+	size: i64 = 0
+	modified: i64 = 0
+	/// The MD5 of its bytes, of which a multipart ETag is the MD5.
+	md5 = ""
+	algorithm = ""
+	checksum = ""
+}
+
+/// S3's tables in a tree.
+export class Tables {
+	store: Store
+	buckets: Table[Bucket]
+	/// By bucket/key, the current version of each key that has one, not a delete marker.
+	objects: Table[Version]
+	/// By version(), every version.
+	versions: Table[Version]
+	/// By bucket/key, a NUL and the upload id.
+	uploads: Table[Upload]
+	/// By the upload id, a NUL and the part number in five digits.
+	parts: Table[Part]
+
+	constructor(store: Store) {
+		this.store = store
+		this.buckets = new Table[Bucket](store, "s3/buckets")
+		this.objects = new Table[Version](store, "s3/objects")
+		this.versions = new Table[Version](store, "s3/versions")
+		this.uploads = new Table[Upload](store, "s3/uploads")
+		this.parts = new Table[Part](store, "s3/parts")
+	}
+}
+
+/// The buckets' places, in the global tree.
+export function places(global: Store): Table[Place] { return new Table[Place](global, "s3/places") }
+/// The key of an object in a bucket.
+export function path(bucket: string, key: string): string { return `${bucket}/${key}` }
+
+/// The key of the version of the order given, which sorts after the versions written after it.
+export function version(bucket: string, key: string, order: i64): string {
+	const n = `${9223372036854775807 - order}`
+	return `${path(bucket, key)}\x00${"0000000000000000000".slice(n.length, 19)}${n}`
+}
+
+/// The key of a part of an upload.
+export function part(upload: string, n: i32): string { return `${upload}\x00${`${100000 + n}`.slice(1, 6)}` }
+
+/// Puts v under k of t, with the blob b if not null; a record holds no float, the one thing JSON cannot encode.
+export function put[V extends Decodable](t: Table[V], k: string, v: V, b: Blob | null = null) throws Fault {
+	try {
+		t.put(k, v, b)
+	} catch (e: EncodeError) {
+		throw new Fault(500, "InternalError", `A record of ${e.value} cannot be stored`)
+	}
+}
+
+/// Where a body is held in the tree, by its record's table and key.
+function held(table: string, k: string): string { return `s3/bodies\x00${table}\x00${k}` }
+
+/// Puts v under k of t, named name, with body: in the tree if under 64 KiB, else as a blob.
+export function save[V extends Decodable](db: Tables, t: Table[V], name: string, k: string, v: V,
+	body: string) throws Fault {
+	if (body.length < inline) {
+		db.store.put(held(name, k), body)
+		put(t, k, v)
+		return
+	}
+	const w = new BlobWriter()
+	try {
+		w.write(body)
+		const b = w.finish()
+		try {
+			put(t, k, v, b)
+		} finally {
+			b.close()
+		}
+	} finally {
+		w.close()
+	}
+}
+
+/// Puts v under k of t, named name, with the body held under from of the table named of, shared, not copied.
+export function share[V extends Decodable](db: Tables, of: string, from: string, t: Table[V], name: string, k: string,
+	v: V) throws Fault {
+	const b = db.store.blob(`${of}\x00${from}`)
+	if (b == null) {
+		db.store.put(held(name, k), db.store.get(held(of, from)) ?? "")
+		put(t, k, v)
+		return
+	}
+	try {
+		put(t, k, v, b)
+	} finally {
+		b!.close()
+	}
+}
+
+/// Deletes k of t, named name, and its body.
+export function drop[V extends Decodable](db: Tables, t: Table[V], name: string, k: string) throws Fault {
+	t.delete(k)
+	db.store.delete(held(name, k))
+}
+
+/// The bytes from at, up to n, of the body of k in the table named name.
+export function read(db: Tables, name: string, k: string, at: i64 = 0, n: i64 = 9223372036854775807): string {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b == null) {
+		const s = db.store.get(held(name, k)) ?? ""
+		return s.slice(at as i32, if (n < (s.length as i64) - at) (at + n) as i32 else s.length)
+	}
+	try {
+		return b!.read(at, n)
+	} finally {
+		b!.close()
+	}
+}
+
+/// The body of k in the table named name from at, up to n: of a blob, one that streams it.
+export function body(db: Tables, name: string, k: string, at: i64, n: i64): Body {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b == null) {
+		return new Body(read(db, name, k, at, n))
+	}
+	try {
+		return b!.body(at, n)
+	} finally {
+		b!.close()
+	}
+}
+
+/// The blob of the body of k in the table named name, made of it if held in the tree: a handle to close.
+export function blob(db: Tables, name: string, k: string): Blob throws Fault {
+	const b = db.store.blob(`${name}\x00${k}`)
+	if (b != null) {
+		return b!
+	}
+	const w = new BlobWriter()
+	try {
+		w.write(db.store.get(held(name, k)) ?? "")
+		return w.finish()
+	} finally {
+		w.close()
+	}
+}
+
+/// Puts v under k of t, named name, with the blob b as its body, held in the tree if under 64 KiB.
+export function keep[V extends Decodable](db: Tables, t: Table[V], name: string, k: string, v: V,
+	b: Blob) throws Fault {
+	if (b.size() < inline) {
+		db.store.put(held(name, k), b.read())
+		put(t, k, v)
+	} else {
+		put(t, k, v, b)
+	}
+}

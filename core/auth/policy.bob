@@ -55,8 +55,8 @@ export class Policy {
 }
 
 /// Who makes a request: the root user of an account, an IAM user, a role's session, a federated user's session (of
-/// GetFederationToken), a web or SAML identity provider's user, or an AWS service.
-export type PrincipalKind = "root" | "user" | "role" | "federated-user" | "federated" | "service"
+/// GetFederationToken), a web or SAML identity provider's user, an AWS service, or anyone, of a request not signed.
+export type PrincipalKind = "root" | "user" | "role" | "federated-user" | "federated" | "service" | "anonymous"
 
 export class Principal {
 	kind: PrincipalKind = "user"
@@ -165,7 +165,7 @@ export function evaluate(r: Request, p: Policies): Decision {
 	}
 	const who = r.principal
 	const grant = if (resource == null) "" else granted(resource, r, action)
-	if (who.kind == "service" || who.kind == "federated") {
+	if (who.kind == "service" || who.kind == "federated" || who.kind == "anonymous") {
 		return if (grant != "") new Decision("allowed", rk) else new Decision("implicitDeny", rk)
 	}
 	const identity = who.kind == "root" || p.identity.some(x => decides(x, r, action, true))

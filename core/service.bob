@@ -73,21 +73,25 @@ export class Caller {
 	/// ARN, given the resource's own policy if it has one, as IAM evaluates them: its identity-based policies,
 	/// permissions boundary and session policies, and the resource's, of the context keys the gateway knows and those
 	/// of context. The root of an account has no identity-based policies to allow it; a service, a caller made by
-	/// internal, none at all. The resource policy of sts:AssumeRole is the role's trust policy. The message names the
-	/// resource as shown, if not null, as IAM names some.
-	allow(resource: string, policy: string | null = null, context: Context = [],
-		shown: string | null = null) throws Fault {
+	/// internal, none at all, nor an anonymous caller, of account "". The resource policy of sts:AssumeRole is the
+	/// role's trust policy. The message names the resource as shown, if not null, as IAM names some. The resource is of
+	/// the account of, if not null, else of the account its ARN names, as an S3 bucket's names none.
+	allow(resource: string, policy: string | null = null, context: Context = [], shown: string | null = null,
+		of: string | null = null) throws Fault {
 		const r = new auth.Request()
 		r.resource = resource
 		const named = owner(resource)
 		// One of AWS's, of the account aws, is as if of the caller's.
-		r.owner = if (named == null || named == "aws") this.account else named!
+		r.owner = of ?? (if (named == null || named == "aws") this.account else named!)
 		let ps = new auth.Policies()
 		if (this.source != "") {
 			r.principal.kind = "service"
 			r.principal.arn = this.arn
 			r.context.push(["aws:SourceArn", this.source])
 			r.context.push(["aws:SourceAccount", this.account])
+		} else if (this.account == "") {
+			r.principal.kind = "anonymous"
+			r.principal.arn = this.arn
 		} else if (this.arn == `arn:aws:iam::${this.account}:root`) {
 			r.principal.kind = "root"
 			r.principal.arn = this.arn
@@ -100,7 +104,7 @@ export class Caller {
 			r.principal.arn = this.arn
 			r.principal.account = this.account
 		}
-		if (r.principal.kind != "service") {
+		if (r.principal.kind != "service" && r.principal.kind != "anonymous") {
 			this.describe(r.principal, r.context)
 		}
 		r.context.append(context)

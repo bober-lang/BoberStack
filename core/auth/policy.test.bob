@@ -230,6 +230,20 @@ test "trust policies" {
 
 // With NotPrincipal, a principal is excluded only if its own ARN, its role's for a session, and its account are
 // named (IAM User Guide, "AWS JSON policy elements: NotPrincipal").
+test "an anonymous request is allowed by a resource policy of the principal * alone" {
+	const object = "arn:aws:s3:::b/k"
+	const r = request("anonymous", "*", "", "s3:GetObject", object, "111122223333")
+	const p = new Policies()
+	assert is(evaluate(r, p), "implicitDeny", "resource")
+	p.resource = policy(`{"Effect":"Allow","Principal":{"AWS":"111122223333"},"Action":"s3:*","Resource":"*"}`,
+		"resource")
+	assert is(evaluate(r, p), "implicitDeny", "resource")
+	p.resource = policy(`{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"${object}"}`, "resource")
+	assert is(evaluate(r, p), "allowed", "resource")
+	r.action = "s3:PutObject"
+	assert is(evaluate(r, p), "implicitDeny", "resource")
+}
+
 test "NotPrincipal" {
 	const r = sessionRequest()
 	const p = new Policies()

@@ -1,7 +1,7 @@
 import { Fault } from "../fault"
 import { Caller } from "../service"
 import { Request, Response } from "std/http"
-import { call, Header, Label, Name, Payload, Prefix, Query, Route, Service } from "./restxml"
+import { call, Header, Label, Name, Payload, Prefix, Query, Route, Service, Unwrapped } from "./restxml"
 
 class Get {
 	Bucket: string @Label
@@ -25,9 +25,14 @@ class Listed @Name["ListBucketResult"] {
 	KeyCount: i32 | null
 }
 
+class Located @Name["LocationConstraint"] @Unwrapped {
+	LocationConstraint: string | null
+}
+
 const s3 = new Service("com.amazonaws.s3#AmazonS3", "http://s3.amazonaws.com/doc/2006-03-01/", false)
 
 const routes = [new Route("GetObjectAcl", "GET", "/{Bucket}/{Key+}", ["acl"]),
+	new Route("GetBucketLocation", "GET", "/{Bucket}", ["location"]),
 	new Route("ListObjectsV2", "GET", "/{Bucket}", ["list-type=2"]),
 	new Route("GetObject", "GET", "/{Bucket}/{Key+}", ["x-id=GetObject"]),
 	new Route("HeadObject", "HEAD", "/{Bucket}/{Key+}")]
@@ -52,12 +57,17 @@ function list(c: Caller, input: List): Listed throws Fault {
 	return out
 }
 
+function locate(c: Caller, input: List): Located throws Fault {
+	return { ...new Located(), LocationConstraint: "eu-west-1" }
+}
+
 /// The answer of the gateway's switch to req.
 function serve(req: Request): Response throws IoError {
 	const c = call(caller(), req, s3, routes)
 	switch (c.operation) {
 		case "GetObject", "HeadObject": return c.serve(get)
 		case "ListObjectsV2": return c.serve(list)
+		case "GetBucketLocation": return c.serve(locate)
 		default: return c.unknownOperation()
 	}
 }
@@ -68,6 +78,7 @@ test "a route needs no x-id, its greedy label takes the rest of the path, unesca
 	assert res.body.whole == "hello"
 	assert res.headers.get("x-amz-meta-colour") == "blue"
 	assert res.headers.get("x-amz-request-id") == "R1"
+	assert res.headers.get("x-amz-id-2") == "UjE="
 	assert serve(new Request("GET", "/bucket/a/b%20c.txt?x-id=GetObject", "")).status == 200
 }
 
@@ -78,10 +89,16 @@ test "a query literal makes a route more specific, and an output names its root"
 	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${xml}<KeyCount>0</KeyCount></ListBucketResult>`
 }
 
-test "S3's errors are an Error of the RequestId, and a HEAD's answer has no body" {
+test "an unwrapped output is the text of its root" {
+	const xml = "<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">eu-west-1</LocationConstraint>"
+	const res = serve(new Request("GET", "/bucket?location", ""))
+	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`
+}
+
+test "S3's errors are an Error of the RequestId and HostId, and a HEAD's answer has no body" {
 	const res = serve(new Request("GET", "/bucket/missing", ""))
 	assert res.status == 404
-	const body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><RequestId>R1</RequestId></Error>"
+	const body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><RequestId>R1</RequestId><HostId>UjE=</HostId></Error>"
 	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${body}`
 	const head = serve(new Request("HEAD", "/bucket/missing", ""))
 	assert head.status == 404
@@ -93,6 +110,6 @@ test "a request of no route is MethodNotAllowed" {
 	const res = serve(new Request("DELETE", "/bucket", ""))
 	assert res.status == 405
 	const message = "The specified method is not allowed against this resource."
-	const body = `<Error><Code>MethodNotAllowed</Code><Message>${message}</Message><RequestId>R1</RequestId></Error>`
+	const body = `<Error><Code>MethodNotAllowed</Code><Message>${message}</Message><RequestId>R1</RequestId><HostId>UjE=</HostId></Error>`
 	assert res.body.whole == `<?xml version="1.0" encoding="UTF-8"?>\n${body}`
 }

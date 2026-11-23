@@ -48,6 +48,8 @@ export class Value[K extends string] {}
 /// Tags an i64 member, or its items, as a timestamp in ns since 1970, on the wire in the format F: date-time,
 /// epoch-seconds or http-date, or if "" that of where it is bound: http-date in a header, date-time elsewhere.
 export class Timestamp[F extends string = ""] {}
+/// Tags an output whose one member of the body is the text of the document's root, as S3's GetBucketLocation's.
+export class Unwrapped {}
 /// Tags a string member, or its items, as bytes: base64 on the wire, but as they are in a payload.
 export class Blob {}
 
@@ -664,6 +666,8 @@ export function reply[O](service: Service, out: O, requestId: string, code: i32 
 						if (s != "") {
 							doc!.attrs.push(new Attribute(tag(f.tags, Name, f.name), s))
 						}
+					} else if (has(O.tags, Unwrapped)) {
+						doc!.insert(new Node("text", "", format(out[f.name], f.tags)))
 					} else {
 						put(doc!, tag(f.tags, Name, f.name), out[f.name], f.tags)
 					}
@@ -680,9 +684,23 @@ export function reply[O](service: Service, out: O, requestId: string, code: i32 
 	if (kind != "" && !res.headers.has("content-type")) {
 		res.headers.set("content-type", kind)
 	}
-	res.headers.set(if (service.wrapped) "x-amzn-requestid" else "x-amz-request-id", requestId)
+	identify(res, service, requestId)
 	return res
 }
+
+/// Sets on res the headers of the request requestId to service: x-amzn-requestid if it wraps its errors, else S3's
+/// x-amz-request-id and x-amz-id-2, its host id.
+function identify(res: Response, service: Service, requestId: string) {
+	if (service.wrapped) {
+		res.headers.set("x-amzn-requestid", requestId)
+	} else {
+		res.headers.set("x-amz-request-id", requestId)
+		res.headers.set("x-amz-id-2", hostId(requestId))
+	}
+}
+
+/// The id of the host that answers the request requestId, as S3's HostId: here, of the request id alone.
+function hostId(requestId: string): string { return base64.encode(requestId) }
 
 /// The status x is, if set, else otherwise.
 function status[T](x: T, otherwise: i32): i32 {
@@ -867,7 +885,7 @@ function child(el: Node, n: string, tags: Type[]): Node {
 }
 
 /// The answer of the fault f from service to the request requestId: of an Error in an ErrorResponse if the service
-/// wraps its errors, else of an Error alone that holds the RequestId.
+/// wraps its errors, else of an Error alone that holds the RequestId and HostId.
 export function error(service: Service, f: Fault, requestId: string): Response {
 	const e = new Node("element", "Error")
 	if (service.wrapped) {
@@ -878,11 +896,12 @@ export function error(service: Service, f: Fault, requestId: string): Response {
 	let xml = serialize(e)
 	const end = indexOf(xml, "</Error>") // after the message, whose text cannot hold it
 	const id = serialize(text(new Node("element", ""), "RequestId", requestId))
+	const host = serialize(text(new Node("element", ""), "HostId", hostId(requestId)))
 	xml = if (service.wrapped) `<ErrorResponse>${xml.slice(0, end)}${f.members}</Error>${id}</ErrorResponse>`
-		else `${xml.slice(0, end)}${f.members}${id}</Error>`
+		else `${xml.slice(0, end)}${f.members}${id}${host}</Error>`
 	const res = new Response(f.status, `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`)
 	res.headers.set("content-type", "application/xml")
-	res.headers.set(if (service.wrapped) "x-amzn-requestid" else "x-amz-request-id", requestId)
+	identify(res, service, requestId)
 	return res
 }
 
