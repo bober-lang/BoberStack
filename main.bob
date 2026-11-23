@@ -1,14 +1,5 @@
-import { Gateway } from "./core/gateway"
-import * as dynamodbApi from "./services/dynamodb/api"
-import * as dynamodb from "./services/dynamodb/dynamodb"
-import * as iamApi from "./services/iam/api"
 import { Catalog } from "./services/iam/catalog"
-import * as iam from "./services/iam/iam"
-import { identify } from "./services/iam/identities"
-import * as stsApi from "./services/sts/api"
-import * as sqsApi from "./services/sqs/api"
-import * as sqs from "./services/sqs/sqs"
-import * as sts from "./services/sts/sts"
+import { stack } from "./stack"
 import { decode, help } from "std/encoding/optarg"
 import { serve } from "std/http"
 import { ParseError } from "std/string"
@@ -36,18 +27,8 @@ function main(): i32 {
 		print(`boberstack: the AWS managed policies do not parse at byte ${e.at}`)
 		return 1
 	}
-	const g = new Gateway()
-	g.identify = identify(catalog!)
-	const i = new iam.Handler(catalog!)
-	const s = new sts.Handler()
-	const q = new sqs.Handler()
-	const d = new dynamodb.Handler()
-	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
-	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
-	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
-	g.services.set(dynamodbApi.signingName, (caller, req) => dynamodbApi.handle(d, caller, req))
 	try {
-		serve(g.handle, `:${o.port}`)
+		serve(stack(catalog!).handle, `:${o.port}`)
 	} catch (e: IoError | ParseError) {
 		print(`boberstack: ${e}`)
 		return 1

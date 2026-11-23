@@ -1,0 +1,37 @@
+//! BoberStack whole: every service behind one gateway, as main serves it and tests of several services build it.
+
+import { Gateway } from "./core/gateway"
+import * as dynamodbApi from "./services/dynamodb/api"
+import * as dynamodb from "./services/dynamodb/dynamodb"
+import * as eventsApi from "./services/events/api"
+import * as events from "./services/events/events"
+import * as iamApi from "./services/iam/api"
+import { Catalog } from "./services/iam/catalog"
+import * as iam from "./services/iam/iam"
+import { identify } from "./services/iam/identities"
+import * as snsApi from "./services/sns/api"
+import * as sns from "./services/sns/sns"
+import * as sqsApi from "./services/sqs/api"
+import * as sqs from "./services/sqs/sqs"
+import * as stsApi from "./services/sts/api"
+import * as sts from "./services/sts/sts"
+
+/// A gateway to every service, each by its signing name, with catalog as the policies AWS manages; those that
+/// deliver to others call them directly.
+export function stack(catalog: Catalog): Gateway {
+	const g = new Gateway()
+	g.identify = identify(catalog)
+	const i = new iam.Handler(catalog)
+	const s = new sts.Handler()
+	const q = new sqs.Handler()
+	const d = new dynamodb.Handler()
+	const n = new sns.Handler(q)
+	const e = new events.Handler(q, n)
+	g.services.set(iamApi.signingName, (caller, req) => iamApi.handle(i, caller, req))
+	g.services.set(stsApi.signingName, (caller, req) => stsApi.handle(s, caller, req))
+	g.services.set(sqsApi.signingName, (caller, req) => sqsApi.handle(q, caller, req))
+	g.services.set(dynamodbApi.signingName, (caller, req) => dynamodbApi.handle(d, caller, req))
+	g.services.set(snsApi.signingName, (caller, req) => snsApi.handle(n, caller, req))
+	g.services.set(eventsApi.signingName, (caller, req) => eventsApi.handle(e, caller, req))
+	return g
+}
