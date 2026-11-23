@@ -1,0 +1,274 @@
+//! A composite alarm's rule: ALARM, OK and INSUFFICIENT_DATA of an alarm, AT_LEAST, TRUE, FALSE, NOT, AND and OR,
+//! binding in that order, and parentheses. Its syntax errors are worded as AWS words them.
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit, isSpace } from "std/ascii"
+import { parseFloat } from "std/float"
+import { ParseError, trim } from "std/string"
+
+/// A rule of kind "state", "TRUE", "FALSE", "NOT", "AND", "OR", or "AT_LEAST": at least name, a count or "n%", of its
+/// operands are in the state value, "NOT ALARM" for one not in ALARM.
+export class Rule {
+	kind = ""
+	value = ""
+	name = ""
+	operands: Rule[] = []
+	least = 0.0
+}
+
+export class SyntaxError {
+	message: string
+
+	constructor(message: string) { this.message = message }
+}
+
+const expected = ", must be: '(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA"
+
+export function parse(s: string): Rule throws SyntaxError {
+	const p = new Parser(s)
+	const r = p.or()
+	p.skip()
+	if (p.at < s.length) {
+		throw p.unsupported("")
+	}
+	return r
+}
+
+export function names(r: Rule): string[] {
+	const out: string[] = []
+	collect(r, out)
+	return out
+}
+
+function collect(r: Rule, out: string[]): void {
+	if (r.kind == "state" && !out.includes(r.name)) {
+		out.push(r.name)
+	}
+	for (const o of r.operands) {
+		collect(o, out)
+	}
+}
+
+/// Whether r holds where state gives each alarm's state by name, "" for one that does not exist.
+export function holds(r: Rule, state: (name: string) => string): bool {
+	switch (r.kind) {
+		case "state": return state(r.name) == r.value
+		case "TRUE": return true
+		case "FALSE": return false
+		case "NOT": return !holds(r.operands[0], state)
+		case "AT_LEAST":
+			const negated = startsWith(r.value, "NOT ")
+			const n = r.operands.filter(o => (state(o.name) == o.value) != negated).length
+			if (endsWith(r.name, "%")) {
+				return (n as f64) * 100.0 >= r.least * (r.operands.length as f64)
+			}
+			return (n as f64) >= r.least
+		case "AND": return r.operands.every(o => holds(o, state))
+		default: return r.operands.some(o => holds(o, state))
+	}
+}
+
+class Parser {
+	s: string
+	at = 0
+
+	constructor(s: string) { this.s = s }
+
+	or(): Rule throws SyntaxError {
+		const first = this.and()
+		if (!this.keyword("OR")) {
+			return first
+		}
+		const r = { ...new Rule(), kind: "OR", operands: [first, this.and()] }
+		while (this.keyword("OR")) {
+			r.operands.push(this.and())
+		}
+		return r
+	}
+
+	and(): Rule throws SyntaxError {
+		const first = this.unary()
+		if (!this.keyword("AND")) {
+			return first
+		}
+		const r = { ...new Rule(), kind: "AND", operands: [first, this.unary()] }
+		while (this.keyword("AND")) {
+			r.operands.push(this.unary())
+		}
+		return r
+	}
+
+	unary(): Rule throws SyntaxError {
+		if (this.keyword("NOT")) {
+			return { ...new Rule(), kind: "NOT", operands: [this.unary()] }
+		}
+		this.skip()
+		if (this.at < this.s.length && this.s[this.at] == 40) {
+			this.at++
+			const r = this.or()
+			this.close()
+			return r
+		}
+		const start = this.at
+		const w = this.word()
+		switch (w) {
+			case "TRUE", "FALSE": return { ...new Rule(), kind: w }
+			case "ALARM", "OK", "INSUFFICIENT_DATA":
+				this.skip()
+				if (this.at >= this.s.length || this.s[this.at] != 40) {
+					throw this.unsupported("")
+				}
+				this.at++
+				const r = { ...new Rule(), kind: "state", value: w, name: this.name() }
+				this.close()
+				return r
+			case "AT_LEAST": return this.atLeast()
+		}
+		this.at = start
+		throw this.unsupported(expected)
+	}
+
+	atLeast(): Rule throws SyntaxError {
+		this.expect(40)
+		this.skip()
+		const start = this.at
+		while (this.at < this.s.length
+			&& (isDigit(this.s[this.at]) || this.s[this.at] == 46 || this.s[this.at] == 37)) {
+			this.at++
+		}
+		const count = this.s.slice(start, this.at)
+		if (count == "" || count == "%" || count == "."
+			|| (endsWith(count, "%") && indexOf(count, "%") < count.length - 1)) {
+			this.at = start
+			throw this.unsupported(", must be: NUMBER, PERCENTAGE NUMBER")
+		}
+		this.expect(44)
+		let value = if (this.keyword("NOT")) "NOT " else ""
+		this.skip()
+		const from = this.at
+		while (this.at < this.s.length && (isAlphanumeric(this.s[this.at]) || this.s[this.at] == 95)) {
+			this.at++
+		}
+		const named = this.s.slice(from, this.at)
+		if (!["ALARM", "OK", "INSUFFICIENT_DATA"].includes(named)) {
+			this.at = from
+			throw this.unsupported(", must be: 'NOT', ALARM, OK, or INSUFFICIENT_DATA")
+		}
+		value += named
+		this.expect(44)
+		this.expect(40)
+		const r = { ...new Rule(), kind: "AT_LEAST", value: value, name: count }
+		try {
+			r.least = parseFloat(if (endsWith(count, "%")) count.slice(0, count.length - 1) else count)
+		} catch (e: ParseError) {
+			this.at = start
+			throw this.unsupported(", must be: NUMBER, PERCENTAGE NUMBER")
+		}
+		while (true) {
+			this.skip()
+			const from = this.at
+			while (this.at < this.s.length && this.s[this.at] != 44 && this.s[this.at] != 41) {
+				this.at++
+			}
+			let n = trim(this.s.slice(from, this.at))
+			if (startsWith(n, "\"") && endsWith(n, "\"") && n.length >= 2) {
+				n = n.slice(1, n.length - 1)
+			}
+			if (n == "") {
+				this.at = from
+				throw this.unsupported("")
+			}
+			const colon = lastIndexOf(n, ":alarm:")
+			n = if (colon >= 0) n.slice(colon + 7, n.length) else n
+			r.operands.push({ ...new Rule(), kind: "state", value: named, name: n })
+			if (this.at < this.s.length && this.s[this.at] == 44) {
+				this.at++
+				continue
+			}
+			break
+		}
+		this.close()
+		this.close()
+		const n = r.operands.length
+		if (!endsWith(count, "%") && (r.least < 1.0 || r.least > (n as f64))) {
+			throw new SyntaxError(`Error in AlarmRule [AT_LEAST absolute threshold must be between 1 and number of alarms (${n})]`)
+		}
+		return r
+	}
+
+	expect(c: u8) throws SyntaxError {
+		this.skip()
+		if (this.at >= this.s.length || this.s[this.at] != c) {
+			throw this.unsupported("")
+		}
+		this.at++
+	}
+
+	name(): string throws SyntaxError {
+		this.skip()
+		let n = ""
+		if (this.at < this.s.length && this.s[this.at] == 34) {
+			const end = indexOf(this.s, "\"", this.at + 1)
+			if (end < 0) {
+				this.at = this.s.length
+				throw this.unsupported("")
+			}
+			n = this.s.slice(this.at + 1, end)
+			this.at = end + 1
+		} else {
+			const end = indexOf(this.s, ")", this.at)
+			if (end < 0) {
+				this.at = this.s.length
+				throw this.unsupported("")
+			}
+			n = trim(this.s.slice(this.at, end))
+			this.at = end
+		}
+		const colon = lastIndexOf(n, ":alarm:")
+		return if (colon >= 0) n.slice(colon + 7, n.length) else n
+	}
+
+	close() throws SyntaxError {
+		this.skip()
+		if (this.at >= this.s.length || this.s[this.at] != 41) {
+			throw this.unsupported("")
+		}
+		this.at++
+	}
+
+	keyword(k: string): bool {
+		this.skip()
+		const start = this.at
+		if (this.word() == k) {
+			return true
+		}
+		this.at = start
+		return false
+	}
+
+	word(): string {
+		const start = this.at
+		while (this.at < this.s.length && !isSpace(this.s[this.at]) && this.s[this.at] != 40 && this.s[this.at] != 41
+			&& this.s[this.at] != 44) {
+			this.at++
+		}
+		if (this.at == start && this.at < this.s.length) {
+			this.at++
+		}
+		return this.s.slice(start, this.at)
+	}
+
+	skip() {
+		while (this.at < this.s.length && isSpace(this.s[this.at])) {
+			this.at++
+		}
+	}
+
+	unsupported(more: string): SyntaxError {
+		this.skip()
+		const start = this.at
+		const w = if (this.at < this.s.length) this.word() else "<EOF>"
+		this.at = start
+		return new SyntaxError(`Error in AlarmRule [Unsupported token '${w}' at char ${start}${more}]`)
+	}
+}

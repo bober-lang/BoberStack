@@ -1,0 +1,116 @@
+//! CloudWatch's state in an account's regional tree. A metric's key is its namespace, NUL, name and each sorted
+//! dimension's name and value after a NUL; its samples are by that key, 0x01, the timestamp in 20 digits and the
+//! request's id and place, so that a time range is a range of keys. History is by alarm name, NUL, time and a sequence.
+
+import { Store, Table } from "../../core/state/store"
+import * as api from "./api"
+import { sortBy } from "std/algo"
+
+export class Series {
+	namespace = ""
+	name = ""
+	dimensions: [string, string][] = []
+	/// When data was last put to it, in ns as are all times here.
+	put: i64 = 0
+}
+
+export class Sample {
+	count = 0.0
+	sum = 0.0
+	min = 0.0
+	max = 0.0
+	values: f64[] = []
+	counts: f64[] = []
+	unit = "None"
+}
+
+export class Alarm {
+	name = ""
+	creationId = ""
+	description: string | null = null
+	actionsEnabled = true
+	ok: string[] = []
+	alarm: string[] = []
+	insufficient: string[] = []
+	namespace: string | null = null
+	metric: string | null = null
+	dimensions: [string, string][] = []
+	statistic: string | null = null
+	extended: string | null = null
+	period: i32 = 0
+	unit: string | null = null
+	evaluationPeriods: i32 = 1
+	datapointsToAlarm: i32 = 1
+	threshold = 0.0
+	comparison = ""
+	treatMissingData = "missing"
+	/// Whether the two above were given, as DescribeAlarms shows them only then.
+	datapointsGiven = false
+	missingGiven = false
+	metrics: api.MetricDataQuery[] = []
+	tags: [string, string][] = []
+	updated: i64 = 0
+	state = "INSUFFICIENT_DATA"
+	reason = "Unchecked: Initial alarm creation"
+	stateUpdated: i64 = 0
+	transitioned: i64 = 0
+	/// Until when a state set by SetAlarmState holds: the end of the period it was set in.
+	held: i64 = 0
+	/// Of a composite alarm its rule, else null; the alarms the rule names; and the data of its state's reason.
+	rule: string | null = null
+	children: string[] = []
+	reasonData: string | null = null
+}
+
+export class History {
+	type = ""
+	summary = ""
+	data = ""
+	at: i64 = 0
+}
+
+export class Dashboard {
+	body = ""
+	modified: i64 = 0
+}
+
+export class Detector {
+	namespace = ""
+	name = ""
+	dimensions: [string, string][] = []
+	stat = ""
+	configuration: api.AnomalyDetectorConfiguration | null = null
+}
+
+export class MetricStream {
+	put: api.PutMetricStreamInput = new api.PutMetricStreamInput()
+	state = "running"
+	created: i64 = 0
+	updated: i64 = 0
+}
+
+export class InsightRule {
+	definition = ""
+	state = "ENABLED"
+	transformed = false
+}
+
+export function series(s: Store): Table[Series] { return new Table[Series](s, "cloudwatch/series") }
+export function samples(s: Store): Table[Sample] { return new Table[Sample](s, "cloudwatch/samples") }
+export function alarms(s: Store): Table[Alarm] { return new Table[Alarm](s, "cloudwatch/alarms") }
+export function history(s: Store): Table[History] { return new Table[History](s, "cloudwatch/history") }
+export function dashboards(s: Store): Table[Dashboard] { return new Table[Dashboard](s, "cloudwatch/dashboards") }
+export function detectors(s: Store): Table[Detector] { return new Table[Detector](s, "cloudwatch/detectors") }
+export function metricStreams(s: Store): Table[MetricStream] { return new Table[MetricStream](s, "cloudwatch/streams") }
+export function insightRules(s: Store): Table[InsightRule] { return new Table[InsightRule](s, "cloudwatch/insights") }
+
+/// The key of the metric of namespace, name and dimensions, which it sorts.
+export function key(namespace: string, name: string, dimensions: [string, string][]): string {
+	sortBy(dimensions, (a, b) => a[0] < b[0])
+	return [namespace, name, ...dimensions.map(d => `${d[0]}\x00${d[1]}`)].join("\x00")
+}
+
+export function padded(t: i64): string {
+	const s = `${t}`
+	return "00000000000000000000".slice(0, 20 - s.length) + s
+}

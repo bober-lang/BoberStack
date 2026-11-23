@@ -1,0 +1,2029 @@
+//! Amazon CloudWatch: metrics, metric math, metric and composite alarms and dashboards, in awsQuery and awsJson alike.
+//! Datapoints are stored as put and aggregated at each read. There is no background work: an alarm is evaluated when
+//! data is put to its metric and before the Describe*Alarm* calls answer, and its actions are delivered within the
+//! request by SNS's Publish as cloudwatch.amazonaws.com, so that the topic's policy decides. Anomaly detectors stay
+//! PENDING_TRAINING; metric streams and Contributor Insights rules are kept but do nothing. Where AWS differs:
+//!
+//! - Retention is of the request's time: 15 months, 15 days for periods under 5 minutes, 63 under an hour; a metric
+//!   without data put in two weeks is not listed.
+//! - Percentiles are exact, of the values put, where AWS's are of its approximation; a statistic set has none.
+//! - Only PutMetricData, GetMetricStatistics and ListMetrics word validation errors as AWS; the rest as the codec does.
+//! - Metric math knows + - * / ^, comparisons, METRICS(), SUM, AVG, MIN, MAX, FILL, RATE, IF and ABS; anomaly
+//!   detectors of metric math are not implemented.
+//! - Only SNS actions are delivered; an alarm message's Region is the region's code and has no StateReasonData.
+//! - A composite alarm's syntax errors list fewer of the tokens AWS would take; its reasons are worded more briefly.
+//! - A dashboard's body is checked for its widgets' types only, and its Size is the body's length.
+
+import { Fault } from "../../core/fault"
+import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
+import { Table } from "../../core/state/store"
+import * as snsApi from "../sns/api"
+import * as api from "./api"
+import { holds, names, parse, Rule, SyntaxError } from "./rule"
+
+import { Alarm, alarms, Dashboard, dashboards, Detector, detectors, History, history, InsightRule, insightRules, key,
+	MetricStream, metricStreams, padded, Sample, samples, Series, series } from "./records"
+
+import { indexOf, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit } from "std/ascii"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { formatFloat, parseFloat } from "std/float"
+import { abs, isFinite, max, min, nan, pow } from "std/math"
+import { ParseError, parseInt, split } from "std/string"
+import { day, hour, minute, rfc3339, second } from "std/time"
+
+/// The data a PutMetricData may hold: datums, values of one, dimensions of one.
+const datumLimit = 1000
+const valueLimit = 150
+const dimensionLimit = 30
+const pointLimit = 1440
+const statistics = ["SampleCount", "Average", "Sum", "Minimum", "Maximum"]
+const idPattern = "^[a-z][a-zA-Z0-9_]*$"
+
+/// The units, in the order AWS lists them.
+const units = ["Megabits", "Terabits", "Gigabits", "Count", "Bytes", "Gigabytes", "Gigabytes/Second", "Kilobytes",
+	"Kilobits/Second", "Terabytes", "Terabits/Second", "Bytes/Second", "Percent", "Megabytes", "Megabits/Second",
+	"Milliseconds", "Microseconds", "Kilobytes/Second", "Gigabits/Second", "Megabytes/Second", "Bits", "Bits/Second",
+	"Count/Second", "Seconds", "Kilobits", "Terabytes/Second", "None"]
+
+export class Handler {
+	...api.Unimplemented
+
+	sns: snsApi.SNS
+
+	constructor(sns: snsApi.SNS) { this.sns = sns }
+
+	putMetricData(caller: Caller, input: api.PutMetricDataInput): Unit throws Fault {
+		caller.allow("*")
+		const namespace = required(input.Namespace, "Namespace")
+		const data = input.MetricData ?? []
+		if (data.length == 0) {
+			throw api.missingRequiredParameterException("At least one MetricDatum object must be present in the request.")
+		}
+		if (data.length > datumLimit) {
+			throw api.invalidParameterValueException(`The collection MetricData must not have a size greater than ${datumLimit}.`)
+		}
+		const t = now()
+		const db = caller.regional()
+		const keys: string[] = []
+		for (let i = 0; i < data.length; i++) {
+			const d = data[i]
+			const at = `MetricData.member.${i + 1}`
+			const name = required(d.MetricName, `${at}.MetricName`)
+			checkUnit(d.Unit, `${at}.Unit`)
+			const s = sample(d, at)
+			const when = d.Timestamp ?? t
+			if (when < t - 14 * day) {
+				throw api.invalidParameterValueException(`The parameter ${at}.Timestamp must specify a time within the past two weeks.`)
+			}
+			if (when > t + 2 * hour) {
+				throw api.invalidParameterValueException(`The parameter ${at}.Timestamp must specify a time no more than two hours in the future.`)
+			}
+			const r = d.StorageResolution
+			if (r != null && r != 1 && r != 60) {
+				throw api.invalidParameterValueException(`The parameter ${at}.StorageResolution must be a value in the set [ 1, 60 ].`)
+			}
+			const dims = dimensionsOf(d.Dimensions ?? [], `${at}.Dimensions`)
+			const k = key(namespace, name, dims)
+			series(db).put(k, { ...new Series(), namespace: namespace, name: name, dimensions: dims, put: t })
+			samples(db).put(`${k}\x01${padded(when)}\x01${caller.requestId}${padded(i as i64)}`, s)
+			if (!keys.includes(k)) {
+				keys.push(k)
+			}
+		}
+		for (const [_, a] of alarms(db).scan()) {
+			if (watched(a).some(k => keys.includes(k))) {
+				this.evaluate(caller, a, t)
+			}
+		}
+		return new Unit()
+	}
+
+	listMetrics(caller: Caller, input: api.ListMetricsInput): api.ListMetricsOutput throws Fault {
+		caller.allow("*")
+		if (input.RecentlyActive != null && input.RecentlyActive != "PT3H") {
+			throw api.invalidParameterValueException("Request parameter recentlyActive value is invalid")
+		}
+		const t = now()
+		const prefix = if (input.Namespace == null) ""
+			else if (input.MetricName == null) `${input.Namespace!}\x00`
+			else `${input.Namespace!}\x00${input.MetricName!}`
+		const filters = input.Dimensions ?? []
+		const out = new api.ListMetricsOutput()
+		out.Metrics = []
+		let after = input.NextToken
+		while (true) {
+			const page = series(caller.regional()).scan(after, 1000, prefix)
+			for (const [k, s] of page) {
+				after = k
+				const recent = s.put >= t - (if (input.RecentlyActive != null) 3 * hour else 14 * day)
+				const named = input.MetricName == null || s.name == input.MetricName
+				const matched = filters.every(f => s.dimensions.some(d => d[0] == f.Name
+					&& (f.Value == null || d[1] == f.Value)))
+				if (recent && named && matched) {
+					out.Metrics!.push(metricOf(s))
+					if (out.Metrics!.length == 500) {
+						out.NextToken = k
+						return out
+					}
+				}
+			}
+			if (page.length < 1000) {
+				return out
+			}
+		}
+	}
+
+	getMetricStatistics(caller: Caller,
+		input: api.GetMetricStatisticsInput): api.GetMetricStatisticsOutput throws Fault {
+		caller.allow("*")
+		const namespace = required(input.Namespace, "Namespace")
+		const metric = required(input.MetricName, "MetricName")
+		const start = required(input.StartTime, "StartTime")
+		const end = required(input.EndTime, "EndTime")
+		const period = required(input.Period, "Period")
+		const stats = input.Statistics ?? []
+		for (let i = 0; i < stats.length; i++) {
+			if (!statistics.includes(stats[i])) {
+				throw api.invalidParameterValueException(`The parameter Statistics.member.${i + 1}.<list element> must be a `
+					+ `value in the set [${statistics.join(", ")}].`)
+			}
+		}
+		checkUnit(input.Unit, "Unit")
+		const extended = input.ExtendedStatistics ?? []
+		if (stats.length == 0 && extended.length == 0) {
+			throw api.invalidParameterCombinationException("At least one of the parameters Statistics and ExtendedStatistics must be specified.")
+		}
+		for (let i = 0; i < extended.length; i++) {
+			if (percentile(extended[i]) == null) {
+				throw api.invalidParameterValueException(`The value ${extended[i]} for parameter ExtendedStatistics.member.${i + 1}.<list element> is not supported.`)
+			}
+		}
+		checkPeriod(period, "The parameter Period must be a multiple of 60.")
+		if (start >= end) {
+			throw api.invalidParameterValueException("The parameter StartTime must be less than the parameter EndTime.")
+		}
+		const g = grid(start, end, period, now())
+		if (g.points > pointLimit) {
+			throw api.invalidParameterCombinationException(`You have requested up to ${g.points} datapoints, which exceeds `
+				+ `the limit of ${pointLimit}. You may reduce the datapoints requested by increasing Period, or decreasing the `
+				+ "time range.")
+		}
+		const dims = dimensionsOf(input.Dimensions ?? [], "Dimensions")
+		const buckets = bucketed(caller, key(namespace, metric, dims), g, input.Unit as (api.StandardUnit | null))
+		const out = new api.GetMetricStatisticsOutput()
+		out.Label = metric
+		out.Datapoints = []
+		for (let i = 0; i < buckets.length; i++) {
+			const b = buckets[i]
+			if (b.length == 0) {
+				continue
+			}
+			const p = new api.Datapoint()
+			p.Timestamp = g.start + (i as i64) * g.period
+			const c = combined(b)
+			for (const s of stats) {
+				switch (s) {
+					case "SampleCount": p.SampleCount = c.count
+					case "Average": p.Average = c.sum / c.count
+					case "Sum": p.Sum = c.sum
+					case "Minimum": p.Minimum = c.min
+					case "Maximum": p.Maximum = c.max
+				}
+			}
+			if (extended.length > 0) {
+				const xs: [string, f64][] = []
+				for (const e of extended) {
+					const v = ranked(c, percentile(e)!)
+					if (v != null) {
+						xs.push([e, v!])
+					}
+				}
+				p.ExtendedStatistics = xs
+			}
+			p.Unit = (input.Unit ?? c.unit) as api.StandardUnit
+			out.Datapoints!.push(p)
+		}
+		return out
+	}
+
+	getMetricData(caller: Caller, input: api.GetMetricDataInput): api.GetMetricDataOutput throws Fault {
+		caller.allow("*")
+		const qs = input.MetricDataQueries
+		if (qs.length == 0) {
+			throw api.validationException("The parameter MetricDataQueries is required.\n")
+		}
+		if (input.StartTime >= input.EndTime) {
+			throw api.validationException("The parameter StartTime must be less than the parameter EndTime.")
+		}
+		let period: i32 = 0
+		for (let i = 0; i < qs.length; i++) {
+			const q = qs[i]
+			const at = `MetricDataQueries.member.${i + 1}`
+			if (!identifier(q.Id)) {
+				throw api.validationException(`The value for parameter ${at}.Id is not matching the expected pattern ${idPattern}.\n`)
+			}
+			if (qs.filter(o => o.Id == q.Id).length > 1) {
+				throw api.validationException(`The value for parameter ${at}.Id is duplicated.\n`)
+			}
+			if ((q.MetricStat == null) == (q.Expression == null)) {
+				throw api.validationException(`Exactly one element of the metrics list should have MetricStat or Expression.\n`)
+			}
+			if (q.MetricStat != null) {
+				const st = q.MetricStat!.Stat
+				if (!statistics.includes(st) && percentile(st) == null) {
+					throw api.validationException(`The value for parameter ${at}.MetricStat.Stat is not a valid statistic.\n`)
+				}
+				checkPeriod(q.MetricStat!.Period, `The parameter ${at}.MetricStat.Period must be a multiple of 60.`)
+				if (period == 0) {
+					period = q.MetricStat!.Period
+				}
+			}
+		}
+		if (!qs.some(q => q.ReturnData ?? true)) {
+			throw api.validationException("No metric data query has ReturnData set to true.\n")
+		}
+		const t = now()
+		const g = grid(input.StartTime, input.EndTime, if (period == 0) qs[0].Period ?? 60 else period, t)
+		const m = new Maths(caller, g, qs)
+		const out = new api.GetMetricDataOutput()
+		out.MetricDataResults = []
+		out.Messages = []
+		const descending = (input.ScanBy ?? "TimestampDescending") == "TimestampDescending"
+		// A page holds MaxDatapoints of the datapoints of all results in order; a NextToken counts those given before.
+		let start = 0
+		if (input.NextToken != null) {
+			try {
+				start = parseInt(token(input.NextToken!)) as i32
+			} catch (e: ParseError) {
+				throw api.invalidNextToken("The service cannot complete the request.")
+			}
+		}
+		let skip = start
+		let left = input.MaxDatapoints ?? 100800
+		let partial = false
+		for (const q of qs) {
+			if (!(q.ReturnData ?? true)) {
+				continue
+			}
+			for (const l of m.lines(q)) {
+				const r = new api.MetricDataResult()
+				r.Id = q.Id
+				r.Label = q.Label ?? l.label
+				r.Timestamps = []
+				r.Values = []
+				r.StatusCode = "Complete"
+				r.Messages = []
+				for (let i = 0; i < l.values.length; i++) {
+					const j = if (descending) l.values.length - 1 - i else i
+					const v = l.values[j]
+					if (v != null && isFinite(v!)) {
+						r.Timestamps!.push(g.start + (j as i64) * g.period)
+						r.Values!.push(v!)
+					} else if (v != null && r.Messages!.length == 0) {
+						r.Messages!.push({ ...new api.MessageData(), Code: "ArithmeticError",
+							Value: "One or more "
+							+ "data-points have been dropped due to non-numeric values (NaN, -Infinite, +Infinite)" })
+					}
+				}
+				const from = min(skip, r.Values!.length)
+				const to = from + min(left, r.Values!.length - from)
+				if (to < r.Values!.length) {
+					r.StatusCode = "PartialData"
+					partial = true
+				}
+				r.Timestamps = r.Timestamps!.slice(from, to)
+				r.Values = r.Values!.slice(from, to)
+				skip -= from
+				left -= to - from
+				start += to - from
+				out.MetricDataResults!.push(r)
+			}
+		}
+		if (partial) {
+			out.NextToken = base64.encode(`${start}`)
+		}
+		return out
+	}
+
+	putMetricAlarm(caller: Caller, input: api.PutMetricAlarmInput): Unit throws Fault {
+		const tags: [string, string][] = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		caller.actions = caller.actions.filter(a => a == "cloudwatch:PutMetricAlarm" || tags.length > 0)
+		const arn = alarmArn(caller, input.AlarmName)
+		const db = alarms(caller.regional())
+		const found = db.get(input.AlarmName)
+		const context = requestTags(tags)
+		if (found != null) {
+			context.append(resourceTags(found!.tags))
+		}
+		caller.allow(arn, null, context)
+		const period = input.Period ?? 0
+		const metrics = input.Metrics ?? []
+		if (metrics.length == 0 && ![10, 20, 30].includes(period) && (period <= 0 || period % 60 != 0)) {
+			throw api.validationException("Period must be 10, 20, 30 or a multiple of 60")
+		}
+		const cmp = input.ComparisonOperator
+		if (cmp == null
+			|| !["GreaterThanOrEqualToThreshold", "GreaterThanThreshold", "LessThanThreshold",
+			"LessThanOrEqualToThreshold"].includes(cmp!)) {
+			throw api.validationException("ComparisonOperator must be one of GreaterThanOrEqualToThreshold, "
+				+ "GreaterThanThreshold, LessThanThreshold, LessThanOrEqualToThreshold")
+		}
+		const n = input.EvaluationPeriods ?? 0
+		if (n < 1) {
+			throw api.validationException(`1 validation error detected: Value '${n}' at 'evaluationPeriods' failed to `
+				+ "satisfy constraint: Member must have value greater than or equal to 1")
+		}
+		const m = input.DatapointsToAlarm ?? n
+		if (m < 1 || m > n) {
+			throw api.validationException("DatapointsToAlarm must be less than or equal to EvaluationPeriods")
+		}
+		const missing = input.TreatMissingData ?? "missing"
+		if (!["breaching", "notBreaching", "ignore", "missing"].includes(missing)) {
+			throw api.validationException("Invalid value for TreatMissingData. Valid values are: breaching, notBreaching, "
+				+ "ignore, missing")
+		}
+		if (metrics.length == 0 && (input.Statistic == null) == (input.ExtendedStatistic == null)) {
+			throw api.invalidParameterCombinationException("Exactly one of the parameters Statistic and ExtendedStatistic must be specified.")
+		}
+		if (metrics.length == 0 && (input.MetricName == null || input.Namespace == null)) {
+			throw api.validationException("MetricName and Namespace must be specified for an alarm on a single metric.")
+		}
+		if (input.ExtendedStatistic != null && percentile(input.ExtendedStatistic!) == null) {
+			throw api.invalidParameterValueException(`The value ${input.ExtendedStatistic!} for parameter ExtendedStatistic `
+				+ "is not supported.")
+		}
+		for (const a of [...input.OKActions ?? [], ...input.AlarmActions ?? [],
+			...input.InsufficientDataActions ?? []]) {
+			if (!startsWith(a, "arn:")) {
+				throw api.validationException(`Invalid arn syntax: ${a}`)
+			}
+		}
+		const t = now()
+		const a = found
+			?? { ...new Alarm(), stateUpdated: t, transitioned: t, creationId: `${caller.requestId}/${t / 1_000_000}` }
+		a.name = input.AlarmName
+		a.description = input.AlarmDescription
+		a.actionsEnabled = input.ActionsEnabled ?? true
+		a.ok = input.OKActions ?? []
+		a.alarm = input.AlarmActions ?? []
+		a.insufficient = input.InsufficientDataActions ?? []
+		a.namespace = input.Namespace
+		a.metric = input.MetricName
+		a.dimensions = dimensionsOf(input.Dimensions ?? [], "Dimensions")
+		a.statistic = input.Statistic
+		a.extended = input.ExtendedStatistic
+		a.period = period
+		a.unit = input.Unit
+		a.evaluationPeriods = n
+		a.datapointsToAlarm = m
+		a.datapointsGiven = input.DatapointsToAlarm != null
+		a.threshold = input.Threshold ?? 0.0
+		a.comparison = cmp!
+		a.treatMissingData = missing
+		a.missingGiven = input.TreatMissingData != null
+		a.metrics = metrics
+		a.updated = t
+		a.held = 0
+		for (const [k, v] of tags) {
+			a.tags = a.tags.filter(x => x[0] != k)
+			a.tags.push([k, v])
+		}
+		db.put(a.name, a)
+		note(caller, a.name, "ConfigurationUpdate", `Alarm "${a.name}" ${if (found == null) "created" else "updated"}`,
+			"", t)
+		this.evaluate(caller, a, t)
+		return new Unit()
+	}
+
+	putDashboard(caller: Caller, input: api.PutDashboardInput): api.PutDashboardOutput throws Fault {
+		const name = input.DashboardName
+		caller.allow(dashboardArn(caller, name))
+		if (!dashboardName(name)) {
+			throw api.invalidParameterValueException("The value for field DashboardName contains invalid characters. It "
+				+ "can only contain alphanumerics, dash (-) and underscore (_).\n")
+		}
+		checkBody(input.DashboardBody)
+		(dashboards(caller.regional())).put(name, { ...new Dashboard(), body: input.DashboardBody, modified: now() })
+		const out = new api.PutDashboardOutput()
+		out.DashboardValidationMessages = []
+		return out
+	}
+
+	getDashboard(caller: Caller, input: api.GetDashboardInput): api.GetDashboardOutput throws Fault {
+		const name = input.DashboardName
+		caller.allow(dashboardArn(caller, name))
+		const d = dashboards(caller.regional()).get(name)
+		if (d == null) {
+			throw api.dashboardNotFoundError(`Dashboard ${name} does not exist`)
+		}
+		const out = new api.GetDashboardOutput()
+		out.DashboardArn = dashboardArn(caller, name)
+		out.DashboardBody = d!.body
+		out.DashboardName = name
+		return out
+	}
+
+	listDashboards(caller: Caller, input: api.ListDashboardsInput): api.ListDashboardsOutput throws Fault {
+		caller.allow("*")
+		const out = new api.ListDashboardsOutput()
+		out.DashboardEntries = []
+		const page = dashboards(caller.regional()).scan(input.NextToken, 1000, input.DashboardNamePrefix ?? "")
+		for (const [name, d] of page) {
+			const e = new api.DashboardEntry()
+			e.DashboardName = name
+			e.DashboardArn = dashboardArn(caller, name)
+			e.LastModified = d.modified
+			e.Size = d.body.length as i64
+			out.DashboardEntries!.push(e)
+		}
+		if (page.length == 1000) {
+			out.NextToken = page[999][0]
+		}
+		return out
+	}
+
+	deleteDashboards(caller: Caller, input: api.DeleteDashboardsInput): api.DeleteDashboardsOutput throws Fault {
+		const db = dashboards(caller.regional())
+		for (const name of input.DashboardNames) {
+			caller.allow(dashboardArn(caller, name))
+		}
+		for (const name of input.DashboardNames) {
+			db.delete(name)
+		}
+		return new api.DeleteDashboardsOutput()
+	}
+
+	putAnomalyDetector(caller: Caller, input: api.PutAnomalyDetectorInput): api.PutAnomalyDetectorOutput throws Fault {
+		const d = detectorOf(input.SingleMetricAnomalyDetector, input.MetricMathAnomalyDetector != null,
+			input.Namespace, input.MetricName, input.Dimensions, input.Stat)
+		d.configuration = input.Configuration
+		(detectors(caller.regional())).put(detectorKey(d), d)
+		return new api.PutAnomalyDetectorOutput()
+	}
+
+	describeAnomalyDetectors(caller: Caller,
+		input: api.DescribeAnomalyDetectorsInput): api.DescribeAnomalyDetectorsOutput throws Fault {
+		const out = new api.DescribeAnomalyDetectorsOutput()
+		out.AnomalyDetectors = []
+		const types = input.AnomalyDetectorTypes ?? ["SINGLE_METRIC"]
+		if (!types.includes("SINGLE_METRIC")) {
+			return out
+		}
+		const filters = dimensionsOf(input.Dimensions ?? [], "Dimensions")
+		for (const [_, d] of detectors(caller.regional()).scan()) {
+			if ((input.Namespace == null || input.Namespace == d.namespace)
+				&& (input.MetricName == null || input.MetricName == d.name)
+				&& filters.every(f => d.dimensions.some(x => x[0] == f[0] && x[1] == f[1]))) {
+				const dims = d.dimensions.map(x => ({ ...new api.Dimension(), Name: x[0], Value: x[1] }))
+				const a = new api.AnomalyDetector()
+				a.Namespace = d.namespace
+				a.MetricName = d.name
+				a.Dimensions = dims
+				a.Stat = d.stat
+				a.Configuration = d.configuration
+					?? { ...new api.AnomalyDetectorConfiguration(), ExcludedTimeRanges: [] }
+				a.StateValue = "PENDING_TRAINING"
+				a.SingleMetricAnomalyDetector = { ...new api.SingleMetricAnomalyDetector(), Namespace: d.namespace,
+					MetricName: d.name, Dimensions: dims, Stat: d.stat }
+				out.AnomalyDetectors!.push(a)
+			}
+		}
+		return out
+	}
+
+	deleteAnomalyDetector(caller: Caller,
+		input: api.DeleteAnomalyDetectorInput): api.DeleteAnomalyDetectorOutput throws Fault {
+		const d = detectorOf(input.SingleMetricAnomalyDetector, input.MetricMathAnomalyDetector != null,
+			input.Namespace, input.MetricName, input.Dimensions, input.Stat)
+		if (!detectors(caller.regional()).delete(detectorKey(d))) {
+			throw api.resourceNotFoundException("This anomaly detection model does not exist")
+		}
+		return new api.DeleteAnomalyDetectorOutput()
+	}
+
+	putMetricStream(caller: Caller, input: api.PutMetricStreamInput): api.PutMetricStreamOutput throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a != "cloudwatch:TagResource" || tags.length > 0)
+		const arn = `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`
+		caller.allow(arn, null, requestTags(tags.map(t => [t.Key, t.Value])))
+		if ((input.IncludeFilters ?? []).length > 0 && (input.ExcludeFilters ?? []).length > 0) {
+			throw api.invalidParameterCombinationException("You cannot include both IncludeFilters and ExcludeFilters.")
+		}
+		const db = metricStreams(caller.regional())
+		const t = now()
+		const s = db.get(input.Name) ?? { ...new MetricStream(), created: t }
+		s.put = input
+		s.updated = t
+		db.put(input.Name, s)
+		const out = new api.PutMetricStreamOutput()
+		out.Arn = arn
+		return out
+	}
+
+	getMetricStream(caller: Caller, input: api.GetMetricStreamInput): api.GetMetricStreamOutput throws Fault {
+		caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`)
+		const s = metricStreams(caller.regional()).get(input.Name)
+		if (s == null) {
+			throw api.resourceNotFoundException("")
+		}
+		const p = s!.put
+		const out = new api.GetMetricStreamOutput()
+		out.Arn = `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${p.Name}`
+		out.Name = p.Name
+		out.IncludeFilters = p.IncludeFilters ?? []
+		out.ExcludeFilters = p.ExcludeFilters ?? []
+		out.FirehoseArn = p.FirehoseArn
+		out.RoleArn = p.RoleArn
+		out.State = s!.state
+		out.CreationDate = s!.created
+		out.LastUpdateDate = s!.updated
+		out.OutputFormat = p.OutputFormat
+		out.StatisticsConfigurations = p.StatisticsConfigurations ?? []
+		out.IncludeLinkedAccountsMetrics = p.IncludeLinkedAccountsMetrics ?? false
+		return out
+	}
+
+	listMetricStreams(caller: Caller, input: api.ListMetricStreamsInput): api.ListMetricStreamsOutput throws Fault {
+		caller.allow("*")
+		const most = input.MaxResults ?? 100
+		const out = new api.ListMetricStreamsOutput()
+		out.Entries = []
+		for (const [name, s] of metricStreams(caller.regional()).scan(if (input.NextToken == null) null
+			else token(input.NextToken!), most + 1)) {
+			if (out.Entries!.length == most) {
+				out.NextToken = base64.encode(out.Entries![most - 1].Name ?? "")
+				break
+			}
+			out.Entries!.push({ ...new api.MetricStreamEntry(), Name: name, FirehoseArn: s.put.FirehoseArn,
+				Arn: `arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${name}`, State: s.state,
+				CreationDate: s.created, LastUpdateDate: s.updated, OutputFormat: s.put.OutputFormat })
+		}
+		return out
+	}
+
+	deleteMetricStream(caller: Caller, input: api.DeleteMetricStreamInput): api.DeleteMetricStreamOutput throws Fault {
+		caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${input.Name}`)
+		metricStreams(caller.regional()).delete(input.Name)
+		return new api.DeleteMetricStreamOutput()
+	}
+
+	startMetricStreams(caller: Caller, input: api.StartMetricStreamsInput): api.StartMetricStreamsOutput throws Fault {
+		this.streaming(caller, input.Names, "running")
+		return new api.StartMetricStreamsOutput()
+	}
+
+	stopMetricStreams(caller: Caller, input: api.StopMetricStreamsInput): api.StopMetricStreamsOutput throws Fault {
+		this.streaming(caller, input.Names, "stopped")
+		return new api.StopMetricStreamsOutput()
+	}
+
+	putInsightRule(caller: Caller, input: api.PutInsightRuleInput): api.PutInsightRuleOutput throws Fault {
+		const tags = input.Tags ?? []
+		caller.actions = caller.actions.filter(a => a != "cloudwatch:TagResource" || tags.length > 0)
+		caller.allow(insightArn(caller, input.RuleName), null, requestTags(tags.map(t => [t.Key, t.Value])))
+		const state = input.RuleState ?? "ENABLED"
+		if (state != "ENABLED" && state != "DISABLED") {
+			throw api.invalidParameterValueException("RuleState must be ENABLED or DISABLED")
+		}
+		(insightRules(caller.regional())).put(input.RuleName,
+			{ ...new InsightRule(), definition: input.RuleDefinition, state: state,
+			transformed: input.ApplyOnTransformedLogs ?? false })
+		return new api.PutInsightRuleOutput()
+	}
+
+	describeInsightRules(caller: Caller,
+		input: api.DescribeInsightRulesInput): api.DescribeInsightRulesOutput throws Fault {
+		caller.allow("*")
+		const most = input.MaxResults ?? 500
+		const out = new api.DescribeInsightRulesOutput()
+		out.InsightRules = []
+		for (const [name, r] of insightRules(caller.regional()).scan(if (input.NextToken == null) null
+			else token(input.NextToken!), most + 1)) {
+			if (out.InsightRules!.length == most) {
+				out.NextToken = base64.encode(out.InsightRules![most - 1].Name)
+				break
+			}
+			out.InsightRules!.push({ ...new api.InsightRule(), Name: name, State: r.state, Definition: r.definition,
+				Schema: `{"Name": "CloudWatchLogRule", "Version": 1}`, ManagedRule: false,
+				ApplyOnTransformedLogs: r.transformed })
+		}
+		return out
+	}
+
+	deleteInsightRules(caller: Caller, input: api.DeleteInsightRulesInput): api.DeleteInsightRulesOutput throws Fault {
+		const out = new api.DeleteInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "")
+		return out
+	}
+
+	enableInsightRules(caller: Caller, input: api.EnableInsightRulesInput): api.EnableInsightRulesOutput throws Fault {
+		const out = new api.EnableInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "ENABLED")
+		return out
+	}
+
+	disableInsightRules(caller: Caller,
+		input: api.DisableInsightRulesInput): api.DisableInsightRulesOutput throws Fault {
+		const out = new api.DisableInsightRulesOutput()
+		out.Failures = this.insights(caller, input.RuleNames, "DISABLED")
+		return out
+	}
+
+	putCompositeAlarm(caller: Caller, input: api.PutCompositeAlarmInput): Unit throws Fault {
+		const tags: [string, string][] = (input.Tags ?? []).map(t => [t.Key, t.Value])
+		caller.actions = caller.actions.filter(a => a == "cloudwatch:PutCompositeAlarm" || tags.length > 0)
+		const name = input.AlarmName
+		const db = alarms(caller.regional())
+		const found = db.get(name)
+		const context = requestTags(tags)
+		if (found != null) {
+			context.append(resourceTags(found!.tags))
+		}
+		caller.allow(alarmArn(caller, name), null, context)
+		const children = names(ruleOf(input.AlarmRule))
+		if (children.includes(name) || children.some(c => this.reaches(db, c, name, 0))) {
+			throw api.validationException("A composite alarm cannot have a child relation with itself via its AlarmRule, "
+				+ "as it would introduce a circular dependency")
+		}
+		const missing = children.filter(c => db.get(c) == null)
+		if (missing.length > 0) {
+			throw api.validationException(`Could not save the composite alarm as alarms `
+				+ `[${missing.map(c => alarmArn(caller, c)).join(", ")}] in the alarm rule do not exist`)
+		}
+		for (const a of [...input.OKActions ?? [], ...input.AlarmActions ?? [],
+			...input.InsufficientDataActions ?? []]) {
+			if (!startsWith(a, "arn:")) {
+				throw api.validationException(`Invalid arn syntax: ${a}`)
+			}
+		}
+		const t = now()
+		const a = found
+			?? { ...new Alarm(), stateUpdated: t, transitioned: t, creationId: `${caller.requestId}/${t / 1_000_000}` }
+		a.name = name
+		a.description = input.AlarmDescription
+		a.actionsEnabled = input.ActionsEnabled ?? true
+		a.ok = input.OKActions ?? []
+		a.alarm = input.AlarmActions ?? []
+		a.insufficient = input.InsufficientDataActions ?? []
+		a.rule = input.AlarmRule
+		a.children = children
+		a.updated = t
+		for (const [k, v] of tags) {
+			a.tags = a.tags.filter(x => x[0] != k)
+			a.tags.push([k, v])
+		}
+		db.put(name, a)
+		const verb = if (found == null) "created" else "updated"
+		note(caller, name, "ConfigurationUpdate", `Alarm "${name}" ${verb}`, "", t)
+		const state = this.ruled(caller, a, t)
+		a.reasonData = this.triggering(caller, a)
+		this.change(caller, a, state, `${alarmArn(caller, name)} was ${verb} and its alarm rule evaluates to ${state}`,
+			t, found == null)
+		return new Unit()
+	}
+
+	describeAlarms(caller: Caller, input: api.DescribeAlarmsInput): api.DescribeAlarmsOutput throws Fault {
+		caller.allow("*")
+		const most = input.MaxRecords ?? 50
+		if (most < 1 || most > 100) {
+			throw api.validationException(`1 validation error detected: Value '${most}' at 'maxRecords' failed to satisfy `
+				+ `constraint: Member must have value ${if (most < 1) "greater than or equal to 1" else "less than or equal to 100"}`)
+		}
+		const types = input.AlarmTypes ?? ["MetricAlarm"]
+		const out = new api.DescribeAlarmsOutput()
+		out.MetricAlarms = []
+		out.CompositeAlarms = []
+		out.LogAlarms = []
+		const t = now()
+		const db = alarms(caller.regional())
+		const related = input.ChildrenOfAlarmName ?? input.ParentsOfAlarmName
+		if (related != null) {
+			const by = if (input.ChildrenOfAlarmName != null) "ChildrenOfAlarmName" else "ParentsOfAlarmName"
+			if (input.ActionPrefix != null || input.AlarmNamePrefix != null || input.AlarmNames != null
+				|| input.AlarmTypes != null || input.StateValue != null) {
+				throw api.validationException(`${by} requests cannot be used with the following parameters: ActionPrefix, `
+					+ "AlarmNamePrefix, AlarmNames, AlarmTypes, StateValue")
+			}
+			const of = db.get(related!)
+			const kin: Alarm[] = []
+			if (by == "ParentsOfAlarmName") {
+				for (const [_, p] of db.scan()) {
+					if (p.children.includes(related!)) {
+						kin.push(p)
+					}
+				}
+			} else if (of != null) {
+				for (const c of of!.children) {
+					const a = db.get(c)
+					if (a != null) {
+						kin.push(a!)
+					}
+				}
+			}
+			for (const found of kin) {
+				const a = this.evaluate(caller, found, t)
+				if (a.rule == null) {
+					out.MetricAlarms!.push({ ...new api.MetricAlarm(), AlarmName: a.name,
+						AlarmArn: alarmArn(caller, a.name), StateValue: a.state as api.StateValue,
+						StateUpdatedTimestamp: a.stateUpdated, StateTransitionedTimestamp: a.transitioned })
+				} else {
+					// A composite one by its name and ARN alone, as AWS lists it.
+					out.CompositeAlarms!.push({ ...new api.CompositeAlarm(), AlarmName: a.name,
+						AlarmArn: alarmArn(caller, a.name) })
+				}
+			}
+			return out
+		}
+		const names = input.AlarmNames ?? []
+		let shown = 0
+		let last = ""
+		for (const [_, found] of db.scan(input.NextToken)) {
+			if (!types.includes(if (found.rule == null) "MetricAlarm" else "CompositeAlarm")) {
+				continue
+			}
+			const a = this.evaluate(caller, found, t)
+			const named = names.length == 0 || names.includes(a.name)
+			const prefixed = input.AlarmNamePrefix == null || startsWith(a.name, input.AlarmNamePrefix!)
+			const state = input.StateValue == null || a.state == input.StateValue
+			const action = input.ActionPrefix == null
+				|| [...a.ok, ...a.alarm, ...a.insufficient].some(x => startsWith(x, input.ActionPrefix!))
+			if (named && prefixed && state && action) {
+				if (shown == most) {
+					out.NextToken = last
+					return out
+				}
+				if (a.rule == null) {
+					out.MetricAlarms!.push(described(caller, a))
+				} else {
+					out.CompositeAlarms!.push(composite(caller, a))
+				}
+				shown++
+				last = a.name
+			}
+		}
+		return out
+	}
+
+	describeAlarmsForMetric(caller: Caller,
+		input: api.DescribeAlarmsForMetricInput): api.DescribeAlarmsForMetricOutput throws Fault {
+		caller.allow("*")
+		const t = now()
+		const k = key(input.Namespace, input.MetricName, dimensionsOf(input.Dimensions ?? [], "Dimensions"))
+		const out = new api.DescribeAlarmsForMetricOutput()
+		out.MetricAlarms = []
+		for (const [_, found] of alarms(caller.regional()).scan()) {
+			if (found.metric == null || key(found.namespace ?? "", found.metric!, found.dimensions) != k) {
+				continue
+			}
+			const a = this.evaluate(caller, found, t)
+			const stat = input.Statistic == null || a.statistic == input.Statistic
+			const ext = input.ExtendedStatistic == null || a.extended == input.ExtendedStatistic
+			const period = input.Period == null || a.period == input.Period
+			const unit = input.Unit == null || a.unit == input.Unit
+			if (stat && ext && period && unit) {
+				out.MetricAlarms!.push(described(caller, a))
+			}
+		}
+		return out
+	}
+
+	deleteAlarms(caller: Caller, input: api.DeleteAlarmsInput): Unit throws Fault {
+		if (input.AlarmNames.length > 100) {
+			throw api.validationException(`1 validation error detected: Value '[${input.AlarmNames.join(", ")}]' at `
+				+ "'alarmNames' failed to satisfy constraint: Member must have length less than or equal to 100")
+		}
+		const db = caller.regional()
+		for (const name of input.AlarmNames) {
+			caller.allow(alarmArn(caller, name))
+		}
+		const composites = input.AlarmNames.filter(n => alarms(db).get(n)?.rule != null)
+		if (composites.length > 1) {
+			throw api.validationException(`Cannot delete [${composites.length}] Composite Alarms as only one composite alarm `
+				+ "delete is allowed in single request")
+		}
+		const held: string[] = []
+		for (const [_, p] of alarms(db).scan()) {
+			for (const c of p.children) {
+				if (input.AlarmNames.includes(c) && !input.AlarmNames.includes(p.name) && !held.includes(c)) {
+					held.push(c)
+				}
+			}
+		}
+		if (held.length > 0) {
+			throw api.validationException(`Cannot delete ${held.join(",")} as there are composite alarm(s) depending on `
+				+ (if (held.length == 1) "it." else "them."))
+		}
+		for (const name of input.AlarmNames) {
+			if (alarms(db).delete(name)) {
+				for (const [k, _] of history(db).scan(null, 1000000, `${name}\x00`)) {
+					history(db).delete(k)
+				}
+			}
+		}
+		return new Unit()
+	}
+
+	setAlarmState(caller: Caller, input: api.SetAlarmStateInput): Unit throws Fault {
+		caller.allow(alarmArn(caller, input.AlarmName))
+		const a = alarms(caller.regional()).get(input.AlarmName)
+		if (a == null) {
+			throw api.resourceNotFound("")
+		}
+		if (input.StateReasonData != null) {
+			try {
+				json.decode[json.Unknown](input.StateReasonData!)
+			} catch (e: ParseError) {
+				throw api.invalidFormatFault("Invalid JSON in StateReasonData")
+			}
+		}
+		const t = now()
+		const period = (max(a!.period, 60) as i64) * second
+		a!.held = t - t % period + period
+		this.change(caller, a!, input.StateValue, input.StateReason, t)
+		return new Unit()
+	}
+
+	enableAlarmActions(caller: Caller, input: api.EnableAlarmActionsInput): Unit throws Fault {
+		this.enable(caller, input.AlarmNames, true)
+		return new Unit()
+	}
+
+	disableAlarmActions(caller: Caller, input: api.DisableAlarmActionsInput): Unit throws Fault {
+		this.enable(caller, input.AlarmNames, false)
+		return new Unit()
+	}
+
+	describeAlarmHistory(caller: Caller,
+		input: api.DescribeAlarmHistoryInput): api.DescribeAlarmHistoryOutput throws Fault {
+		caller.allow(if (input.AlarmName == null) "*" else alarmArn(caller, input.AlarmName!))
+		const t = now()
+		const db = caller.regional()
+		if (input.AlarmName != null) {
+			const a = alarms(db).get(input.AlarmName!)
+			if (a != null) {
+				this.evaluate(caller, a!, t)
+			}
+		}
+		const items: [string, api.AlarmHistoryItem][] = []
+		const prefix = if (input.AlarmName == null) "" else `${input.AlarmName!}\x00`
+		const kinds = input.AlarmTypes ?? ["MetricAlarm"]
+		for (const [k, h] of history(db).scan(null, 1000000, prefix)) {
+			const name = split(k, "\x00")[0]
+			const of = alarms(db).get(name)
+			const kind: api.AlarmType = if (of != null && of!.rule != null) "CompositeAlarm" else "MetricAlarm"
+			const typed = (input.HistoryItemType == null || h.type == input.HistoryItemType) && kinds.includes(kind)
+			const after = input.StartDate == null || h.at >= input.StartDate!
+			const before = input.EndDate == null || h.at < input.EndDate!
+			if (typed && after && before) {
+				const i = new api.AlarmHistoryItem()
+				i.AlarmName = name
+				i.AlarmType = kind
+				i.Timestamp = h.at
+				i.HistoryItemType = h.type as api.HistoryItemType
+				i.HistorySummary = h.summary
+				i.HistoryData = h.data
+				items.push([`${padded(h.at)}${k}`, i])
+			}
+		}
+		const ascending = input.ScanBy == "TimestampAscending"
+		sortBy(items, (a, b) => if (ascending) a[0] < b[0] else a[0] > b[0])
+		let from = 0
+		if (input.NextToken != null) {
+			const after = token(input.NextToken!)
+			while (from < items.length && (if (ascending) items[from][0] <= after else items[from][0] >= after)) {
+				from++
+			}
+		}
+		const most = input.MaxRecords ?? 100
+		const out = new api.DescribeAlarmHistoryOutput()
+		out.AlarmHistoryItems = items.slice(from, min(items.length, from + most)).map(i => i[1])
+		if (from + most < items.length) {
+			out.NextToken = base64.encode(items[from + most - 1][0])
+		}
+		return out
+	}
+
+	tagResource(caller: Caller, input: api.TagResourceInput): api.TagResourceOutput throws Fault {
+		const tags: [string, string][] = input.Tags.map(t => [t.Key, t.Value])
+		const [db, a] = this.tagged(caller, input.ResourceARN, requestTags(tags))
+		for (const [k, v] of tags) {
+			a.tags = a.tags.filter(x => x[0] != k)
+			a.tags.push([k, v])
+		}
+		db.put(a.name, a)
+		return new api.TagResourceOutput()
+	}
+
+	untagResource(caller: Caller, input: api.UntagResourceInput): api.UntagResourceOutput throws Fault {
+		const [db, a] = this.tagged(caller, input.ResourceARN, [["aws:TagKeys", input.TagKeys]])
+		a.tags = a.tags.filter(x => !input.TagKeys.includes(x[0]))
+		db.put(a.name, a)
+		return new api.UntagResourceOutput()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceInput): api.ListTagsForResourceOutput throws Fault {
+		const [_, a] = this.tagged(caller, input.ResourceARN, [])
+		const out = new api.ListTagsForResourceOutput()
+		out.Tags = a.tags.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] }))
+		return out
+	}
+
+	private tagged(caller: Caller, arn: string,
+		context: [string, string | string[]][]): [Table[Alarm], Alarm] throws Fault {
+		const prefix = `arn:aws:cloudwatch:${caller.region}:${caller.account}:alarm:`
+		const db = alarms(caller.regional())
+		const a = if (startsWith(arn, prefix)) db.get(arn.slice(prefix.length, arn.length)) else null
+		if (a != null) {
+			context.append(resourceTags(a!.tags))
+		}
+		caller.allow(arn, null, context)
+		if (a == null) {
+			throw api.resourceNotFoundException("")
+		}
+		return [db, a!]
+	}
+
+	private enable(caller: Caller, names: string[], enabled: bool) throws Fault {
+		const db = alarms(caller.regional())
+		for (const name of names) {
+			caller.allow(alarmArn(caller, name))
+			const a = db.get(name)
+			if (a != null) {
+				a!.actionsEnabled = enabled
+				db.put(name, a!)
+			}
+		}
+	}
+
+	private evaluate(caller: Caller, a: Alarm, t: i64): Alarm throws Fault {
+		if (a.rule != null && t >= a.held) {
+			const state = this.ruled(caller, a, t)
+			const now = alarms(caller.regional()).get(a.name) ?? a
+			if (state == now.state) {
+				return now
+			}
+			now.reasonData = this.triggering(caller, now)
+			return this.change(caller, now, state, `${alarmArn(caller, a.name)} alarm rule evaluates to ${state}`, t,
+				false)
+		}
+		const seconds = if (a.metric != null) a.period else mathPeriod(a.metrics)
+		if ((a.metric == null && a.metrics.length == 0) || seconds <= 0 || t < a.held) {
+			return a
+		}
+		const period = (seconds as i64) * second
+		const end = t - t % period + period
+		const g = new Grid(end - (a.evaluationPeriods as i64) * period, period, a.evaluationPeriods)
+		const values: (f64 | null)[] = []
+		if (a.metric != null) {
+			for (const b of bucketed(caller, key(a.namespace ?? "", a.metric!, a.dimensions), g, a.unit)) {
+				values.push(if (b.length == 0) null else statOf(combined(b), a.statistic ?? a.extended!))
+			}
+		} else {
+			// The series of the query whose ReturnData is true; an expression that does not evaluate leaves the alarm.
+			const q = a.metrics.find(m => m.ReturnData ?? true) ?? a.metrics[a.metrics.length - 1]
+			try {
+				const lines = new Maths(caller, g, a.metrics).lines(q)
+				if (lines.length != 1) {
+					return a
+				}
+				for (const v of lines[0].values) {
+					values.push(if (v == null || !isFinite(v!)) null else v)
+				}
+			} catch (f: Fault) {
+				return a
+			}
+		}
+		const points: [i64, f64 | null][] = []
+		for (let i = 0; i < values.length; i++) {
+			points.push([g.start + (i as i64) * period, values[i]])
+		}
+		const present = points.filter(p => p[1] != null)
+		const breaching = present.filter(p => crosses(a, p[1]!))
+		let counted = breaching.length
+		let known = present.length
+		if (a.treatMissingData == "breaching") {
+			counted += points.length - present.length
+			known = points.length
+		} else if (a.treatMissingData == "notBreaching") {
+			known = points.length
+		}
+		const word = comparisonWord(a.comparison)
+		const shown = present.slice(max(present.length - a.datapointsToAlarm, 0),
+			present.length).reverse().map(p => `${number(p[1]!)} (${clock(p[0])})`).join(", ")
+		const n = present.length
+		const datapoints = `${n} datapoint${if (n == 1) "" else "s"}`
+		if (counted >= a.datapointsToAlarm) {
+			const why = `Threshold Crossed: ${datapoints} [${shown}] ${if (n == 1) "was" else "were"} ${word} the threshold `
+				+ `(${number(a.threshold)}).`
+			return this.change(caller, a, "ALARM", why, t, false)
+		}
+		if (known == 0) {
+			if (a.treatMissingData == "ignore") {
+				return a
+			}
+			return this.change(caller, a, "INSUFFICIENT_DATA",
+				`Insufficient Data: ${a.evaluationPeriods} datapoint${if (a.evaluationPeriods == 1) " was" else "s were"} unknown.`,
+				t, false)
+		}
+		const why = `Threshold Crossed: ${datapoints} [${shown}] ${if (n == 1) "was" else "were"} not ${word} the threshold `
+			+ `(${number(a.threshold)}).`
+		return this.change(caller, a, "OK", why, t, false)
+	}
+
+	private streaming(caller: Caller, names: string[], state: string) throws Fault {
+		const db = metricStreams(caller.regional())
+		for (const n of names) {
+			caller.allow(`arn:aws:cloudwatch:${caller.region}:${caller.account}:metric-stream/${n}`)
+		}
+		for (const n of names) {
+			const s = db.get(n)
+			if (s != null) {
+				s!.state = state
+				db.put(n, s!)
+			}
+		}
+	}
+
+	/// Sets the state of the insight rules names, or deletes them for state "".
+	private insights(caller: Caller, names: string[], state: string): api.PartialFailure[] throws Fault {
+		const db = insightRules(caller.regional())
+		for (const n of names) {
+			caller.allow(insightArn(caller, n))
+		}
+		const failures: api.PartialFailure[] = []
+		for (const n of names) {
+			const r = db.get(n)
+			if (r == null) {
+				failures.push({ ...new api.PartialFailure(), FailureResource: n,
+					ExceptionType: "ResourceNotFoundException", FailureCode: "404",
+					FailureDescription: "Rule not found" })
+			} else if (state == "") {
+				db.delete(n)
+			} else {
+				r!.state = state
+				db.put(n, r!)
+			}
+		}
+		return failures
+	}
+
+	private ruled(caller: Caller, a: Alarm, t: i64): string throws Fault {
+		const db = alarms(caller.regional())
+		const states: [string, string][] = []
+		for (const n of a.children) {
+			const c = db.get(n)
+			if (c != null) {
+				states.push([n, this.evaluate(caller, c!, t).state])
+			}
+		}
+		const r = ruleOf(a.rule ?? "FALSE")
+		const of = (n: string): string => {
+			const f = states.find(x => x[0] == n)
+			return if (f == null) "" else f[1]
+		}
+		return if (holds(r, of)) "ALARM" else "OK"
+	}
+
+	private triggering(caller: Caller, a: Alarm): string {
+		const db = alarms(caller.regional())
+		const items: string[] = []
+		for (const n of a.children) {
+			const c = db.get(n)
+			if (c != null) {
+				items.push(`{"arn":${json.quoted(alarmArn(caller, n))},"state":{"value":${json.quoted(c!.state)},`
+					+ `"timestamp":${json.quoted(stamped(c!.stateUpdated))}}}`)
+			}
+		}
+		return `{"triggeringAlarms":[${items.join(",")}]}`
+	}
+
+	private reaches(db: Table[Alarm], from: string, target: string, depth: i32): bool {
+		const a = db.get(from)
+		if (a == null || depth > 100) {
+			return false
+		}
+		return a!.children.includes(target) || a!.children.some(c => this.reaches(db, c, target, depth + 1))
+	}
+
+	/// Saves a in state, noting its history and delivering its actions if it changes, or if forced.
+	private change(caller: Caller, a: Alarm, state: string, reason: string, t: i64, forced = true): Alarm throws Fault {
+		if (a.state == state && !forced) {
+			return a
+		}
+		const old = a.state
+		const was = a.reason
+		const changed = old != state
+		a.state = state
+		a.reason = reason
+		a.stateUpdated = t
+		if (changed) {
+			a.transitioned = t
+		}
+		(alarms(caller.regional())).put(a.name, a)
+		const data = `{"version":"1.0","oldState":{"stateValue":${json.quoted(old)},"stateReason":${json.quoted(was)}},`
+			+ `"newState":{"stateValue":${json.quoted(state)},"stateReason":${json.quoted(reason)}}}`
+		note(caller, a.name, "StateUpdate", `Alarm updated from ${old} to ${state}`, data, t)
+		if (changed) {
+			for (const [_, p] of alarms(caller.regional()).scan()) {
+				if (p.children.includes(a.name)) {
+					this.evaluate(caller, p, t)
+				}
+			}
+		}
+		if (!a.actionsEnabled) {
+			return a
+		}
+		const actions = if (state == "ALARM") a.alarm else if (state == "OK") a.ok else a.insufficient
+		for (const action of actions) {
+			if (!startsWith(action, "arn:aws:sns:")) {
+				continue
+			}
+			const input = new snsApi.PublishInput()
+			input.TopicArn = action
+			input.Subject = `${state}: "${a.name}" in ${caller.region}`
+			input.Message = message(caller, a, old, t)
+			const arn = alarmArn(caller, a.name)
+			try {
+				this.sns.publish(caller.internal("cloudwatch.amazonaws.com", arn, ["sns:Publish"]), input)
+				note(caller, a.name, "Action", `Successfully executed action ${action}`, "", t)
+			} catch (f: Fault) {
+				note(caller, a.name, "Action", `Failed to execute action ${action}. Received error: "${f.message}"`, "",
+					t)
+			}
+		}
+		return a
+	}
+}
+
+/// The time grid of a request; its period is in ns.
+class Grid {
+	start: i64
+	period: i64
+	points: i32
+
+	constructor(start: i64, period: i64, points: i32) {
+		this.start = start
+		this.period = period
+		this.points = points
+	}
+}
+
+class Combined {
+	count = 0.0
+	sum = 0.0
+	min = 0.0
+	max = 0.0
+	values: [f64, f64][] = []
+	unit = "None"
+}
+
+class Line {
+	label: string
+	values: (f64 | null)[]
+
+	constructor(label: string, values: (f64 | null)[]) {
+		this.label = label
+		this.values = values
+	}
+}
+
+class Value {
+	scalar: f64 | null = null
+	lines: Line[] = []
+	many = false
+}
+
+class Maths {
+	caller: Caller
+	g: Grid
+	qs: api.MetricDataQuery[]
+	done: [string, Value][] = []
+	text = ""
+	id = ""
+	at: i32 = 0
+
+	constructor(caller: Caller, g: Grid, qs: api.MetricDataQuery[]) {
+		this.caller = caller
+		this.g = g
+		this.qs = qs
+	}
+
+	lines(q: api.MetricDataQuery): Line[] throws Fault {
+		const v = this.of(q)
+		if (v.scalar != null && q.Expression != null) {
+			throw this.error("The return value of the expression must be TimeSeries or Array[TimeSeries]")
+		}
+		return v.lines
+	}
+
+	of(q: api.MetricDataQuery): Value throws Fault {
+		for (const [i, v] of this.done) {
+			if (i == q.Id) {
+				return v
+			}
+		}
+		const v = new Value()
+		if (q.MetricStat != null) {
+			const s = q.MetricStat!
+			const m = s.Metric
+			const k = key(m.Namespace ?? "", m.MetricName ?? "", dimensionsOf(m.Dimensions ?? [], "Dimensions"))
+			const buckets = bucketed(this.caller, k, this.g, s.Unit)
+			v.lines.push(new Line(m.MetricName ?? "",
+				buckets.map(b => if (b.length == 0) null else statOf(combined(b), s.Stat))))
+		} else {
+			const text = this.text
+			const id = this.id
+			const at = this.at
+			this.text = q.Expression!
+			this.id = q.Id
+			this.at = 0
+			const r = this.compared()
+			this.space()
+			if (this.at < this.text.length) {
+				throw this.error("Syntax error")
+			}
+			v.scalar = r.scalar
+			v.lines = r.lines.map(l => new Line(q.Id, l.values))
+			v.many = r.many
+			this.text = text
+			this.id = id
+			this.at = at
+		}
+		this.done.push([q.Id, v])
+		return v
+	}
+
+	error(why: string): Fault { return api.validationException(`Error in expression '${this.id}': ${why}`) }
+
+	space() {
+		while (this.at < this.text.length && this.text[this.at] == 32) {
+			this.at++
+		}
+	}
+
+	eat(s: string): bool {
+		this.space()
+		if (this.at + s.length <= this.text.length && this.text.slice(this.at, this.at + s.length) == s) {
+			this.at += s.length
+			return true
+		}
+		return false
+	}
+
+	compared(): Value throws Fault {
+		const a = this.sum()
+		for (const op of [">=", "<=", "==", "!=", ">", "<"]) {
+			if (this.eat(op)) {
+				return combine(a, this.sum(), op)
+			}
+		}
+		return a
+	}
+
+	sum(): Value throws Fault {
+		let a = this.product()
+		while (true) {
+			if (this.eat("+")) {
+				a = combine(a, this.product(), "+")
+			} else if (this.eat("-")) {
+				a = combine(a, this.product(), "-")
+			} else {
+				return a
+			}
+		}
+	}
+
+	product(): Value throws Fault {
+		let a = this.power()
+		while (true) {
+			if (this.eat("*")) {
+				a = combine(a, this.power(), "*")
+			} else if (this.eat("/")) {
+				a = combine(a, this.power(), "/")
+			} else {
+				return a
+			}
+		}
+	}
+
+	power(): Value throws Fault {
+		const a = this.unary()
+		return if (this.eat("^")) combine(a, this.power(), "^") else a
+	}
+
+	unary(): Value throws Fault {
+		if (this.eat("-")) {
+			const zero = new Value()
+			zero.scalar = 0.0
+			return combine(zero, this.unary(), "-")
+		}
+		return this.atom()
+	}
+
+	atom(): Value throws Fault {
+		this.space()
+		if (this.eat("(")) {
+			const v = this.compared()
+			if (!this.eat(")")) {
+				throw this.error("Syntax error")
+			}
+			return v
+		}
+		if (this.eat("[")) {
+			const v = new Value()
+			v.many = true
+			while (true) {
+				v.lines.append(this.compared().lines)
+				if (this.eat("]")) {
+					return v
+				}
+				if (!this.eat(",")) {
+					throw this.error("Syntax error")
+				}
+			}
+		}
+		const start = this.at
+		while (this.at < this.text.length && (isDigit(this.text[this.at]) || this.text[this.at] == 46)) {
+			this.at++
+		}
+		if (this.at > start) {
+			const v = new Value()
+			try {
+				v.scalar = parseFloat(this.text.slice(start, this.at))
+			} catch (e: ParseError) {
+				throw this.error("Syntax error")
+			}
+			return v
+		}
+		while (this.at < this.text.length && (isAlphanumeric(this.text[this.at]) || this.text[this.at] == 95)) {
+			this.at++
+		}
+		const name = this.text.slice(start, this.at)
+		if (name == "") {
+			throw this.error("Syntax error")
+		}
+		if (!this.eat("(")) {
+			for (const q of this.qs) {
+				if (q.Id == name && q.Id != this.id) {
+					return this.of(q)
+				}
+			}
+			throw this.error(`ID '${name}' not found`)
+		}
+		const args: Value[] = []
+		if (!this.eat(")")) {
+			while (true) {
+				if (name == "METRICS") {
+					this.eat("\"")
+					const end = indexOf(this.text, "\"", this.at)
+					this.at = if (end < 0) this.text.length else end + 1
+				} else {
+					args.push(this.compared())
+				}
+				if (this.eat(")")) {
+					break
+				}
+				if (!this.eat(",")) {
+					throw this.error("Syntax error")
+				}
+			}
+		}
+		return this.call(name, args)
+	}
+
+	call(name: string, args: Value[]): Value throws Fault {
+		const out = new Value()
+		switch (name) {
+			case "METRICS":
+				out.many = true
+				for (const q of this.qs) {
+					if (q.MetricStat != null) {
+						out.lines.append(this.of(q).lines)
+					}
+				}
+				return out
+			case "SUM", "AVG", "MIN", "MAX":
+				this.arity(args, 1)
+				const a = args[0]
+				if (a.scalar != null) {
+					return a
+				}
+				if (a.many) {
+					const n = this.g.points
+					const values: (f64 | null)[] = []
+					for (let i = 0; i < n; i++) {
+						const xs = a.lines.map(l => l.values[i]).filter(x => x != null).map(x => x!)
+						values.push(if (xs.length == 0) null else reduced(name, xs))
+					}
+					out.lines.push(new Line("", values))
+					return out
+				}
+				const xs = a.lines[0].values.filter(x => x != null).map(x => x!)
+				out.scalar = if (xs.length == 0) nan else reduced(name, xs)
+				return out
+			case "ABS":
+				this.arity(args, 1)
+				return mapped(args[0], x => abs(x))
+			case "FILL":
+				this.arity(args, 2)
+				const by = args[1].scalar
+				if (by == null) {
+					throw this.error("FILL takes a number as its second argument")
+				}
+				return mapped(args[0], x => x, by!)
+			case "RATE":
+				this.arity(args, 1)
+				out.many = args[0].many
+				for (const l of args[0].lines) {
+					const values: (f64 | null)[] = l.values.map(_ => null)
+					let last = -1
+					for (let i = 0; i < l.values.length; i++) {
+						if (l.values[i] == null) {
+							continue
+						}
+						if (last >= 0) {
+							const seconds = ((i - last) as f64) * ((this.g.period / second) as f64)
+							values[i] = (l.values[i]! - l.values[last]!) / seconds
+						}
+						last = i
+					}
+					out.lines.push(new Line(l.label, values))
+				}
+				return out
+			case "IF":
+				if (args.length != 2 && args.length != 3) {
+					this.arity(args, 3)
+				}
+				const otherwise = if (args.length == 3) args[2] else new Value()
+				const yes = combine(args[0], args[1], "if")
+				return if (args.length == 3) combine(yes, combine(args[0], otherwise, "else"), "or") else yes
+			default: throw this.error(`Function '${name}' not found`)
+		}
+	}
+
+	arity(args: Value[], n: i32) throws Fault {
+		if (args.length != n) {
+			throw this.error(`Invalid number of arguments: expected ${n}, got ${args.length}`)
+		}
+	}
+}
+
+/// The value of op on a and b, elementwise: arithmetic, comparisons of 1 or 0, "if" of b where a is true, "else" of
+/// b where a is false, "or" of a where it has a value, else b. A missing value of either is missing.
+function combine(a: Value, b: Value, op: string): Value {
+	const out = new Value()
+	if (a.scalar != null && b.scalar != null) {
+		out.scalar = apply(a.scalar, b.scalar, op)
+		return out
+	}
+	out.many = a.many || b.many
+	const left: (Line | null)[] = if (a.scalar != null) b.lines.map(_ => null as (Line | null))
+		else a.lines.map(l => l as (Line | null))
+	const right: (Line | null)[] = if (b.scalar != null) a.lines.map(_ => null as (Line | null))
+		else b.lines.map(l => l as (Line | null))
+	const n = max(left.length, right.length)
+	for (let i = 0; i < n; i++) {
+		const l = left[min(i, left.length - 1)]
+		const r = right[min(i, right.length - 1)]
+		const base = if (l == null) r! else l!
+		const values: (f64 | null)[] = []
+		for (let j = 0; j < base.values.length; j++) {
+			const x = if (l == null) a.scalar else l!.values[j]
+			const y = if (r == null) b.scalar else r!.values[j]
+			values.push(apply(x, y, op))
+		}
+		out.lines.push(new Line(base.label, values))
+	}
+	return out
+}
+
+function apply(x: f64 | null, y: f64 | null, op: string): f64 | null {
+	if (op == "or") {
+		return x ?? y
+	}
+	if (x == null || y == null) {
+		return null
+	}
+	const [a, b] = [x!, y!]
+	switch (op) {
+		case "+": return a + b
+		case "-": return a - b
+		case "*": return a * b
+		case "/": return a / b
+		case "^": return pow(a, b)
+		case ">": return if (a > b) 1.0 else 0.0
+		case "<": return if (a < b) 1.0 else 0.0
+		case ">=": return if (a >= b) 1.0 else 0.0
+		case "<=": return if (a <= b) 1.0 else 0.0
+		case "==": return if (a == b) 1.0 else 0.0
+		case "!=": return if (a != b) 1.0 else 0.0
+		case "if": return if (a != 0.0) b else null
+		default: return if (a == 0.0) b else null // else
+	}
+}
+
+function mapped(v: Value, f: (x: f64) => f64, fill: f64 | null = null): Value {
+	const out = new Value()
+	out.many = v.many
+	if (v.scalar != null) {
+		out.scalar = f(v.scalar!)
+		return out
+	}
+	for (const l of v.lines) {
+		out.lines.push(new Line(l.label, l.values.map(x => if (x == null) fill else f(x!))))
+	}
+	return out
+}
+
+function reduced(name: string, xs: f64[]): f64 {
+	let r = if (name == "MIN" || name == "MAX") xs[0] else 0.0
+	for (const x of xs) {
+		r = if (name == "MIN") min(r, x) else if (name == "MAX") max(r, x) else r + x
+	}
+	return if (name == "AVG") r / (xs.length as f64) else r
+}
+
+function sample(d: api.MetricDatum, at: string): Sample throws Fault {
+	const s = new Sample()
+	s.unit = d.Unit ?? "None"
+	if (d.Value != null && d.Values != null) {
+		throw api.invalidParameterCombinationException(`The parameters ${at}.Value and ${at}.Values are mutually exclusive and you have specified both.`)
+	}
+	if (d.Value != null && d.StatisticValues != null) {
+		throw api.invalidParameterCombinationException(`The parameters ${at}.Value and ${at}.StatisticValues are mutually exclusive and you have specified both.`)
+	}
+	if (d.Values != null && d.StatisticValues != null) {
+		throw api.invalidParameterCombinationException(`The parameters ${at}.Values and ${at}.StatisticValues are mutually exclusive and you have specified both.`)
+	}
+	if (d.Value != null) {
+		const v = finite(d.Value!, `${at}.Value`)
+		s.count = 1.0
+		s.sum = v
+		s.min = v
+		s.max = v
+		s.values = [v]
+		s.counts = [1.0]
+		return s
+	}
+	if (d.StatisticValues != null) {
+		const st = d.StatisticValues!
+		const named: [string, f64][] = [["SampleCount", st.SampleCount], ["Sum", st.Sum], ["Minimum", st.Minimum],
+			["Maximum", st.Maximum]]
+		for (const [n, v] of named) {
+			finite(v, `${at}.StatisticValues.${n}`)
+		}
+		if (st.SampleCount <= 0.0) {
+			throw api.invalidParameterValueException(`The parameter ${at}.StatisticValues.SampleCount must be greater than 0.`)
+		}
+		if (st.Minimum > st.Maximum) {
+			throw api.invalidParameterValueException(`The parameter ${at}.StatisticValues.Maximum must be greater than ${at}.StatisticValues.Minimum.`)
+		}
+		s.count = st.SampleCount
+		s.sum = st.Sum
+		s.min = st.Minimum
+		s.max = st.Maximum
+		return s
+	}
+	const values = d.Values ?? []
+	if (values.length == 0) {
+		throw api.invalidParameterCombinationException(`At least one of the parameters ${at}.Value, ${at}.StatisticValues `
+			+ `or ${at}.Values must be specified.`)
+	}
+	if (values.length > valueLimit) {
+		throw api.invalidParameterValueException(`The collection ${at}.Values must not have a size greater than ${valueLimit}.`)
+	}
+	const counts = d.Counts ?? values.map(_ => 1.0)
+	if (counts.length != values.length) {
+		throw api.invalidParameterValueException(`The parameters ${at}.Values and ${at}.Counts must be of the same size.`)
+	}
+	s.min = values[0]
+	s.max = values[0]
+	for (let i = 0; i < values.length; i++) {
+		const v = finite(values[i], `${at}.Values.member.${i + 1}`)
+		const c = finite(counts[i], `${at}.Counts.member.${i + 1}`)
+		s.count += c
+		s.sum += v * c
+		s.min = min(s.min, v)
+		s.max = max(s.max, v)
+	}
+	s.values = values
+	s.counts = counts
+	return s
+}
+
+function finite(v: f64, at: string): f64 throws Fault {
+	if (!isFinite(v) || abs(v) > 1.0e108 || v != 0.0 && abs(v) < 1.0e-130) {
+		throw api.invalidParameterValueException(`The value ${number(v)} for parameter ${at} is invalid.`)
+	}
+	return v
+}
+
+function dimensionsOf(ds: api.Dimension[], at: string): [string, string][] throws Fault {
+	if (ds.length > dimensionLimit) {
+		throw api.invalidParameterValueException(`The collection ${at} must not have a size greater than ${dimensionLimit}.`)
+	}
+	const out: [string, string][] = []
+	for (let i = 0; i < ds.length; i++) {
+		const d = ds[i]
+		if (d.Value == "") {
+			throw api.invalidParameterValueException(`The parameter ${at}.member.${i + 1}.Value must not be empty.`)
+		}
+		if (out.some(o => o[0] == d.Name)) {
+			throw api.invalidParameterValueException(`No metric may have duplicate dimension names.`)
+		}
+		out.push([d.Name, d.Value])
+	}
+	return out
+}
+
+function detectorOf(single: api.SingleMetricAnomalyDetector | null, math: bool, namespace: string | null,
+	name: string | null, dimensions: api.Dimension[] | null, stat: string | null): Detector throws Fault {
+	if (math) {
+		throw notImplemented("MetricMathAnomalyDetector")
+	}
+	const d = new Detector()
+	d.namespace = single?.Namespace ?? namespace ?? ""
+	d.name = single?.MetricName ?? name ?? ""
+	d.dimensions = dimensionsOf(single?.Dimensions ?? dimensions ?? [], "Dimensions")
+	d.stat = single?.Stat ?? stat ?? ""
+	for (const [member, v] of [["Namespace", d.namespace], ["MetricName", d.name], ["Stat", d.stat]]) {
+		if (v == "") {
+			throw api.missingRequiredParameterException(`The parameter ${member} is required.`)
+		}
+	}
+	return d
+}
+
+function detectorKey(d: Detector): string { return `${key(d.namespace, d.name, d.dimensions)}\x01${d.stat}` }
+
+/// The ARN of the dashboard name, which names no region.
+function dashboardArn(caller: Caller, name: string): string {
+	return `arn:aws:cloudwatch::${caller.account}:dashboard/${name}`
+}
+
+function checkBody(body: string) throws Fault {
+	let top = new json.Keys()
+	try {
+		top = json.decode[json.Keys](body)
+	} catch (e: ParseError) {
+		throw api.dashboardInvalidInputError("The field DashboardBody must be a valid JSON object")
+	}
+	const errors: [string, string][] = []
+	const widgets = top.all.find(k => k[0] == "widgets")
+	if (widgets == null) {
+		errors.push(["", "Should have required property 'widgets'"])
+	} else {
+		let items: json.Keys[] = []
+		try {
+			items = json.decode[json.Keys[]](widgets[1])
+		} catch (e: ParseError) {
+			errors.push(["/widgets", "Should be array"])
+		}
+		for (let i = 0; i < items.length; i++) {
+			if (!items[i].all.some(k => k[0] == "type")) {
+				errors.push([`/widgets/${i}`, "Should have required property 'type'"])
+			}
+		}
+	}
+	if (errors.length > 0) {
+		const listed = errors.map(e => `  {\n    "dataPath": ${json.quoted(e[0])},\n    "message": ${json.quoted(e[1])}\n  }`)
+		throw api.dashboardInvalidInputError(`The dashboard body is invalid, there are ${errors.length} validation `
+			+ `errors:\n[\n${listed.join(",\n")}\n]`)
+	}
+}
+
+function required[T](v: T | null, at: string): T throws Fault {
+	if (v == null) {
+		throw api.missingRequiredParameterException(`The parameter ${at} is required.`)
+	}
+	return v!
+}
+
+function checkUnit(u: string | null, at: string) throws Fault {
+	if (u != null && !units.includes(u!)) {
+		throw api.invalidParameterValueException(`The parameter ${at} must be a value in the set [ ${units.join(", ")} ].`)
+	}
+}
+
+function checkPeriod(p: i32, why: string) throws Fault {
+	if (p <= 0 || p % 60 != 0 && ![1, 5, 10, 20, 30].includes(p)) {
+		throw api.invalidParameterValueException(why)
+	}
+}
+
+/// The grid from start to end of period seconds, start rounded down as AWS rounds it by its age at t: to the minute,
+/// within 15 days, to 5 minutes within 63, else to the hour.
+function grid(start: i64, end: i64, period: i32, t: i64): Grid {
+	const age = t - start
+	const unit = if (age <= 15 * day) (if (period < 60) second else minute)
+		else if (age <= 63 * day) 5 * minute
+		else hour
+	const s = start - (start % unit + unit) % unit
+	const p = (period as i64) * second
+	return new Grid(s, p, ((end - s + p - 1) / p) as i32)
+}
+
+function bucketed(caller: Caller, k: string, g: Grid, unit: string | null): Sample[][] throws Fault {
+	const t = now()
+	const out: Sample[][] = []
+	for (let i = 0; i < g.points; i++) {
+		out.push([])
+	}
+	const kept = if (g.period < 5 * minute) t - 15 * day else if (g.period < hour) t - 63 * day else t - 455 * day
+	const from = max(g.start, kept)
+	const end = g.start + (g.points as i64) * g.period
+	const db = samples(caller.regional())
+	let after: string | null = `${k}\x01${padded(from - 1)}\x01\xff`
+	while (true) {
+		const page = db.scan(after, 1000, `${k}\x01`)
+		for (const [key, s] of page) {
+			after = key
+			const at = parseTime(key.slice(k.length + 1, k.length + 21))
+			if (at >= end) {
+				return out
+			}
+			if (at >= from && (unit == null || s.unit == unit)) {
+				out[((at - g.start) / g.period) as i32].push(s)
+			}
+		}
+		if (page.length < 1000) {
+			return out
+		}
+	}
+}
+
+function parseTime(s: string): i64 {
+	let n: i64 = 0
+	for (let i = 0; i < s.length; i++) {
+		n = n * 10 + ((s[i] - 48) as i64)
+	}
+	return n
+}
+
+function combined(ss: Sample[]): Combined {
+	const c = new Combined()
+	c.min = ss[0].min
+	c.max = ss[0].max
+	c.unit = ss[0].unit
+	for (const s of ss) {
+		c.count += s.count
+		c.sum += s.sum
+		c.min = min(c.min, s.min)
+		c.max = max(c.max, s.max)
+		for (let i = 0; i < s.values.length; i++) {
+			c.values.push([s.values[i], s.counts[i]])
+		}
+	}
+	sortBy(c.values, (a, b) => a[0] < b[0])
+	return c
+}
+
+function statOf(c: Combined, stat: string): f64 | null {
+	switch (stat) {
+		case "SampleCount": return c.count
+		case "Average": return c.sum / c.count
+		case "Sum": return c.sum
+		case "Minimum": return c.min
+		case "Maximum": return c.max
+		default:
+			const p = percentile(stat)
+			return if (p == null) null else ranked(c, p!)
+	}
+}
+
+function percentile(stat: string): f64 | null {
+	if (stat.length < 2 || stat[0] != 112) {
+		return null
+	}
+	const digits = stat.slice(1, stat.length)
+	for (let i = 0; i < digits.length; i++) {
+		if (!isDigit(digits[i]) && digits[i] != 46) {
+			return null
+		}
+	}
+	try {
+		const p = parseFloat(digits)
+		return if (p >= 0.0 && p <= 100.0) p else null
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function ranked(c: Combined, p: f64): f64 | null {
+	if (c.values.length == 0) {
+		return null
+	}
+	let total = 0.0
+	for (const v of c.values) {
+		total += v[1]
+	}
+	const rank = p / 100.0 * total
+	let seen = 0.0
+	for (const v of c.values) {
+		seen += v[1]
+		if (seen >= rank) {
+			return v[0]
+		}
+	}
+	return c.values[c.values.length - 1][0]
+}
+
+function crosses(a: Alarm, v: f64): bool {
+	switch (a.comparison) {
+		case "GreaterThanOrEqualToThreshold": return v >= a.threshold
+		case "GreaterThanThreshold": return v > a.threshold
+		case "LessThanThreshold": return v < a.threshold
+		default: return v <= a.threshold
+	}
+}
+
+function comparisonWord(c: string): string {
+	switch (c) {
+		case "GreaterThanOrEqualToThreshold": return "greater than or equal to"
+		case "GreaterThanThreshold": return "greater than"
+		case "LessThanThreshold": return "less than"
+		default: return "less than or equal to"
+	}
+}
+
+/// x as CloudWatch writes it in a reason, as 7.0.
+function number(x: f64): string {
+	const s = formatFloat(x)
+	return if (indexOf(s, ".") < 0 && indexOf(s, "e") < 0 && isFinite(x)) `${s}.0` else s
+}
+
+/// t as dd/MM/yy HH:mm:ss.
+function clock(t: i64): string {
+	const r = rfc3339(t - t % second)
+	return `${r.slice(8, 10)}/${r.slice(5, 7)}/${r.slice(2, 4)} ${r.slice(11, 19)}`
+}
+
+/// t as an alarm's message stamps it, as 2026-11-23T00:00:00.000+0000.
+function stamped(t: i64): string {
+	const ms = `${(t % second) / 1000000}`
+	return `${rfc3339(t - t % second).slice(0, 19)}.${"000".slice(0, 3 - ms.length)}${ms}+0000`
+}
+
+function token(t: string): string throws Fault {
+	try {
+		return base64.decode(t)
+	} catch (e: ParseError) {
+		throw api.invalidNextToken("The service cannot complete the request.")
+	}
+}
+
+function watched(a: Alarm): string[] throws Fault {
+	if (a.metric != null) {
+		return [key(a.namespace ?? "", a.metric!, a.dimensions)]
+	}
+	const out: string[] = []
+	for (const q of a.metrics) {
+		if (q.MetricStat != null) {
+			const m = q.MetricStat!.Metric
+			out.push(key(m.Namespace ?? "", m.MetricName ?? "", dimensionsOf(m.Dimensions ?? [], "Dimensions")))
+		}
+	}
+	return out
+}
+
+/// An alarm on metric math has the period of its query that returns data, else its first metric's.
+function mathPeriod(qs: api.MetricDataQuery[]): i32 {
+	const q = qs.find(m => m.ReturnData ?? true)
+	if (q != null && (q!.MetricStat?.Period ?? q!.Period) != null) {
+		return q!.MetricStat?.Period ?? q!.Period!
+	}
+	const m = qs.find(m => m.MetricStat != null)
+	return if (m == null) 60 else m!.MetricStat!.Period
+}
+
+function insightArn(caller: Caller, name: string): string {
+	return `arn:aws:cloudwatch:${caller.region}:${caller.account}:insight-rule/${name}`
+}
+
+function ruleOf(s: string): Rule throws Fault {
+	try {
+		return parse(s)
+	} catch (e: SyntaxError) {
+		throw api.validationException(e.message)
+	}
+}
+
+function composite(caller: Caller, a: Alarm): api.CompositeAlarm {
+	const c = new api.CompositeAlarm()
+	c.AlarmName = a.name
+	c.AlarmArn = alarmArn(caller, a.name)
+	c.CreationId = a.creationId
+	c.AlarmDescription = a.description
+	c.AlarmRule = a.rule
+	c.AlarmConfigurationUpdatedTimestamp = a.updated
+	c.ActionsEnabled = a.actionsEnabled
+	c.OKActions = a.ok
+	c.AlarmActions = a.alarm
+	c.InsufficientDataActions = a.insufficient
+	c.StateValue = a.state as api.StateValue
+	c.StateReason = a.reason
+	c.StateReasonData = a.reasonData
+	c.StateUpdatedTimestamp = a.stateUpdated
+	c.StateTransitionedTimestamp = a.transitioned
+	return c
+}
+
+function alarmArn(caller: Caller, name: string): string {
+	return `arn:aws:cloudwatch:${caller.region}:${caller.account}:alarm:${name}`
+}
+
+function note(caller: Caller, name: string, type$: string, summary: string, data: string, t: i64) throws Fault {
+	const db = history(caller.regional())
+	const prefix = `${name}\x00${padded(t)}\x00`
+	const n = db.scan(null, 1000000, prefix).length
+	db.put(`${prefix}${padded(n as i64)}`, { ...new History(), type: type$, summary: summary, data: data, at: t })
+}
+
+function metricOf(s: Series): api.Metric {
+	const m = new api.Metric()
+	m.Namespace = s.namespace
+	m.MetricName = s.name
+	m.Dimensions = s.dimensions.map(d => ({ ...new api.Dimension(), Name: d[0], Value: d[1] }))
+	return m
+}
+
+function described(caller: Caller, a: Alarm): api.MetricAlarm {
+	const m = new api.MetricAlarm()
+	m.AlarmName = a.name
+	m.AlarmArn = alarmArn(caller, a.name)
+	m.CreationId = a.creationId
+	m.AlarmDescription = a.description
+	m.AlarmConfigurationUpdatedTimestamp = a.updated
+	m.ActionsEnabled = a.actionsEnabled
+	m.OKActions = a.ok
+	m.AlarmActions = a.alarm
+	m.InsufficientDataActions = a.insufficient
+	m.StateValue = a.state as api.StateValue
+	m.StateReason = a.reason
+	m.StateUpdatedTimestamp = a.stateUpdated
+	m.StateTransitionedTimestamp = a.transitioned
+	m.MetricName = a.metric
+	m.Namespace = a.namespace
+	m.Statistic = a.statistic as (api.Statistic | null)
+	m.ExtendedStatistic = a.extended
+	m.Dimensions = a.dimensions.map(d => ({ ...new api.Dimension(), Name: d[0], Value: d[1] }))
+	m.Period = if (a.metrics.length == 0) a.period else null
+	m.Unit = a.unit as (api.StandardUnit | null)
+	m.EvaluationPeriods = a.evaluationPeriods
+	m.DatapointsToAlarm = if (a.datapointsGiven) a.datapointsToAlarm else null
+	m.Threshold = a.threshold
+	m.ComparisonOperator = a.comparison as api.ComparisonOperator
+	m.TreatMissingData = if (a.missingGiven) a.treatMissingData else null
+	m.Metrics = if (a.metrics.length == 0) null else a.metrics
+	return m
+}
+
+function message(caller: Caller, a: Alarm, old: string, t: i64): string {
+	const q = (s: string | null) => if (s == null) "null" else json.quoted(s!)
+	const list = (xs: string[]) => `[${xs.map(x => json.quoted(x)).join(",")}]`
+	const dims = a.dimensions.map(d => `{"value":${json.quoted(d[1])},"name":${json.quoted(d[0])}}`).join(",")
+	const trigger = `{"MetricName":${q(a.metric)},"Namespace":${q(a.namespace)},"StatisticType":`
+		+ `${if (a.extended == null) "\"Statistic\"" else "\"ExtendedStatistic\""},`
+		+ `${if (a.extended == null) `"Statistic":${q(if (a.statistic == null) null else upper(a.statistic!))}` else `"ExtendedStatistic":${q(a.extended)}`},"Unit":${q(a.unit)},"Dimensions":[${dims}],"Period":${a.period},`
+		+ `"EvaluationPeriods":${a.evaluationPeriods},"DatapointsToAlarm":${a.datapointsToAlarm},`
+		+ `"ComparisonOperator":${q(a.comparison)},"Threshold":${number(a.threshold)},"TreatMissingData":`
+		+ `${q(a.treatMissingData)},"EvaluateLowSampleCountPercentile":""}`
+	return `{"AlarmName":${q(a.name)},"AlarmDescription":${q(a.description)},"AWSAccountId":${q(caller.account)},`
+		+ `"AlarmConfigurationUpdatedTimestamp":${q(stamped(a.updated))},"NewStateValue":${q(a.state)},`
+		+ `"NewStateReason":${q(a.reason)},"StateChangeTime":${q(stamped(t))},"Region":${q(caller.region)},`
+		+ `"AlarmArn":${q(alarmArn(caller, a.name))},"OldStateValue":${q(old)},"OKActions":${list(a.ok)},`
+		+ `"AlarmActions":${list(a.alarm)},"InsufficientDataActions":${list(a.insufficient)},"Trigger":${trigger}}`
+}
+
+function upper(s: string): string {
+	const out: u8[] = []
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		out.push(if (c >= 97 && c <= 122) c - 32 else c)
+	}
+	return fromBytes(out)
+}
+
+function dashboardName(name: string): bool {
+	for (let i = 0; i < name.length; i++) {
+		if (!isAlphanumeric(name[i]) && name[i] != 45 && name[i] != 95) {
+			return false
+		}
+	}
+	return true
+}
+
+function identifier(id: string): bool {
+	if (id.length == 0 || id[0] < 97 || id[0] > 122) {
+		return false
+	}
+	for (let i = 0; i < id.length; i++) {
+		if (!isAlphanumeric(id[i]) && id[i] != 95) {
+			return false
+		}
+	}
+	return true
+}

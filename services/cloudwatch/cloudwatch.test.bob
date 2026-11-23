@@ -1,0 +1,339 @@
+import { request, sign, text, texts } from "../../core/client"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { Caller } from "../../core/service"
+import * as snsApi from "../sns/api"
+import * as api from "./api"
+import { Handler } from "./cloudwatch"
+import { indexOf } from "std/algo"
+import { parseFloat } from "std/float"
+import { Request, Response } from "std/http"
+import { escape } from "std/url"
+
+class Topics {
+	...snsApi.Unimplemented
+
+	published: snsApi.PublishInput[] = []
+	callers: Caller[] = []
+
+	publish(caller: Caller, input: snsApi.PublishInput): snsApi.PublishResponse throws Fault {
+		this.published.push(input)
+		this.callers.push(caller)
+		return new snsApi.PublishResponse()
+	}
+}
+
+const topicArn = "arn:aws:sns:us-east-1:000000000000:t"
+
+function gateway(s: Topics): Gateway {
+	const h = new Handler(s)
+	const g = new Gateway()
+	g.services.set(api.signingName, (caller, req) => {
+		return if (req.headers.has("x-amz-target")) api.handleJson(h, caller, req) else api.handle(h, caller, req)
+	})
+	return g
+}
+
+/// The answer of g to action with params in awsQuery, from the root of 000000000000, at 2015-06-26T14:00:00Z.
+function call(g: Gateway, action: string, params: [string, string][] = []): Response {
+	const query = params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	return g.handle(request("monitoring", "test", "test", `Action=${action}&Version=2010-08-01${query}`))
+}
+
+function callJson(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.0")
+	req.headers.set("x-amz-target", `GraniteServiceVersion20100801.${op}`)
+	sign(req, body, "monitoring", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+}
+
+function numbers(res: Response, name: string): f64[] { return texts(res, name).map(s => parseFloat(s)) }
+
+/// Puts to the metric m of namespace n with dimension D=v the params of each datum.
+function put(g: Gateway, data: [string, string][][]): Response {
+	const params: [string, string][] = [["Namespace", "n"]]
+	for (let i = 0; i < data.length; i++) {
+		const at = `MetricData.member.${i + 1}`
+		params.push([`${at}.MetricName`, "m"])
+		params.push([`${at}.Dimensions.member.1.Name`, "D"])
+		params.push([`${at}.Dimensions.member.1.Value`, "v"])
+		for (const [k, v] of data[i]) {
+			params.push([`${at}.${k}`, v])
+		}
+	}
+	return call(g, "PutMetricData", params)
+}
+
+const metric: [string, string][] = [["Namespace", "n"], ["MetricName", "m"], ["Dimensions.member.1.Name", "D"],
+	["Dimensions.member.1.Value", "v"]]
+
+test "statistics are of buckets aligned to the minute, of values, counts and units as put" {
+	const g = gateway(new Topics())
+	assert put(g,
+		[[["Value", "3"], ["Timestamp", "2015-06-26T13:50:10Z"], ["Unit", "Seconds"]],
+		[["Values.member.1", "1"], ["Values.member.2", "5"], ["Counts.member.1", "1"], ["Counts.member.2", "2"],
+		["Timestamp", "2015-06-26T13:50:40Z"], ["Unit", "Seconds"]],
+		[["Value", "10"], ["Timestamp", "2015-06-26T13:55:00Z"], ["Unit", "Seconds"]]]).status == 200
+	const res = call(g, "GetMetricStatistics",
+		[...metric, ["StartTime", "2015-06-26T13:50:34Z"], ["EndTime", "2015-06-26T14:00:00Z"], ["Period", "300"],
+		["Statistics.member.1", "Sum"], ["Statistics.member.2", "SampleCount"], ["Statistics.member.3", "Maximum"],
+		["ExtendedStatistics.member.1", "p50"]])
+	assert res.status == 200
+	assert text(res, "Label") == "m"
+	assert texts(res, "Timestamp") == ["2015-06-26T13:50:00Z", "2015-06-26T13:55:00Z"]
+	assert numbers(res, "Sum") == [14.0, 10.0]
+	assert numbers(res, "SampleCount") == [4.0, 1.0]
+	assert numbers(res, "Maximum") == [5.0, 10.0]
+	assert texts(res, "Unit") == ["Seconds", "Seconds"]
+	const other = call(g, "GetMetricStatistics",
+		[...metric, ["StartTime", "2015-06-26T13:00:00Z"], ["EndTime", "2015-06-26T14:00:00Z"], ["Period", "3600"],
+		["Statistics.member.1", "Sum"], ["Unit", "Bytes"]])
+	assert texts(other, "Sum") == []
+}
+
+test "PutMetricData and GetMetricStatistics answer as AWS does" {
+	const g = gateway(new Topics())
+	assert fails(call(g, "PutMetricData", [["Namespace", "n"]]), 400, "MissingParameter",
+		"At least one MetricDatum object must be present in the request.")
+	assert fails(put(g, [[["Value", "1"], ["Values.member.1", "1"]]]), 400, "InvalidParameterCombination",
+		"The parameters MetricData.member.1.Value and MetricData.member.1.Values are mutually exclusive and you have "
+		+ "specified both.")
+	assert fails(put(g, [[["Values.member.1", "1"], ["Values.member.2", "2"], ["Counts.member.1", "1"]]]), 400,
+		"InvalidParameterValue",
+		"The parameters MetricData.member.1.Values and MetricData.member.1.Counts must be of the " + "same size.")
+	assert fails(put(g, [[["Value", "1"], ["Timestamp", "2015-05-01T00:00:00Z"]]]), 400, "InvalidParameterValue",
+		"The parameter MetricData.member.1.Timestamp must specify a time within the past two weeks.")
+	assert fails(put(g, [[["Value", "1"], ["StorageResolution", "5"]]]), 400, "InvalidParameterValue",
+		"The parameter MetricData.member.1.StorageResolution must be a value in the set [ 1, 60 ].")
+	const window: [string, string][] = [["StartTime", "2015-06-26T13:00:00Z"], ["EndTime", "2015-06-26T14:00:00Z"]]
+	assert fails(call(g, "GetMetricStatistics", [...metric, ...window, ["Period", "60"]]), 400,
+		"InvalidParameterCombination",
+		"At least one of the parameters Statistics and ExtendedStatistics must be specified.")
+	assert fails(call(g, "GetMetricStatistics",
+		[...metric, ...window, ["Period", "61"], ["Statistics.member.1", "Sum"]]), 400, "InvalidParameterValue",
+		"The parameter Period must be a multiple of 60.")
+	assert fails(call(g, "GetMetricStatistics",
+		[...metric, ...window, ["Period", "60"], ["ExtendedStatistics.member.1", "p101"]]), 400,
+		"InvalidParameterValue",
+		"The value p101 for parameter ExtendedStatistics.member.1.<list element> is not supported.")
+	assert fails(call(g, "GetMetricStatistics",
+		[...metric, ["StartTime", "2015-06-26T14:00:00Z"], ["EndTime", "2015-06-26T13:00:00Z"], ["Period", "60"],
+		["Statistics.member.1", "Sum"]]), 400, "InvalidParameterValue",
+		"The parameter StartTime must be less than the parameter EndTime.")
+}
+
+test "ListMetrics filters by name and dimensions" {
+	const g = gateway(new Topics())
+	assert put(g, [[["Value", "1"]]]).status == 200
+	assert call(g, "PutMetricData",
+		[["Namespace", "o"], ["MetricData.member.1.MetricName", "x"], ["MetricData.member.1.Value", "1"]]).status == 200
+	assert texts(call(g, "ListMetrics"), "MetricName") == ["m", "x"]
+	assert texts(call(g, "ListMetrics", [["Namespace", "n"]]), "MetricName") == ["m"]
+	assert texts(call(g, "ListMetrics", [["Dimensions.member.1.Name", "D"]]), "MetricName") == ["m"]
+	assert texts(call(g, "ListMetrics", [["Dimensions.member.1.Name", "D"], ["Dimensions.member.1.Value", "w"]]),
+		"MetricName") == []
+	assert texts(call(g, "ListMetrics", [["RecentlyActive", "PT3H"]]), "MetricName") == ["m", "x"]
+}
+
+test "GetMetricData answers metrics and metric math in awsJson" {
+	const g = gateway(new Topics())
+	assert put(g,
+		[[["Value", "2"], ["Timestamp", "2015-06-26T13:50:00Z"]],
+		[["Value", "4"], ["Timestamp", "2015-06-26T13:55:00Z"]]]).status == 200
+	const m = `{"Namespace":"n","MetricName":"m","Dimensions":[{"Name":"D","Value":"v"}]}`
+	const q = `{"Id":"m1","MetricStat":{"Metric":${m},"Period":300,"Stat":"Sum"},"ReturnData":false}`
+	const res = callJson(g, "GetMetricData",
+		`{"StartTime":1435326600,"EndTime":1435327200,"ScanBy":"TimestampAscending",`
+		+ `"MetricDataQueries":[${q},{"Id":"e1","Expression":"m1 * 2 + 1"},{"Id":"e2","Expression":"IF(m1 > 3, m1, 0)"},`
+		+ `{"Id":"e3","Expression":"SUM(METRICS())","Label":"all"}]}`)
+	const body = res.body.whole ?? ""
+	assert res.status == 200
+	assert indexOf(body, `{"Id":"e1","Label":"e1","Timestamps":[1435326600,1435326900],"Values":[5,9]`) >= 0
+	assert indexOf(body, `"Values":[0,4]`) >= 0
+	assert indexOf(body, `"Label":"all"`) >= 0
+	assert indexOf(body, `"Id":"m1"`) < 0
+	// as CloudWatch answered on 2026-11-23: any real power, and no datapoint where it is not a number
+	const powers = callJson(g, "GetMetricData",
+		`{"StartTime":1435326600,"EndTime":1435327200,"ScanBy":"TimestampAscending","MetricDataQueries":[${q},`
+		+ `{"Id":"e1","Expression":"m1 ^ 0.5"},{"Id":"e2","Expression":"m1 ^ -1"},{"Id":"e3","Expression":"(0 - m1) ^ 0.5"},{"Id":"e4","Expression":"m1 / 0"},{"Id":"e5","Expression":"m1 ^ 2000"}]}`)
+	const raised = powers.body.whole ?? ""
+	assert indexOf(raised, `"Values":[1.4142135623730951,2]`) >= 0
+	assert indexOf(raised, `"Values":[0.5,0.25]`) >= 0
+	assert indexOf(raised,
+		`{"Id":"e3","Label":"e3","Timestamps":[],"Values":[],"StatusCode":"Complete","Messages":[{`
+		+ `"Code":"ArithmeticError","Value":"One or more data-points have been dropped due to non-numeric values `
+		+ `(NaN, -Infinite, +Infinite)"}]}`) >= 0
+	for (const id of ["e4", "e5"]) {
+		assert indexOf(raised,
+			`{"Id":"${id}","Label":"${id}","Timestamps":[],"Values":[],"StatusCode":"Complete",`
+			+ `"Messages":[{"Code":"ArithmeticError"`) >= 0
+	}
+	const bad = callJson(g, "GetMetricData",
+		`{"StartTime":1435326600,"EndTime":1435327200,"MetricDataQueries":[${q},`
+		+ `{"Id":"e1","Expression":"FOO(m1)"}]}`)
+	assert bad.status == 400
+	assert indexOf(bad.body.whole ?? "", "Error in expression 'e1': Function 'FOO' not found") >= 0
+}
+
+test "an alarm is evaluated as data is put and delivers its actions to SNS" {
+	const s = new Topics()
+	const g = gateway(s)
+	assert call(g, "PutMetricAlarm",
+		[["AlarmName", "a"], ...metric, ["Statistic", "Maximum"], ["Period", "60"], ["EvaluationPeriods", "1"],
+		["Threshold", "5"], ["ComparisonOperator", "GreaterThanThreshold"], ["AlarmActions.member.1", topicArn]]).status
+		== 200
+	assert text(call(g, "DescribeAlarms"), "StateValue") == "INSUFFICIENT_DATA"
+	assert put(g, [[["Value", "9"]]]).status == 200
+	assert s.published.length == 1
+	assert s.published[0].TopicArn == topicArn
+	assert s.published[0].Subject == `ALARM: "a" in us-east-1`
+	assert indexOf(s.published[0].Message,
+		`"NewStateValue":"ALARM","NewStateReason":"Threshold Crossed: 1 datapoint `
+		+ "[9.0 (26/06/15 14:00:00)] was greater than the threshold (5.0).\"") >= 0
+	assert s.callers[0].source == "arn:aws:cloudwatch:us-east-1:000000000000:alarm:a"
+	assert texts(call(g, "DescribeAlarms", [["StateValue", "ALARM"]]), "AlarmName") == ["a"]
+	assert texts(call(g, "DescribeAlarmsForMetric", metric), "AlarmName") == ["a"]
+	assert call(g, "DisableAlarmActions", [["AlarmNames.member.1", "a"]]).status == 200
+	assert call(g, "SetAlarmState", [["AlarmName", "a"], ["StateValue", "OK"], ["StateReason", "r"]]).status == 200
+	assert text(call(g, "DescribeAlarms"), "StateValue") == "OK"
+	assert s.published.length == 1
+	assert texts(call(g, "DescribeAlarmHistory", [["AlarmName", "a"], ["HistoryItemType", "StateUpdate"]]),
+		"HistorySummary") == ["Alarm updated from ALARM to OK", "Alarm updated from INSUFFICIENT_DATA to ALARM"]
+	assert fails(call(g, "SetAlarmState", [["AlarmName", "b"], ["StateValue", "OK"], ["StateReason", "r"]]), 404,
+		"ResourceNotFound")
+	assert call(g, "DeleteAlarms", [["AlarmNames.member.1", "a"], ["AlarmNames.member.2", "b"]]).status == 200
+	assert texts(call(g, "DescribeAlarms"), "AlarmName") == []
+}
+
+test "PutMetricAlarm checks its period and comparison, and alarms are tagged" {
+	const g = gateway(new Topics())
+	const alarm: [string, string][] = [["AlarmName", "a"], ...metric, ["Statistic", "Sum"], ["EvaluationPeriods", "1"],
+		["Threshold", "1"]]
+	assert fails(call(g, "PutMetricAlarm",
+		[...alarm, ["Period", "61"], ["ComparisonOperator", "GreaterThanThreshold"]]), 400, "ValidationError",
+		"Period must be 10, 20, 30 or a multiple of 60")
+	assert call(g, "PutMetricAlarm",
+		[...alarm, ["Period", "60"], ["ComparisonOperator", "LessThanThreshold"], ["Tags.member.1.Key", "k"],
+		["Tags.member.1.Value", "v"]]).status == 200
+	const arn = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:a"
+	assert call(g, "TagResource",
+		[["ResourceARN", arn], ["Tags.member.1.Key", "l"], ["Tags.member.1.Value", "w"]]).status == 200
+	assert call(g, "UntagResource", [["ResourceARN", arn], ["TagKeys.member.1", "k"]]).status == 200
+	assert texts(call(g, "ListTagsForResource", [["ResourceARN", arn]]), "Key") == ["l"]
+	assert call(g, "ListTagsForResource", [["ResourceARN", `${arn}x`]]).status == 404
+	assert fails(call(g, "DescribeAlarms", [["MaxRecords", "0"]]), 400, "ValidationError")
+}
+
+test "anomaly detectors are stored, of either form of request, and deleted" {
+	const g = gateway(new Topics())
+	assert call(g, "PutAnomalyDetector", [...metric, ["Stat", "Average"]]).status == 200
+	const single: [string, string][] = [["SingleMetricAnomalyDetector.Namespace", "n"],
+		["SingleMetricAnomalyDetector.MetricName", "m"], ["SingleMetricAnomalyDetector.Stat", "Maximum"]]
+	assert call(g, "PutAnomalyDetector", single).status == 200
+	const found = call(g, "DescribeAnomalyDetectors", [["Namespace", "n"]])
+	assert texts(found, "Stat") == ["Average", "Average", "Maximum", "Maximum"]
+	assert texts(found, "StateValue") == ["PENDING_TRAINING", "PENDING_TRAINING"]
+	assert texts(call(g, "DescribeAnomalyDetectors",
+		[["Dimensions.member.1.Name", "D"], ["Dimensions.member.1.Value", "v"]]), "Stat") == ["Average", "Average"]
+	assert fails(call(g, "PutAnomalyDetector", [["Namespace", "n"], ["MetricName", "m"]]), 400, "MissingParameter")
+	assert call(g, "DeleteAnomalyDetector", single).status == 200
+	assert fails(call(g, "DeleteAnomalyDetector", single), 404, "ResourceNotFoundException")
+	assert texts(call(g, "DescribeAnomalyDetectors"), "Stat") == ["Average", "Average"]
+}
+
+test "metric streams and insight rules are kept as put, started and stopped, enabled and disabled" {
+	const g = gateway(new Topics())
+	assert call(g, "PutMetricStream",
+		[["Name", "s"], ["FirehoseArn", "arn:aws:firehose:us-east-1:000000000000:x"],
+		["RoleArn", "arn:aws:iam::000000000000:role/r"], ["OutputFormat", "json"]]).status == 200
+	assert text(call(g, "GetMetricStream", [["Name", "s"]]), "State") == "running"
+	assert call(g, "StopMetricStreams", [["Names.member.1", "s"]]).status == 200
+	assert text(call(g, "ListMetricStreams", []), "State") == "stopped"
+	assert call(g, "DeleteMetricStream", [["Name", "s"]]).status == 200
+	assert fails(call(g, "GetMetricStream", [["Name", "s"]]), 404, "ResourceNotFoundException")
+	assert call(g, "PutInsightRule", [["RuleName", "r"], ["RuleDefinition", "{}"]]).status == 200
+	assert texts(call(g, "DisableInsightRules", [["RuleNames.member.1", "r"], ["RuleNames.member.2", "q"]]),
+		"FailureResource").join(",") == "q"
+	assert text(call(g, "DescribeInsightRules", []), "State") == "DISABLED"
+	assert call(g, "DeleteInsightRules", [["RuleNames.member.1", "r"]]).status == 200
+	assert texts(call(g, "DescribeInsightRules", []), "Name").length == 0
+}
+
+test "a composite alarm's AT_LEAST counts its alarms in a state, or not in it, by number or percentage" {
+	const g = gateway(new Topics())
+	for (const name of ["a", "b", "c"]) {
+		const threshold = if (name == "c") "50" else "5"
+		assert call(g, "PutMetricAlarm",
+			[["AlarmName", name], ...metric, ["Statistic", "Maximum"], ["Period", "60"], ["EvaluationPeriods", "1"],
+			["Threshold", threshold], ["ComparisonOperator", "GreaterThanThreshold"]]).status == 200
+	}
+	assert put(g, [[["Value", "9"]]]).status == 200
+	const state = (rule: string) => {
+		assert call(g, "PutCompositeAlarm", [["AlarmName", "p"], ["AlarmRule", rule]]).status == 200
+		return text(call(g, "DescribeAlarms",
+			[["AlarmNames.member.1", "p"], ["AlarmTypes.member.1", "CompositeAlarm"]]), "StateValue")
+	}
+	assert state("AT_LEAST(2, ALARM, (a, b, c))") == "ALARM"
+	assert state("AT_LEAST(3, ALARM, (a, b, c))") == "OK"
+	assert state("AT_LEAST(60%, ALARM, (\"a\", b, c))") == "ALARM"
+	assert state("AT_LEAST(1, NOT ALARM, (a, b)) OR AT_LEAST(1, OK, (c))") == "ALARM"
+	assert state("AT_LEAST(100%, NOT OK, (a, b))") == "ALARM"
+	assert fails(call(g, "PutCompositeAlarm", [["AlarmName", "p"], ["AlarmRule", "AT_LEAST(x, ALARM, (a))"]]), 400,
+		"ValidationError")
+	const first = call(g, "DescribeAlarmHistory", [["MaxRecords", "2"], ["AlarmTypes.member.1", "MetricAlarm"]])
+	assert texts(first, "AlarmName").length == 2
+	const next = text(first, "NextToken") ?? ""
+	assert next != ""
+	const rest = call(g, "DescribeAlarmHistory",
+		[["MaxRecords", "100"], ["NextToken", next], ["AlarmTypes.member.1", "MetricAlarm"]])
+	assert texts(rest, "AlarmName").length == 4 && text(rest, "NextToken") == null
+	assert texts(call(g, "DescribeAlarmHistory", [["AlarmTypes.member.1", "CompositeAlarm"]]),
+		"AlarmType").every(t => t == "CompositeAlarm")
+}
+
+test "GetMetricData pages by MaxDatapoints of all its results, in either order" {
+	const g = gateway(new Topics())
+	assert put(g,
+		[[["Value", "2"], ["Timestamp", "2015-06-26T13:50:00Z"]],
+		[["Value", "4"], ["Timestamp", "2015-06-26T13:55:00Z"]]]).status == 200
+	const m = `{"Namespace":"n","MetricName":"m","Dimensions":[{"Name":"D","Value":"v"}]}`
+	const page = (token: string) => {
+		const t = if (token == "") "" else `"NextToken":"${token}",`
+		const res = callJson(g, "GetMetricData",
+			`{"StartTime":1435326600,"EndTime":1435327200,"MaxDatapoints":3,${t}`
+			+ `"MetricDataQueries":[{"Id":"m1","MetricStat":{"Metric":${m},"Period":300,"Stat":"Sum"}},`
+			+ `{"Id":"e1","Expression":"m1 * 10"}]}`)
+		assert res.status == 200
+		return res.body.whole ?? ""
+	}
+	const first = page("")
+	assert indexOf(first, `"Values":[4,2],"StatusCode":"Complete"`) >= 0
+	assert indexOf(first, `"Values":[40],"StatusCode":"PartialData"`) >= 0
+	const at = indexOf(first, `"NextToken":"`) + 13
+	const second = page(first.slice(at, indexOf(first, "\"", at)))
+	assert indexOf(second, `"Values":[20]`) >= 0 && indexOf(second, "NextToken") < 0
+}
+
+test "an alarm on metric math is evaluated on the query that returns data, as data is put to its metrics" {
+	const g = gateway(new Topics())
+	const m1 = "Metrics.member.1"
+	assert call(g, "PutMetricAlarm",
+		[["AlarmName", "x"], ["EvaluationPeriods", "1"], ["Threshold", "10"],
+		["ComparisonOperator", "GreaterThanThreshold"], [`${m1}.Id`, "m1"], [`${m1}.ReturnData`, "false"],
+		[`${m1}.MetricStat.Metric.Namespace`, "n"], [`${m1}.MetricStat.Metric.MetricName`, "m"],
+		[`${m1}.MetricStat.Metric.Dimensions.member.1.Name`, "D"],
+		[`${m1}.MetricStat.Metric.Dimensions.member.1.Value`, "v"], [`${m1}.MetricStat.Period`, "60"],
+		[`${m1}.MetricStat.Stat`, "Sum"], ["Metrics.member.2.Id", "e1"], ["Metrics.member.2.Expression", "m1 * 2"],
+		["Metrics.member.2.ReturnData", "true"]]).status == 200
+	const state = () => text(call(g, "DescribeAlarms", [["AlarmNames.member.1", "x"]]), "StateValue")
+	assert state() == "INSUFFICIENT_DATA"
+	assert put(g, [[["Value", "4"]]]).status == 200
+	assert state() == "OK"
+	assert put(g, [[["Value", "2"]]]).status == 200
+	assert state() == "ALARM"
+}
