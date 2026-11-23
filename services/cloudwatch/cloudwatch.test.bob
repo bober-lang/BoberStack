@@ -154,8 +154,8 @@ test "GetMetricData answers metrics and metric math in awsJson" {
 		+ `{"Id":"e3","Expression":"SUM(METRICS())","Label":"all"}]}`)
 	const body = res.body.whole ?? ""
 	assert res.status == 200
-	assert indexOf(body, `{"Id":"e1","Label":"e1","Timestamps":[1435326600,1435326900],"Values":[5,9]`) >= 0
-	assert indexOf(body, `"Values":[0,4]`) >= 0
+	assert indexOf(body, `{"Id":"e1","Label":"e1","Timestamps":[1435326600,1435326900],"Values":[5.0,9.0]`) >= 0
+	assert indexOf(body, `"Values":[0.0,4.0]`) >= 0
 	assert indexOf(body, `"Label":"all"`) >= 0
 	assert indexOf(body, `"Id":"m1"`) < 0
 	// as CloudWatch answered on 2026-11-23: any real power, and no datapoint where it is not a number
@@ -163,7 +163,7 @@ test "GetMetricData answers metrics and metric math in awsJson" {
 		`{"StartTime":1435326600,"EndTime":1435327200,"ScanBy":"TimestampAscending","MetricDataQueries":[${q},`
 		+ `{"Id":"e1","Expression":"m1 ^ 0.5"},{"Id":"e2","Expression":"m1 ^ -1"},{"Id":"e3","Expression":"(0 - m1) ^ 0.5"},{"Id":"e4","Expression":"m1 / 0"},{"Id":"e5","Expression":"m1 ^ 2000"}]}`)
 	const raised = powers.body.whole ?? ""
-	assert indexOf(raised, `"Values":[1.4142135623730951,2]`) >= 0
+	assert indexOf(raised, `"Values":[1.4142135623730951,2.0]`) >= 0
 	assert indexOf(raised, `"Values":[0.5,0.25]`) >= 0
 	assert indexOf(raised,
 		`{"Id":"e3","Label":"e3","Timestamps":[],"Values":[],"StatusCode":"Complete","Messages":[{`
@@ -313,11 +313,11 @@ test "GetMetricData pages by MaxDatapoints of all its results, in either order" 
 		return res.body.whole ?? ""
 	}
 	const first = page("")
-	assert indexOf(first, `"Values":[4,2],"StatusCode":"Complete"`) >= 0
-	assert indexOf(first, `"Values":[40],"StatusCode":"PartialData"`) >= 0
+	assert indexOf(first, `"Values":[4.0,2.0],"StatusCode":"Complete"`) >= 0
+	assert indexOf(first, `"Values":[40.0],"StatusCode":"PartialData"`) >= 0
 	const at = indexOf(first, `"NextToken":"`) + 13
 	const second = page(first.slice(at, indexOf(first, "\"", at)))
-	assert indexOf(second, `"Values":[20]`) >= 0 && indexOf(second, "NextToken") < 0
+	assert indexOf(second, `"Values":[20.0]`) >= 0 && indexOf(second, "NextToken") < 0
 }
 
 test "an alarm on metric math is evaluated on the query that returns data, as data is put to its metrics" {
