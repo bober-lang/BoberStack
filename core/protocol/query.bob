@@ -3,18 +3,19 @@
 //! T[], a map a [K, V][], a union a union of classes of one field each, its member the field set, and a member whose
 //! type does not take null is required.
 
-import { startsWith } from "std/algo"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import * as base64 from "std/encoding/base64"
 import { Attr, Attribute, encode, Node, OmitEmpty, serialize } from "std/encoding/xml"
 import { parseFloat } from "std/float"
 import { Request, Response } from "std/http"
-import { round } from "std/math"
-import { lower, ParseError, parseInt } from "std/string"
+import { isFinite, round } from "std/math"
+import { ParseError, parseInt } from "std/string"
 import { httpDate, millisecond, parseHttpDate, parseRfc3339, rfc3339, second } from "std/time"
 import { Decodable, has, tag } from "std/types"
 import { Query } from "std/url"
 import { Fault } from "../fault"
 import { Caller, Unit } from "../service"
+import { check, Default, path, Validation, values, Violations } from "./model"
 
 /// Tags a member to be named K on the wire, as Smithy's xmlName on it.
 export class Name[K extends string] {}
@@ -32,26 +33,34 @@ export class Timestamp[F extends string = "date-time"] {}
 /// Tags a string member, or its items, as bytes, base64 on the wire.
 export class Blob {}
 
+/// The XML namespace of AWS's generic faults, which no service's model declares.
+const awsFault = "http://webservices.amazon.com/AWSFault/2005-15-09"
+
 /// A request from caller to the service of API version and XML namespace ns.
 export class Call {
 	caller: Caller
 	params: Query
 	ns: string
+	validation: Validation
 	/// The operation it asks for, "" if its Version is not the service's.
 	action: string
 
-	constructor(caller: Caller, params: Query, version: string, ns: string) {
+	constructor(caller: Caller, params: Query, version: string, ns: string,
+		validation: Validation = new Validation("ValidationError")) {
 		this.caller = caller
 		this.params = params
 		this.ns = ns
+		this.validation = validation
 		this.action = if (params.get("Version") == version) params.get("Action") ?? "" else ""
 	}
 
-	/// The answer by h, the handler of its action: h's output or the Fault that h or decoding its input throws.
-	serve[I extends Decodable, O](h: (caller: Caller, input: I) => O throws Fault): Response {
+	/// The answer by h, the handler of its action, which IAM authorizes as actions: h's output or the Fault it throws.
+	serve[I extends Decodable, O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = []): Response {
 		const id = this.caller.requestId
+		this.caller.actions = actions
 		try {
-			return reply(result(this.action, this.ns, id, h(this.caller, decode[I](this.params))), id)
+			const out = h(this.caller, decode[I](this.params, this.validation))
+			return reply(result(this.action, this.ns, id, out), id)
 		} catch (f: Fault) {
 			return error(f, id, this.ns)
 		}
@@ -61,17 +70,24 @@ export class Call {
 	invalidAction(): Response {
 		const p = this.params
 		const why = `Could not find operation ${p.get("Action") ?? ""} for version ${p.get("Version") ?? ""}`
-		return error(new Fault(400, "InvalidAction", why), this.caller.requestId, this.ns)
+		return error(new Fault(400, "InvalidAction", why), this.caller.requestId, awsFault)
 	}
 }
 
 /// The call of req from caller to the service of API version and XML namespace ns.
-export function call(caller: Caller, req: Request, version: string, ns: string): Call throws IoError {
-	return new Call(caller, Query.parse(req.body.text()), version, ns)
+export function call(caller: Caller, req: Request, version: string, ns: string,
+	validation: Validation = new Validation("ValidationError")): Call throws IoError {
+	return new Call(caller, Query.parse(req.body.text()), version, ns, validation)
 }
 
-/// The T whose members p holds; a required one missing, or a value not of its type, is a ValidationError.
-export function decode[T extends Decodable](p: Query): T throws Fault { return value[T](p, "", []) }
+/// The T whose members p holds, or validation's fault where p breaks T's model.
+export function decode[T extends Decodable](p: Query,
+	validation: Validation = new Validation("ValidationError")): T throws Fault {
+	const v = new Violations(validation)
+	const r = value[T](p, "", "", [], v)
+	v.check()
+	return r
+}
 
 /// The document answering the operation op of the service of namespace ns with out.
 export function result[O](op: string, ns: string, requestId: string, out: O): string {
@@ -95,7 +111,8 @@ export function reply(xml: string, requestId: string, status: i32 = 200): Respon
 class Error {
 	Type = "Sender"
 	Code = ""
-	Message = ""
+	/// None for a fault of no message, as IAM answers some InvalidInput.
+	Message: string @OmitEmpty = ""
 }
 
 class ErrorResponse {
@@ -112,82 +129,109 @@ export function error(f: Fault, requestId: string, ns: string = ""): Response {
 	e.Error.Code = f.code
 	e.Error.Message = f.message
 	e.RequestId = requestId
-	return reply(encode(e), requestId, f.status)
+	const xml = encode(e)
+	const end = indexOf(xml, "</Error>") // after the message, whose text cannot hold it
+	return reply(xml.slice(0, end) + f.members + xml.slice(end, xml.length), requestId, f.status)
+}
+
+/// The XML of v's fields, an error's members besides its message.
+export function members[T](v: T): string {
+	const el = new Node("element", "Error")
+	put(el, "Error", v, [])
+	const e = el.children[0]
+	if (e.children.length == 0) {
+		return "" // all null, an empty element without a closing tag
+	}
+	const xml = serialize(e)
+	return xml.slice(indexOf(xml, ">") + 1, lastIndexOf(xml, "<"))
 }
 
 /// The T that the parameter k of p holds, or those within it, of a member tagged tags.
-function value[T extends Decodable](p: Query, k: string, tags: Type[]): T throws Fault {
+function value[T extends Decodable](p: Query, k: string, at: string, tags: Type[], v: Violations): T throws Fault {
 	const s = p.get(k) ?? ""
 	switch (T.kind) {
 		case "union":
 			if (T.members.filter(M => M.kind == "class").length > 1) {
-				return variant[T](p, k)
+				return variant[T](p, k, at, v)
 			}
-			let last = invalid(s, k, "Member must satisfy enum value set")
+			if (T.members.every(M => M.kind == "literal" || M.kind == "null")) {
+				return choice[T](s, at, v)
+			}
+			let last: Fault | null = null
 			for (const M of T.members) {
 				if (M.kind != "null") {
 					try {
-						return value[M](p, k, tags)
+						return value[M](p, k, at, tags, v)
 					} catch (f: Fault) {
 						last = f
 					}
 				}
 			}
-			throw last
-		case "literal":
-			if (s == T.value) {
-				return T.value
-			}
-			throw invalid(s, k, "Member must satisfy enum value set")
+			throw last ?? v.fault(s, at, `Member must be a ${T.name}`)
+		case "literal": return choice[T](s, at, v)
 		case "array":
 			// k.member.1 or, flattened, k.1; a map's items k.entry.1.key and k.entry.1.value, or k.1.key.
 			const xs: T = []
 			const item = if (T.elem.kind == "tuple") "entry" else tag(tags, Member, "member")
-			const at = if (has(tags, Flat)) k else `${k}.${item}`
-			for (let i = 1; present(p, `${at}.${i}`); i++) {
-				xs.push(value[T.elem](p, `${at}.${i}`, tags))
+			const of = if (has(tags, Flat)) k else `${k}.${item}`
+			for (let i = 1; present(p, `${of}.${i}`); i++) {
+				xs.push(value[T.elem](p, `${of}.${i}`, `${at}.${i}.member`, tags, v))
 			}
+			check(xs, at, tags, v)
 			return xs
 		case "tuple":
-			const e = new T() // a map's entry
+			const e = new T() // a map's entry, its value of the member's constraints
 			for (const f of T.fields) {
-				const n = if (f.name == "0") tag(tags, Key, "key") else tag(tags, Value, "value")
-				e[f.name] = value[f.type](p, `${k}.${n}`, tags)
+				const key = f.name == "0"
+				const n = if (key) tag(tags, Key, "key") else tag(tags, Value, "value")
+				e[f.name] = value[f.type](p, `${k}.${n}`, `${at}.${if (key) "key" else "value"}`, if (key) [] else tags,
+					v)
 			}
 			return e
 		case "class":
 			const r = new T()
+			const from: i32[] = []
 			for (const f of T.fields) {
+				from.push(v.found.length)
 				const m = (if (k == "") "" else `${k}.`) + tag(f.tags, Name, f.name)
 				if (present(p, m)) {
-					r[f.name] = value[f.type](p, m, f.tags)
-				} else if (!nullable(f.type)) {
-					throw invalid(null, m, "Member must not be null")
+					r[f.name] = value[f.type](p, m, path(at, f.name), f.tags, v)
+				} else if (!nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, path(at, f.name), "Member must not be null")
 				}
 			}
+			v.order(T.fields.map(f => path("", f.name)), from)
 			return r
 		case "string":
 			if (!has(tags, Blob)) {
+				check(s, at, tags, v)
 				return s
 			}
+			let b = ""
 			try {
-				return base64.decode(s)
+				b = base64.decode(s)
 			} catch (e: ParseError) {
-				throw invalid(s, k, "Member must be base64")
+				throw v.fault(s, at, "Member must be base64")
 			}
+			check(b, at, tags, v, true)
+			return b
 		case "bool":
 			if (s == "true" || s == "false") {
 				return s == "true"
 			}
-			throw invalid(s, k, "Member must be true or false")
-		case "int": try {
-			if (T == i64 && has(tags, Timestamp)) {
-				return instant(s, tag(tags, Timestamp, ""))
+			throw v.fault(s, at, "Member must be true or false")
+		case "int":
+			let n: T = 0
+			try {
+				if (T == i64 && has(tags, Timestamp)) {
+					return instant(s, tag(tags, Timestamp, ""))
+				}
+				n = parseInt[T](s)
+			} catch (e: ParseError) {
+				throw v.fault(s, at, `Member must be ${if (has(tags, Timestamp)) "a timestamp" else "an integer"}`)
 			}
-			return parseInt[T](s)
-		} catch (e: ParseError) {
-			throw invalid(s, k, `Member must be ${if (has(tags, Timestamp)) "a timestamp" else "an integer"}`)
-		}
+			check(n, at, tags, v)
+			return n
 		case "float":
 			const zero: T = 0.0
 			switch (s) {
@@ -195,29 +239,54 @@ function value[T extends Decodable](p: Query, k: string, tags: Type[]): T throws
 				case "Infinity": return 1.0 / zero
 				case "-Infinity": return -1.0 / zero
 			}
+			let x: T = 0.0
 			try {
-				return parseFloat[T](s)
+				x = parseFloat[T](s)
 			} catch (e: ParseError) {
-				throw invalid(s, k, "Member must be a number")
+				throw v.fault(s, at, "Member must be a number")
 			}
-		default: throw invalid(s, k, `Member must be a ${T.name}`)
+			check(x, at, tags, v)
+			return x
+		default: throw v.fault(s, at, `Member must be a ${T.name}`)
 	}
 }
 
+/// The value of the enum T that s names; if none, its first, with a violation noted into v.
+export function choice[T](s: string, at: string, v: Violations): T {
+	if (T.kind == "literal") {
+		if (s != T.value) {
+			v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
+		}
+		return T.value
+	}
+	for (const M of T.members) {
+		if (M.kind == "literal" && s == M.value) {
+			return M.value
+		}
+	}
+	v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
+	for (const M of T.members) {
+		if (M.kind == "literal") {
+			return M.value
+		}
+	}
+	return T.value
+}
+
 /// The T, a union, of the one member that p holds within k.
-function variant[T extends Decodable](p: Query, k: string): T throws Fault {
+function variant[T extends Decodable](p: Query, k: string, at: string, v: Violations): T throws Fault {
 	let r: T | null = null
 	let n = 0
 	for (const M of T.members) {
 		if (M.kind == "class") {
 			if (present(p, `${k}.${tag(M.fields[0].tags, Name, M.fields[0].name)}`)) {
-				r = value[M](p, k, [])
+				r = value[M](p, k, at, [], v)
 				n++
 			}
 		}
 	}
 	if (n != 1) {
-		throw invalid(null, k, "Member must have exactly one member set")
+		throw v.fault(null, at, "Member must have exactly one member set")
 	}
 	return r!
 }
@@ -228,14 +297,6 @@ function present(p: Query, k: string): bool { return p.entries.some(e => e[0] ==
 /// Whether t takes null.
 function nullable(t: Type): bool {
 	return t.kind == "null" || t.kind == "union" && t.members.some(M => M.kind == "null")
-}
-
-/// A ValidationError of the value s, or null, at the parameter k, as AWS words one.
-export function invalid(s: string | null, k: string, why: string): Fault {
-	const v = if (s == null) "null" else `'${s}'`
-	const at = lower(k.slice(0, 1)) + k.slice(1, k.length)
-	return new Fault(400, "ValidationError",
-		`1 validation error detected: Value ${v} at '${at}' failed to satisfy constraint: ${why}`)
 }
 
 /// The instant that the timestamp s in format names.
@@ -298,7 +359,11 @@ function format[T](v: T, tags: Type[]): string {
 	if (T == string && has(tags, Blob)) {
 		return base64.encode(v)
 	}
-	return `${v}` // a float's NaN and infinities as awsQuery has them too
+	const s = `${v}` // a float's NaN and infinities as awsQuery has them too
+	if ((T == f64 || T == f32) && isFinite(v as f64) && indexOf(s, ".") < 0 && indexOf(s, "e") < 0) {
+		return `${s}.0` // a whole number as AWS writes it
+	}
+	return s
 }
 
 /// A new element named n, el's last child.

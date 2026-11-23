@@ -1,16 +1,17 @@
-//! AWS Signature Version 4 in the Authorization header: parsing it and checking a request's signature.
+//! AWS Signature Version 4, in the Authorization header or a presigned URL: parsing it and checking signatures.
 
+import { Fault } from "../fault"
 import { indexOf, sortBy, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
 import { equal, hmacSha256, sha256 } from "std/crypto/hash"
 import * as hex from "std/encoding/hex"
 import { Request } from "std/http"
-import { ParseError, split, trim } from "std/string"
+import { ParseError, parseInt, replace, split, trim } from "std/string"
 import { iso8601Basic, minute, parseIso8601Basic, second } from "std/time"
-import { escape } from "std/url"
+import { escape, unescape } from "std/url"
 
 /// What an Authorization header of the form `AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request,
-/// SignedHeaders=a;b, Signature=hex` says.
+/// SignedHeaders=a;b, Signature=hex` says, or a presigned URL's X-Amz-* parameters.
 export class Authorization {
 	accessKey = ""
 	/// The credential scope's date, as 20150830.
@@ -19,7 +20,17 @@ export class Authorization {
 	service = ""
 	signedHeaders: string[] = []
 	signature = ""
+	/// A presigned URL's X-Amz-Expires in seconds, 0 for a header; of SigV2, its Expires, in seconds since the epoch.
+	expires: i64 = 0
+	/// 2 of a SigV2 presigned URL, which has no scope but its access key, else 4.
+	version = 4
 }
+
+/// The values of X-Amz-Content-Sha256 that stand for a body not hashed.
+export const unsigned = "UNSIGNED-PAYLOAD"
+
+export const streaming = ["STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+	"STREAMING-UNSIGNED-PAYLOAD-TRAILER"]
 
 /// header as a SigV4 Authorization, or null if it is not one.
 export function parse(header: string): Authorization | null {
@@ -33,15 +44,9 @@ export function parse(header: string): Authorization | null {
 		const eq = indexOf(p, "=")
 		const v = p.slice(eq + 1, p.length)
 		switch (p.slice(0, if (eq < 0) 0 else eq)) {
-			case "Credential":
-				const scope = split(v, "/")
-				if (scope.length != 5 || scope[4] != "aws4_request") {
-					return null
-				}
-				a.accessKey = scope[0]
-				a.date = scope[1]
-				a.region = scope[2]
-				a.service = scope[3]
+			case "Credential": if (!credential(a, v)) {
+				return null
+			}
 			case "SignedHeaders": a.signedHeaders = split(v, ";")
 			case "Signature": a.signature = v
 		}
@@ -49,11 +54,69 @@ export function parse(header: string): Authorization | null {
 	return if (a.accessKey == "" || a.signedHeaders.length == 0 || a.signature == "") null else a
 }
 
+/// The authorization req bears, null if none; throws if it is malformed, as AWS words it.
+export function authorization(req: Request): Authorization | null throws Fault {
+	const header = req.headers.get("authorization")
+	if (header != null) {
+		const a = parse(header!)
+		if (a == null) {
+			throw new Fault(400, "IncompleteSignature",
+				`Authorization header requires 'Credential', 'Signature' and `
+				+ `'SignedHeaders' parameters in the form AWS4-HMAC-SHA256: ${header}`)
+		}
+		return a
+	}
+	const q = req.url.query
+	if (!q.has("X-Amz-Algorithm")) {
+		return null
+	}
+	const a = new Authorization()
+	const needed = "Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, "
+		+ "X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters."
+	if (q.get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256") {
+		throw new Fault(400, "AuthorizationQueryParametersError",
+			"X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256\"")
+	}
+	if (!credential(a, q.get("X-Amz-Credential") ?? "") || !q.has("X-Amz-Date") || !q.has("X-Amz-Expires")) {
+		throw new Fault(400, "AuthorizationQueryParametersError", needed)
+	}
+	a.signedHeaders = split(q.get("X-Amz-SignedHeaders") ?? "", ";").filter(h => h != "")
+	a.signature = q.get("X-Amz-Signature") ?? ""
+	try {
+		a.expires = parseInt[i64](q.get("X-Amz-Expires")!)
+	} catch (e: ParseError) {
+		throw new Fault(400, "AuthorizationQueryParametersError", "X-Amz-Expires should be a number")
+	}
+	if (a.signedHeaders.length == 0 || a.signature == "") {
+		throw new Fault(400, "AuthorizationQueryParametersError", needed)
+	}
+	if (a.expires < 1) {
+		throw new Fault(400, "AuthorizationQueryParametersError", "X-Amz-Expires must be non-negative")
+	}
+	if (a.expires > 604800) {
+		throw new Fault(400, "AuthorizationQueryParametersError",
+			"X-Amz-Expires must be less than a week (in seconds) that is; 604800")
+	}
+	return a
+}
+
+function credential(a: Authorization, v: string): bool {
+	const scope = split(v, "/")
+	if (scope.length != 5 || scope[4] != "aws4_request" || scope[0] == "") {
+		return false
+	}
+	a.accessKey = scope[0]
+	a.date = scope[1]
+	a.region = scope[2]
+	a.service = scope[3]
+	return true
+}
+
 /// Why req, whose body is body, does not bear auth's signature by secret at the instant now, as AWS words it; null if
 /// it does. A request dated more than 15 minutes from now has expired.
 export function verify(req: Request, body: string, auth: Authorization, secret: string,
-	now: i64): string | null throws CryptoError {
-	const stamp = req.headers.get("x-amz-date") ?? ""
+	now: i64): string | Fault | null throws CryptoError {
+	const stamp = stampOf(req, auth)
 	let t: i64 = 0
 	try {
 		t = parseIso8601Basic(stamp)
@@ -61,44 +124,109 @@ export function verify(req: Request, body: string, auth: Authorization, secret: 
 		return `X-Amz-Date ${stamp} is not a timestamp such as 20150830T123600Z`
 	}
 	const [early, late] = [now - 15 * minute, now + 15 * minute]
-	if (t < early) {
+	if (auth.expires != 0 && now > t + auth.expires * second) {
+		const members = `<X-Amz-Expires>${auth.expires}</X-Amz-Expires><Expires>${iso(t + auth.expires * second)}`
+			+ `</Expires><ServerTime>${iso(now)}</ServerTime>`
+		return new Fault(403, "AccessDenied", "Request has expired", true, members)
+	}
+	if (auth.expires == 0 && t < early) {
 		return `Signature expired: ${stamp} is now earlier than ${basic(early)} (${basic(now)} - 15 min.)`
 	}
 	if (t > late) {
 		return `Signature not yet current: ${stamp} is still later than ${basic(late)} (${basic(now)} + 15 min.)`
 	}
-	if (!equal(signature(req, body, auth, secret), auth.signature)) {
+	const ok = equal(signature(req, body, auth, secret), auth.signature)
+		|| auth.expires != 0 && equal(signature(req, body, auth, secret, hex.encode(sha256(body))), auth.signature)
+	if (!ok && auth.service == "s3") {
+		const canonical = canonicalRequest(req, payload(req, body, auth), auth)
+		return mismatch(auth, stringToSign(req, auth, canonical),
+			[["CanonicalRequest", canonical], ["CanonicalRequestBytes", bytesOf(canonical)]])
+	}
+	if (!ok) {
 		return "The request signature we calculated does not match the signature you provided. Check your AWS Secret "
 			+ "Access Key and signing method. Consult the service documentation for details."
 	}
 	return null
 }
 
-/// The signature, in hex, of req with body by secret in auth's scope over auth's signed headers.
-export function signature(req: Request, body: string, auth: Authorization, secret: string): string throws CryptoError {
-	const scope = `${auth.date}/${auth.region}/${auth.service}/aws4_request`
-	const canonical = hex.encode(sha256(canonicalRequest(req, body, auth.signedHeaders)))
-	const toSign = `AWS4-HMAC-SHA256\n${req.headers.get("x-amz-date") ?? ""}\n${scope}\n${canonical}`
-	let key = `AWS4${secret}`
-	for (const part of [auth.date, auth.region, auth.service, "aws4_request"]) {
-		key = hmacSha256(key, part)
-	}
-	return hex.encode(hmacSha256(key, toSign))
+/// S3's SignatureDoesNotMatch, which shows the string to sign and the signature given.
+export function mismatch(auth: Authorization, signed: string, more: [string, string][]): Fault {
+	const members: [string, string][] = [["AWSAccessKeyId", auth.accessKey], ["StringToSign", signed],
+		["SignatureProvided", auth.signature], ["StringToSignBytes", bytesOf(signed)]]
+	members.append(more)
+	const text = members.map(m => `<${m[0]}>${escaped(m[1])}</${m[0]}>`).join("")
+	return new Fault(403, "SignatureDoesNotMatch",
+		"The request signature we calculated does not match the signature you provided. Check your key and signing "
+		+ "method.", true, text)
 }
 
-/// The canonical request of req with body over the headers signed: its method, its path and query encoded once more,
-/// the signed headers with their values trimmed, and the body's hash, never X-Amz-Content-Sha256's, which outside S3
-/// is a signed header like any other.
-export function canonicalRequest(req: Request, body: string, signed: string[]): string throws CryptoError {
-	const path = if (req.url.path == "") "/" else req.url.path
-	const query = req.url.query.entries.map(e => [escape(e[0], "component"), escape(e[1], "component")])
+function escaped(s: string): string { return replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") }
+
+function bytesOf(s: string): string {
+	const out: string[] = []
+	for (let i = 0; i < s.length; i++) {
+		out.push(hex.encode(s.slice(i, i + 1)))
+	}
+	return out.join(" ")
+}
+
+/// The signature, in hex, of req with body by secret in auth's scope over auth's signed headers.
+export function signature(req: Request, body: string, auth: Authorization, secret: string,
+	hash: string | null = null): string throws CryptoError {
+	return hex.encode(hmacSha256(key(auth, secret),
+		stringToSign(req, auth, canonicalRequest(req, hash ?? payload(req, body, auth), auth))))
+}
+
+function stringToSign(req: Request, auth: Authorization, canonical: string): string throws CryptoError {
+	return `AWS4-HMAC-SHA256\n${stampOf(req, auth)}\n${scope(auth)}\n${hex.encode(sha256(canonical))}`
+}
+
+export function key(auth: Authorization, secret: string): string throws CryptoError {
+	let k = `AWS4${secret}`
+	for (const part of [auth.date, auth.region, auth.service, "aws4_request"]) {
+		k = hmacSha256(k, part)
+	}
+	return k
+}
+
+export function scope(auth: Authorization): string { return `${auth.date}/${auth.region}/${auth.service}/aws4_request` }
+
+export function stampOf(req: Request, auth: Authorization): string {
+	return (if (auth.expires != 0) req.url.query.get("X-Amz-Date") else req.headers.get("x-amz-date")) ?? ""
+}
+
+/// What stands for req's body in its canonical request. X-Amz-Content-Sha256 counts only if unsigned or streaming:
+/// outside S3 it is a signed header like any other.
+export function payload(req: Request, body: string, auth: Authorization): string throws CryptoError {
+	const declared = req.headers.get("x-amz-content-sha256") ?? ""
+	if (declared == unsigned || streaming.includes(declared)) {
+		return declared
+	}
+	return if (auth.expires != 0) unsigned else hex.encode(sha256(body))
+}
+
+/// The canonical request of req, whose payload's hash is hash, over the headers auth signs; S3 encodes its path once,
+/// the others twice.
+export function canonicalRequest(req: Request, hash: string, auth: Authorization): string {
+	const raw = if (req.url.path == "") "/" else req.url.path
+	const path = if (auth.service == "s3") split(raw, "/").map(s => escape(unescape(s, "path"), "component")).join("/")
+		else escape(raw, "path")
+	const query = req.url.query.entries.filter(e => e[0]
+		!= "X-Amz-Signature").map(e => [escape(e[0], "component"), escape(e[1], "component")])
 	sortBy(query, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+	const signed = auth.signedHeaders
 	const headers = signed.map(h => `${h}:${req.headers.all(h).map(value).join(",")}\n`)
-	return [req.method, escape(path, "path"), query.map(e => `${e[0]}=${e[1]}`).join("&"), headers.join(""),
-		signed.join(";"), hex.encode(sha256(body))].join("\n")
+	return [req.method, path, query.map(e => `${e[0]}=${e[1]}`).join("&"), headers.join(""), signed.join(";"),
+		hash].join("\n")
 }
 
 /// A header's value trimmed, its runs of spaces one.
 function value(v: string): string { return split(trim(v), " ").filter(w => w != "").join(" ") }
 /// t to the second as SigV4 dates a request: 20150830T123600Z.
 function basic(t: i64): string { return iso8601Basic(t - t % second) }
+
+/// t to the second as S3 writes an instant in an error: 2015-08-30T12:36:00Z.
+export function iso(t: i64): string {
+	const b = basic(t)
+	return `${b.slice(0, 4)}-${b.slice(4, 6)}-${b.slice(6, 11)}:${b.slice(11, 13)}:${b.slice(13, 16)}`
+}
