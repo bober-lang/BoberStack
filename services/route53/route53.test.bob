@@ -1,0 +1,124 @@
+import { sign, text, texts } from "../../core/client"
+import { Gateway } from "../../core/gateway"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { Request, Response } from "std/http"
+import { normal } from "./route53"
+
+const ns = "https://route53.amazonaws.com/doc/2013-04-01/"
+
+function call(g: Gateway, method: string, path: string, body = ""): Response {
+	const req = new Request(method, `http://localhost:4566/2013-04-01${path}`, body)
+	req.headers.set("host", "localhost:4566")
+	sign(req, body, "route53", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function create(name: string, reference: string): string {
+	return `<CreateHostedZoneRequest xmlns="${ns}"><Name>${name}</Name><CallerReference>${reference}</CallerReference>`
+		+ "</CreateHostedZoneRequest>"
+}
+
+function batch(changes: [string, string][]): string {
+	const each = changes.map(c => `<Change><Action>${c[0]}</Action><ResourceRecordSet>${c[1]}</ResourceRecordSet></Change>`)
+	return `<ChangeResourceRecordSetsRequest xmlns="${ns}"><ChangeBatch><Changes>${each.join("")}</Changes>`
+		+ "</ChangeBatch></ChangeResourceRecordSetsRequest>"
+}
+
+function a(name: string, value: string): string {
+	return `<Name>${name}</Name><Type>A</Type><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>${value}</Value>`
+		+ "</ResourceRecord></ResourceRecords>"
+}
+
+test "names are normalised as Route 53 holds them" {
+	assert normal("WWW.Example.COM") == "www.example.com."
+	assert normal("*.example.com.") == "\\052.example.com."
+	assert normal("\\052.example.com") == "\\052.example.com."
+	assert normal("a b.example.com") == "a\\040b.example.com."
+}
+
+test "a zone, its records and its deletion" {
+	const g = stack(new Catalog(0, 0))
+	const made = call(g, "POST", "/hostedzone", create("example.test", "r1"))
+	assert made.status == 201
+	assert made.headers.get("content-type") == "text/xml"
+	const id = text(made, "Id")!
+	assert made.headers.get("location") == `http://localhost:4566/2013-04-01${id}`
+	assert texts(made, "NameServer").length == 4
+	assert texts(made, "Status").includes("PENDING")
+	const again = call(g, "POST", "/hostedzone", create("other.test", "r1"))
+	assert again.status == 409 && text(again, "Code") == "HostedZoneAlreadyExists"
+	const listed = call(g, "GET", `${id}/rrset`)
+	assert texts(listed, "Type") == ["NS", "SOA"]
+	const changed = call(g, "POST", `${id}/rrset`,
+		batch([["CREATE", a("WWW.example.test", "192.0.2.1")], ["CREATE", a("b.a.example.test", "192.0.2.2")],
+		["CREATE", a("*.example.test", "192.0.2.3")]]))
+	assert changed.status == 200
+	assert text(call(g, "GET", text(changed, "Id")!), "Status") == "PENDING"
+	assert text(call(g, "GET", text(changed, "Id")!), "Status") == "INSYNC"
+	const names = texts(call(g, "GET", `${id}/rrset`), "Name")
+	assert names == ["example.test.", "example.test.", "\\052.example.test.", "b.a.example.test.", "www.example.test."]
+	const page = call(g, "GET", `${id}/rrset?maxitems=3`)
+	assert text(page, "IsTruncated") == "true" && text(page, "NextRecordName") == "b.a.example.test."
+	const whole = call(g, "POST", `${id}/rrset`,
+		batch([["CREATE", a("c.example.test", "192.0.2.4")], ["DELETE", a("v.example.test", "192.0.2.4")]]))
+	assert whole.status == 400 && text(whole, "Code") == "InvalidChangeBatch"
+	assert text(whole, "Message")
+		== "[Tried to delete resource record set [name='v.example.test.', type='A'] but it was not found]"
+	assert texts(call(g, "GET", `${id}/rrset`), "Name").length == 5
+	const full = call(g, "DELETE", id)
+	assert full.status == 400 && text(full, "Code") == "HostedZoneNotEmpty"
+	const emptied = call(g, "POST", `${id}/rrset`,
+		batch([["DELETE", a("www.example.test", "192.0.2.1")], ["DELETE", a("b.a.example.test", "192.0.2.2")],
+		["DELETE", a("\\052.example.test", "192.0.2.3")]]))
+	assert emptied.status == 200
+	assert call(g, "DELETE", id).status == 200
+	const gone = call(g, "GET", id)
+	assert gone.status == 404 && text(gone, "Code") == "NoSuchHostedZone"
+}
+
+test "a private zone and its VPCs" {
+	const g = stack(new Catalog(0, 0))
+	const body = `<CreateHostedZoneRequest xmlns="${ns}"><Name>internal.test</Name><VPC><VPCRegion>us-east-1</VPCRegion>`
+		+ "<VPCId>vpc-1</VPCId></VPC><CallerReference>p1</CallerReference></CreateHostedZoneRequest>"
+	const made = call(g, "POST", "/hostedzone", body)
+	assert made.status == 201 && text(made, "PrivateZone") == "true" && texts(made, "NameServer") == []
+	const id = text(made, "Id")!
+	const vpc = (v: string) => `<VPC><VPCRegion>us-east-1</VPCRegion><VPCId>${v}</VPCId></VPC>`
+	const assoc = (v: string) => `<AssociateVPCWithHostedZoneRequest xmlns="${ns}">${vpc(v)}</AssociateVPCWithHostedZoneRequest>`
+	const dissoc = (v: string) => `<DisassociateVPCFromHostedZoneRequest xmlns="${ns}">${vpc(v)}`
+		+ "</DisassociateVPCFromHostedZoneRequest>"
+	assert call(g, "POST", `${id}/associatevpc`, assoc("vpc-2")).status == 200
+	const byVpc = call(g, "GET", "/hostedzonesbyvpc?vpcid=vpc-2&vpcregion=us-east-1")
+	assert texts(byVpc, "Name") == ["internal.test."]
+	assert call(g, "POST", `${id}/disassociatevpc`, dissoc("vpc-1")).status == 200
+	const last = call(g, "POST", `${id}/disassociatevpc`, dissoc("vpc-2"))
+	assert last.status == 400 && text(last, "Code") == "LastVPCAssociation"
+}
+
+test "tags of a zone" {
+	const g = stack(new Catalog(0, 0))
+	const id = text(call(g, "POST", "/hostedzone", create("tagged.test", "t1")), "Id")!
+	const bare = id.slice(12, id.length)
+	const change = `<ChangeTagsForResourceRequest xmlns="${ns}"><AddTags><Tag><Key>team</Key><Value>dns</Value></Tag>`
+		+ "</AddTags></ChangeTagsForResourceRequest>"
+	assert call(g, "POST", `/tags/hostedzone/${bare}`, change).status == 200
+	const listed = call(g, "GET", `/tags/hostedzone/${bare}`)
+	assert texts(listed, "Key") == ["team"] && texts(listed, "Value") == ["dns"]
+}
+
+test "a health check's update resets only the elements named" {
+	const g = stack(new Catalog(0, 0))
+	const made = call(g, "POST", "/healthcheck",
+		`<CreateHealthCheckRequest xmlns="${ns}"><CallerReference>h1`
+		+ "</CallerReference><HealthCheckConfig><Type>HTTP</Type><ResourcePath>/up</ResourcePath>"
+		+ "<FullyQualifiedDomainName>example.com</FullyQualifiedDomainName></HealthCheckConfig></CreateHealthCheckRequest>")
+	assert made.status == 201 && text(made, "Port") == "80" && text(made, "EnableSNI") == "false"
+	const id = text(made, "Id")!
+	const updated = call(g, "POST", `/healthcheck/${id}`,
+		`<UpdateHealthCheckRequest xmlns="${ns}"><ResetElements>`
+		+ "<ResettableElementName>ResourcePath</ResettableElementName></ResetElements></UpdateHealthCheckRequest>")
+	assert updated.status == 200 && text(updated, "HealthCheckVersion") == "2"
+	assert text(updated, "ResourcePath") == null && text(updated, "FullyQualifiedDomainName") == "example.com"
+	assert texts(call(g, "GET", `/healthcheck/${id}/status`), "Status").length == 8
+}

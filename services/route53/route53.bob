@@ -1,0 +1,1272 @@
+//! Amazon Route 53: hosted zones, record sets, changes, tags, health checks, reusable delegation sets, CIDR
+//! collections and limits. Route 53 is global: requests are signed for us-east-1.
+//!
+//! A change is answered PENDING, and so to its first GetChange, then INSYNC. There is no DNS server: record sets are
+//! stored and validated, never served; TestDNSAnswer is answered REFUSED, as AWS answers it of a zone that no parent
+//! delegates to. Private zones take any VPC id. XML is decoded by the model, not Route 53's schema: an element out of
+//! order is taken. Health checks are never run: every checker reports success. Limits are AWS's defaults, as of
+//! 2026-11-23. CloudWatch-alarm and recovery-control health checks, traffic policies, DNSSEC and query logging are not
+//! implemented.
+
+import { Fault } from "../../core/fault"
+import * as rest from "../../core/protocol/rest"
+import * as restxml from "../../core/protocol/restxml"
+import { Caller } from "../../core/service"
+import * as api from "./api"
+
+import { Alias, Change, Check, CheckReference, Collection, DelegationSet, Record, Reference, Tables,
+	Zone } from "./records"
+
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric, isDigit } from "std/ascii"
+import { bytes } from "std/crypto/random"
+import * as hex from "std/encoding/hex"
+import { encode, EncodeError } from "std/encoding/json"
+import { Body, Request, Response } from "std/http"
+import { min } from "std/math"
+import { lower, ParseError, parseInt, replace, split } from "std/string"
+
+/// What a zone's SOA names after its first name server.
+const soa = "awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"
+
+export class Handler {
+	...api.Unimplemented
+
+	createHostedZone(caller: Caller, input: api.CreateHostedZoneRequest): api.CreateHostedZoneResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		domain(input.Name)
+		const name = normal(input.Name)
+		if (name == "example.com." || endsWith(name, ".example.com.")) {
+			throw api.invalidDomainName(`${input.Name} is reserved by AWS!`)
+		}
+		if (t.references.get(input.CallerReference) != null) {
+			throw api.hostedZoneAlreadyExists("A hosted zone has already been created with the specified caller reference.")
+		}
+		const z = new Zone()
+		z.id = id("Z")
+		z.name = name
+		z.reference = input.CallerReference
+		z.comment = input.HostedZoneConfig?.Comment
+		z.created = now()
+		if (input.VPC != null) {
+			z.isPrivate = true
+			z.vpcs = [[input.VPC!.VPCRegion ?? "", input.VPC!.VPCId ?? ""]]
+		}
+		if (input.DelegationSetId != null) {
+			const d = set(t, input.DelegationSetId!)
+			z.delegationSet = d.id
+			z.nameServers = d.nameServers
+		} else {
+			z.nameServers = nameServers()
+		}
+		const ns = new Record()
+		ns.name = name
+		ns.type = "NS"
+		ns.ttl = 172800
+		ns.values = z.nameServers.map(n => `${n}.`)
+		const s = new Record()
+		s.name = name
+		s.type = "SOA"
+		s.ttl = 900
+		s.values = [`${z.nameServers[0]}. ${soa}`]
+		z.records = [ns, s]
+		put(t, z)
+		t.references.put(input.CallerReference, reference(z.id))
+		const out = new api.CreateHostedZoneResponse()
+		out.HostedZone = zoneOf(z)
+		out.ChangeInfo = submit(t, null)
+		out.DelegationSet = delegation(t, z) ?? new api.DelegationSet()
+		if (z.isPrivate) {
+			out.VPC = input.VPC
+		}
+		out.Location = `${caller.endpoint}/2013-04-01/hostedzone/${z.id}`
+		return out
+	}
+
+	getHostedZone(caller: Caller, input: api.GetHostedZoneRequest): api.GetHostedZoneResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
+		const out = new api.GetHostedZoneResponse()
+		out.HostedZone = zoneOf(z)
+		out.DelegationSet = delegation(t, z)
+		if (z.isPrivate) {
+			out.VPCs = z.vpcs.map(v => vpc(v))
+		}
+		out.HostedZoneDeletionProtectionEnabled = false
+		return out
+	}
+
+	getHostedZoneCount(caller: Caller,
+		input: api.GetHostedZoneCountRequest): api.GetHostedZoneCountResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetHostedZoneCountResponse()
+		out.HostedZoneCount = all(new Tables(caller.store())).length
+		return out
+	}
+
+	getHostedZoneLimit(caller: Caller,
+		input: api.GetHostedZoneLimitRequest): api.GetHostedZoneLimitResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const z = zone(new Tables(caller.store()), input.HostedZoneId)
+		const out = new api.GetHostedZoneLimitResponse()
+		out.Limit.Type = input.Type
+		const rrsets = input.Type == "MAX_RRSETS_BY_ZONE"
+		out.Limit.Value = if (rrsets) 10000 else 300
+		out.Count = if (rrsets) z.records.length else z.vpcs.length
+		return out
+	}
+
+	getAccountLimit(caller: Caller, input: api.GetAccountLimitRequest): api.GetAccountLimitResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const out = new api.GetAccountLimitResponse()
+		out.Limit.Type = input.Type
+		switch (input.Type) {
+			case "MAX_HOSTED_ZONES_BY_OWNER":
+				out.Limit.Value = 500
+				out.Count = all(t).length
+			case "MAX_HEALTH_CHECKS_BY_OWNER":
+				out.Limit.Value = 200
+				out.Count = checks(t).length
+			case "MAX_REUSABLE_DELEGATION_SETS_BY_OWNER": out.Limit.Value = 100
+			case "MAX_TRAFFIC_POLICIES_BY_OWNER": out.Limit.Value = 50
+			default: out.Limit.Value = 5 // of health check sources and traffic policy instances
+		}
+		return out
+	}
+
+	testDNSAnswer(caller: Caller, input: api.TestDNSAnswerRequest): api.TestDNSAnswerResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		zone(new Tables(caller.store()), input.HostedZoneId)
+		const out = new api.TestDNSAnswerResponse()
+		out.Nameserver = "127.0.0.1"
+		const name = input.RecordName
+		out.RecordName = if (endsWith(name, ".") && name != ".") name.slice(0, name.length - 1) else name
+		out.RecordType = input.RecordType
+		out.ResponseCode = "REFUSED"
+		out.Protocol = "UDP"
+		return out
+	}
+
+	createReusableDelegationSet(caller: Caller,
+		input: api.CreateReusableDelegationSetRequest): api.CreateReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		if (t.sets.scan(null, 1000000).some(e => e[1].reference == input.CallerReference)) {
+			throw api.delegationSetAlreadyCreated("A delegation set has already been created with the specified caller "
+				+ "reference.")
+		}
+		const d = new DelegationSet()
+		d.id = id("N")
+		d.reference = input.CallerReference
+		d.nameServers = if (input.HostedZoneId == null) nameServers() else zone(t, input.HostedZoneId!).nameServers
+		t.sets.put(d.id, d)
+		const out = new api.CreateReusableDelegationSetResponse()
+		out.DelegationSet = setOf(d)
+		out.Location = `${caller.endpoint}/2013-04-01/delegationset/${d.id}`
+		return out
+	}
+
+	getReusableDelegationSet(caller: Caller,
+		input: api.GetReusableDelegationSetRequest): api.GetReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetReusableDelegationSetResponse()
+		out.DelegationSet = setOf(set(new Tables(caller.store()), input.Id))
+		return out
+	}
+
+	listReusableDelegationSets(caller: Caller,
+		input: api.ListReusableDelegationSetsRequest): api.ListReusableDelegationSetsResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const ds = new Tables(caller.store()).sets.scan(null,
+			1000000).map(e => e[1]).filter(d => input.Marker == null || d.id >= input.Marker!)
+		const out = new api.ListReusableDelegationSetsResponse()
+		out.DelegationSets = ds.slice(0, min(max, ds.length)).map(d => setOf(d))
+		out.Marker = input.Marker ?? ""
+		out.MaxItems = max
+		if (ds.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = ds[max].id
+		}
+		return out
+	}
+
+	getReusableDelegationSetLimit(caller: Caller,
+		input: api.GetReusableDelegationSetLimitRequest): api.GetReusableDelegationSetLimitResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const d = set(t, input.DelegationSetId)
+		const out = new api.GetReusableDelegationSetLimitResponse()
+		out.Limit.Type = input.Type
+		out.Limit.Value = 100
+		out.Count = all(t).filter(z => z.delegationSet == d.id).length
+		return out
+	}
+
+	deleteReusableDelegationSet(caller: Caller,
+		input: api.DeleteReusableDelegationSetRequest): api.DeleteReusableDelegationSetResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const d = set(t, input.Id)
+		if (all(t).some(z => z.delegationSet == d.id)) {
+			throw api.delegationSetInUse("The specified delegation set contains associated hosted zones.")
+		}
+		t.sets.delete(d.id)
+		return new api.DeleteReusableDelegationSetResponse()
+	}
+
+	createCidrCollection(caller: Caller,
+		input: api.CreateCidrCollectionRequest): api.CreateCidrCollectionResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const cs = collections(t)
+		let c = cs.find(c => c.reference == input.CallerReference)
+		if (c == null) {
+			if (cs.some(c => c.name == input.Name)) {
+				throw api.cidrCollectionAlreadyExistsException("")
+			}
+			const made = new Collection()
+			made.id = uuid()
+			made.name = input.Name
+			made.reference = input.CallerReference
+			save(t, made)
+			c = made
+		}
+		const out = new api.CreateCidrCollectionResponse()
+		out.Collection = collectionOf(c!)
+		out.Location = `${caller.endpoint}/2013-04-01/cidrcollection/${c!.id}`
+		return out
+	}
+
+	changeCidrCollection(caller: Caller,
+		input: api.ChangeCidrCollectionRequest): api.ChangeCidrCollectionResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.Id}`)
+		const t = new Tables(caller.store())
+		const c = collection(t, input.Id)
+		if (input.CollectionVersion != null && input.CollectionVersion! != c.version) {
+			throw api.cidrCollectionVersionMismatchException("")
+		}
+		for (const ch of input.Changes) {
+			for (const b of ch.CidrList) {
+				const slash = split(b, "/")
+				if (slash.length == 2 && split(b, ":").length == 1 && parseIntOr(slash[1]) > 24) {
+					throw api.invalidInput(`IPv4 cidr block ${b} has network prefix length greater than account limit of 24`)
+				}
+				const held = c.blocks.find(k => k[1] == b)
+				if (ch.Action == "PUT") {
+					if (held != null && held![0] != ch.LocationName) {
+						throw api.cidrBlockInUseException("")
+					}
+					if (held == null) {
+						c.blocks.push([ch.LocationName, b])
+					}
+				} else {
+					c.blocks = c.blocks.filter(k => k[1] != b || k[0] != ch.LocationName)
+				}
+			}
+		}
+		sortBy(c.blocks, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+		c.version++
+		save(t, c)
+		const out = new api.ChangeCidrCollectionResponse()
+		out.Id = uuid()
+		return out
+	}
+
+	listCidrCollections(caller: Caller,
+		input: api.ListCidrCollectionsRequest): api.ListCidrCollectionsResponse throws Fault {
+		caller.allow("*")
+		const out = new api.ListCidrCollectionsResponse()
+		out.CidrCollections = collections(new Tables(caller.store())).map(c => {
+			const s = new api.CollectionSummary()
+			const full = collectionOf(c)
+			s.Arn = full.Arn
+			s.Id = full.Id
+			s.Name = full.Name
+			s.Version = full.Version
+			return s
+		})
+		return out
+	}
+
+	listCidrLocations(caller: Caller, input: api.ListCidrLocationsRequest): api.ListCidrLocationsResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.CollectionId}`)
+		const c = collection(new Tables(caller.store()), input.CollectionId)
+		const out = new api.ListCidrLocationsResponse()
+		const names: string[] = []
+		for (const b of c.blocks) {
+			if (!names.includes(b[0])) {
+				names.push(b[0])
+			}
+		}
+		out.CidrLocations = names.map(n => {
+			const l = new api.LocationSummary()
+			l.LocationName = n
+			return l
+		})
+		return out
+	}
+
+	listCidrBlocks(caller: Caller, input: api.ListCidrBlocksRequest): api.ListCidrBlocksResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.CollectionId}`)
+		const c = collection(new Tables(caller.store()), input.CollectionId)
+		const out = new api.ListCidrBlocksResponse()
+		out.CidrBlocks = c.blocks.filter(b => input.LocationName == null || b[0] == input.LocationName!).map(b => {
+			const s = new api.CidrBlockSummary()
+			s.CidrBlock = b[1]
+			s.LocationName = b[0]
+			return s
+		})
+		return out
+	}
+
+	deleteCidrCollection(caller: Caller,
+		input: api.DeleteCidrCollectionRequest): api.DeleteCidrCollectionResponse throws Fault {
+		caller.allow(`arn:aws:route53:::cidrcollection/${input.Id}`)
+		const t = new Tables(caller.store())
+		const c = collection(t, input.Id)
+		if (c.blocks.length > 0) {
+			throw api.cidrCollectionInUseException("")
+		}
+		t.collections.delete(c.id)
+		return new api.DeleteCidrCollectionResponse()
+	}
+
+	listHostedZones(caller: Caller, input: api.ListHostedZonesRequest): api.ListHostedZonesResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const zs = all(new Tables(caller.store())).filter(z => input.Marker == null
+			|| z.id >= input.Marker!).filter(z => input.HostedZoneType == null || z.isPrivate)
+		const out = new api.ListHostedZonesResponse()
+		out.HostedZones = zs.slice(0, min(max, zs.length)).map(z => zoneOf(z))
+		out.Marker = input.Marker
+		out.MaxItems = max
+		if (zs.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = zs[max].id
+		}
+		return out
+	}
+
+	listHostedZonesByName(caller: Caller,
+		input: api.ListHostedZonesByNameRequest): api.ListHostedZonesByNameResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		let from = ""
+		if (input.DNSName != null) {
+			domain(input.DNSName!)
+			from = key(normal(input.DNSName!))
+		}
+		const zs = all(new Tables(caller.store()))
+		sortBy(zs, (a, b) => key(a.name) < key(b.name) || key(a.name) == key(b.name) && a.id < b.id)
+		const after = input.HostedZoneId
+		const listed = zs.filter(z => key(z.name) > from || key(z.name) == from && (after == null || z.id >= after!))
+		const out = new api.ListHostedZonesByNameResponse()
+		out.HostedZones = listed.slice(0, min(max, listed.length)).map(z => zoneOf(z))
+		out.DNSName = input.DNSName
+		out.HostedZoneId = input.HostedZoneId
+		out.MaxItems = max
+		if (listed.length > max) {
+			out.IsTruncated = true
+			out.NextDNSName = listed[max].name
+			out.NextHostedZoneId = listed[max].id
+		}
+		return out
+	}
+
+	listHostedZonesByVPC(caller: Caller,
+		input: api.ListHostedZonesByVPCRequest): api.ListHostedZonesByVPCResponse throws Fault {
+		caller.allow("*")
+		const out = new api.ListHostedZonesByVPCResponse()
+		for (const z of all(new Tables(caller.store()))) {
+			if (z.vpcs.some(v => v[0] == input.VPCRegion && v[1] == input.VPCId)) {
+				const s = new api.HostedZoneSummary()
+				s.HostedZoneId = z.id
+				s.Name = z.name
+				s.Owner.OwningAccount = caller.account
+				out.HostedZoneSummaries.push(s)
+			}
+		}
+		out.MaxItems = items(input.MaxItems)
+		return out
+	}
+
+	updateHostedZoneComment(caller: Caller,
+		input: api.UpdateHostedZoneCommentRequest): api.UpdateHostedZoneCommentResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
+		z.comment = input.Comment
+		put(t, z)
+		const out = new api.UpdateHostedZoneCommentResponse()
+		out.HostedZone = zoneOf(z)
+		return out
+	}
+
+	deleteHostedZone(caller: Caller, input: api.DeleteHostedZoneRequest): api.DeleteHostedZoneResponse throws Fault {
+		caller.allow(arn(input.Id))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.Id)
+		if (z.records.some(r => !apex(z, r))) {
+			throw api.hostedZoneNotEmpty("The specified hosted zone contains resource record sets other than the default "
+				+ "SOA and NS records and so cannot be deleted. Delete all non-default records and try again.")
+		}
+		t.zones.delete(z.id)
+		const out = new api.DeleteHostedZoneResponse()
+		out.ChangeInfo = submit(t, null)
+		return out
+	}
+
+	associateVPCWithHostedZone(caller: Caller,
+		input: api.AssociateVPCWithHostedZoneRequest): api.AssociateVPCWithHostedZoneResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		if (!z.isPrivate) {
+			throw api.publicZoneVPCAssociation(`Public hosted zone ${z.id} cannot be associated with a VPC.`)
+		}
+		const v: [string, string] = [input.VPC.VPCRegion ?? "", input.VPC.VPCId ?? ""]
+		if (z.vpcs.some(w => w[0] == v[0] && w[1] == v[1])) {
+			throw api.conflictingDomainExists(`The VPC ${v[1]} in ${v[0]} region is already associated with the hosted zone.`)
+		}
+		z.vpcs.push(v)
+		put(t, z)
+		const out = new api.AssociateVPCWithHostedZoneResponse()
+		out.ChangeInfo = submit(t, input.Comment)
+		return out
+	}
+
+	disassociateVPCFromHostedZone(caller: Caller,
+		input: api.DisassociateVPCFromHostedZoneRequest): api.DisassociateVPCFromHostedZoneResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		const region = input.VPC.VPCRegion ?? ""
+		const vpcId = input.VPC.VPCId ?? ""
+		const kept = z.vpcs.filter(w => w[0] != region || w[1] != vpcId)
+		if (kept.length == z.vpcs.length) {
+			throw api.vpcAssociationNotFound(`The specified VPC ${vpcId} and hosted zone ${z.id} are not currently associated.`)
+		}
+		if (kept.length == 0) {
+			throw api.lastVPCAssociation("The VPC that you're trying to disassociate from the private hosted zone is the last "
+				+ "VPC that is associated with the hosted zone. Amazon Route 53 doesn't support disassociating the last VPC "
+				+ "from a hosted zone.")
+		}
+		z.vpcs = kept
+		put(t, z)
+		const out = new api.DisassociateVPCFromHostedZoneResponse()
+		out.ChangeInfo = submit(t, input.Comment)
+		return out
+	}
+
+	changeResourceRecordSets(caller: Caller,
+		input: api.ChangeResourceRecordSetsRequest): api.ChangeResourceRecordSetsResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
+		for (const c of input.ChangeBatch.Changes) {
+			shaped(c)
+		}
+		const errors: string[] = []
+		for (const c of input.ChangeBatch.Changes) {
+			const why = apply(z, c.Action, record(c.ResourceRecordSet))
+			if (why != null) {
+				errors.push(why!)
+			}
+		}
+		if (errors.length > 0) {
+			throw api.invalidChangeBatch(`[${errors.join(", ")}]`)
+		}
+		put(t, z)
+		const out = new api.ChangeResourceRecordSetsResponse()
+		out.ChangeInfo = submit(t, input.ChangeBatch.Comment)
+		return out
+	}
+
+	listResourceRecordSets(caller: Caller,
+		input: api.ListResourceRecordSetsRequest): api.ListResourceRecordSetsResponse throws Fault {
+		caller.allow(arn(input.HostedZoneId))
+		const z = zone(new Tables(caller.store()), input.HostedZoneId)
+		if (input.StartRecordName == null && input.StartRecordType != null) {
+			throw api.invalidInput("")
+		}
+		const max = items(input.MaxItems)
+		let rs = z.records
+		if (input.StartRecordName != null) {
+			const from = order(normal(input.StartRecordName!), input.StartRecordType ?? "",
+				input.StartRecordIdentifier ?? "")
+			rs = rs.filter(r => order(r.name, r.type, r.setIdentifier ?? "") >= from)
+		}
+		const out = new api.ListResourceRecordSetsResponse()
+		out.ResourceRecordSets = rs.slice(0, min(max, rs.length)).map(r => wire(r))
+		out.MaxItems = max
+		if (rs.length > max) {
+			const next = rs[max]
+			out.IsTruncated = true
+			out.NextRecordName = next.name
+			out.NextRecordType = next.type as api.RRType
+			out.NextRecordIdentifier = next.setIdentifier
+		}
+		return out
+	}
+
+	getChange(caller: Caller, input: api.GetChangeRequest): api.GetChangeResponse throws Fault {
+		caller.allow(`arn:aws:route53:::change/${input.Id}`)
+		const t = new Tables(caller.store())
+		const c = t.changes.get(input.Id)
+		if (c == null) {
+			throw api.noSuchChange(`Could not find resource with ID: ${input.Id}`)
+		}
+		const out = new api.GetChangeResponse()
+		out.ChangeInfo = info(c!)
+		if (c!.read) {
+			out.ChangeInfo.Status = "INSYNC"
+		} else {
+			c!.read = true
+			t.changes.put(c!.id, c!)
+		}
+		return out
+	}
+
+	changeTagsForResource(caller: Caller,
+		input: api.ChangeTagsForResourceRequest): api.ChangeTagsForResourceResponse throws Fault {
+		const t = new Tables(caller.store())
+		const removed = input.RemoveTagKeys ?? []
+		const retag = (old: [string, string][]): [string, string][] => {
+			let tags = old.filter(g => !removed.includes(g[0]))
+			for (const g of input.AddTags ?? []) {
+				const k = g.Key ?? ""
+				tags = tags.filter(h => h[0] != k)
+				tags.push([k, g.Value ?? ""])
+			}
+			return tags
+		}
+		if (input.ResourceType == "healthcheck") {
+			caller.allow(checkArn(input.ResourceId))
+			const c = check(t, input.ResourceId)
+			c.tags = retag(c.tags)
+			keep(t, c)
+		} else {
+			const z = tagged(caller, t, input.ResourceType, input.ResourceId)
+			z.tags = retag(z.tags)
+			put(t, z)
+		}
+		return new api.ChangeTagsForResourceResponse()
+	}
+
+	listTagsForResource(caller: Caller,
+		input: api.ListTagsForResourceRequest): api.ListTagsForResourceResponse throws Fault {
+		const out = new api.ListTagsForResourceResponse()
+		out.ResourceTagSet = tagSet(caller, new Tables(caller.store()), input.ResourceType, input.ResourceId)
+		return out
+	}
+
+	listTagsForResources(caller: Caller,
+		input: api.ListTagsForResourcesRequest): api.ListTagsForResourcesResponse throws Fault {
+		const t = new Tables(caller.store())
+		const out = new api.ListTagsForResourcesResponse()
+		for (const r of input.ResourceIds) {
+			out.ResourceTagSets.push(tagSet(caller, t, input.ResourceType, r))
+		}
+		return out
+	}
+
+	createHealthCheck(caller: Caller, input: api.CreateHealthCheckRequest): api.CreateHealthCheckResponse throws Fault {
+		caller.allow("*")
+		const t = new Tables(caller.store())
+		const config = configured(t, input.HealthCheckConfig)
+		const made = t.checkReferences.get(input.CallerReference)
+		if (made != null) {
+			const c = t.checks.get(made!.check)
+			if (c == null || !alike(c!.config, config)) {
+				throw api.healthCheckAlreadyExists("A different health check has already been created with the specified "
+					+ "caller reference. If that health check has been deleted, Route 53 will still maintain the caller "
+					+ "reference for a number of days.")
+			}
+			return created(caller, c!)
+		}
+		const c = new Check()
+		c.id = uuid()
+		c.reference = input.CallerReference
+		c.config = config
+		keep(t, c)
+		const r = new CheckReference()
+		r.check = c.id
+		t.checkReferences.put(input.CallerReference, r)
+		return created(caller, c)
+	}
+
+	getHealthCheck(caller: Caller, input: api.GetHealthCheckRequest): api.GetHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const out = new api.GetHealthCheckResponse()
+		out.HealthCheck = checkOf(check(new Tables(caller.store()), input.HealthCheckId))
+		return out
+	}
+
+	getHealthCheckCount(caller: Caller,
+		input: api.GetHealthCheckCountRequest): api.GetHealthCheckCountResponse throws Fault {
+		caller.allow("*")
+		const out = new api.GetHealthCheckCountResponse()
+		out.HealthCheckCount = checks(new Tables(caller.store())).length
+		return out
+	}
+
+	listHealthChecks(caller: Caller, input: api.ListHealthChecksRequest): api.ListHealthChecksResponse throws Fault {
+		caller.allow("*")
+		const max = items(input.MaxItems)
+		const cs = checks(new Tables(caller.store())).filter(c => input.Marker == null || c.id >= input.Marker!)
+		const out = new api.ListHealthChecksResponse()
+		out.HealthChecks = cs.slice(0, min(max, cs.length)).map(c => checkOf(c))
+		out.Marker = input.Marker
+		out.MaxItems = max
+		if (cs.length > max) {
+			out.IsTruncated = true
+			out.NextMarker = cs[max].id
+		}
+		return out
+	}
+
+	updateHealthCheck(caller: Caller, input: api.UpdateHealthCheckRequest): api.UpdateHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const t = new Tables(caller.store())
+		const c = check(t, input.HealthCheckId)
+		if (input.HealthCheckVersion != null && input.HealthCheckVersion! != c.version) {
+			throw api.healthCheckVersionMismatch(`Health check with id ${c.id} has version ${c.version}, but expected to `
+				+ `have version ${input.HealthCheckVersion!}. Could not proceed with update.`)
+		}
+		const k = c.config
+		for (const e of input.ResetElements ?? []) {
+			switch (e) {
+				case "FullyQualifiedDomainName": k.FullyQualifiedDomainName = null
+				case "Regions": k.Regions = null
+				case "ResourcePath": k.ResourcePath = null
+				case "ChildHealthChecks": k.ChildHealthChecks = []
+			}
+		}
+		k.IPAddress = input.IPAddress ?? k.IPAddress
+		k.Port = input.Port ?? k.Port
+		k.ResourcePath = input.ResourcePath ?? k.ResourcePath
+		k.FullyQualifiedDomainName = input.FullyQualifiedDomainName ?? k.FullyQualifiedDomainName
+		k.SearchString = input.SearchString ?? k.SearchString
+		k.FailureThreshold = input.FailureThreshold ?? k.FailureThreshold
+		k.Inverted = input.Inverted ?? k.Inverted
+		k.Disabled = input.Disabled ?? k.Disabled
+		k.HealthThreshold = input.HealthThreshold ?? k.HealthThreshold
+		k.ChildHealthChecks = input.ChildHealthChecks ?? k.ChildHealthChecks
+		k.EnableSNI = input.EnableSNI ?? k.EnableSNI
+		k.Regions = input.Regions ?? k.Regions
+		k.AlarmIdentifier = input.AlarmIdentifier ?? k.AlarmIdentifier
+		k.InsufficientDataHealthStatus = input.InsufficientDataHealthStatus ?? k.InsufficientDataHealthStatus
+		c.config = configured(t, k)
+		c.version++
+		keep(t, c)
+		const out = new api.UpdateHealthCheckResponse()
+		out.HealthCheck = checkOf(c)
+		return out
+	}
+
+	deleteHealthCheck(caller: Caller, input: api.DeleteHealthCheckRequest): api.DeleteHealthCheckResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const t = new Tables(caller.store())
+		t.checks.delete(check(t, input.HealthCheckId).id)
+		return new api.DeleteHealthCheckResponse()
+	}
+
+	getHealthCheckStatus(caller: Caller,
+		input: api.GetHealthCheckStatusRequest): api.GetHealthCheckStatusResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		const k = checked(check(new Tables(caller.store()), input.HealthCheckId))
+		const out = new api.GetHealthCheckStatusResponse()
+		const regions: api.HealthCheckRegion[] = ["us-east-1", "us-west-1", "us-west-2", "eu-west-1", "ap-southeast-1",
+			"ap-southeast-2", "ap-northeast-1", "sa-east-1"]
+		out.HealthCheckObservations = (k.Regions ?? regions).map(r => {
+			const o = new api.HealthCheckObservation()
+			o.Region = r
+			const s = new api.StatusReport()
+			s.Status = if (k.Type == "TCP") "Success: TCP connection established"
+				else "Success: HTTP Status Code 200, OK"
+			s.CheckedTime = now()
+			o.StatusReport = s
+			return o
+		})
+		return out
+	}
+
+	getHealthCheckLastFailureReason(caller: Caller,
+		input: api.GetHealthCheckLastFailureReasonRequest): api.GetHealthCheckLastFailureReasonResponse throws Fault {
+		caller.allow(checkArn(input.HealthCheckId))
+		checked(check(new Tables(caller.store()), input.HealthCheckId))
+		return new api.GetHealthCheckLastFailureReasonResponse()
+	}
+}
+
+/// Answers in text/xml, as Route 53 does, an output of no members as an empty element of its name.
+export function serve(h: Handler, caller: Caller, req: Request): Response throws IoError {
+	const res = api.handle(h, caller, req)
+	if (res.status == 200 && !res.headers.has("content-type")) {
+		const op = rest.routed(req, api.routes)[0]
+		res.body = new Body(`<?xml version="1.0"?>\n<${op}Response xmlns="${api.service.ns}"></${op}Response>`)
+		res.headers.set("content-type", "text/xml")
+	}
+	return typed(res)
+}
+
+export function error(f: Fault, requestId: string): Response { return typed(restxml.error(api.service, f, requestId)) }
+
+/// res, its body typed text/xml if it has one, and an error of it of Route 53's namespace and of no empty message.
+function typed(res: Response): Response {
+	if (res.headers.has("content-type")) {
+		res.headers.set("content-type", "text/xml")
+	}
+	if (res.status >= 400) {
+		try {
+			let body = replace(res.body.text(), "<ErrorResponse>", `<ErrorResponse xmlns="${api.service.ns}">`)
+			body = replace(replace(body, "<Message></Message>", ""), "<Message/>", "")
+			res.body = new Body(body)
+		} catch (e: IoError) {
+			// an error's body is a string, which reads without fail
+		}
+	}
+	return res
+}
+
+function arn(id: string): string { return `arn:aws:route53:::hostedzone/${bare(id)}` }
+/// id without the /hostedzone/ that an SDK may leave on it.
+function bare(id: string): string { return if (startsWith(id, "/hostedzone/")) id.slice(12, id.length) else id }
+
+function zone(t: Tables, id: string): Zone throws Fault {
+	const z = t.zones.get(bare(id))
+	if (z == null) {
+		throw api.noSuchHostedZone(`No hosted zone found with ID: ${bare(id)}`)
+	}
+	return z!
+}
+
+function tagged(caller: Caller, t: Tables, kind: api.TagResourceType, id: string): Zone throws Fault {
+	if (kind != "hostedzone") {
+		throw notImplementedTags(kind)
+	}
+	caller.allow(arn(id))
+	return zone(t, id)
+}
+
+function notImplementedTags(kind: string): Fault {
+	return new Fault(501, "NotImplemented", `Tags of a ${kind} are not implemented`)
+}
+
+function tagSet(caller: Caller, t: Tables, kind: api.TagResourceType, id: string): api.ResourceTagSet throws Fault {
+	const s = new api.ResourceTagSet()
+	s.ResourceType = kind
+	let tags: [string, string][] = []
+	if (kind == "healthcheck") {
+		caller.allow(checkArn(id))
+		const c = check(t, id)
+		s.ResourceId = c.id
+		tags = c.tags
+	} else {
+		const z = tagged(caller, t, kind, id)
+		s.ResourceId = z.id
+		tags = z.tags
+	}
+	s.Tags = tags.map(g => {
+		const tag = new api.Tag()
+		tag.Key = g[0]
+		tag.Value = g[1]
+		return tag
+	})
+	return s
+}
+
+function all(t: Tables): Zone[] { return t.zones.scan(null, 1000000).map(e => e[1]) }
+
+/// Stores z, its record sets in AWS's order.
+function put(t: Tables, z: Zone) throws Fault {
+	sortBy(z.records,
+		(a, b) => order(a.name, a.type, a.setIdentifier ?? "") < order(b.name, b.type, b.setIdentifier ?? ""))
+	t.zones.put(z.id, z)
+}
+
+function reference(zone: string): Reference {
+	const r = new Reference()
+	r.zone = zone
+	return r
+}
+
+function submit(t: Tables, comment: string | null): api.ChangeInfo throws Fault {
+	const c = new Change()
+	c.id = id("C")
+	c.submitted = now()
+	c.comment = comment
+	t.changes.put(c.id, c)
+	return info(c)
+}
+
+function info(c: Change): api.ChangeInfo {
+	const i = new api.ChangeInfo()
+	i.Id = `/change/${c.id}`
+	i.SubmittedAt = c.submitted
+	i.Comment = c.comment
+	return i
+}
+
+function items(n: i32 | null): i32 { return if (n == null || n! <= 0) 100 else n! }
+
+/// A new id of the prefix p, as AWS's: 20 upper-case letters and digits after it.
+function id(p: string): string throws Fault {
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	let b = ""
+	try {
+		b = bytes(20)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	const out: u8[] = []
+	for (let i = 0; i < 20; i++) {
+		out.push(alphabet[(b[i] as i32) % alphabet.length])
+	}
+	return p + fromBytes(out)
+}
+
+/// Four name servers, as AWS's: of .com, .net, .org and .co.uk.
+function nameServers(): string[] throws Fault {
+	let b = ""
+	try {
+		b = bytes(8)
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	const out: string[] = []
+	const tlds = ["com", "net", "org", "co.uk"]
+	for (let i = 0; i < 4; i++) {
+		const n = ((b[2 * i] as i32) * 8 + (b[2 * i + 1] as i32) % 8) % 2048
+		const d = (b[2 * i + 1] as i32) % 64
+		out.push(`ns-${n}.awsdns-${if (d < 10) "0" else ""}${d}.${tlds[i]}`)
+	}
+	return out
+}
+
+function zoneOf(z: Zone): api.HostedZone {
+	const h = new api.HostedZone()
+	h.Id = `/hostedzone/${z.id}`
+	h.Name = z.name
+	h.CallerReference = z.reference
+	const c = new api.HostedZoneConfig()
+	c.Comment = z.comment
+	c.PrivateZone = z.isPrivate
+	c.HostedZoneTier = "STANDARD"
+	h.Config = c
+	h.ResourceRecordSetCount = z.records.length
+	const f = new api.HostedZoneFeatures()
+	f.AcceleratedRecoveryStatus = "DISABLED"
+	const history = new api.ChangeHistoryFeature()
+	history.Status = "DISABLED"
+	f.ChangeHistory = history
+	const guardrails: [api.ChangeGuardrailName, api.ChangeGuardrailStatus][] = [["NS_OCCLUSION_CHECK", "DISABLED"],
+		["NS_DELEGATION_AUTHORITY_CHECK", "ENABLED"], ["NS_FORMAT_CHECK", "ENABLED"],
+		["ALIAS_TARGET_CHECK", "DISABLED"], ["ACTIVE_RECORD_CHECK", "DISABLED"],
+		["ACTIVE_DELEGATION_CHECK", "DISABLED"]]
+	f.ChangeGuardrails = guardrails.map(g => {
+		const r = new api.ChangeGuardrail()
+		r.Name = g[0]
+		r.Status = g[1]
+		return r
+	})
+	h.Features = f
+	return h
+}
+
+function delegation(t: Tables, z: Zone): api.DelegationSet | null {
+	if (z.isPrivate) {
+		return null
+	}
+	const d = t.sets.get(z.delegationSet)
+	if (d != null) {
+		return setOf(d!)
+	}
+	const out = new api.DelegationSet()
+	out.NameServers = z.nameServers
+	return out
+}
+
+function collections(t: Tables): Collection[] { return t.collections.scan(null, 1000000).map(e => e[1]) }
+
+function collection(t: Tables, id: string): Collection throws Fault {
+	const c = t.collections.get(id)
+	if (c == null) {
+		throw api.noSuchCidrCollectionException("")
+	}
+	return c!
+}
+
+function save(t: Tables, c: Collection) throws Fault { t.collections.put(c.id, c) }
+
+function collectionOf(c: Collection): api.CidrCollection {
+	const out = new api.CidrCollection()
+	out.Arn = `arn:aws:route53:::cidrcollection/${c.id}`
+	out.Id = c.id
+	out.Name = c.name
+	out.Version = c.version
+	return out
+}
+
+function set(t: Tables, id: string): DelegationSet throws Fault {
+	const d = t.sets.get(if (startsWith(id, "/delegationset/")) id.slice(15, id.length) else id)
+	if (d == null) {
+		throw api.noSuchDelegationSet(id)
+	}
+	return d!
+}
+
+function setOf(d: DelegationSet): api.DelegationSet {
+	const out = new api.DelegationSet()
+	out.Id = `/delegationset/${d.id}`
+	out.CallerReference = d.reference
+	out.NameServers = d.nameServers
+	return out
+}
+
+function vpc(v: [string, string]): api.VPC {
+	const out = new api.VPC()
+	out.VPCRegion = v[0] as api.VPCRegion
+	out.VPCId = v[1]
+	return out
+}
+
+function domain(name: string) throws Fault {
+	const trimmed = if (endsWith(name, ".") && name != ".") name.slice(0, name.length - 1) else name
+	if (split(trimmed, ".").some(l => l == "")) {
+		throw api.invalidDomainName(`FATAL problem: DomainLabelEmpty (Domain label is empty) encountered with '${name}'`)
+	}
+}
+
+/// name as Route 53 holds it: lower case, of a trailing dot, each character but letters, digits, - and _ escaped as
+/// \ and its octal code, as * is \052.
+export function normal(name: string): string {
+	const s = lower(name)
+	let out = ""
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i]
+		if (c == "\\"[0] && i + 3 < s.length && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3])) {
+			out += s.slice(i, i + 4)
+			i += 3
+		} else if (isAlphanumeric(c) || c == "-"[0] || c == "_"[0] || c == "."[0]) {
+			out += s.slice(i, i + 1)
+		} else {
+			const n = c as i32
+			out += `\\${n / 64}${n / 8 % 8}${n % 8}`
+		}
+	}
+	return if (endsWith(out, ".")) out else out + "."
+}
+
+/// The key that orders names as AWS lists them: by their labels from the last, each unescaped.
+function key(name: string): string {
+	const labels = split(name, ".").filter(l => l != "").map(l => unescaped(l))
+	labels.reverse()
+	return labels.join("\x01")
+}
+
+function order(name: string, kind: string, set: string): string { return `${key(name)}\x00${kind}\x00${set}` }
+
+function unescaped(label: string): string {
+	let out = ""
+	for (let i = 0; i < label.length; i++) {
+		if (label[i] == "\\"[0] && i + 3 < label.length && isDigit(label[i + 1])) {
+			const n = ((label[i + 1] as i32) - 48) * 64 + ((label[i + 2] as i32) - 48) * 8
+				+ ((label[i + 3] as i32) - 48)
+			out += fromBytes([n as u8])
+			i += 3
+		} else {
+			out += label.slice(i, i + 1)
+		}
+	}
+	return out
+}
+
+function apex(z: Zone, r: Record): bool { return r.name == z.name && (r.type == "NS" || r.type == "SOA") }
+
+function shaped(c: api.Change) throws Fault {
+	const r = c.ResourceRecordSet
+	const at = `Change with [Action=${c.Action}, Name=${r.Name}, Type=${r.Type}, SetIdentifier=${r.SetIdentifier ?? "null"}]`
+	const plain = r.TTL != null && r.ResourceRecords != null
+	const forms = [r.AliasTarget != null, plain, r.TrafficPolicyInstanceId != null].filter(p => p).length
+	if (forms != 1) {
+		const found = if (forms == 0) "none" else "more than one"
+		throw api.invalidInput("Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and ResourceRecords], "
+			+ `or TrafficPolicyInstanceId], but found ${found} in ${at}`)
+	}
+	const policies = [r.Weight != null, r.Region != null, r.Failover != null, r.GeoLocation != null,
+		r.MultiValueAnswer != null, r.GeoProximityLocation != null, r.CidrRoutingConfig != null,
+		r.AZAffinity != null].filter(p => p).length
+	if (r.SetIdentifier == null && policies > 0) {
+		throw api.invalidInput(`Invalid request: Missing field 'SetIdentifier' in ${at}`)
+	}
+	if (r.SetIdentifier != null && policies != 1) {
+		const found = if (policies == 0) "none" else "more than one"
+		throw api.invalidInput("Invalid request: Expected exactly one of [Weight, Region, Failover, GeoLocation, "
+			+ "MultiValueAnswer, GeoProximityLocation, CidrRoutingConfig, or AZAffinity], but found "
+			+ `${found} in ${at}`)
+	}
+}
+
+function record(s: api.ResourceRecordSet): Record {
+	const r = new Record()
+	r.name = normal(s.Name)
+	r.type = s.Type
+	r.setIdentifier = s.SetIdentifier
+	r.weight = s.Weight
+	r.region = s.Region
+	r.continent = s.GeoLocation?.ContinentCode
+	r.country = s.GeoLocation?.CountryCode
+	r.subdivision = s.GeoLocation?.SubdivisionCode
+	r.failover = s.Failover
+	r.multiValue = s.MultiValueAnswer
+	r.ttl = s.TTL
+	r.values = s.ResourceRecords?.map(v => v.Value)
+	if (s.AliasTarget != null) {
+		const a = new Alias()
+		a.zone = bare(s.AliasTarget!.HostedZoneId)
+		a.name = normal(s.AliasTarget!.DNSName)
+		a.evaluate = s.AliasTarget!.EvaluateTargetHealth
+		r.alias = a
+	}
+	r.healthCheck = s.HealthCheckId
+	return r
+}
+
+function wire(r: Record): api.ResourceRecordSet {
+	const s = new api.ResourceRecordSet()
+	s.Name = r.name
+	s.Type = r.type as api.RRType
+	s.SetIdentifier = r.setIdentifier
+	s.Weight = r.weight
+	if (r.region != null) {
+		s.Region = r.region! as api.ResourceRecordSetRegion
+	}
+	if (r.continent != null || r.country != null || r.subdivision != null) {
+		const g = new api.GeoLocation()
+		g.ContinentCode = r.continent
+		g.CountryCode = r.country
+		g.SubdivisionCode = r.subdivision
+		s.GeoLocation = g
+	}
+	if (r.failover != null) {
+		s.Failover = r.failover! as api.ResourceRecordSetFailover
+	}
+	s.MultiValueAnswer = r.multiValue
+	s.TTL = r.ttl
+	s.ResourceRecords = r.values?.map(v => {
+		const out = new api.ResourceRecord()
+		out.Value = v
+		return out
+	})
+	if (r.alias != null) {
+		const a = new api.AliasTarget()
+		a.HostedZoneId = r.alias!.zone
+		a.DNSName = r.alias!.name
+		a.EvaluateTargetHealth = r.alias!.evaluate
+		s.AliasTarget = a
+	}
+	s.HealthCheckId = r.healthCheck
+	return s
+}
+
+function same(a: Record, b: Record): bool {
+	return a.name == b.name && a.type == b.type && a.setIdentifier == b.setIdentifier
+}
+
+/// Whether a and b hold the same, as a DELETE must name what is there.
+function equal(a: Record, b: Record): bool {
+	try {
+		return encode(a) == encode(b)
+	} catch (e: EncodeError) {
+		return false
+	}
+}
+
+function identified(r: Record): string {
+	return `[name='${r.name}', type='${r.type}'`
+		+ (if (r.setIdentifier == null) "" else `, set-identifier='${r.setIdentifier!}'`)
+		+ (if (r.healthCheck == null) "" else `, health check='${r.healthCheck!}'`) + "]"
+}
+
+/// Applies the action to r in z; or why it cannot, as AWS words it in an InvalidChangeBatch, z then as it was.
+function apply(z: Zone, action: api.ChangeAction, r: Record): string | null {
+	const named = identified(r)
+	if (r.name != z.name && !endsWith(r.name, `.${z.name}`)) {
+		return `RRSet with DNS name ${r.name} is not permitted in zone ${z.name}`
+	}
+	if (r.type == "A" && r.values != null) {
+		for (const v of r.values!) {
+			if (!ipv4(v)) {
+				return "Invalid Resource Record: 'FATAL problem: ARRDATAIllegalIPv4Address (Value is not a valid IPv4 "
+					+ `address) encountered with '${v}''`
+			}
+		}
+	}
+	const there = z.records.filter(o => same(o, r)).at(0)
+	if (action == "DELETE") {
+		if (there == null) {
+			return `Tried to delete resource record set ${named} but it was not found`
+		}
+		if (!equal(there!, r)) {
+			return if (r.type == "SOA") `Tried to delete resource record set ${named} but the rdata provided is invalid`
+				else `Tried to delete resource record set ${named} but the values provided do not match the current values`
+		}
+		if (apex(z, r)) {
+			return if (r.type == "SOA") "A HostedZone must contain exactly one SOA record."
+				else "A HostedZone must contain at least one NS record for the zone itself."
+		}
+		z.records = z.records.filter(o => !same(o, r))
+		return null
+	}
+	if (action == "CREATE" && there != null) {
+		return `Tried to create resource record set ${identified(there!)} but it already exists`
+	}
+	if (r.type == "CNAME" && r.name == z.name) {
+		return `RRSet of type CNAME with DNS name ${r.name} is not permitted at apex in zone ${z.name}`
+	}
+	const others = z.records.filter(o => o.name == r.name && !same(o, r))
+	if (r.type == "CNAME" && others.some(o => o.type != "CNAME")) {
+		return `RRSet of type CNAME with DNS name ${r.name} is not permitted as it conflicts with other records with the `
+			+ `same DNS name in zone ${z.name}`
+	}
+	if (r.type != "CNAME" && others.some(o => o.type == "CNAME")) {
+		return `RRSet of type ${r.type} with DNS name ${r.name} is not permitted because a conflicting RRSet of type `
+			+ `CNAME with the same DNS name already exists in zone ${z.name}`
+	}
+	z.records = z.records.filter(o => !same(o, r))
+	z.records.push(r)
+	return null
+}
+
+function ipv4(v: string): bool {
+	const parts = split(v, ".")
+	return parts.length == 4
+		&& parts.every(p => p.length > 0 && p.length <= 3 && parseIntOr(p) >= 0 && parseIntOr(p) <= 255)
+}
+
+function parseIntOr(p: string): i32 {
+	try {
+		return parseInt(p) as i32
+	} catch (e: ParseError) {
+		return -1
+	}
+}
+
+function checkArn(id: string): string { return `arn:aws:route53:::healthcheck/${id}` }
+
+function check(t: Tables, id: string): Check throws Fault {
+	const c = t.checks.get(id)
+	if (c == null) {
+		throw api.noSuchHealthCheck(`A health check with id ${id} does not exist.`)
+	}
+	return c!
+}
+
+function keep(t: Tables, c: Check) throws Fault { t.checks.put(c.id, c) }
+function checks(t: Tables): Check[] { return t.checks.scan(null, 1000000).map(e => e[1]) }
+
+function created(caller: Caller, c: Check): api.CreateHealthCheckResponse {
+	const out = new api.CreateHealthCheckResponse()
+	out.HealthCheck = checkOf(c)
+	out.Location = `${caller.endpoint}/2013-04-01/healthcheck/${c.id}`
+	return out
+}
+
+function checkOf(c: Check): api.HealthCheck {
+	const h = new api.HealthCheck()
+	h.Id = c.id
+	h.CallerReference = c.reference
+	h.HealthCheckConfig = c.config
+	h.HealthCheckVersion = c.version
+	return h
+}
+
+function alike(a: api.HealthCheckConfig, b: api.HealthCheckConfig): bool {
+	try {
+		return encode(a) == encode(b)
+	} catch (e: EncodeError) {
+		return false
+	}
+}
+
+/// k validated as AWS validates a health check of its type, AWS's defaults filled in.
+function configured(t: Tables, k: api.HealthCheckConfig): api.HealthCheckConfig throws Fault {
+	k.Inverted = k.Inverted ?? false
+	k.Disabled = k.Disabled ?? false
+	if (k.Type == "CALCULATED") {
+		k.ChildHealthChecks = k.ChildHealthChecks ?? []
+		const missing = k.ChildHealthChecks!.filter(id => t.checks.get(id) == null)
+		if (missing.length > 0) {
+			throw api.invalidInput("Invalid parameter : Child health check IDs do not exist or are deleted: "
+				+ missing.join(", "))
+		}
+		return k
+	}
+	if (k.Type == "CLOUDWATCH_METRIC" || k.Type == "RECOVERY_CONTROL") {
+		throw new Fault(501, "NotImplemented", `Health checks of type ${k.Type} are not implemented`)
+	}
+	if (k.IPAddress == null && k.FullyQualifiedDomainName == null) {
+		throw api.invalidInput("Invalid parameter : IP address and fully qualified domain name can not be both empty.")
+	}
+	if (k.IPAddress != null && forbidden(k.IPAddress!)) {
+		throw api.invalidInput(`IPv4 address ${k.IPAddress!} is forbidden`)
+	}
+	const secure = k.Type == "HTTPS" || k.Type == "HTTPS_STR_MATCH"
+	if (k.Port == null) {
+		if (k.Type == "TCP") {
+			throw api.invalidInput("TCP health checks must specify a port")
+		}
+		k.Port = if (secure) 443 else 80
+	}
+	k.RequestInterval = k.RequestInterval ?? 30
+	if (k.RequestInterval! != 10 && k.RequestInterval! != 30) {
+		throw api.invalidInput(`Value '${k.RequestInterval!}' is not facet-valid with respect to enumeration '[10, 30]'. `
+			+ "It must be a value from the enumeration.")
+	}
+	k.FailureThreshold = k.FailureThreshold ?? 3
+	k.MeasureLatency = k.MeasureLatency ?? false
+	k.EnableSNI = k.EnableSNI ?? secure
+	return k
+}
+
+/// Whether v is an IPv4 address that Route 53 does not check: of a local, private, documentation, link-local or
+/// multicast range.
+function forbidden(v: string): bool {
+	if (!ipv4(v)) {
+		return false
+	}
+	const p = split(v, ".").map(s => parseIntOr(s))
+	const [a, b, c] = [p[0], p[1], p[2]]
+	return a == 0 || a == 10 || a == 127 || a >= 224 || a == 169 && b == 254 || a == 172 && b >= 16 && b < 32
+		|| a == 192 && b == 168 || a == 192 && b == 0 && c == 2 || a == 198 && b == 51 && c == 100
+		|| a == 203 && b == 0 && c == 113
+}
+
+/// The config of c, whose status a checker reports, else InvalidInput, as AWS answers of a calculated or disabled one.
+function checked(c: Check): api.HealthCheckConfig throws Fault {
+	if (c.config.Type == "CALCULATED") {
+		throw api.invalidInput("Invalid parameter : To get the status of a calculated health check, use either the "
+			+ "Route 53 console or the CloudWatch console. The GetHealthCheckStatus action can't return the health of "
+			+ "calculated health checks.")
+	}
+	if (c.config.Disabled ?? false) {
+		throw api.invalidInput("Invalid parameter : The specified health check has a special status of always healthy. "
+			+ "GetHealthCheckStatus can't return the status of one of these special health checks.")
+	}
+	return c.config
+}
+
+function uuid(): string throws Fault {
+	let h = ""
+	try {
+		h = hex.encode(bytes(16))
+	} catch (e: IoError) {
+		throw new Fault(500, "InternalFailure", `No random bytes: ${e}`)
+	}
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
