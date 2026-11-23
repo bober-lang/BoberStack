@@ -80,7 +80,8 @@ test "a service called for a request writes into the request's trees" {
 	g.services.set("test", (caller: Caller, req: Request) => {
 		const sns = caller.internal("sns.amazonaws.com", "arn:aws:sns:us-east-1:000000000000:t")
 		try {
-			sns.regional().put("k", `${sns.arn} ${sns.source.slice(0, 11)} ${caller.regional().get("k")}`)
+			sns.regional().put("k",
+				`${sns.arn} ${sns.source.slice(0, 11)} ${sns.endpoint} ${caller.regional().get("k")}`)
 		} catch (f: Fault) {
 			return new Response(f.status, f.message)
 		}
@@ -88,7 +89,7 @@ test "a service called for a request writes into the request's trees" {
 	})
 	assert g.handle(request("test", "test", "test", "fail")).status == 400 && g.trees.size == 0
 	assert g.handle(request("test", "test", "test", "ok")).status == 200
-	assert g.trees.get("000000000000/us-east-1")?.get("k") == "sns.amazonaws.com arn:aws:sns null"
+	assert g.trees.get("000000000000/us-east-1")?.get("k") == "sns.amazonaws.com arn:aws:sns http://localhost:4566 null"
 	g.close()
 	assert live() == before
 }
