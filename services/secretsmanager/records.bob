@@ -1,0 +1,36 @@
+//! Secrets Manager's state in an account's regional tree: its secrets by name, each with its versions.
+
+import { Fault } from "../../core/fault"
+import { Store, Table } from "../../core/state/store"
+
+export class Version {
+	id = ""
+	/// The ciphertext blob of the value, in base64, and whether the value is bytes.
+	sealed = ""
+	binary = false
+	/// Its staging labels; none if it is deprecated.
+	stages: string[] = []
+	created: i64 = 0
+	/// The day it was last read, null if never.
+	accessed: i64 | null = null
+	/// The KMS key it is encrypted under as given, null for aws/secretsmanager.
+	kmsKey: string | null = null
+}
+
+export class Secret {
+	name = ""
+	arn = ""
+	description: string | null = null
+	kmsKey: string | null = null
+	type: string | null = null
+	tags: [string, string][] = []
+	policy: string | null = null
+	created: i64 = 0
+	changed: i64 = 0
+	accessed: i64 | null = null
+	deleting: i64 | null = null
+	versions: Version[] = []
+}
+
+export function secrets(s: Store): Table[Secret] { return new Table[Secret](s, "secretsmanager/secrets") }
+export function save(t: Table[Secret], s: Secret) throws Fault { t.put(s.name, s) }
