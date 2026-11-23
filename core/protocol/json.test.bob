@@ -66,7 +66,7 @@ test "a missing required member" {
 	const why = message("Value null at 'name' failed to satisfy constraint: Member must not be null")
 	assert decode[Scalars](`{"Count": 1}`) throws new Fault(400, "ValidationException", why)
 	assert decode[Scalars](`{"Name": null}`) throws new Fault(400, "ValidationException", why)
-	const nested = message("Value null at 'items.2.Name' failed to satisfy constraint: Member must not be null")
+	const nested = message("Value null at 'items.2.member.name' failed to satisfy constraint: Member must not be null")
 	assert decode[Nested](`{"Items": [{"Name": "a"}, {"Count": 1}]}`) throws new Fault(400, "ValidationException",
 		nested)
 }
@@ -83,7 +83,7 @@ function malformed(what: string, at: string, s: string): Fault {
 test "a value not of its type" {
 	const count = malformed("an integer", "'Count'", `"1"`)
 	assert decode[Scalars](`{"Name": "", "Count": "1"}`) throws count
-	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set")
+	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [fast, safe]")
 	assert decode[Scalars](`{"Name": "", "Mode": "slow"}`) throws new Fault(400, "ValidationException", mode)
 	assert decode[Collections](`{"Sparse": [1]}`) throws malformed("a string", "'Sparse.1'", "1")
 	assert decode[Collections](`{"Strings": ["a", null]}`) throws malformed("a string", "'Strings.2'", "null")
@@ -147,7 +147,8 @@ test "an output" {
 	assert result(new Unit()) == ""
 }
 
-const caller = new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "id")
+/// A caller of its own, which serving changes.
+function caller(): Caller { return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "id") }
 
 const json10 = new Service("smithy.example#Greeter", "1.0", false,
 	[new ErrorShape("smithy.example#Denied", "Message", "")])
@@ -159,7 +160,7 @@ const json11 = new Service("smithy.example#Greeter", "1.1", false, [])
 
 /// A call of Greet, with body, to service.
 function call(service: Service, body: string, target: string = "Greeter.Greet"): Call {
-	return new Call(caller, service, target, body)
+	return new Call(caller(), service, target, body)
 }
 
 test "serve" {

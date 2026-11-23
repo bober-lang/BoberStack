@@ -93,7 +93,7 @@ test "users: create, get, list, update, delete" {
 	assert fails(call(g, "CreateUser", [["UserName", "a/b"]]), 400, "ValidationError")
 	assert fails(call(g, "CreateUser", [["UserName", "carol"], ["Path", "dev"]]), 400, "ValidationError")
 	assert fails(call(g, "CreateUser"), 400, "ValidationError",
-		"1 validation error detected: Value null at 'userName' failed to satisfy constraint: Member must not be null")
+		"1 validation error detected: Value at 'userName' failed to satisfy constraint: Member must not be null")
 	res = call(g, "GetUser", [["UserName", "Bob"]])
 	assert res.status == 200 && text(res, "UserId") == id && text(res, "UserName") == "bob"
 	assert fails(call(g, "GetUser", [["UserName", "nobody"]]), 404, "NoSuchEntity",
@@ -307,7 +307,8 @@ test "managed policies and their versions" {
 	assert text(call(g, "GetPolicy", [["PolicyArn", arn]]), "PolicyName") == "p"
 	assert fails(call(g, "GetPolicy", [["PolicyArn", "arn:aws:iam::000000000000:policy/p"]]), 404, "NoSuchEntity",
 		"Policy arn:aws:iam::000000000000:policy/p was not found.")
-	assert fails(call(g, "GetPolicy", [["PolicyArn", "p"]]), 400, "InvalidInput", "ARN p is not valid.")
+	const short = "1 validation error detected: Value at 'policyArn' failed to satisfy constraint: Member must have length greater than or equal to 20"
+	assert fails(call(g, "GetPolicy", [["PolicyArn", "p"]]), 400, "ValidationError", short)
 	const doc = (i: i32) => `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:Get${i}","Resource":"*"}]}`
 	for (const i of 2 ... 5) {
 		const params: [string, string][] = [["PolicyArn", arn], ["PolicyDocument", doc(i)]]

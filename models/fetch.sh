@@ -4,6 +4,7 @@ set -eu
 commit=3678d8a26e38bf4855aff5bae7be447ca52e63a0
 cd "$(dirname "$0")"
 for model in sts/service/2011-06-15/sts-2011-06-15.json iam/service/2010-05-08/iam-2010-05-08.json \
-	sqs/service/2012-11-05/sqs-2012-11-05.json; do
+	sqs/service/2012-11-05/sqs-2012-11-05.json dynamodb/service/2012-08-10/dynamodb-2012-08-10.json \
+	sns/service/2010-03-31/sns-2010-03-31.json eventbridge/service/2015-10-07/eventbridge-2015-10-07.json; do
 	curl -fsS -A curl -o "${model%%/*}.json" "https://raw.githubusercontent.com/aws/api-models-aws/$commit/models/$model"
 done

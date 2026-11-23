@@ -1,0 +1,189 @@
+//! What the codecs apply of a service's model besides the types of its members: their defaults and constraints, under
+//! the tags below, and how the service words a request that breaks them, as AWS does: each violation as "Value 'x' at
+//! 'path' failed to satisfy constraint: why", those of a request together in one fault, the members of a structure in
+//! the order of a Java HashMap of their names, which is the order AWS lists them in.
+
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { parseFloat } from "std/float"
+import { compile, Regex } from "std/regex"
+import { lower, ParseError } from "std/string"
+import { Fault } from "../fault"
+
+/// Tags a member that takes its initial value when a request leaves it out, as Smithy's default.
+export class Default {}
+/// Tags a member, or its items, with its shape's constraints, each "" where it has none: a string's length in
+/// characters, a blob's in bytes or a number's value, from Min to Max, and a string's pattern P.
+export class Valid[Min extends string, Max extends string, P extends string] {}
+/// Tags a list or map member with the number of its items, from Min to Max, either "" for no bound.
+export class Size[Min extends string, Max extends string] {}
+
+/// How a service answers a request breaking its model: the code of the fault, and whether its message quotes the
+/// values.
+export class Validation {
+	code: string
+	quoted: bool
+
+	constructor(code: string, quoted: bool = true) {
+		this.code = code
+		this.quoted = quoted
+	}
+}
+
+/// The violations of a request, as decoding it meets them: each the text of AWS's message on it.
+export class Violations {
+	validation: Validation
+	found: string[] = []
+
+	constructor(validation: Validation) { this.validation = validation }
+
+	/// Notes the value v, or null, at the member path at, failing why.
+	note(v: string | null, at: string, why: string) {
+		const value = if (!this.validation.quoted) "" else if (v == null) " null" else ` '${v}'`
+		this.found.push(`Value${value} at '${at}' failed to satisfy constraint: ${why}`)
+	}
+
+	/// The fault of the violations noted, and of v at the member path at failing why if why is given.
+	fault(v: string | null = null, at: string = "", why: string = ""): Fault {
+		if (why != "") {
+			this.note(v, at, why)
+		}
+		const n = this.found.length
+		const detected = `${n} validation error${if (n == 1) "" else "s"} detected: `
+		return new Fault(400, this.validation.code, detected + this.found.join("; "))
+	}
+
+	/// Throws the fault of the violations noted, if any.
+	check() throws Fault {
+		if (this.found.length > 0) {
+			throw this.fault()
+		}
+	}
+
+	/// Puts the violations of a structure's members, noted from the index from[i] on for its member names[i], in the
+	/// order AWS lists them.
+	order(names: string[], from: i32[]) {
+		const runs: [i32, i32, string[]][] = [] // a member's bucket, its place and its violations
+		for (let i = 0; i < names.length; i++) {
+			const to = if (i + 1 < names.length) from[i + 1] else this.found.length
+			runs.push([bucket(names[i], names.length), i, this.found.slice(from[i], to)])
+		}
+		sortBy(runs, (a, b) => a[0] < b[0] || a[0] == b[0] && a[1] < b[1])
+		this.found = this.found.slice(0, if (names.length == 0) this.found.length else from[0])
+		for (const r of runs) {
+			this.found.append(r[2])
+		}
+	}
+}
+
+/// The bucket of the key k in a Java HashMap, made empty, of n keys: as String.hashCode spreads it, in a table of 16
+/// slots doubled while n is more than 3/4 of them.
+function bucket(k: string, n: i32): i32 {
+	let h: i64 = 0
+	for (const c of k) {
+		h = (31 * h + (c as i64)) & 4294967295
+	}
+	let slots: i64 = 16
+	while ((n as i64) * 4 > slots * 3) {
+		slots *= 2
+	}
+	return ((h ^ (h >> 16)) & (slots - 1)) as i32
+}
+
+/// The member path at, of a structure's member named n, as AWS gives it: n lowered at its start.
+export function path(at: string, n: string): string {
+	const m = lower(n.slice(0, 1)) + n.slice(1, n.length)
+	return if (at == "") m else `${at}.${m}`
+}
+
+/// Notes into v how x, at the member path at, of a member tagged tags, breaks the constraints those hold: of its
+/// length in bytes if bytes, as a blob's.
+export function check[T](x: T, at: string, tags: Type[], v: Violations, bytes: bool = false) {
+	for (const t of tags) {
+		const size = t.base == Size
+		if (t.base != Valid && !size) {
+			continue
+		}
+		const min = t.args[0].value as string
+		const max = t.args[1].value as string
+		if (size != (T.kind == "array")) {
+			continue // a list's count, on its items, or their constraints, on the list
+		}
+		let n = 0.0
+		let what = "length"
+		switch (T.kind) {
+			case "string": n = (if (bytes) x.length else characters(x)) as f64
+			case "int", "float":
+				n = x as f64
+				what = "value"
+			case "array": n = x.length as f64
+			default: continue
+		}
+		if (min != "" && n < number(min)) {
+			v.note(text(x), at, `Member must have ${what} greater than or equal to ${min}`)
+		} else if (max != "" && n > number(max)) {
+			v.note(text(x), at, `Member must have ${what} less than or equal to ${max}`)
+		}
+		const p = if (size) "" else t.args[2].value as string
+		if (T.kind == "string" && p != "") {
+			const r = regex(p)
+			if (r != null && !r!.test(x)) {
+				const shown = p.slice(if (startsWith(p, "^")) 1 else 0, p.length - (if (endsWith(p, "$")) 1 else 0))
+				v.note(text(x), at, `Member must satisfy regular expression pattern: ${shown}`)
+			}
+		}
+	}
+}
+
+/// The values of the enum T, a union of literals, as AWS lists them: in the order of a Java HashSet of them.
+export function values[T](): string {
+	const all: string[] = []
+	for (const M of T.members) {
+		if (M.kind == "literal") {
+			all.push(`${M.value}`)
+		}
+	}
+	const n = all.length
+	sortBy(all, (a, b) => bucket(a, n) < bucket(b, n))
+	return `[${all.join(", ")}]`
+}
+
+/// The text of x as AWS quotes it.
+function text[T](x: T): string {
+	if (T.kind == "array") {
+		const items: string[] = []
+		for (const i of x) {
+			items.push(text(i))
+		}
+		return `[${items.join(", ")}]`
+	}
+	return `${x}`
+}
+
+/// The number of characters of s, of UTF-8.
+function characters(s: string): i32 {
+	let n = 0
+	for (const c of s) {
+		if ((c & 192) != 128) {
+			n++
+		}
+	}
+	return n
+}
+
+/// The number of a bound of a constraint.
+function number(s: string): f64 {
+	try {
+		return parseFloat[f64](s)
+	} catch (e: ParseError) {
+		return 0.0 // the generator writes only numbers
+	}
+}
+
+/// The regular expression of the pattern p, null if std/regex cannot run it, which the generator does not let be.
+function regex(p: string): Regex | null {
+	try {
+		return compile(p)
+	} catch (e: ParseError) {
+		return null
+	}
+}

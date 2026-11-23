@@ -11,8 +11,10 @@
 //! or `-- models/awsquery-tests.json protocoltests/query/api.bob protocoltests/query/skips.txt`.
 
 import { indexOf, lastIndexOf, sortBy, startsWith, unique } from "std/algo"
+import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { min, round } from "std/math"
+import { compile } from "std/regex"
 import { lower, ParseError, replace, split } from "std/string"
 
 class Model {
@@ -51,6 +53,9 @@ class Traits {
 	timestampFormat: string | null @json.Name["smithy.api#timestampFormat"]
 	enumValue: string | i32 | null @json.Name["smithy.api#enumValue"]
 	enum: EnumValue[] | null @json.Name["smithy.api#enum"]
+	length: Bounds | null @json.Name["smithy.api#length"]
+	range: Bounds | null @json.Name["smithy.api#range"]
+	pattern: string | null @json.Name["smithy.api#pattern"]
 	streaming: Mark | null @json.Name["smithy.api#streaming"]
 	sparse: Mark | null @json.Name["smithy.api#sparse"]
 	error: string | null @json.Name["smithy.api#error"]
@@ -93,6 +98,11 @@ class EnumValue {
 	rest: json.Unknown[] @json.Rest = []
 }
 
+class Bounds {
+	min: f64 | null
+	max: f64 | null
+}
+
 class QueryError {
 	code = ""
 	httpResponseCode: i32 = 0
@@ -105,6 +115,24 @@ class Sigv4 {
 
 class Service {
 	sdkId = ""
+	rest: json.Unknown[] @json.Rest = []
+}
+
+/// A service's authorization reference, of the operations' actions.
+class Reference {
+	Operations: Operation[] = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Operation {
+	Name = ""
+	AuthorizedActions: Action[] = []
+	rest: json.Unknown[] @json.Rest = []
+}
+
+class Action {
+	Name = ""
+	Service = ""
 	rest: json.Unknown[] @json.Rest = []
 }
 
@@ -128,15 +156,30 @@ class Decl {
 
 const width = 120
 
+/// How the services below answer a request breaking their models' constraints, as AWS did on 2026-11-23: by their
+/// shape ids, the code of the fault, whether its messages quote the values, and whether a pattern is checked as the
+/// others are; if not, a member of a pattern is left to the service's handlers, as are all of a service not listed.
+const validations: [string, string, bool, bool][] = [["com.amazonaws.iam#AWSIdentityManagementV20100508",
+	"ValidationError", false, false],
+	["com.amazonaws.sts#AWSSecurityTokenServiceV20110615", "ValidationError", true, true],
+	["com.amazonaws.eventbridge#AWSEvents", "ValidationException", true, true]]
+
 class Generator {
 	model: Model
 	/// The structures, unions and enums the operations reach.
 	structures: string[] = []
 	enums: string[] = []
+	/// How the service answers a request breaking its model's constraints, null if they are not checked.
+	validation: [string, string, bool, bool] | null = null
+	/// The aliases of the constraints of shapes, by their ids; whether a tag of core/protocol/model is used; and the
+	/// patterns std/regex cannot run, by their shapes' ids, which go unchecked.
+	aliases: [string, string][] = []
+	modeled = false
+	unchecked: string[] = []
 
 	/// The names declared, the imported ones too, to fail on a second of one.
-	taken = ["query", "json", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response", "signingName",
-		"version", "ns", "service", "Unimplemented", "handle"]
+	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
+		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle"]
 
 	/// The service's protocol, awsQuery, awsJson1_0 or awsJson1_1, once api has begun; and its shape id, operations and
 	/// version, once api has run.
@@ -163,12 +206,14 @@ class Generator {
 			const why = "not an awsQuery service of an XML namespace or an awsJson one, of sigv4, or has resources"
 			throw new ModelError(`${services[0][0]}: ${why}`)
 		}
+		this.validation = validations.find(v => v[0] == services[0][0])
 		const ops = s.operations.map(r => r.target)
 		sortNames(ops)
 		const errors = s.errors.map(r => r.target)
 		const signatures: Decl[] = []
 		const unimplemented: Decl[] = []
 		const cases: string[] = []
+		const actions = this.actions(from, t.sigv4!.name)
 		let unit = false
 		for (const id of ops) {
 			const op = this.shape(id)
@@ -181,31 +226,53 @@ class Generator {
 			const head = `\t${lowerCamel(name(id))}(caller: Caller, input: ${input}): ${output} throws Fault`
 			signatures.push(new Decl("method", signature(head)))
 			unimplemented.push(new Decl("method", method(head, [`\t\tthrow notImplemented(${json.quoted(name(id))})`])))
-			cases.push(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))})`)
+			const authorized = actions.find(a => a[0] == name(id))
+			const by = if (authorized == null) "" else `, [${authorized[1].map(a => json.quoted(a)).join(", ")}]`
+			cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))}${by})`))
 		}
 		sortNames(errors)
+		for (const id of unique(errors)) {
+			for (const m of this.shape(id).members.filter(m => lower(m[0]) != "message")) {
+				this.reach(m[1].target)
+			}
+		}
 		sortNames(this.structures)
 		sortNames(this.enums)
-		const decls = imports(out, query, unit)
-		decls.push(new Decl("const", [`export const signingName = ${json.quoted(t.sigv4!.name)}`]))
+		const body: Decl[] = []
+		for (const id of this.enums) {
+			body.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, this.values(id))))
+		}
+		const classes: Decl[] = []
+		for (const id of this.structures) {
+			classes.push(...this.classOf(id))
+		}
+		for (const id of unique(errors)) {
+			classes.append(this.maker(id))
+		}
+		sortBy(this.aliases, (a, b) => a[0] < b[0])
+		body.append(this.aliases.map(a => new Decl("type", wrap(a[1]))))
+		body.append(classes)
+		const head: Decl[] = imports(out, query, unit, this.modeled || this.validation != null)
+		const unchecked = if (this.unchecked.length == 0) []
+			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
+		head.push(new Decl("const", [...unchecked, `export const signingName = ${json.quoted(t.sigv4!.name)}`]))
+		const v = this.validation
+		if (v != null) {
+			const quoted = if (v[2]) "" else ", false"
+			const line = `export const validation = new model.Validation(${json.quoted(v[1])}${quoted})`
+			head.push(new Decl("const", [line]))
+		}
 		if (query) {
-			decls.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
-			decls.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
+			head.push(new Decl("const", [`export const version = ${json.quoted(s.version)}`]))
+			head.push(new Decl("const", [`export const ns = ${json.quoted(t.xmlNamespace!.uri)}`]))
 		} else {
 			const shapes = unique(errors).map(id => `new json.ErrorShape(${this.errorShape(id)})`)
 			const version = json.quoted(if (this.protocol == "awsJson1_0") "1.0" else "1.1")
-			const head = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
-			decls.push(new Decl("const", wrap(`${head}, ${t.queryCompatible != null}, [${shapes.join(", ")}])`)))
+			const start = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
+			const end = if (v == null) "" else ", validation"
+			head.push(new Decl("const", wrap(`${start}, ${t.queryCompatible != null}, [${shapes.join(", ")}]${end})`)))
 		}
-		for (const id of this.enums) {
-			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, this.values(id))))
-		}
-		for (const id of this.structures) {
-			decls.push(...this.classOf(id))
-		}
-		for (const id of unique(errors)) {
-			decls.push(new Decl("function", this.maker(id)))
-		}
+		const decls = [...head, ...body]
 		const handlers = this.declare(replace(t.service?.sdkId ?? name(services[0][0]), " ", ""))
 		this.id = services[0][0]
 		this.version = s.version
@@ -213,7 +280,7 @@ class Generator {
 		decls.push(new Decl("interface", [`export interface ${handlers} {`, ...layout(signatures), "}"]))
 		const doc = "/// Every operation, not implemented: a service mixes it in and declares those it implements."
 		decls.push(new Decl("class", [doc, "export class Unimplemented {", ...layout(unimplemented), "}"]))
-		decls.push(new Decl("function", handle(handlers, cases, query)))
+		decls.push(new Decl("function", handle(handlers, cases, query, v != null)))
 		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
 	}
 
@@ -298,7 +365,7 @@ class Generator {
 			for (const m of s.members) {
 				const v = this.declare(`${name(id)}$${m[0]}`)
 				variants.push(v)
-				decls.push(new Decl("class", [`export class ${v} {`, this.field(id, m, true), "}"]))
+				decls.push(new Decl("class", [`export class ${v} {`, ...this.field(id, m, true).lines, "}"]))
 			}
 			decls.push(new Decl("type", fill(`export type ${this.declare(name(id))} = `, variants)))
 			return decls
@@ -307,16 +374,16 @@ class Generator {
 		if (s.members.length == 0) {
 			return [new Decl("class", [`export class ${n} {}`])]
 		}
-		const lines = [`export class ${n} {`]
+		const fields: Decl[] = []
 		for (const m of s.members) {
-			lines.push(this.field(id, m, m[1].traits.required != null))
+			fields.push(this.field(id, m, m[1].traits.required != null))
 		}
-		lines.push("}")
+		const lines = [`export class ${n} {`, ...layout(fields), "}"]
 		return [new Decl("class", lines)]
 	}
 
-	/// The field of the member m of the shape id, null unless required.
-	field(id: string, m: [string, Ref], required: bool): string throws ModelError {
+	/// The field of the member m of the shape id, null unless required or of a default.
+	field(id: string, m: [string, Ref], required: bool): Decl throws ModelError {
 		const t = m[1].traits
 		const query = this.protocol == "awsQuery"
 		if (query && t.xmlAttribute != null) {
@@ -329,14 +396,105 @@ class Generator {
 		if (query && t.xmlFlattened != null) {
 			tags.push("@query.Flat")
 		}
-		const ty = this.typeOf(m[1], tags, false)
-		const tagged = tags.map(x => ` ${x}`).join("")
-		const field = if (required) `\t${m[0]}: ${ty}${tagged}${this.initial(m[1].target, ty)}`
-			else `\t${m[0]}: ${ty} | null${tagged}`
-		if (wide(field)) {
-			throw new ModelError(`${id}$${m[0]}: a field wider than a line`) // bober format would wrap it
+		const d = m[1].traits.rest.find(x => x[0] == "smithy.api#default")
+		const initial = if (d == null || d[1] == "null") null else this.defaultOf(m[1], d[1])
+		if (initial != null) {
+			tags.push("@model.Default")
+			this.modeled = true
 		}
-		return field
+		const valid = this.valid(m[1])
+		const ty = this.typeOf(m[1], tags, false)
+		if (valid != "") {
+			tags.push(valid)
+		}
+		const tagged = tags.map(x => ` ${x}`).join("")
+		const field = if (initial != null) `\t${m[0]}: ${ty}${tagged} = ${initial}`
+			else if (required) `\t${m[0]}: ${ty}${tagged}${this.initial(m[1].target, ty)}`
+			else `\t${m[0]}: ${ty} | null${tagged}`
+		if (!wide(field) || initial != null || required) {
+			return new Decl("field", [field]) // which bober format leaves as it is
+		}
+		// as bober format breaks a type too wide before its last member
+		const last = `\t\t| null${tagged}`
+		if (wide(last)) {
+			throw new ModelError(`${id}$${m[0]}: a field wider than a line`)
+		}
+		return new Decl("field", [`\t${m[0]}: ${ty}`, last])
+	}
+
+	/// The value of the member r of the default d, as Smithy's JSON gives it.
+	defaultOf(r: Ref, d: string): string throws ModelError {
+		const s = this.shape(r.target)
+		try {
+			switch (s.type) {
+				case "blob": return json.quoted(base64.decode(json.decode[string](d)))
+				case "map": return "[]"
+				case "timestamp": return `${(round(json.decode[f64](d) * 1000.0) as i64) * 1000000}`
+				default: return this.literal(r, d)
+			}
+		} catch (e: ParseError) {
+			throw new ModelError(`${r.target}: a default of ${d}`)
+		}
+	}
+
+	/// The tag of the constraints of the member or item r, "" if it has none or the service's handlers check them; an
+	/// alias of its target's where the member adds none of its own.
+	valid(r: Ref): string throws ModelError {
+		const v = this.validation
+		const s = this.shape(r.target)
+		const own = r.traits.length != null || r.traits.range != null || r.traits.pattern != null
+		const length = r.traits.length ?? s.traits.length
+		const pattern = r.traits.pattern ?? s.traits.pattern
+		if (v == null || pattern != null && !v[3] || enumerates(s)) {
+			return ""
+		}
+		let tag = ""
+		if (s.type == "list" || s.type == "map") {
+			if (length == null) {
+				return ""
+			}
+			tag = `model.Size[${bound(length!.min)}, ${bound(length!.max)}]`
+		} else {
+			const b = length ?? r.traits.range ?? s.traits.range
+			let p = pattern ?? ""
+			try {
+				compile(p)
+			} catch (e: ParseError) {
+				const unrun = `${r.target}: ${p}`
+				if (!this.unchecked.includes(unrun)) {
+					this.unchecked.push(unrun)
+				}
+				p = ""
+			}
+			if (b == null && p == "") {
+				return ""
+			}
+			tag = `model.Valid[${bound(b?.min)}, ${bound(b?.max)}, ${json.quoted(p)}]`
+		}
+		if (own) {
+			return `@${tag}`
+		}
+		const alias = this.aliases.find(a => a[0] == r.target)
+		if (alias == null) {
+			this.aliases.push([r.target, `type ${this.declare(name(r.target))} = ${tag}`])
+		}
+		return `@${name(r.target)}`
+	}
+
+	/// The actions that authorize each operation, by its name, as the authorization reference of the service of the
+	/// signing name signing, beside the model from, gives them; none if there is no reference.
+	actions(from: string, signing: string): [string, string[]][] throws ModelError {
+		const at = lastIndexOf(from, "/")
+		const file = readFile(`${from.slice(0, at + 1)}${signing}-auth.json`)
+		if (file == null) {
+			return []
+		}
+		try {
+			return json.decode[Reference](file!).Operations.map(o => [o.Name,
+				o.AuthorizedActions.map(a => `${a.Service}:${a.Name}`)])
+		} catch (e: ParseError) {
+			throw new ModelError(`${signing}-auth.json: ${e}`)
+		}
 	}
 
 	/// The initializer of a required field of the shape id, of type ty: none where ty has a zero value.
@@ -390,7 +548,7 @@ class Generator {
 				if (m.traits.xmlName != null) {
 					tags.push(`@query.Member[${json.quoted(m.traits.xmlName!)}]`)
 				}
-				return `${this.typeOf(m, tags, true)}[]`
+				return `${this.item(m, tags)}[]`
 			case "map":
 				const k = s.key!
 				const v = s.value!
@@ -403,10 +561,21 @@ class Generator {
 				if (v.traits.xmlName != null) {
 					tags.push(`@query.Value[${json.quoted(v.traits.xmlName!)}]`)
 				}
-				return `[${this.typeOf(k, tags, true)}, ${this.typeOf(v, tags, true)}][]`
+				return `[${this.typeOf(k, tags, true)}, ${this.item(v, tags)}][]`
 			case "structure", "union": return name(r.target)
 			default: throw new ModelError(`${r.target}: a ${s.type}`)
 		}
+	}
+
+	/// The type of the item r of a list or map, with the tags into tags that it takes: its constraints, unless it is a
+	/// list or map itself, whose number of items they would bound.
+	item(r: Ref, tags: string[]): string throws ModelError {
+		const ty = this.typeOf(r, tags, true)
+		const valid = if (["list", "map"].includes(this.shape(r.target).type)) "" else this.valid(r)
+		if (valid != "") {
+			tags.push(valid)
+		}
+		return ty
 	}
 
 	/// The type of a member, or item, r of an awsJson service, of the timestamp, document, list or map s, with the tags
@@ -422,12 +591,12 @@ class Generator {
 				tags.push("@json.Document")
 				return "string"
 			case "list":
-				const item = this.typeOf(s.member!, tags, true)
+				const item = this.item(s.member!, tags)
 				return if (s.traits.sparse != null) `(${item} | null)[]` else `${item}[]`
 			default:
 				// a map
 				const k = this.typeOf(s.key!, tags, true)
-				const v = this.typeOf(s.value!, tags, true)
+				const v = this.item(s.value!, tags)
 				return `[${k}, ${v}${if (s.traits.sparse != null) " | null" else ""}][]`
 		}
 	}
@@ -440,9 +609,11 @@ class Generator {
 		return `${json.quoted(id)}, ${json.quoted(if (message == null) "" else message[0])}, ${json.quoted(code)}`
 	}
 
-	/// The function making the Fault of the error id, as the protocol answers it, of a message if it has one.
-	maker(id: string): string[] throws ModelError {
-		const t = this.shape(id).traits
+	/// The function making the Fault of the error id, as the protocol answers it, of a message if it has one; and if
+	/// the error has other members, the class of them, which the function takes too.
+	maker(id: string): Decl[] throws ModelError {
+		const s = this.shape(id)
+		const t = s.traits
 		if (t.error == null) {
 			throw new ModelError(`${id}: an error without the error trait`)
 		}
@@ -450,13 +621,26 @@ class Generator {
 		const query = this.protocol == "awsQuery"
 		const status = (if (query) t.queryError?.httpResponseCode else t.httpError) ?? (if (client) 400 else 500)
 		const code = (if (query) t.queryError?.code else null) ?? name(id)
-		const message = query || this.shape(id).members.some(m => lower(m[0]) == "message")
-		const param = if (message) "message: string" else ""
-		const sender = if (client == (status < 500)) "" else `, ${client}`
-		const head = `export function ${this.declare(lowerCamel(name(id)))}(${param}): Fault {`
-		const body = `return new Fault(${status}, ${json.quoted(code)}, ${if (message) "message" else "\"\""}${sender})`
+		const message = query || s.members.some(m => lower(m[0]) == "message")
+		const others = s.members.filter(m => lower(m[0]) != "message")
+		const decls: Decl[] = []
+		const params: string[] = if (message) ["message: string"] else []
+		let members = ""
+		if (others.length > 0) {
+			const c = this.declare(name(id))
+			const doc = `/// The members of ${name(id)} besides its message.`
+			const fields = layout(others.map(m => this.field(id, m, m[1].traits.required != null)))
+			decls.push(new Decl("class", [doc, `export class ${c} {`, ...fields, "}"]))
+			params.push(`members: ${c} = new ${c}()`)
+			members = `, ${client}, ${if (query) "query" else "json"}.members(members)`
+		}
+		const sender = if (members != "" || client == (status < 500)) "" else `, ${client}`
+		const head = `export function ${this.declare(lowerCamel(name(id)))}(${params.join(", ")}): Fault {`
+		const text = if (message) "message" else "\"\""
+		const body = `return new Fault(${status}, ${json.quoted(code)}, ${text}${sender}${members})`
 		const line = `${head} ${body} }` // as bober format puts a body of one statement where it fits
-		return if (wide(line)) [head, `\t${body}`, "}"] else [line]
+		decls.push(new Decl("function", if (wide(line)) [...signature(head), ...wrap(`\t${body}`), "}"] else [line]))
+		return decls
 	}
 
 	/// The tests of the vectors of the operations and their errors, of the API in the file out, after api has run;
@@ -577,10 +761,21 @@ class Generator {
 		if (error != "") {
 			const message = this.shape(error).members.find(m => lower(m[0]) == "message")
 			const given = v.params.all.find(p => message != null && p[0] == message[0])
-			if (v.params.all.length > (if (given == null) 0 else 1) || this.protocol == "awsQuery" && given == null) {
-				throw new ModelError(`${v.id}: an error of members besides a Message`)
+			const query = this.protocol == "awsQuery"
+			if (query && given == null) {
+				throw new ModelError(`${v.id}: an error without a Message, which the awsQuery codec writes`)
 			}
-			const text = if (message == null) "" else if (given == null) "\"\"" else this.literal(message[1], given[1])
+			let text = if (message == null && !query) ""
+				else if (given == null) "\"\""
+				else this.literal(message![1], given[1])
+			const others = v.params.all.filter(p => message == null || p[0] != message[0])
+			if (others.length > 0) {
+				body.push(`\t\tconst e = new api.${name(error)}()`)
+				for (const p of others) {
+					body.append(wrap(`\t\te.${p[0]} = ${this.literal(this.member(error, p[0]), p[1])}`))
+				}
+				text = if (text == "") "e" else `${text}, e`
+			}
 			body.append(wrap(`\t\tthrow api.${lowerCamel(name(error))}(${text})`))
 		} else if (v.params.all.length == 0) {
 			body.push(`\t\treturn new ${output}()`)
@@ -743,12 +938,16 @@ function root(out: string): string {
 	return up
 }
 
-/// The imports of the file out, of the awsQuery codec if query, else of the awsJson one, and of Unit if unit.
-function imports(out: string, query: bool, unit: bool): Decl[] {
+/// The imports of the file out, of the awsQuery codec if query, else of the awsJson one, of Unit if unit, and of the
+/// codecs' model if modeled.
+function imports(out: string, query: bool, unit: bool, modeled: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
 	const codec = if (query) "query" else "json"
 	decls.push(new Decl("import", [`import * as ${codec} from "${up}core/protocol/${codec}"`]))
+	if (modeled) {
+		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))
+	}
 	decls.push(new Decl("import", [`import { Fault } from "${up}core/fault"`]))
 	const names = if (unit) "Caller, notImplemented, Unit" else "Caller, notImplemented"
 	decls.push(new Decl("import", [`import { ${names} } from "${up}core/service"`]))
@@ -757,13 +956,14 @@ function imports(out: string, query: bool, unit: bool): Decl[] {
 }
 
 /// The function serving a request by a handler of the interface handlers, by the cases of its operations, of awsQuery
-/// if query, else of awsJson.
-function handle(handlers: string, cases: string[], query: bool): string[] {
+/// if query, else of awsJson; of the service's validation if validated.
+function handle(handlers: string, cases: string[], query: bool, validated: bool): string[] {
 	const lines = ["/// The answer of h to req."]
 	const head = `export function handle(h: ${handlers}, caller: Caller, req: Request)`
 	lines.append(signature(`${head}: Response throws IoError {`))
 	if (query) {
-		lines.append(["\tconst c = query.call(caller, req, version, ns)", "\tswitch (c.action) {", ...cases])
+		const call = `\tconst c = query.call(caller, req, version, ns${if (validated) ", validation" else ""})`
+		lines.append([call, "\tswitch (c.action) {", ...cases])
 		lines.push("\t\tdefault: return c.invalidAction()")
 	} else {
 		lines.append(["\tconst c = json.call(caller, req, service)", "\tswitch (c.operation) {", ...cases])
@@ -804,14 +1004,18 @@ function signature(line: string): string[] {
 	return lines
 }
 
-/// The decls' lines, a blank line between two of different kinds or of more than a line, as bober format puts them.
+/// The number of lines of d but its comments.
+function code(d: Decl): i32 { return d.lines.filter(l => !startsWith(l, "//")).length }
+
+/// The decls' lines, a blank line between two of different kinds or of more than a line of code, as bober format puts
+/// them.
 function layout(decls: Decl[]): string[] {
 	const lines: string[] = []
 	for (let i = 0; i < decls.length; i++) {
 		const d = decls[i]
 		if (i > 0) {
 			const prev = decls[i - 1]
-			if (prev.kind != d.kind || prev.lines.length > 1 || d.lines.length > 1) {
+			if (prev.kind != d.kind || code(prev) > 1 || code(d) > 1) {
 				lines.push("")
 			}
 		}
@@ -889,6 +1093,15 @@ function pieces(s: string): string[] {
 	}
 	out.push(s.slice(at, s.length))
 	return out
+}
+
+/// The text of a constraint's bound b, "" if none.
+function bound(b: f64 | null): string {
+	if (b == null) {
+		return "\"\""
+	}
+	const n = b!
+	return json.quoted(if (n == round(n)) `${n as i64}` else `${n}`)
 }
 
 /// Whether line is wider than bober format allows, a tab as 4 columns.

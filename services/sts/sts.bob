@@ -2,7 +2,6 @@
 
 import { Credential, credentials, id, secret } from "../../core/auth/credentials"
 import { Fault } from "../../core/fault"
-import { invalid } from "../../core/protocol/query"
 import { Caller } from "../../core/service"
 import { arn, key, save, Tables } from "../iam/records"
 
@@ -10,7 +9,6 @@ import { AssumedRoleUser, AssumeRoleRequest, AssumeRoleResponse, Credentials, Ge
 	GetCallerIdentityResponse, GetSessionTokenRequest, GetSessionTokenResponse, Unimplemented } from "./api"
 
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
-import { isAlphanumeric } from "std/ascii"
 import { second } from "std/time"
 
 /// The service, of the operations implemented.
@@ -28,13 +26,6 @@ export class Handler {
 	assumeRole(caller: Caller, input: AssumeRoleRequest): AssumeRoleResponse throws Fault {
 		const a = input.RoleArn
 		const session = input.RoleSessionName
-		if (session.length < 2 || session.length > 64) {
-			const why = if (session.length < 2) "greater than or equal to 2" else "less than or equal to 64"
-			throw invalid(session, "roleSessionName", `Member must have length ${why}`)
-		}
-		if (!session.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
-			throw invalid(session, "roleSessionName", "Member must satisfy regular expression pattern: [\\w+=,.@-]*")
-		}
 		if (!startsWith(a, "arn:aws:iam::") || indexOf(a, ":role/") != 25) {
 			throw new Fault(400, "ValidationError", `${a} is not a valid role ARN`)
 		}
@@ -46,9 +37,6 @@ export class Handler {
 			throw new Fault(403, "AccessDenied", why)
 		}
 		const seconds = input.DurationSeconds ?? 3600
-		if (seconds < 900) {
-			throw invalid(`${seconds}`, "durationSeconds", "Member must have value greater than or equal to 900")
-		}
 		if (seconds > role.maxSession) {
 			const why = "The requested DurationSeconds exceeds the MaxSessionDuration set for this role."
 			throw new Fault(400, "ValidationError", why)
@@ -69,10 +57,6 @@ export class Handler {
 		// A root's session lasts an hour at most, whatever it asks for.
 		const root = caller.arn == `arn:aws:iam::${caller.account}:root`
 		let seconds = input.DurationSeconds ?? 43200
-		if (seconds < 900 || seconds > 129600) {
-			const why = if (seconds < 900) "greater than or equal to 900" else "less than or equal to 129600"
-			throw invalid(`${seconds}`, "durationSeconds", `Member must have value ${why}`)
-		}
 		if (root && seconds > 3600) {
 			seconds = 3600
 		}

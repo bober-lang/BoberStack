@@ -10,6 +10,10 @@ export const ns = "https://example.com/"
 
 export type FooEnum = "Foo" | "Baz" | "Bar" | "1" | "0"
 
+export class ComplexNestedErrorData {
+	Foo: string | null
+}
+
 export class DatetimeOffsetsOutput {
 	datetime: i64 | null @query.Timestamp
 }
@@ -215,7 +219,16 @@ export class XmlTimestampsOutput {
 	httpDateOnTarget: i64 | null @query.Timestamp["http-date"]
 }
 
-export function complexError(message: string): Fault { return new Fault(400, "ComplexError", message) }
+/// The members of ComplexError besides its message.
+export class ComplexError {
+	TopLevel: string | null
+	Nested: ComplexNestedErrorData | null
+}
+
+export function complexError(message: string, members: ComplexError = new ComplexError()): Fault {
+	return new Fault(400, "ComplexError", message, true, query.members(members))
+}
+
 export function customCodeError(message: string): Fault { return new Fault(402, "Customized", message) }
 export function invalidGreeting(message: string): Fault { return new Fault(400, "InvalidGreeting", message) }
 

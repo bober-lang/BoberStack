@@ -4,7 +4,7 @@
 
 import { Credential, credentials, id, secret } from "../../core/auth/credentials"
 import { Fault } from "../../core/fault"
-import { invalid } from "../../core/protocol/query"
+import { Violations } from "../../core/protocol/model"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
@@ -219,10 +219,6 @@ export class Handler {
 		r.trust = document(input.AssumeRolePolicyDocument)
 		r.description = input.Description
 		r.maxSession = input.MaxSessionDuration ?? 3600
-		if (r.maxSession < 3600 || r.maxSession > 43200) {
-			const why = `Member must have value ${if (r.maxSession < 3600) "greater than or equal to 3600" else "less than or equal to 43200"}`
-			throw invalid(`${r.maxSession}`, "maxSessionDuration", why)
-		}
 		r.tags = tagged([], input.Tags ?? [], "Role")
 		save(db.roles, k, r)
 		const out = new api.CreateRoleResponse()
@@ -340,8 +336,8 @@ export class Handler {
 		const scope = input.Scope ?? "All"
 		// There are no permissions boundaries.
 		const none = input.PolicyUsageFilter == "PermissionsBoundary"
-		const attached = input.OnlyAttached ?? false
-		const n = limit(input.MaxItems)
+		const attached = input.OnlyAttached
+		const n = input.MaxItems ?? 100
 		const after = cursor(input.Marker)
 		const listed: [string, api.Policy][] = []
 		if (!none && scope != "AWS") {
@@ -401,7 +397,7 @@ export class Handler {
 		save(db.versions, within(k, number(p.next)), v)
 		p.next++
 		p.updated = v.created
-		if (input.SetAsDefault ?? false) {
+		if (input.SetAsDefault) {
 			p.defaultVersion = v.id
 		}
 		save(db.policies, k, p)
@@ -817,7 +813,7 @@ function move[V extends Decodable](t: Table[V], from: string, to: string, edit: 
 /// at most max (100 if null, 1 to 1000); and the marker of the next page, null after the last.
 function page[V extends Decodable](t: Table[V], prefix: string, marker: string | null, max: i32 | null,
 	keep: (v: V) => bool): [V[], string | null] throws Fault {
-	const n = limit(max)
+	const n = max ?? 100
 	const got = take(t, prefix, cursor(marker), n + 1, keep)
 	return [got.slice(0, if (got.length < n) got.length else n).map(e => e[1]),
 		if (got.length > n) base64.encode(got[n - 1][0]) else null]
@@ -856,7 +852,7 @@ function take[V extends Decodable](t: Table[V], prefix: string, after: string | 
 
 /// A page of items as page has one, its marker the index of the first of the next.
 function part[T](items: T[], marker: string | null, max: i32 | null): [T[], string | null] throws Fault {
-	const n = limit(max)
+	const n = max ?? 100
 	let from = 0
 	try {
 		from = if (marker == null) 0 else parseInt(marker)
@@ -877,16 +873,6 @@ function tagPage(tags: [string, string][], marker: string | null,
 	return [page.map(t => ({ ...new api.Tag(), Key: t[0], Value: t[1] })), next]
 }
 
-/// The number of items of a page, max, 100 if null.
-function limit(max: i32 | null): i32 throws Fault {
-	const n = max ?? 100
-	if (n < 1 || n > 1000) {
-		const why = if (n < 1) "greater than or equal to 1" else "less than or equal to 1000"
-		throw invalid(`${n}`, "maxItems", `Member must have value ${why}`)
-	}
-	return n
-}
-
 /// tags with given set over them by key, whatever its case, of a resource of a kind, as User; at most 50.
 function tagged(tags: [string, string][], given: api.Tag[], kind: string): [string, string][] throws Fault {
 	for (let i = 0; i < given.length; i++) {
@@ -904,29 +890,34 @@ function tagged(tags: [string, string][], given: api.Tag[], kind: string): [stri
 	return out
 }
 
-/// name, of the member m, if it is a name of at most max characters of IAM's.
+/// name, of the member m, if it is a name of at most max characters of IAM's: as IAM checks one, its characters
+/// first, their fault in IAM's own words.
 function named(name: string, m: string, max: i32): string throws Fault {
-	if (name.length < 1 || name.length > max) {
-		const why = if (name.length < 1) "greater than or equal to 1" else `less than or equal to ${max}`
-		throw invalid(name, m, `Member must have length ${why}`)
+	if (name.length < 1 || !name.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
+		throw invalidValue(m, "It must contain only alphanumeric characters and/or the following: +=,.@_-")
 	}
-	if (!name.every(c => isAlphanumeric(c) || indexOf("_+=,.@-", chr(c)) >= 0)) {
-		throw invalid(name, m, "Member must satisfy regular expression pattern: [\\w+=,.@-]+")
+	if (name.length > max) {
+		throw new Violations(api.validation).fault(name, m, `Member must have length less than or equal to ${max}`)
 	}
 	return name
 }
 
-/// The path p of the member m, / if null; one starts and ends with a /.
+/// The path p of the member m, / if null; one starts and ends with a /, its characters checked first, as by named.
 function path(p: string | null, m: string): string throws Fault {
 	const s = p ?? "/"
-	if (s.length > 512) {
-		throw invalid(s, m, "Member must have length less than or equal to 512")
-	}
 	if (!startsWith(s, "/") || !endsWith(s, "/") || !s.every(isGraphic)) {
-		throw invalid(s, m,
-			"Member must satisfy regular expression pattern: (\\u002F)|(\\u002F[\\u0021-\\u007E]+\\u002F)")
+		throw invalidValue(m,
+			"It must begin and end with / and contain only alphanumeric characters and/or / characters.")
+	}
+	if (s.length > 512) {
+		throw new Violations(api.validation).fault(s, m, "Member must have length less than or equal to 512")
 	}
 	return s
+}
+
+/// The fault of a value of the member m not of the pattern that why words.
+function invalidValue(m: string, why: string): Fault {
+	return new Fault(400, api.validation.code, `The specified value for ${m} is invalid. ${why}`)
 }
 
 /// d, if it is a policy document: a JSON object.

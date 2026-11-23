@@ -1,5 +1,6 @@
 import { Fault } from "../fault"
 import { Caller, notImplemented, Unit } from "../service"
+import { Default, Size, Valid, Validation } from "./model"
 import { Blob, Call, decode, Flat, Key, Member, Name, result, Timestamp, Value } from "./query"
 import { Query } from "std/url"
 
@@ -92,7 +93,7 @@ test "scalars" {
 test "a missing required member" {
 	const why = message("Value null at 'name' failed to satisfy constraint: Member must not be null")
 	assert decode[Scalars](query("Count=1")) throws new Fault(400, "ValidationError", why)
-	const nested = message("Value null at 'items.member.2.Name' failed to satisfy constraint: Member must not be null")
+	const nested = message("Value null at 'items.2.member.name' failed to satisfy constraint: Member must not be null")
 	const items = query("Items.member.1.Name=a&Items.member.2.Count=1")
 	assert decode[Nested](items) throws new Fault(400, "ValidationError", nested)
 }
@@ -101,10 +102,32 @@ class Nested {
 	Items: Scalars[] = []
 }
 
+class Limited {
+	Items: string[] | null @Size["", "1"]
+	Count: i32 | null @Valid["1", "", ""]
+	Name: string @Valid["2", "4", "^[a-z]*$"]
+	Fallback: i32 @Default = 7
+}
+
+test "values outside their constraints, together, in the order AWS lists them" {
+	const why = "4 validation errors detected: "
+		+ "Value '0' at 'count' failed to satisfy constraint: Member must have value greater than or equal to 1; "
+		+ "Value 'A' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 2; "
+		+ "Value 'A' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z]*; "
+		+ "Value '[a, b]' at 'items' failed to satisfy constraint: Member must have length less than or equal to 1"
+	const q = query("Items.member.1=a&Items.member.2=b&Count=0&Name=A")
+	assert decode[Limited](q) throws new Fault(400, "ValidationError", why)
+	const unquoted = "1 validation error detected: Value at 'name' failed to satisfy constraint: "
+		+ "Member must have length less than or equal to 4"
+	const iam = new Validation("ValidationError", false)
+	assert decode[Limited](query("Name=abcde"), iam) throws new Fault(400, "ValidationError", unquoted)
+	assert decode[Limited](query("Name=abc")).Fallback == 7
+}
+
 test "a value not of its type" {
 	const int = message("Value 'x' at 'count' failed to satisfy constraint: Member must be an integer")
 	assert decode[Scalars](query("Name=&Count=x")) throws new Fault(400, "ValidationError", int)
-	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set")
+	const mode = message("Value 'slow' at 'mode' failed to satisfy constraint: Member must satisfy enum value set: [fast, safe]")
 	assert decode[Scalars](query("Name=&Mode=slow")) throws new Fault(400, "ValidationError", mode)
 	const on = message("Value 'yes' at 'on' failed to satisfy constraint: Member must be true or false")
 	assert decode[Scalars](query("Name=&On=yes")) throws new Fault(400, "ValidationError", on)
@@ -187,7 +210,8 @@ test "scalars in a response" {
 	assert result("Struct", ns, id, new Struct()) == response("Struct", xml)
 }
 
-const caller = new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", id)
+/// A caller of its own, which serving changes.
+function caller(): Caller { return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", id) }
 
 /// The error document of code, as a Sender's unless receiver.
 function error(code: string, message: string, receiver = false): string {
@@ -197,7 +221,7 @@ function error(code: string, message: string, receiver = false): string {
 
 /// A call of XmlTest, of version 2020-07-02, with the parameters q.
 function call(q: string): Call {
-	return new Call(caller, query(`Action=XmlTest&Version=2020-07-02&${q}`), "2020-07-02", ns)
+	return new Call(caller(), query(`Action=XmlTest&Version=2020-07-02&${q}`), "2020-07-02", ns)
 }
 
 test "serve" {
@@ -222,7 +246,7 @@ test "serve" {
 }
 
 test "an action of another version" {
-	const c = new Call(caller, query("Action=XmlTest&Version=2019-01-01"), "2020-07-02", ns)
+	const c = new Call(caller(), query("Action=XmlTest&Version=2019-01-01"), "2020-07-02", ns)
 	assert c.action == "" && c.invalidAction().status == 400
 	const why = "Could not find operation XmlTest for version 2019-01-01"
 	assert c.invalidAction().body.whole == error("InvalidAction", why)

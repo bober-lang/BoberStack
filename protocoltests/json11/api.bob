@@ -15,6 +15,10 @@ export const service = new json.Service("aws.protocoltests.json#JsonProtocol", "
 
 export type FooEnum = "Foo" | "Baz" | "Bar" | "1" | "0"
 
+export class ComplexNestedErrorData {
+	Foo: string | null
+}
+
 export class ContentTypeParametersInput {
 	value: i32 | null
 }
@@ -172,8 +176,30 @@ export class UnionInputOutput {
 	contents: MyUnion | null
 }
 
-export function complexError(): Fault { return new Fault(400, "ComplexError", "") }
-export function errorWithMembers(message: string): Fault { return new Fault(400, "ErrorWithMembers", message) }
+/// The members of ComplexError besides its message.
+export class ComplexError {
+	TopLevel: string | null
+	Nested: ComplexNestedErrorData | null
+}
+
+export function complexError(members: ComplexError = new ComplexError()): Fault {
+	return new Fault(400, "ComplexError", "", true, json.members(members))
+}
+
+/// The members of ErrorWithMembers besides its message.
+export class ErrorWithMembers {
+	Code: string | null
+	ComplexData: KitchenSink | null
+	IntegerField: i32 | null
+	ListField: string[] | null
+	MapField: [string, string][] | null
+	StringField: string | null
+}
+
+export function errorWithMembers(message: string, members: ErrorWithMembers = new ErrorWithMembers()): Fault {
+	return new Fault(400, "ErrorWithMembers", message, true, json.members(members))
+}
+
 export function errorWithoutMembers(): Fault { return new Fault(500, "ErrorWithoutMembers", "") }
 export function fooError(): Fault { return new Fault(500, "FooError", "") }
 export function invalidGreeting(message: string): Fault { return new Fault(400, "InvalidGreeting", message) }

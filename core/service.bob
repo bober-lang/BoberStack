@@ -12,6 +12,8 @@ export class Caller {
 	arn: string
 	userId: string
 	requestId: string
+	/// The actions of the operation being served, as IAM names them, set by its service's dispatch.
+	actions: string[] = []
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
@@ -40,6 +42,12 @@ export class Caller {
 		const s = if (c == null) new Store() else c.clone()
 		this.opened.push([account, s])
 		return s
+	}
+
+	/// Throws AccessDenied unless the caller may perform the operation's actions on resource, an ARN, given the
+	/// resource's own policy if it has one.
+	allow(resource: string, policy: string | null = null) throws Fault {
+		// Policies are not evaluated yet: everything is allowed.
 	}
 
 	/// The state of the caller's account.
