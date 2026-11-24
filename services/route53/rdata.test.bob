@@ -1,0 +1,51 @@
+import { Piece } from "./wire"
+import { ipv6, labels, rdata } from "./rdata"
+import * as hex from "std/encoding/hex"
+
+/// The data, its names as their labels joined by dots after a #.
+function shown(ps: Piece[] | null): string {
+	if (ps == null) {
+		return "null"
+	}
+	return ps!.map(p => if (p.name != null) `#${p.name!.join(".")}${if (p.compressed) "" else "!"}`
+		else hex.encode(p.raw)).join(" ")
+}
+
+test "values of each type" {
+	assert shown(rdata("A", "192.0.2.1")) == "c0000201"
+	assert shown(rdata("A", "192.0.2.256")) == "null"
+	assert shown(rdata("AAAA", "2001:db8::1")) == "20010db8000000000000000000000001"
+	assert shown(rdata("AAAA", "::ffff:192.0.2.1")) == "00000000000000000000ffffc0000201"
+	assert shown(rdata("AAAA", "1:2:3:4:5:6:7:8:9")) == "null"
+	assert shown(rdata("CNAME", "Target.example.com")) == "#Target.example.com"
+	assert shown(rdata("MX", "10 mail.example.com.")) == "000a #mail.example.com"
+	assert shown(rdata("SOA", "ns-1.awsdns-1.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"))
+		== "#ns-1.awsdns-1.com #awsdns-hostmaster.amazon.com 0000000100001c20000003840012750000015180"
+	assert shown(rdata("TXT", "\"a b\" \"c\\\"d\" e")) == "03612062036322640165"
+	assert shown(rdata("SRV", "1 2 443 sip.example.com")) == "0001000201bb #sip.example.com!"
+	assert shown(rdata("CAA", "0 issue \"ca.example.net\"")) == "0005697373756563612e6578616d706c652e6e6574"
+	assert shown(rdata("DS", "12345 13 2 ABCDEF01")) == "30390d02abcdef01"
+	assert shown(rdata("SSHFP", "1 1 09F6A01D")) == "010109f6a01d"
+	assert shown(rdata("TLSA", "3 1 1 abcd")) == "030101abcd"
+	assert shown(rdata("NAPTR", "100 50 \"u\" \"E2U+sip\" \"!^.*$!sip:x@example.com!\" .")) != "null"
+	assert shown(rdata("HTTPS", "1 . alpn=\"h2,h3\" port=8443 ipv4hint=192.0.2.1"))
+		== "0001 #! 000100060268320268330003000220fb00040004c0000201"
+	assert shown(rdata("SVCB", "0 svc.example.com")) == "0000 #svc.example.com!"
+	assert shown(rdata("WAT", "x")) == "null"
+}
+
+test "TXT strings over 255 bytes are split" {
+	let long = ""
+	for (let i = 0; i < 300; i++) {
+		long += "x"
+	}
+	const ps = rdata("TXT", `"${long}"`)!
+	assert ps.length == 1 && ps[0].raw.length == 302 && ps[0].raw[0] == 255 && ps[0].raw[256] == 45
+}
+
+test "names as written" {
+	assert labels("a\\.b.example.com.") == ["a.b", "example", "com"]
+	assert labels("\\052.example.com") == ["*", "example", "com"]
+	assert labels(".") == []
+	assert ipv6("::").length == 16
+}

@@ -1,23 +1,27 @@
 //! Amazon Route 53: hosted zones, record sets, changes, tags, health checks, reusable delegation sets, CIDR
 //! collections and limits. Route 53 is global: requests are signed for us-east-1.
 //!
-//! A change is answered PENDING, and so to its first GetChange, then INSYNC. There is no DNS server: record sets are
-//! stored and validated, never served; TestDNSAnswer is answered REFUSED, as AWS answers it of a zone that no parent
-//! delegates to. Private zones take any VPC id. XML is decoded by the model, not Route 53's schema: an element out of
-//! order is taken. Health checks are never run: every checker reports success. Limits are AWS's defaults, as of
-//! 2026-11-23. CloudWatch-alarm and recovery-control health checks, traffic policies, DNSSEC and query logging are not
-//! implemented.
+//! A change is answered PENDING, and so to its first GetChange, then INSYNC. Public zones are served by dns.bob, given
+//! --dns-port, as answer.bob resolves them; TestDNSAnswer answers alike, from its own zone, of which it gives every
+//! answer's value, a chased CNAME's too, and is REFUSED of a private zone. Where AWS differs: it refuses a zone that no
+//! parent delegates to, here every public zone is answered. Private zones take any VPC id. XML is decoded by the model,
+//! not Route 53's schema: an element out of order is taken. Health checks are never run: every checker reports
+//! success. Limits are AWS's defaults, as of 2026-11-23. CloudWatch-alarm and recovery-control health checks, traffic
+//! policies, DNSSEC and query logging are not implemented.
 
 import { Fault } from "../../core/fault"
 import { pick, random, uuid } from "../../core/random"
 import * as rest from "../../core/protocol/rest"
 import * as restxml from "../../core/protocol/restxml"
 import { Caller } from "../../core/service"
+import { Client, ip, resolve, Result, View } from "./answer"
 import * as api from "./api"
 
 import { Alias, Change, Check, CheckReference, Collection, DelegationSet, Record, Reference, Tables,
 	Zone } from "./records"
 
+import { labels } from "./rdata"
+import { code, refused } from "./wire"
 import { endsWith, sortBy, startsWith } from "std/algo"
 import { isAlphanumeric, isDigit } from "std/ascii"
 import { encode, EncodeError } from "std/encoding/json"
@@ -138,14 +142,40 @@ export class Handler {
 
 	testDNSAnswer(caller: Caller, input: api.TestDNSAnswerRequest): api.TestDNSAnswerResponse throws Fault {
 		caller.allow(arn(input.HostedZoneId))
-		zone(new Tables(caller.store()), input.HostedZoneId)
+		const t = new Tables(caller.store())
+		const z = zone(t, input.HostedZoneId)
 		const out = new api.TestDNSAnswerResponse()
-		out.Nameserver = "127.0.0.1"
+		out.Nameserver = if (z.nameServers.length == 0) "" else z.nameServers[0]
 		const name = input.RecordName
 		out.RecordName = if (endsWith(name, ".") && name != ".") name.slice(0, name.length - 1) else name
 		out.RecordType = input.RecordType
-		out.ResponseCode = "REFUSED"
 		out.Protocol = "UDP"
+		const v = new View()
+		v.add(caller.account, all(t), collections(t))
+		const client = new Client()
+		client.address = ip(input.ResolverIP ?? "") ?? ""
+		client.bits = client.address.length * 8
+		if (input.EDNS0ClientSubnetIP != null) {
+			client.address = ip(input.EDNS0ClientSubnetIP!) ?? ""
+			const width = client.address.length * 8
+			const mask = input.EDNS0ClientSubnetMask
+			client.bits = if (mask == null) (if (width == 32) 24 else 64) else parseIntOr(mask!)
+			if (client.bits < 0 || client.bits > width) {
+				throw api.invalidInput(`Invalid EDNS0ClientSubnetMask ${mask ?? ""}`)
+			}
+		}
+		const served = v.zone(z.id)
+		let res = new Result()
+		res.rcode = refused
+		try {
+			if (served != null) {
+				res = resolve(v, labels(normal(name)), code(input.RecordType), client, served)
+			}
+		} catch (e: ParseError) {
+			throw api.invalidInput(`Invalid RecordName ${name}`)
+		}
+		out.RecordData = res.answers.map(a => a.value)
+		out.ResponseCode = ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"][res.rcode as i32]
 		return out
 	}
 
@@ -1004,6 +1034,10 @@ function record(s: api.ResourceRecordSet): Record {
 	r.subdivision = s.GeoLocation?.SubdivisionCode
 	r.failover = s.Failover
 	r.multiValue = s.MultiValueAnswer
+	if (s.CidrRoutingConfig != null) {
+		r.cidr = [s.CidrRoutingConfig!.CollectionId, s.CidrRoutingConfig!.LocationName]
+	}
+	r.proximity = s.GeoProximityLocation
 	r.ttl = s.TTL
 	r.values = s.ResourceRecords?.map(v => v.Value)
 	if (s.AliasTarget != null) {
@@ -1037,6 +1071,13 @@ function wire(r: Record): api.ResourceRecordSet {
 		s.Failover = r.failover! as api.ResourceRecordSetFailover
 	}
 	s.MultiValueAnswer = r.multiValue
+	if (r.cidr != null) {
+		const c = new api.CidrRoutingConfig()
+		c.CollectionId = r.cidr![0]
+		c.LocationName = r.cidr![1]
+		s.CidrRoutingConfig = c
+	}
+	s.GeoProximityLocation = r.proximity
 	s.TTL = r.ttl
 	s.ResourceRecords = r.values?.map(v => {
 		const out = new api.ResourceRecord()

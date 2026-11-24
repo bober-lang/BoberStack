@@ -1,0 +1,219 @@
+import { Answer, Client, key, resolve, Result, View } from "./answer"
+import { Alias, Collection, Record, Zone } from "./records"
+import { labels } from "./rdata"
+import { normal } from "./route53"
+import * as wire from "./wire"
+import { GeoProximityLocation } from "./api"
+import { sort } from "std/algo"
+
+function set(name: string, kind: string, values: string[], ttl: i64 = 300): Record {
+	const r = new Record()
+	r.name = normal(name)
+	r.type = kind
+	r.ttl = ttl
+	r.values = values
+	return r
+}
+
+function zone(id: string, name: string, records: Record[]): Zone {
+	const z = new Zone()
+	z.id = id
+	z.name = normal(name)
+	z.nameServers = ["ns-1.awsdns-01.com"]
+	z.records = [set(name, "NS", ["ns-1.awsdns-01.com."], 172800),
+		set(name, "SOA", ["ns-1.awsdns-01.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"], 900)]
+	z.records.append(records)
+	return z
+}
+
+function view(zones: Zone[], collections: Collection[] = []): View {
+	const v = new View()
+	v.add("000000000000", zones, collections)
+	return v
+}
+
+function ask(v: View, name: string, kind: string, client = new Client()): Result {
+	return resolve(v, labels(name), wire.code(kind), client)
+}
+
+function values(as: Answer[]): string[] {
+	const out = as.map(a => `${key(a.name)} ${a.type} ${a.ttl} ${a.value}`)
+	sort(out)
+	return out
+}
+
+const example = () => zone("Z1", "example.test",
+	[set("www.example.test", "A", ["192.0.2.1", "192.0.2.2"]), set("mail.example.test", "MX", ["10 mx.example.test"]),
+	set("alias.example.test", "CNAME", ["www.example.test"]),
+	set("chain.example.test", "CNAME", ["alias.example.test."]),
+	set("loop1.example.test", "CNAME", ["loop2.example.test"]),
+	set("loop2.example.test", "CNAME", ["loop1.example.test"]),
+	set("out.example.test", "CNAME", ["www.elsewhere.test"]), set("*.wild.example.test", "TXT", ["\"wild\""]),
+	set("a.b.c.example.test", "A", ["192.0.2.9"]),
+	set("sub.example.test", "NS", ["ns1.sub.example.test", "ns.other.test"]),
+	set("sub.example.test", "DS", ["1 13 2 abcd"]), set("ns1.sub.example.test", "A", ["192.0.2.53"])])
+
+test "an answer, authoritative, of every value" {
+	const res = ask(view([example()]), "WWW.Example.test", "A")
+	assert res.rcode == 0 && res.authoritative
+	assert values(res.answers) == ["www.example.test. A 300 192.0.2.1", "www.example.test. A 300 192.0.2.2"]
+	assert res.answers[0].name == ["WWW", "Example", "test"]
+}
+
+test "a name in no zone is refused, the longest suffix answers" {
+	const v = view([example(), zone("Z2", "deep.example.test", [set("x.deep.example.test", "A", ["192.0.2.7"])])])
+	assert ask(v, "www.nowhere.test", "A").rcode == wire.refused
+	assert !ask(v, "www.nowhere.test", "A").authoritative
+	assert values(ask(v, "x.deep.example.test", "A").answers) == ["x.deep.example.test. A 300 192.0.2.7"]
+}
+
+test "NODATA and NXDOMAIN carry the SOA at its minimum" {
+	const v = view([example()])
+	const nodata = ask(v, "www.example.test", "AAAA")
+	assert nodata.rcode == 0 && nodata.answers.length == 0
+	assert values(nodata.authority)[0]
+		== "example.test. SOA 900 ns-1.awsdns-01.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"
+	const nx = ask(v, "nope.example.test", "A")
+	assert nx.rcode == wire.nxDomain && nx.authority.length == 1 && nx.authority[0].type == "SOA"
+	// one between a record and its zone exists
+	const between = ask(v, "b.c.example.test", "A")
+	assert between.rcode == 0 && between.answers.length == 0
+}
+
+test "CNAMEs are followed, a loop ends" {
+	const v = view([example()])
+	const res = ask(v, "chain.example.test", "A")
+	assert values(res.answers)
+		== ["alias.example.test. CNAME 300 www.example.test", "chain.example.test. CNAME 300 alias.example.test.",
+		"www.example.test. A 300 192.0.2.1", "www.example.test. A 300 192.0.2.2"]
+	assert ask(v, "chain.example.test", "CNAME").answers.length == 1
+	const loop = ask(v, "loop1.example.test", "A")
+	assert loop.rcode == 0 && loop.answers.length == 2
+	const out = ask(v, "out.example.test", "A")
+	assert out.rcode == 0 && out.answers.length == 1
+}
+
+test "wildcards answer names below the closest that exists" {
+	const v = view([example()])
+	assert values(ask(v, "x.wild.example.test", "TXT").answers) == ["x.wild.example.test. TXT 300 \"wild\""]
+	assert values(ask(v, "y.x.wild.example.test", "TXT").answers) == ["y.x.wild.example.test. TXT 300 \"wild\""]
+	assert ask(v, "x.wild.example.test", "A").answers.length == 0 && ask(v, "x.wild.example.test", "A").rcode == 0
+	assert ask(v, "wild.example.test", "TXT").rcode == 0
+	assert ask(v, "x.nowild.example.test", "TXT").rcode == wire.nxDomain
+}
+
+test "a delegation is referred, with glue, but for its DS" {
+	const v = view([example()])
+	const res = ask(v, "host.sub.example.test", "A")
+	assert !res.authoritative && res.rcode == 0 && res.answers.length == 0
+	assert values(res.authority)
+		== ["sub.example.test. NS 300 ns.other.test", "sub.example.test. NS 300 ns1.sub.example.test"]
+	assert values(res.additional) == ["ns1.sub.example.test. A 300 192.0.2.53"]
+	const ds = ask(v, "sub.example.test", "DS")
+	assert ds.authoritative && values(ds.answers) == ["sub.example.test. DS 300 1 13 2 abcd"]
+}
+
+test "ANY answers every set" {
+	const v = view([example()])
+	const res = ask(v, "example.test", "ANY")
+	assert res.answers.map(a => a.type).includes("SOA") && res.answers.map(a => a.type).includes("NS")
+}
+
+function routed(name: string, id: string, value: string, f: (r: Record) => void): Record {
+	const r = set(name, "A", [value])
+	r.setIdentifier = id
+	f(r)
+	return r
+}
+
+test "routing policies" {
+	const sets = [routed("w.example.test", "heavy", "192.0.2.1", r => {
+		r.weight = 3
+	}), routed("w.example.test", "light", "192.0.2.2", r => {
+		r.weight = 1
+	}), routed("w.example.test", "off", "192.0.2.3", r => {
+		r.weight = 0
+	}), routed("f.example.test", "b", "192.0.2.2", r => {
+		r.failover = "SECONDARY"
+	}), routed("f.example.test", "a", "192.0.2.1", r => {
+		r.failover = "PRIMARY"
+	}), routed("l.example.test", "eu", "192.0.2.1", r => {
+		r.region = "eu-west-1"
+	}), routed("l.example.test", "us", "192.0.2.2", r => {
+		r.region = "us-east-1"
+	}), routed("g.example.test", "de", "192.0.2.1", r => {
+		r.country = "DE"
+	}), routed("g.example.test", "default", "192.0.2.2", r => {
+		r.country = "*"
+	}), routed("gx.example.test", "de", "192.0.2.1", r => {
+		r.country = "DE"
+	}), routed("i.example.test", "office", "192.0.2.1", r => {
+		r.cidr = ["c1", "office"]
+	}), routed("i.example.test", "rest", "192.0.2.2", r => {
+		r.cidr = ["c1", "*"]
+	}), routed("p.example.test", "far", "192.0.2.1", r => {
+		const g = new GeoProximityLocation()
+		g.AWSRegion = "ap-south-1"
+		r.proximity = g
+	})]
+	for (let i = 0; i < 12; i++) {
+		sets.push(routed("m.example.test", `m${i}`, `192.0.2.${i + 10}`, r => {
+			r.multiValue = true
+		}))
+	}
+	const c = new Collection()
+	c.id = "c1"
+	c.blocks = [["office", "198.51.100.0/24"], ["office", "2001:db8::/32"]]
+	const v = view([zone("Z1", "example.test", sets)], [c])
+	let heavy = 0
+	for (let i = 0; i < 400; i++) {
+		const got = ask(v, "w.example.test", "A").answers
+		assert got.length == 1 && got[0].value != "192.0.2.3"
+		heavy += if (got[0].value == "192.0.2.1") 1 else 0
+	}
+	assert heavy > 260 && heavy < 340
+	assert values(ask(v, "f.example.test", "A").answers) == ["f.example.test. A 300 192.0.2.1"]
+	assert values(ask(v, "l.example.test", "A").answers) == ["l.example.test. A 300 192.0.2.2"]
+	assert values(ask(v, "g.example.test", "A").answers) == ["g.example.test. A 300 192.0.2.2"]
+	const nowhere = ask(v, "gx.example.test", "A")
+	assert nowhere.rcode == 0 && nowhere.answers.length == 0 && nowhere.authority.length == 1
+	assert ask(v, "m.example.test", "A").answers.length == 8
+	assert values(ask(v, "p.example.test", "A").answers) == ["p.example.test. A 300 192.0.2.1"]
+	const inside = new Client()
+	inside.address = "\xc6\x33\x64\x07"
+	inside.bits = 32
+	const located = ask(v, "i.example.test", "A", inside)
+	assert located.located && values(located.answers) == ["i.example.test. A 300 192.0.2.1"]
+	const wide = new Client()
+	wide.address = "\xc6\x33\x00\x00"
+	wide.bits = 16
+	assert values(ask(v, "i.example.test", "A", wide).answers) == ["i.example.test. A 300 192.0.2.2"]
+	assert values(ask(v, "i.example.test", "A").answers) == ["i.example.test. A 300 192.0.2.2"]
+}
+
+test "aliases answer with their target's records and TTL" {
+	const alias = (name: string, zoneId: string, target: string) => {
+		const r = new Record()
+		r.name = normal(name)
+		r.type = "A"
+		const a = new Alias()
+		a.zone = zoneId
+		a.name = normal(target)
+		r.alias = a
+		return r
+	}
+	const v = view([zone("Z1", "example.test",
+		[set("www.example.test", "A", ["192.0.2.1"], 60), alias("example.test", "Z1", "www.example.test"),
+		alias("cdn.example.test", "Z2FDTNDATAQYW2", "d1.cloudfront.net"),
+		alias("twice.example.test", "Z1", "example.test")])])
+	assert values(ask(v, "example.test", "A").answers) == ["example.test. A 60 192.0.2.1"]
+	assert values(ask(v, "twice.example.test", "A").answers) == ["twice.example.test. A 60 192.0.2.1"]
+	const cdn = ask(v, "cdn.example.test", "A")
+	assert cdn.rcode == 0 && cdn.answers.length == 0 && cdn.authority.length == 1
+}
+
+test "private zones are not served" {
+	const z = example()
+	z.isPrivate = true
+	assert ask(view([z]), "www.example.test", "A").rcode == wire.refused
+}

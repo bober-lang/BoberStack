@@ -6,6 +6,7 @@ import { Fault } from "./core/fault"
 import { uuid } from "./core/random"
 import { Runner } from "./services/lambda/runner"
 import { Catalog } from "./services/iam/catalog"
+import * as dns from "./services/route53/dns"
 import { Smtp } from "./services/ses/smtp"
 import { stack } from "./stack"
 import { indexOf } from "std/algo"
@@ -36,6 +37,8 @@ class Options {
 	containers = ""
 	/// The seconds a function's environment is kept once idle.
 	idle: u32 = 300
+	/// The port to answer Route 53's public zones on, over UDP and TCP, as its name servers do; none if 0.
+	dnsPort: u16 @Name["dns-port"] = 0
 	/// The port to take mail on as SES's SMTP interface does, with STARTTLS given --cert; none if 0.
 	smtpPort: u16 @Name["smtp-port"] = 0
 	/// Print this help.
@@ -92,8 +95,14 @@ function main(): i32 {
 	const local = o.host == "" || o.host == "0.0.0.0" || o.host == "::"
 	const named = if (local) "localhost" else if (indexOf(o.host, ":") >= 0) "[" + o.host + "]" else o.host
 	g.endpoint = `http://${named}:${o.port}`
+	const names = new dns.Server(() => dns.accounts(g.trees, g.named))
+	names.addr = `${o.host}:${o.dnsPort}`
 	try {
 		server.listen()
+		if (o.dnsPort != 0) {
+			names.listen()
+			const answering = async names.serve()
+		}
 		if (smtp != null) {
 			smtp!.addr = `${o.host}:${o.smtpPort}`
 			smtp!.tls = server.tls

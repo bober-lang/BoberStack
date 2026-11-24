@@ -1,0 +1,352 @@
+//! DNS messages (RFC 1035) as a name server reads queries and writes answers: names compressed in owners and in the
+//! data of the types RFC 3597 lets be, EDNS's OPT (RFC 6891), and an answer cut to a size with TC set. std/net/dns
+//! has a codec of its own, for its resolver, which it does not export.
+
+import { HashMap } from "std/collections/hashmap"
+import { Reader, Writer } from "std/encoding/binary"
+import { ParseError } from "std/string"
+
+const types: [string, u16][] = [["A", 1], ["NS", 2], ["CNAME", 5], ["SOA", 6], ["PTR", 12], ["MX", 15], ["TXT", 16],
+	["AAAA", 28], ["SRV", 33], ["NAPTR", 35], ["OPT", 41], ["DS", 43], ["SSHFP", 44], ["TLSA", 52], ["SVCB", 64],
+	["HTTPS", 65], ["SPF", 99], ["IXFR", 251], ["AXFR", 252], ["ANY", 255], ["CAA", 257]]
+
+/// The code of a type by its name; 0 for one not known here.
+export function code(name: string): u16 {
+	for (const [n, c] of types) {
+		if (n == name) {
+			return c
+		}
+	}
+	return 0
+}
+
+/// The name of a type, or TYPEn (RFC 3597).
+export function typeName(c: u16): string {
+	for (const [n, k] of types) {
+		if (k == c) {
+			return n
+		}
+	}
+	return `TYPE${c}`
+}
+
+export const noError: u8 = 0
+export const formErr: u8 = 1
+export const servFail: u8 = 2
+export const nxDomain: u8 = 3
+export const notImp: u8 = 4
+export const refused: u8 = 5
+/// EDNS's BADVERS, 16: 1 in the upper bits, 0 in the header.
+export const badVers = 16
+
+/// A part of a record's data: bytes, or a name, which may point to one before it only if compressed.
+export class Piece {
+	raw = ""
+	name: string[] | null = null
+	compressed = false
+}
+
+export class Question {
+	/// Its labels, as sent.
+	name: string[] = []
+	type: u16 = 0
+	rrclass: u16 = 1
+}
+
+export class Record {
+	name: string[] = []
+	type: u16 = 0
+	rrclass: u16 = 1
+	ttl: u32 = 0
+	data: Piece[] = []
+	/// A decoded record's data, raw, and where it starts in its message, for the names in it.
+	raw = ""
+	at = 0
+}
+
+export class Edns {
+	/// The largest UDP payload the sender takes.
+	size: u16 = 512
+	version: u8 = 0
+	/// The extended rcode's upper eight bits.
+	upper: u8 = 0
+	dnssec = false
+	options: [u16, string][] = []
+}
+
+export class Message {
+	id: u16 = 0
+	response = false
+	opcode: u8 = 0
+	authoritative = false
+	truncated = false
+	recursionDesired = false
+	recursionAvailable = false
+	checkingDisabled = false
+	/// The header's four bits; EDNS's upper bits are in edns.
+	rcode: u8 = 0
+	questions: Question[] = []
+	answers: Record[] = []
+	authority: Record[] = []
+	/// Without the OPT, which is edns.
+	additional: Record[] = []
+	edns: Edns | null = null
+}
+
+/// The message bytes hold; a ParseError at the first byte that cannot be read, or at an OPT that is not the only one.
+export function decode(bytes: string): Message throws ParseError {
+	const r = new Reader(bytes)
+	const m = new Message()
+	m.id = read16(r)
+	const flags = read16(r)
+	m.response = (flags & 0x8000) != 0
+	m.opcode = ((flags >> 11) & 0xf) as u8
+	m.authoritative = (flags & 0x0400) != 0
+	m.truncated = (flags & 0x0200) != 0
+	m.recursionDesired = (flags & 0x0100) != 0
+	m.recursionAvailable = (flags & 0x0080) != 0
+	m.checkingDisabled = (flags & 0x0010) != 0
+	m.rcode = (flags & 0xf) as u8
+	const qd = read16(r)
+	const an = read16(r)
+	const ns = read16(r)
+	const ar = read16(r)
+	for (let i = 0; i < (qd as i32); i++) {
+		const q = new Question()
+		q.name = name(bytes, r)
+		q.type = read16(r)
+		q.rrclass = read16(r)
+		m.questions.push(q)
+	}
+	for (let i = 0; i < (an as i32); i++) {
+		m.answers.push(record(bytes, r))
+	}
+	for (let i = 0; i < (ns as i32); i++) {
+		m.authority.push(record(bytes, r))
+	}
+	for (let i = 0; i < (ar as i32); i++) {
+		const at = r.pos
+		const rec = record(bytes, r)
+		if (rec.type != 41) {
+			m.additional.push(rec)
+			continue
+		}
+		if (m.edns != null || rec.name.length != 0) {
+			throw new ParseError("syntax", at)
+		}
+		const e = new Edns()
+		e.size = rec.rrclass
+		e.upper = (rec.ttl >> 24) as u8
+		e.version = ((rec.ttl >> 16) & 0xff) as u8
+		e.dnssec = (rec.ttl & 0x8000) != 0
+		const o = new Reader(rec.raw)
+		while (o.pos < rec.raw.length) {
+			const c = read16(o)
+			const n = read16(o)
+			e.options.push([c, o.raw(n as i32)])
+		}
+		m.edns = e
+	}
+	return m
+}
+
+/// m's bytes, cut to limit if they are longer: the records from the first that does not fit on are left out, TC set if
+/// one of them answers or is an authority (RFC 2181 9), and the OPT kept.
+export function encode(m: Message, limit: i32 = 65535): string {
+	const e = new Encoder()
+	for (const q of m.questions) {
+		e.name(q.name, true)
+		be16(e.w, q.type)
+		be16(e.w, q.rrclass)
+	}
+	const opt = if (m.edns == null) "" else option(m.edns!)
+	const room = limit - 12 - opt.length
+	const counts = [0, 0, 0]
+	let truncated = m.truncated
+	const sections = [m.answers, m.authority, m.additional]
+	let full = false
+	for (let s = 0; s < 3 && !full; s++) {
+		for (const rec of sections[s]) {
+			const mark = e.w.bytes.length
+			e.record(rec)
+			if (e.w.bytes.length > room) {
+				e.w.bytes = e.w.bytes.slice(0, mark)
+				truncated = truncated || s < 2
+				full = true
+				break
+			}
+			counts[s]++
+		}
+	}
+	const h = new Writer()
+	be16(h, m.id)
+	let flags = ((m.opcode as i32) & 0xf) << 11 | ((m.rcode as i32) & 0xf)
+	flags |= (if (m.response) 0x8000 else 0) | (if (m.authoritative) 0x0400 else 0) | (if (truncated) 0x0200 else 0)
+	flags |= (if (m.recursionDesired) 0x0100 else 0) | (if (m.recursionAvailable) 0x0080 else 0)
+	flags |= if (m.checkingDisabled) 0x0010 else 0
+	be16(h, flags as u16)
+	be16(h, m.questions.length as u16)
+	be16(h, counts[0] as u16)
+	be16(h, counts[1] as u16)
+	be16(h, (counts[2] + (if (m.edns == null) 0 else 1)) as u16)
+	return h.bytes + e.w.bytes + opt
+}
+
+/// The OPT record of e, which is never compressed and so may go anywhere.
+function option(e: Edns): string {
+	const w = new Writer()
+	w.u8(0)
+	be16(w, 41)
+	be16(w, e.size)
+	be32(w, ((e.upper as u32) << 24) | ((e.version as u32) << 16) | (if (e.dnssec) 0x8000 as u32 else 0))
+	let data = new Writer()
+	for (const [c, v] of e.options) {
+		be16(data, c)
+		be16(data, v.length as u16)
+		data.raw(v)
+	}
+	be16(w, data.bytes.length as u16)
+	w.raw(data.bytes)
+	return w.bytes
+}
+
+/// Writes past a header of 12 bytes, pointing to the names already written.
+class Encoder {
+	w = new Writer()
+	/// Each name's offset by its key: its labels, lower case, each after its length.
+	private at = new HashMap[string, i32]()
+
+	name(labels: string[], compressed: bool) {
+		const keys: string[] = []
+		let key = ""
+		for (let i = labels.length - 1; i >= 0; i--) {
+			key = fromBytes([labels[i].length as u8]) + lower(labels[i]) + key
+			keys.insert(0, key)
+		}
+		for (let i = 0; i < labels.length; i++) {
+			const there = this.at.get(keys[i])
+			if (compressed && there != null) {
+				be16(this.w, (0xc000 | there!) as u16)
+				return
+			}
+			const here = 12 + this.w.bytes.length
+			if (here < 0x4000 && there == null) {
+				this.at.set(keys[i], here)
+			}
+			this.w.u8(labels[i].length as u8)
+			this.w.raw(labels[i])
+		}
+		this.w.u8(0)
+	}
+
+	record(r: Record) {
+		this.name(r.name, true)
+		be16(this.w, r.type)
+		be16(this.w, r.rrclass)
+		be32(this.w, r.ttl)
+		const length = this.w.bytes.length
+		be16(this.w, 0)
+		for (const p of r.data) {
+			if (p.name != null) {
+				this.name(p.name!, p.compressed)
+			} else {
+				this.w.raw(p.raw)
+			}
+		}
+		const n = this.w.bytes.length - length - 2
+		const b = this.w.bytes
+		this.w.bytes = b.slice(0, length) + fromBytes([(n >> 8) as u8, (n & 0xff) as u8])
+			+ b.slice(length + 2, b.length)
+	}
+}
+
+/// s with A to Z lowered, and every other byte as it is.
+export function lower(s: string): string {
+	let upper = false
+	for (const c of s) {
+		upper = upper || (c >= 65 && c <= 90)
+	}
+	if (!upper) {
+		return s
+	}
+	const out: u8[] = []
+	for (const c of s) {
+		out.push(if (c >= 65 && c <= 90) c + 32 else c)
+	}
+	return fromBytes(out)
+}
+
+function record(bytes: string, r: Reader): Record throws ParseError {
+	const rec = new Record()
+	rec.name = name(bytes, r)
+	rec.type = read16(r)
+	rec.rrclass = read16(r)
+	rec.ttl = read32(r)
+	const n = read16(r)
+	rec.at = r.pos
+	rec.raw = r.raw(n as i32)
+	return rec
+}
+
+/// The name at r, which ends past it; one of at most 255 bytes on the wire, its pointers each to before itself.
+function name(bytes: string, r: Reader): string[] throws ParseError {
+	const [labels, end] = nameAt(bytes, r.pos)
+	r.pos = end
+	return labels
+}
+
+/// The name at at in bytes, and where it ends there.
+function nameAt(bytes: string, at: i32): [string[], i32] throws ParseError {
+	const labels: string[] = []
+	let pos = at
+	let end = -1
+	let size = 1
+	while (true) {
+		if (pos >= bytes.length) {
+			throw new ParseError("syntax", pos)
+		}
+		const n = bytes[pos] as i32
+		if (n == 0) {
+			pos++
+			break
+		}
+		if ((n & 0xc0) == 0xc0) {
+			if (pos + 1 >= bytes.length) {
+				throw new ParseError("syntax", pos)
+			}
+			const to = ((n & 0x3f) << 8) | (bytes[pos + 1] as i32)
+			if (to >= pos) {
+				throw new ParseError("syntax", pos)
+			}
+			if (end < 0) {
+				end = pos + 2
+			}
+			pos = to
+			continue
+		}
+		if ((n & 0xc0) != 0 || pos + 1 + n > bytes.length) {
+			throw new ParseError("syntax", pos)
+		}
+		size += n + 1
+		if (size > 255) {
+			throw new ParseError("syntax", pos)
+		}
+		labels.push(bytes.slice(pos + 1, pos + 1 + n))
+		pos += 1 + n
+	}
+	return [labels, if (end < 0) pos else end]
+}
+
+// std/encoding/binary is little-endian only; DNS is big-endian.
+function read16(r: Reader): u16 throws ParseError { return ((r.u8() as u16) << 8) | (r.u8() as u16) }
+function read32(r: Reader): u32 throws ParseError { return ((read16(r) as u32) << 16) | (read16(r) as u32) }
+
+export function be16(w: Writer, v: u16) {
+	w.u8((v >> 8) as u8)
+	w.u8((v & 0xff) as u8)
+}
+
+export function be32(w: Writer, v: u32) {
+	be16(w, (v >> 16) as u16)
+	be16(w, (v & 0xffff) as u16)
+}

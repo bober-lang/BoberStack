@@ -4,7 +4,7 @@ import { Gateway } from "../../core/gateway"
 import { Catalog } from "../iam/catalog"
 import { stack } from "../../stack"
 import { Request, Response } from "std/http"
-import { normal } from "./route53"
+import { bare, normal } from "./route53"
 
 const ns = "https://route53.amazonaws.com/doc/2013-04-01/"
 
@@ -95,6 +95,35 @@ test "a private zone and its VPCs" {
 	assert call(g, "POST", `${id}/disassociatevpc`, dissoc("vpc-1")).status == 200
 	const last = call(g, "POST", `${id}/disassociatevpc`, dissoc("vpc-2"))
 	assert last.status == 400 && text(last, "Code") == "LastVPCAssociation"
+	const tested = call(g, "GET", `/testdnsanswer?hostedzoneid=${bare(id)}&recordname=internal.test&recordtype=SOA`)
+	assert text(tested, "ResponseCode") == "REFUSED" && texts(tested, "RecordDataEntry") == []
+}
+
+test "TestDNSAnswer answers as the name servers do" {
+	const g = stack(new Catalog(""))
+	const made = call(g, "POST", "/hostedzone", create("example.test", "r1"))
+	const id = text(made, "Id")!
+	const cname = "<Name>alias.example.test</Name><Type>CNAME</Type><TTL>60</TTL><ResourceRecords><ResourceRecord>"
+		+ "<Value>www.example.test</Value></ResourceRecord></ResourceRecords>"
+	assert call(g, "POST", `${id}/rrset`,
+		batch([["CREATE", a("www.example.test", "192.0.2.1")], ["CREATE", cname],
+		["CREATE", a("*.w.example.test", "192.0.2.2")]])).status == 200
+	const ask = (name: string, kind: string, extra: string) => call(g, "GET",
+		`/testdnsanswer?hostedzoneid=${bare(id)}&recordname=${name}&recordtype=${kind}${extra}`)
+	const www = ask("WWW.example.test.", "A", "")
+	assert www.status == 200 && text(www, "ResponseCode") == "NOERROR" && text(www, "RecordName") == "WWW.example.test"
+	assert texts(www, "RecordDataEntry") == ["192.0.2.1"] && text(www, "Protocol") == "UDP"
+	assert text(www, "Nameserver") == texts(made, "NameServer")[0]
+	assert texts(ask("alias.example.test", "A", ""), "RecordDataEntry") == ["www.example.test", "192.0.2.1"]
+	assert texts(ask("a.b.w.example.test", "A", ""), "RecordDataEntry") == ["192.0.2.2"]
+	assert text(ask("nope.example.test", "A", ""), "ResponseCode") == "NXDOMAIN"
+	const nodata = ask("www.example.test", "AAAA", "")
+	assert text(nodata, "ResponseCode") == "NOERROR" && texts(nodata, "RecordDataEntry") == []
+	assert text(ask("www.other.test", "A", ""), "ResponseCode") == "REFUSED"
+	assert texts(ask("example.test", "SOA", "&resolverip=192.0.2.9&edns0clientsubnetip=198.51.100.7"),
+		"RecordDataEntry").length == 1
+	const mask = ask("www.example.test", "A", "&edns0clientsubnetip=198.51.100.7&edns0clientsubnetmask=33")
+	assert mask.status == 400 && text(mask, "Code") == "InvalidInput"
 }
 
 test "tags of a zone" {

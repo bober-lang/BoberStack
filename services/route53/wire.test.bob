@@ -1,0 +1,83 @@
+import { decode, Edns, encode, Message, Piece, Question, Record } from "./wire"
+import { ParseError } from "std/string"
+
+const header = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+
+test "a query reads back" {
+	const m = new Message()
+	m.id = 0x1234
+	m.recursionDesired = true
+	const q = new Question()
+	q.name = ["www", "Example", "com"]
+	q.type = 1
+	m.questions.push(q)
+	const back = decode(encode(m))
+	assert back.id == 0x1234 && back.recursionDesired && !back.response
+	assert back.questions[0].name == ["www", "Example", "com"] && back.questions[0].type == 1
+}
+
+function repeat(s: string, n: i32): string {
+	let out = ""
+	for (let i = 0; i < n; i++) {
+		out += s
+	}
+	return out
+}
+
+function fails(bytes: string): bool {
+	try {
+		decode(bytes)
+	} catch (e: ParseError) {
+		return true
+	}
+	return false
+}
+
+test "names that do not read" {
+	assert !fails(header + "\x01a\x00\x00\x01\x00\x01")
+	assert fails(header + "\xc0\x0c\x00\x01\x00\x01") // to itself
+	assert fails(header + "\xc0\x20\x00\x01\x00\x01") // forward
+	assert fails(header + "\x05ab")
+	assert fails(header + "\x41a\x00\x00\x01\x00\x01") // 0x40, an extended label type
+	let long = ""
+	for (let i = 0; i < 5; i++) {
+		long += "\x3f" + repeat("x", 63)
+	}
+	assert fails(header + long + "\x00\x00\x01\x00\x01")
+	assert fails(header)
+}
+
+test "names are compressed, case aside, and an answer cut where it no longer fits" {
+	const m = new Message()
+	const q = new Question()
+	q.name = ["WWW", "example", "test"]
+	q.type = 16
+	m.questions.push(q)
+	for (let i = 0; i < 3; i++) {
+		const r = new Record()
+		r.name = ["www", "example", "test"]
+		r.type = 16
+		const p = new Piece()
+		p.raw = "\xc8" + repeat("x", 200)
+		r.data = [p]
+		m.answers.push(r)
+	}
+	const whole = encode(m)
+	assert whole.length == 12 + 22 + 3 * (2 + 10 + 201)
+	const back = decode(whole)
+	assert back.answers.length == 3 && back.answers[2].name == ["WWW", "example", "test"]
+	const cut = decode(encode(m, 512))
+	assert cut.truncated && cut.answers.length == 2
+	m.edns = new Edns()
+	const room = decode(encode(m, 512))
+	assert room.truncated && room.answers.length == 2 && room.edns != null
+}
+
+test "a second OPT, or one not at the root, does not read" {
+	const opt = "\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00"
+	const query = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00"
+	const question = "\x01a\x00\x00\x01\x00\x01"
+	assert decode(query + "\x01" + question + opt).edns!.size == 4096
+	assert fails(query + "\x02" + question + opt + opt)
+	assert fails(query + "\x01" + question + "\x01a" + opt)
+}

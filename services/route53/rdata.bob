@@ -1,0 +1,460 @@
+//! Record values as Route 53 takes them, in a zone file's presentation format, to the data DNS sends: names absolute
+//! whether or not they end in a dot, \ and three octal digits a byte as Route 53 escapes them, a TXT's strings of over
+//! 255 bytes split, and SVCB's and HTTPS's parameters as RFC 9460 encodes them. A value that does not parse has no data.
+
+import { Piece, be16, be32 } from "./wire"
+import { sortBy } from "std/algo"
+import { isDigit } from "std/ascii"
+import * as base64 from "std/encoding/base64"
+import { Writer } from "std/encoding/binary"
+import * as hex from "std/encoding/hex"
+import { ParseError, parseInt, split } from "std/string"
+
+/// The data of a value of type t; null if it does not parse or t is not served.
+export function rdata(t: string, value: string): Piece[] | null {
+	try {
+		return parsed(t, value)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function parsed(t: string, value: string): Piece[] | null throws ParseError {
+	const ws = words(value)
+	const out = new Out()
+	switch (t) {
+		case "A": out.raw(ipv4(one(ws).text))
+		case "AAAA": out.raw(ipv6(one(ws).text))
+		case "CNAME", "NS", "PTR": out.name(one(ws), true)
+		case "MX":
+			arity(ws, 2)
+			out.n16(ws[0])
+			out.name(ws[1], true)
+		case "SOA":
+			arity(ws, 7)
+			out.name(ws[0], true)
+			out.name(ws[1], true)
+			for (let i = 2; i < 7; i++) {
+				out.n32(ws[i])
+			}
+		case "TXT", "SPF":
+			if (ws.length == 0) {
+				throw new ParseError("syntax", 0)
+			}
+			for (const w of ws) {
+				const s = text(w)
+				out.string(s.slice(0, if (s.length < 255) s.length else 255))
+				for (let i = 255; i < s.length; i += 255) {
+					out.string(s.slice(i, if (i + 255 < s.length) i + 255 else s.length))
+				}
+			}
+		case "SRV":
+			arity(ws, 4)
+			out.n16(ws[0])
+			out.n16(ws[1])
+			out.n16(ws[2])
+			out.name(ws[3], false)
+		case "CAA":
+			arity(ws, 3)
+			out.n8(ws[0])
+			const tag = text(ws[1])
+			if (tag.length == 0 || !tag.every(c => isDigit(c) || (c | 32) >= 97 && (c | 32) <= 122)) {
+				throw new ParseError("syntax", 0)
+			}
+			out.string(tag)
+			out.w.raw(text(ws[2]))
+		case "DS":
+			out.n16(at(ws, 0))
+			out.n8(at(ws, 1))
+			out.n8(at(ws, 2))
+			out.w.raw(digest(ws, 3))
+		case "SSHFP":
+			out.n8(at(ws, 0))
+			out.n8(at(ws, 1))
+			out.w.raw(digest(ws, 2))
+		case "TLSA":
+			out.n8(at(ws, 0))
+			out.n8(at(ws, 1))
+			out.n8(at(ws, 2))
+			out.w.raw(digest(ws, 3))
+		case "NAPTR":
+			arity(ws, 6)
+			out.n16(ws[0])
+			out.n16(ws[1])
+			for (let i = 2; i < 5; i++) {
+				const s = text(ws[i])
+				if (s.length > 255) {
+					throw new ParseError("syntax", 0)
+				}
+				out.string(s)
+			}
+			out.name(ws[5], false)
+		case "SVCB", "HTTPS":
+			if (ws.length < 2) {
+				throw new ParseError("syntax", 0)
+			}
+			out.n16(ws[0])
+			out.name(ws[1], false)
+			out.w.raw(params(ws.slice(2, ws.length)))
+		default: return null
+	}
+	return out.pieces()
+}
+
+/// A word of a value as written, its escapes kept, and whether it was quoted.
+class Word {
+	text = ""
+	quoted = false
+}
+
+/// The words of v, split at blanks outside quotes; a quote left open is a syntax error.
+function words(v: string): Word[] throws ParseError {
+	const out: Word[] = []
+	let i = 0
+	while (i < v.length) {
+		const c = v[i]
+		if (c == 32 || c == 9 || c == 10 || c == 13) {
+			i++
+			continue
+		}
+		const w = new Word()
+		w.quoted = c == 34
+		const start = if (w.quoted) i + 1 else i
+		let j = start
+		while (j < v.length && (if (w.quoted) v[j] != 34 else !(v[j] == 32 || v[j] == 9 || v[j] == 10 || v[j] == 13))) {
+			j += if (v[j] == 92 && j + 1 < v.length) 2 else 1
+		}
+		if (w.quoted && j >= v.length) {
+			throw new ParseError("syntax", i)
+		}
+		w.text = v.slice(start, if (j > v.length) v.length else j)
+		out.push(w)
+		i = if (w.quoted) j + 1 else j
+	}
+	return out
+}
+
+/// A word's bytes, \X and \DDD resolved.
+function text(w: Word): string throws ParseError {
+	const out: u8[] = []
+	const s = w.text
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] != 92) {
+			out.push(s[i])
+			continue
+		}
+		const [b, n] = escaped(s, i)
+		out.push(b)
+		i += n - 1
+	}
+	return fromBytes(out)
+}
+
+function octal(c: u8): bool { return c >= 48 && c <= 55 }
+
+/// The byte of the escape at i of s, and its length: Route 53's \ and three octal digits, unlike a zone file's decimal.
+function escaped(s: string, i: i32): [u8, i32] throws ParseError {
+	if (i + 3 < s.length && octal(s[i + 1]) && octal(s[i + 2]) && octal(s[i + 3])) {
+		const n = ((s[i + 1] - 48) as i32) * 64 + ((s[i + 2] - 48) as i32) * 8 + ((s[i + 3] - 48) as i32)
+		if (n > 255) {
+			throw new ParseError("range", i)
+		}
+		return [n as u8, 4]
+	}
+	if (i + 1 >= s.length) {
+		throw new ParseError("syntax", i)
+	}
+	return [s[i + 1], 2]
+}
+
+/// The labels of a name as written, absolute with or without its final dot; "." is the root.
+export function labels(s: string): string[] throws ParseError {
+	if (s == "." || s == "") {
+		if (s == "") {
+			throw new ParseError("syntax", 0)
+		}
+		return []
+	}
+	const out: string[] = []
+	let label: u8[] = []
+	let size = 1
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] == 46) {
+			if (label.length == 0) {
+				throw new ParseError("syntax", i)
+			}
+			out.push(fromBytes(label))
+			label = []
+			continue
+		}
+		if (s[i] == 92) {
+			const [b, n] = escaped(s, i)
+			label.push(b)
+			i += n - 1
+		} else {
+			label.push(s[i])
+		}
+		if (label.length > 63) {
+			throw new ParseError("range", i)
+		}
+	}
+	if (label.length > 0) {
+		out.push(fromBytes(label))
+	}
+	for (const l of out) {
+		size += l.length + 1
+	}
+	if (size > 255) {
+		throw new ParseError("range", 0)
+	}
+	return out
+}
+
+/// The bytes of a dotted IPv4 address.
+export function ipv4(s: string): string throws ParseError {
+	const parts = split(s, ".")
+	if (parts.length != 4) {
+		throw new ParseError("syntax", 0)
+	}
+	const out: u8[] = []
+	for (const p of parts) {
+		if (p.length == 0 || p.length > 3) {
+			throw new ParseError("syntax", 0)
+		}
+		const n = parseInt(p)
+		if (n > 255) {
+			throw new ParseError("range", 0)
+		}
+		out.push(n as u8)
+	}
+	return fromBytes(out)
+}
+
+/// The bytes of an IPv6 address as RFC 4291 2.2 writes it, a dotted IPv4 address as its last 32 bits allowed.
+export function ipv6(s: string): string throws ParseError {
+	const halves = splitOnce(s, "::")
+	const head = groups(halves[0])
+	const tail = if (halves.length == 2) groups(halves[1]) else []
+	const n = head.length + tail.length
+	if (if (halves.length == 2) n > 7 else n != 8) {
+		throw new ParseError("syntax", 0)
+	}
+	const out: u8[] = []
+	for (const g of head) {
+		out.push(...g)
+	}
+	for (let i = n; i < 8; i++) {
+		out.push(0)
+		out.push(0)
+	}
+	for (const g of tail) {
+		out.push(...g)
+	}
+	return fromBytes(out)
+}
+
+function splitOnce(s: string, sep: string): string[] throws ParseError {
+	const parts = split(s, sep)
+	if (parts.length > 2) {
+		throw new ParseError("syntax", 0)
+	}
+	return parts
+}
+
+/// The 16-bit groups of part of an IPv6 address, each as two bytes; an IPv4 address at its end as two.
+function groups(part: string): u8[][] throws ParseError {
+	if (part == "") {
+		return []
+	}
+	const out: u8[][] = []
+	const gs = split(part, ":")
+	for (let i = 0; i < gs.length; i++) {
+		const g = gs[i]
+		if (i == gs.length - 1 && g.some(c => c == 46)) {
+			const v4 = ipv4(g)
+			out.push([v4[0], v4[1]])
+			out.push([v4[2], v4[3]])
+			continue
+		}
+		if (g.length == 0 || g.length > 4) {
+			throw new ParseError("syntax", 0)
+		}
+		const n = parseInt(g, 16)
+		out.push([(n >> 8) as u8, (n & 0xff) as u8])
+	}
+	return out
+}
+
+/// SvcParams (RFC 9460 2.2) as their wire has them: by key, ascending, each once.
+function params(ws: Word[]): string throws ParseError {
+	const found: [u16, string][] = []
+	for (const w of ws) {
+		const s = w.text
+		let eq = 0
+		while (eq < s.length && s[eq] != 61) {
+			eq++
+		}
+		const key = s.slice(0, eq)
+		const v = if (eq < s.length) text(value(s.slice(eq + 1, s.length))) else ""
+		const k = keyOf(key)
+		if (found.some(f => f[0] == k)) {
+			throw new ParseError("syntax", 0)
+		}
+		found.push([k, param(k, v, eq < s.length)])
+	}
+	sortBy(found, (a, b) => a[0] < b[0])
+	const out = new Writer()
+	for (const [k, v] of found) {
+		be16(out, k)
+		be16(out, v.length as u16)
+		out.raw(v)
+	}
+	return out.bytes
+}
+
+/// A parameter's value, its quotes off: k="a b" is one word, as words splits it, only if quoted from its start.
+function value(s: string): Word {
+	const w = new Word()
+	w.quoted = s.length >= 2 && s[0] == 34 && s[s.length - 1] == 34
+	w.text = if (w.quoted) s.slice(1, s.length - 1) else s
+	return w
+}
+
+const keys = ["mandatory", "alpn", "no-default-alpn", "port", "ipv4hint", "ech", "ipv6hint", "dohpath"]
+
+function keyOf(name: string): u16 throws ParseError {
+	for (let i = 0; i < keys.length; i++) {
+		if (keys[i] == name) {
+			return i as u16
+		}
+	}
+	throw new ParseError("syntax", 0)
+}
+
+function param(k: u16, v: string, valued: bool): string throws ParseError {
+	const out = new Writer()
+	if (k == 2) {
+		if (valued) {
+			throw new ParseError("syntax", 0)
+		}
+		return ""
+	}
+	if (!valued || v == "") {
+		throw new ParseError("syntax", 0)
+	}
+	switch (k) {
+		case 0: for (const name of split(v, ",")) {
+			be16(out, keyOf(name))
+		}
+		case 1: for (const id of alpns(v)) {
+			if (id.length == 0 || id.length > 255) {
+				throw new ParseError("syntax", 0)
+			}
+			out.u8(id.length as u8)
+			out.raw(id)
+		}
+		case 3: be16(out, number(v, 65535) as u16)
+		case 4: for (const a of split(v, ",")) {
+			out.raw(ipv4(a))
+		}
+		case 5: out.raw(base64.decode(v))
+		case 6: for (const a of split(v, ",")) {
+			out.raw(ipv6(a))
+		}
+		default: out.raw(v)
+	}
+	return out.bytes
+}
+
+/// alpn's ids, split at commas but those escaped as \, (RFC 9460 A.1).
+function alpns(v: string): string[] {
+	const out: string[] = []
+	let id: u8[] = []
+	for (let i = 0; i < v.length; i++) {
+		if (v[i] == 92 && i + 1 < v.length) {
+			id.push(v[i + 1])
+			i++
+		} else if (v[i] == 44) {
+			out.push(fromBytes(id))
+			id = []
+		} else {
+			id.push(v[i])
+		}
+	}
+	out.push(fromBytes(id))
+	return out
+}
+
+function one(ws: Word[]): Word throws ParseError {
+	arity(ws, 1)
+	return ws[0]
+}
+
+function arity(ws: Word[], n: i32) throws ParseError {
+	if (ws.length != n) {
+		throw new ParseError("syntax", 0)
+	}
+}
+
+function at(ws: Word[], i: i32): Word throws ParseError {
+	if (i >= ws.length) {
+		throw new ParseError("syntax", 0)
+	}
+	return ws[i]
+}
+
+/// The bytes of the hex digits of the words from i on, which may be split by blanks.
+function digest(ws: Word[], i: i32): string throws ParseError {
+	if (i >= ws.length) {
+		throw new ParseError("syntax", 0)
+	}
+	return hex.decode(ws.slice(i, ws.length).map(w => w.text).join(""))
+}
+
+function number(s: string, max: i64): i64 throws ParseError {
+	if (s.length == 0 || !s.every(c => isDigit(c))) {
+		throw new ParseError("syntax", 0)
+	}
+	const n = parseInt[i64](s)
+	if (n > max) {
+		throw new ParseError("range", 0)
+	}
+	return n
+}
+
+class Out {
+	w = new Writer()
+	private done: Piece[] = []
+
+	raw(s: string) { this.w.raw(s) }
+	n8(w: Word) throws ParseError { this.w.u8(number(w.text, 255) as u8) }
+	n16(w: Word) throws ParseError { be16(this.w, number(w.text, 65535) as u16) }
+	n32(w: Word) throws ParseError { be32(this.w, number(w.text, 4294967295) as u32) }
+
+	string(s: string) {
+		this.w.u8(s.length as u8)
+		this.w.raw(s)
+	}
+
+	name(w: Word, compressed: bool) throws ParseError {
+		this.flush()
+		const p = new Piece()
+		p.name = labels(w.text)
+		p.compressed = compressed
+		this.done.push(p)
+	}
+
+	pieces(): Piece[] {
+		this.flush()
+		return this.done
+	}
+
+	private flush() {
+		if (this.w.bytes.length > 0) {
+			const p = new Piece()
+			p.raw = this.w.bytes
+			this.done.push(p)
+			this.w = new Writer()
+		}
+	}
+}

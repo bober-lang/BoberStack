@@ -1,0 +1,483 @@
+//! What Route 53's name servers answer, on the wire and to TestDNSAnswer alike. The public zone of the longest suffix
+//! of a name answers it, authoritatively; a name in none is REFUSED. A name with no record of the type is NODATA, one
+//! that does not exist NXDOMAIN (RFC 4592: one that exists only above a record's name does), both with the zone's SOA,
+//! of its own TTL or its minimum if lower (RFC 2308). A wildcard answers the names below the closest name that exists
+//! if that name has it, an NS at a wildcard never. An NS below the apex delegates: names at and below it are referred,
+//! not authoritatively, the addresses of its servers in the zone given as glue, but for its DS. A CNAME is followed
+//! into the zones of its own zone's account, 16 at most, a loop ending the chain. ANY answers every set at the name.
+//!
+//! Where AWS differs, as no network is around: health checks always pass. A latency or geoproximity set takes the
+//! client to be in us-east-1: the set of that region, else the first. Geolocation cannot place any client, which AWS
+//! answers with the default ("*") set, else no answer. IP-based routing is real: the client's EDNS subnet, else its
+//! address, against the CIDR collection's blocks, the longest that holds it winning, else the default ("*") location.
+//! An alias to a set in a zone served here answers with that set's records under the alias's name, of its TTL; an alias
+//! to anything else, as to a CloudFront distribution, an ELB or an S3 website, has no records here.
+
+import { Fault } from "../../core/fault"
+import { random } from "../../core/random"
+import { Collection, Record, Zone } from "./records"
+import { ipv4, ipv6, labels, rdata } from "./rdata"
+import * as wire from "./wire"
+import { endsWith, sortBy, startsWith } from "std/algo"
+import { isAlphanumeric } from "std/ascii"
+import { HashMap } from "std/collections/hashmap"
+import { Set } from "std/collections/set"
+import { ParseError, parseInt, split } from "std/string"
+
+/// A public zone, its record sets by name, and the CIDR collections of its account.
+export class Served {
+	account: string
+	zone: Zone
+	labels: string[] = []
+	sets = new HashMap[string, Record[]]()
+	/// The names that exist: of its records, and those between them and its own.
+	names = new Set()
+	collections: Collection[]
+
+	constructor(account: string, zone: Zone, collections: Collection[]) {
+		this.account = account
+		this.zone = zone
+		this.collections = collections
+		this.labels = labelsOf(zone.name)
+		for (const r of zone.records) {
+			const rs = this.sets.get(r.name)
+			if (rs == null) {
+				this.sets.set(r.name, [r])
+			} else {
+				rs!.push(r)
+			}
+			let n = r.name
+			while (!this.names.has(n) && n != ".") {
+				this.names.add(n)
+				if (n == zone.name) {
+					break
+				}
+				n = parent(n)
+			}
+		}
+	}
+}
+
+/// The public zones a name server answers for.
+export class View {
+	private byName = new HashMap[string, Served[]]()
+	private byId = new HashMap[string, Served]()
+
+	/// Adds account's public zones; of zones of the same name, the one created first answers.
+	add(account: string, zones: Zone[], collections: Collection[]) {
+		for (const z of zones) {
+			if (z.isPrivate) {
+				continue
+			}
+			const s = new Served(account, z, collections)
+			this.byId.set(z.id, s)
+			const same = this.byName.get(z.name) ?? []
+			same.push(s)
+			sortBy(same,
+				(a, b) => a.zone.created < b.zone.created || a.zone.created == b.zone.created && a.zone.id < b.zone.id)
+			this.byName.set(z.name, same)
+		}
+	}
+
+	zone(id: string): Served | null { return this.byId.get(id) }
+
+	/// The zone of the longest suffix of name, of account unless it is null.
+	enclosing(name: string[], account: string | null): Served | null {
+		for (let i = 0; i <= name.length; i++) {
+			for (const s of this.byName.get(key(name.slice(i, name.length))) ?? []) {
+				if (account == null || s.account == account!) {
+					return s
+				}
+			}
+		}
+		return null
+	}
+}
+
+export class Client {
+	/// The address answers are chosen for, of 4 or 16 bytes, "" if unknown; the leading bits of it known.
+	address = ""
+	bits = 0
+}
+
+export class Answer {
+	/// The owner, as asked.
+	name: string[] = []
+	type = ""
+	ttl: i64 = 0
+	/// As Route 53 holds it.
+	value = ""
+	data: wire.Piece[] = []
+}
+
+export class Result {
+	rcode: u8 = 0
+	authoritative = true
+	answers: Answer[] = []
+	authority: Answer[] = []
+	additional: Answer[] = []
+	/// Whether the client's address chose an answer, which an EDNS client subnet's scope then says.
+	located = false
+	/// The zone that answered.
+	served: Served | null = null
+}
+
+/// The answer to a query of type for name, from start if given, as a server of only that zone answers, else from the
+/// zone of name's longest suffix.
+export function resolve(v: View, name: string[], qtype: u16, client: Client, start: Served | null = null): Result {
+	const res = new Result()
+	let z = if (start == null) v.enclosing(name, null) else if (within(name, start!)) start else null
+	if (z == null) {
+		res.rcode = wire.refused
+		res.authoritative = false
+		return res
+	}
+	res.served = z
+	const r = new Resolution(v, client, res)
+	let at = name
+	const seen = new Set()
+	for (let hop = 0; hop < 16; hop++) {
+		seen.add(key(at))
+		const next = r.lookup(z!, at, qtype, hop == 0)
+		if (next == null || seen.has(key(next!))) {
+			return res
+		}
+		z = v.enclosing(next!, z!.account)
+		if (z == null) {
+			return res
+		}
+		at = next!
+	}
+	return res
+}
+
+class Resolution {
+	view: View
+	client: Client
+	res: Result
+
+	constructor(view: View, client: Client, res: Result) {
+		this.view = view
+		this.client = client
+		this.res = res
+	}
+
+	/// Adds what z answers of name to the result: the name of a CNAME to follow, if there is one.
+	lookup(z: Served, name: string[], qtype: u16, first: bool): string[] | null {
+		const n = name.length - z.labels.length
+		for (let i = n - 1; i >= 0; i--) {
+			const owner = name.slice(i, name.length)
+			const ns = (z.sets.get(key(owner)) ?? []).filter(r => r.type == "NS")
+			if (ns.length > 0 && !(i == 0 && qtype == wire.code("DS"))) {
+				if (first) {
+					this.refer(z, owner, ns)
+				}
+				return null
+			}
+		}
+		const k = key(name)
+		let sets = z.sets.get(k)
+		if (sets == null) {
+			if (z.names.has(k)) {
+				this.negative(z)
+				return null
+			}
+			let i = 1
+			while (i < n && !z.names.has(key(name.slice(i, name.length)))) {
+				i++
+			}
+			sets = z.sets.get(`\\052.${key(name.slice(i, name.length))}`)
+			if (sets == null) {
+				this.res.rcode = wire.nxDomain
+				this.negative(z)
+				return null
+			}
+			sets = sets!.filter(r => r.type != "NS")
+		}
+		return this.at(z, name, sets!, qtype)
+	}
+
+	private at(z: Served, owner: string[], sets: Record[], qtype: u16): string[] | null {
+		const before = this.res.answers.length
+		const any = qtype == wire.code("ANY")
+		const cnames = sets.filter(r => r.type == "CNAME")
+		if (cnames.length > 0 && qtype != wire.code("CNAME")) {
+			const got = this.chosen(z, cnames, owner, 0)
+			if (got.length == 0) {
+				this.negative(z)
+				return null
+			}
+			this.res.answers.append(got)
+			return if (any) null else got[0].data[0].name
+		}
+		const kinds: string[] = []
+		for (const r of sets) {
+			if ((any || r.type == wire.typeName(qtype)) && !kinds.includes(r.type)) {
+				kinds.push(r.type)
+			}
+		}
+		for (const t of kinds) {
+			this.res.answers.append(this.chosen(z, sets.filter(r => r.type == t), owner, 0))
+		}
+		if (this.res.answers.length == before) {
+			this.negative(z)
+		}
+		return null
+	}
+
+	private refer(z: Served, owner: string[], ns: Record[]) {
+		this.res.authoritative = false
+		this.res.authority = this.chosen(z, ns, owner, 0)
+		for (const a of this.res.authority) {
+			const server = a.data[0].name!
+			if (!within(server, z)) {
+				continue
+			}
+			const there = z.sets.get(key(server)) ?? []
+			for (const t of ["A", "AAAA"]) {
+				this.res.additional.append(this.chosen(z, there.filter(r => r.type == t), server, 0))
+			}
+		}
+	}
+
+	/// The zone's SOA as the authority of an answer of none.
+	private negative(z: Served) {
+		const soa = (z.sets.get(z.zone.name) ?? []).filter(r => r.type == "SOA")
+		this.res.authority = this.chosen(z, soa, z.labels, 0).map(a => {
+			const words = split(a.value, " ").filter(w => w != "")
+			try {
+				const minimum = parseInt[i64](words.at(words.length - 1) ?? "")
+				a.ttl = if (minimum < a.ttl) minimum else a.ttl
+			} catch (e: ParseError) {}
+			return a
+		})
+	}
+
+	/// The records of rs, sets of one name and type, that routing picks, under owner, each value with data.
+	private chosen(z: Served, rs: Record[], owner: string[], depth: i32): Answer[] {
+		const out: Answer[] = []
+		for (const r of this.route(z, rs)) {
+			if (r.alias != null) {
+				out.append(this.aliased(r, owner, depth))
+				continue
+			}
+			for (const v of shuffled(r.values ?? [])) {
+				const d = rdata(r.type, v)
+				if (d != null) {
+					const a = new Answer()
+					a.name = owner
+					a.type = r.type
+					a.ttl = r.ttl ?? 0
+					a.value = v
+					a.data = d!
+					out.push(a)
+				}
+			}
+		}
+		return out
+	}
+
+	private aliased(r: Record, owner: string[], depth: i32): Answer[] {
+		const z = this.view.zone(r.alias!.zone)
+		if (z == null || depth >= 8) {
+			return []
+		}
+		const target = (z!.sets.get(r.alias!.name) ?? []).filter(t => t.type == r.type)
+		return this.chosen(z!, target, owner, depth + 1)
+	}
+
+	private route(z: Served, rs: Record[]): Record[] {
+		const simple = rs.filter(r => r.setIdentifier == null)
+		if (simple.length > 0 || rs.length == 0) {
+			return simple
+		}
+		const f = rs[0]
+		if (f.weight != null) {
+			return weighted(rs)
+		}
+		if (f.failover != null) {
+			const primary = rs.filter(r => r.failover == "PRIMARY")
+			return [if (primary.length > 0) primary[0] else rs[0]]
+		}
+		if (f.multiValue != null) {
+			const all = shuffled(rs)
+			return all.slice(0, if (all.length < 8) all.length else 8)
+		}
+		if (f.region != null || f.proximity != null) {
+			const east = rs.find(r => r.region == "us-east-1" || r.proximity?.AWSRegion == "us-east-1"
+				|| startsWith(r.proximity?.LocalZoneGroup ?? "", "us-east-1-"))
+			return [east ?? rs[0]]
+		}
+		if (f.cidr != null) {
+			return this.located(z, rs)
+		}
+		if (f.continent != null || f.country != null || f.subdivision != null) {
+			const fallback = rs.find(r => r.country == "*")
+			return if (fallback == null) [] else [fallback!]
+		}
+		return rs
+	}
+
+	/// IP-based routing's set for the client.
+	private located(z: Served, rs: Record[]): Record[] {
+		const c = this.client
+		let best: Record | null = null
+		let bits = -1
+		let fallback: Record | null = null
+		for (const r of rs) {
+			const [collection, location] = r.cidr ?? ["", ""]
+			if (location == "*") {
+				fallback = r
+				continue
+			}
+			const blocks = z.collections.find(k => k.id == collection)?.blocks ?? []
+			for (const [named, block] of blocks) {
+				const p = prefix(block)
+				if (named == location && p != null && p![0].length == c.address.length && p![1] <= c.bits
+					&& p![1] > bits && holds(p![0], c.address, p![1])) {
+					best = r
+					bits = p![1]
+				}
+			}
+		}
+		if (best != null) {
+			this.res.located = true
+			return [best!]
+		}
+		return if (fallback == null) [] else [fallback!]
+	}
+}
+
+/// One set of rs by weight, the sets of weight 0 only if all are.
+function weighted(rs: Record[]): Record[] {
+	const live = rs.filter(r => (r.weight ?? 0) > 0)
+	const pool = if (live.length > 0) live else rs
+	let total: u64 = 0
+	for (const r of pool) {
+		total += if (live.length > 0) r.weight! as u64 else 1
+	}
+	let x = draws(1)[0] % total
+	for (const r of pool) {
+		const w: u64 = if (live.length > 0) r.weight! as u64 else 1
+		if (x < w) {
+			return [r]
+		}
+		x -= w
+	}
+	return [pool[0]]
+}
+
+/// xs in a random order; as they are if there is no randomness.
+function shuffled[T](xs: T[]): T[] {
+	const out = xs.slice(0, xs.length)
+	if (out.length < 2) {
+		return out
+	}
+	const ds = draws(out.length)
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = (ds[i] % ((i + 1) as u64)) as i32
+		const t = out[i]
+		out[i] = out[j]
+		out[j] = t
+	}
+	return out
+}
+
+/// n random numbers of 32 bits; zeros if there is no randomness.
+function draws(n: i32): u64[] {
+	const out: u64[] = []
+	let b = ""
+	try {
+		b = random(4 * n)
+	} catch (f: Fault) {}
+	for (let i = 0; i < n; i++) {
+		out.push(if (b == "") 0
+			else (b[4 * i] as u64) << 24 | (b[4 * i + 1] as u64) << 16 | (b[4 * i + 2] as u64) << 8
+			| (b[4 * i + 3] as u64))
+	}
+	return out
+}
+
+/// The bytes and length of a CIDR block, "192.0.2.0/24" or "2001:db8::/48".
+function prefix(block: string): [string, i32] | null {
+	const parts = split(block, "/")
+	if (parts.length != 2) {
+		return null
+	}
+	try {
+		const ip = if (parts[0].some(c => c == 58)) ipv6(parts[0]) else ipv4(parts[0])
+		const bits = parseInt(parts[1])
+		return if (bits < 0 || bits > ip.length * 8) null else [ip, bits]
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// Whether a and b agree in their first n bits.
+function holds(a: string, b: string, n: i32): bool {
+	for (let i = 0; i < n; i++) {
+		const mask = (0x80 >> (i % 8)) as u8
+		if ((a[i / 8] & mask) != (b[i / 8] & mask)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether name is z's or below it.
+function within(name: string[], z: Served): bool {
+	const k = key(name)
+	return k == z.zone.name || endsWith(k, `.${z.zone.name}`)
+}
+
+/// name as Route 53 holds names: lower case, each label after its dot, every byte but a letter, a digit, - and _ as \
+/// and three octal digits; the root ".".
+export function key(name: string[]): string {
+	if (name.length == 0) {
+		return "."
+	}
+	const out: u8[] = []
+	for (const l of name) {
+		for (const c of wire.lower(l)) {
+			if (isAlphanumeric(c) || c == 45 || c == 95) {
+				out.push(c)
+			} else {
+				out.append([92, (48 + c / 64) as u8, (48 + c / 8 % 8) as u8, (48 + c % 8) as u8])
+			}
+		}
+		out.push(46)
+	}
+	return fromBytes(out)
+}
+
+function labelsOf(normal: string): string[] {
+	try {
+		return labels(normal)
+	} catch (e: ParseError) {
+		return []
+	}
+}
+
+/// The name above a name Route 53 holds, in which a dot only ends a label.
+function parent(normal: string): string {
+	for (let i = 0; i < normal.length; i++) {
+		if (normal[i] == 46) {
+			return if (i + 1 == normal.length) "." else normal.slice(i + 1, normal.length)
+		}
+	}
+	return "."
+}
+
+/// The bytes of an IPv4 or IPv6 address, one mapped from IPv4 as IPv4; null if text is neither.
+export function ip(text: string): string | null {
+	const bare = if (text.length > 1 && text[0] == 91) text.slice(1, text.length - 1) else text
+	try {
+		if (!bare.some(c => c == 58)) {
+			return ipv4(bare)
+		}
+		const b = ipv6(bare)
+		return if (b.slice(0, 12) == "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff") b.slice(12, 16) else b
+	} catch (e: ParseError) {
+		return null
+	}
+}

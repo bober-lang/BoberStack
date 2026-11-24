@@ -1,0 +1,300 @@
+//! Route 53's name servers: the public zones of every account answered over UDP and TCP, as answer.bob resolves them.
+//! A query reads the committed trees the gateway holds, outside any request and without its lock: it never parks
+//! while it reads, and a commit replaces a tree rather than writing it. The zones are decoded again only once a tree
+//! has been replaced.
+//!
+//! Over UDP an answer is cut to 512 bytes, or to the EDNS size of the query up to 4096, with TC set; over TCP each
+//! message has its length first, a connection carries queries one after another and is closed once idle. A message
+//! that is not DNS gets no answer, nor one with a header but no question it can read but FORMERR; any opcode but QUERY
+//! is NOTIMP, a class but IN or ANY and a zone transfer REFUSED, and an EDNS version but 0 BADVERS. An EDNS client
+//! subnet chooses IP-based answers, and is echoed with the scope it had. Where AWS differs: one server answers every
+//! zone, at the address --host gives, whatever name servers the zone names; of two accounts' zones of the same name,
+//! the one created first answers. No DNSSEC: the DO bit is ignored.
+
+import { Store } from "../../core/state/store"
+import { Answer, Client, ip, resolve, View } from "./answer"
+import { Tables } from "./records"
+import * as wire from "./wire"
+import { indexOf, lastIndexOf } from "std/algo"
+import { HashMap } from "std/collections/hashmap"
+import { Addr, Conn, listen, listenUdp, Listener, UdpConn } from "std/net"
+import { ParseError } from "std/string"
+import { millisecond, second, sleep } from "std/time"
+
+export class Server {
+	/// "host:port", as std/net listens; port 0 takes a free one, which addr then holds.
+	addr = ":53"
+	/// How long a TCP connection may wait for its next query, in ns.
+	idle: i64 = 10 * second
+	private zones: Zones
+	private udp: UdpConn | null = null
+	private tcp: Listener | null = null
+	private conns: Conn[] = []
+	private closed = false
+
+	/// trees gives each account's committed tree, by the account's id.
+	constructor(trees: () => [string, Store][]) { this.zones = new Zones(trees) }
+
+	/// Listens on UDP and TCP at the same port.
+	listen() throws IoError | ParseError {
+		this.udp = listenUdp(this.addr)
+		this.udp!.timeout = 0
+		const host = this.addr.slice(0, lastIndexOf(this.addr, ":"))
+		const port = this.udp!.addr.port
+		try {
+			this.tcp = listen(`${host}:${port}`)
+		} catch (e: IoError | ParseError) {
+			this.udp!.close()
+			throw e
+		}
+		this.addr = `${host}:${port}`
+	}
+
+	/// Answers until closed.
+	serve() {
+		const accepting = async this.accept()
+		this.receive()
+		await accepting
+	}
+
+	close() {
+		this.closed = true
+		try {
+			this.udp?.close()
+			this.tcp?.close()
+		} catch (e: IoError) {} // closed already
+		for (const c of this.conns) {
+			c.end()
+		}
+	}
+
+	private receive() {
+		while (!this.closed) {
+			let got: [string, Addr] | null = null
+			try {
+				got = this.udp!.receive()
+			} catch (e: IoError) {
+				// an ICMP error of an earlier send, or closed
+				continue
+			}
+			const [bytes, from] = got!
+			const reply = this.answer(bytes, from, true)
+			if (reply != null) {
+				try {
+					this.udp!.send(reply!, from.toString())
+				} catch (e: IoError | ParseError) {} // the client's to ask again
+			}
+		}
+	}
+
+	private accept() {
+		while (!this.closed) {
+			try {
+				const c = this.tcp!.accept()
+				this.conns.push(c)
+				const session = async this.session(c)
+			} catch (e: IoError) {
+				if (!this.closed) {
+					sleep(millisecond) // out of descriptors, for one
+				}
+			}
+		}
+	}
+
+	private session(c: Conn) {
+		c.timeout = this.idle
+		try {
+			while (!this.closed) {
+				const head = exactly(c, 2)
+				const body = if (head == null) null else exactly(c, ((head![0] as i32) << 8) | (head![1] as i32))
+				const reply = if (body == null) null else this.answer(body!, c.remote, false)
+				if (reply == null) {
+					break
+				}
+				const n = reply!.length
+				c.write(fromBytes([(n >> 8) as u8, (n & 0xff) as u8]) + reply!)
+			}
+		} catch (e: IoError) {
+			// idle too long, or the client went
+		} finally {
+			try {
+				c.close()
+			} catch (e: IoError) {}
+			const i = this.conns.indexOf(c)
+			if (i >= 0) {
+				this.conns.remove(i)
+			}
+		}
+	}
+
+	/// The bytes of the answer to a message from from; null if it gets none.
+	private answer(bytes: string, from: Addr, udp: bool): string | null {
+		let q = new wire.Message()
+		try {
+			q = wire.decode(bytes)
+		} catch (e: ParseError) {
+			if (bytes.length < 12 || (bytes[2] & 0x80) != 0) {
+				return null
+			}
+			const m = new wire.Message()
+			m.id = ((bytes[0] as u16) << 8) | (bytes[1] as u16)
+			m.response = true
+			m.opcode = (bytes[2] >> 3) & 0xf
+			m.rcode = wire.formErr
+			return wire.encode(m, 512)
+		}
+		if (q.response) {
+			return null
+		}
+		const client = new Client()
+		client.address = ip(from.host) ?? ""
+		client.bits = client.address.length * 8
+		const m = respond(q, this.zones.current(), client)
+		const size = if (q.edns == null) 512 else q.edns!.size as i32
+		return wire.encode(m, if (!udp) 65535 else if (size < 512) 512 else if (size > 4096) 4096 else size)
+	}
+}
+
+/// The answer to q from v for client, unless an EDNS client subnet in q names another.
+function respond(q: wire.Message, v: View, client: Client): wire.Message {
+	const m = new wire.Message()
+	m.id = q.id
+	m.response = true
+	m.opcode = q.opcode
+	m.recursionDesired = q.recursionDesired
+	m.checkingDisabled = q.checkingDisabled
+	m.questions = q.questions
+	let subnet: [u16, string] | null = null
+	if (q.edns != null) {
+		const e = new wire.Edns()
+		e.size = 4096
+		m.edns = e
+		if (q.edns!.version != 0) {
+			e.upper = (wire.badVers >> 4) as u8
+			return m
+		}
+		for (const [c, data] of q.edns!.options) {
+			if (c == 8) {
+				subnet = [c, data]
+			}
+		}
+	}
+	if (q.opcode != 0) {
+		m.rcode = wire.notImp
+		return m
+	}
+	if (q.questions.length != 1) {
+		m.rcode = wire.formErr
+		return m
+	}
+	const question = q.questions[0]
+	const transfer = question.type == wire.code("AXFR") || question.type == wire.code("IXFR")
+	if (question.rrclass != 1 && question.rrclass != 255 || transfer) {
+		m.rcode = wire.refused
+		return m
+	}
+	let source = 0
+	if (subnet != null) {
+		const ecs = subnetOf(subnet![1])
+		if (ecs == null) {
+			m.rcode = wire.formErr
+			return m
+		}
+		client.address = ecs![0]
+		client.bits = ecs![1]
+		source = ecs![1]
+	}
+	const res = resolve(v, question.name, question.type, client)
+	m.rcode = res.rcode
+	m.authoritative = res.authoritative
+	m.answers = res.answers.map(a => record(a))
+	m.authority = res.authority.map(a => record(a))
+	m.additional = res.additional.map(a => record(a))
+	if (subnet != null) {
+		// The scope: the bits of the address the answer was chosen by, as RFC 7871 7.2.1 has it.
+		const echoed = subnet![1].slice(0, 3) + fromBytes([(if (res.located) source else 0) as u8])
+			+ subnet![1].slice(4, subnet![1].length)
+		m.edns!.options.push([8, echoed])
+	}
+	return m
+}
+
+/// An EDNS client subnet's address, padded to 4 or 16 bytes, and its source prefix; null if malformed (RFC 7871 6).
+function subnetOf(data: string): [string, i32] | null {
+	if (data.length < 4) {
+		return null
+	}
+	const family = ((data[0] as i32) << 8) | (data[1] as i32)
+	const bits = data[2] as i32
+	const width = if (family == 1) 4 else if (family == 2) 16 else 0
+	const address = data.slice(4, data.length)
+	if (width == 0 || bits > width * 8 || address.length != (bits + 7) / 8 || data[3] != 0) {
+		return null
+	}
+	let padded = address
+	while (padded.length < width) {
+		padded += "\x00"
+	}
+	return [padded, bits]
+}
+
+function record(a: Answer): wire.Record {
+	const r = new wire.Record()
+	r.name = a.name
+	r.type = wire.code(a.type)
+	r.ttl = (if (a.ttl < 0) 0 else if (a.ttl > 2147483647) 2147483647 else a.ttl) as u32
+	r.data = a.data
+	return r
+}
+
+/// n bytes of c, or null if it ends first.
+function exactly(c: Conn, n: i32): string | null throws IoError {
+	let s = ""
+	while (s.length < n) {
+		const got = c.read(n - s.length)
+		if (got == null) {
+			return null
+		}
+		s += got!
+	}
+	return s
+}
+
+/// The public zones of the trees given, decoded again once one is not the tree it was.
+class Zones {
+	private trees: () => [string, Store][]
+	private seen: [string, Store][] = []
+	private view = new View()
+
+	constructor(trees: () => [string, Store][]) { this.trees = trees }
+
+	current(): View {
+		const now = this.trees()
+		let same = now.length == this.seen.length
+		for (let i = 0; same && i < now.length; i++) {
+			same = now[i][0] == this.seen[i][0] && now[i][1] == this.seen[i][1]
+		}
+		if (!same) {
+			const v = new View()
+			for (const [account, s] of now) {
+				const t = new Tables(s)
+				v.add(account, t.zones.scan(null, 1000000).map(e => e[1]),
+					t.collections.scan(null, 1000000).map(e => e[1]))
+			}
+			this.view = v
+			this.seen = now
+		}
+		return this.view
+	}
+}
+
+/// The trees of accounts among a gateway's, which also holds the global tree and regional ones.
+export function accounts(trees: HashMap[string, Store], named: string[]): [string, Store][] {
+	const out: [string, Store][] = []
+	for (const n of named) {
+		if (n != "" && indexOf(n, "/") < 0) {
+			out.push([n, trees.get(n)!])
+		}
+	}
+	return out
+}
