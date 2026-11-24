@@ -249,14 +249,17 @@ const strings: [string, string[]][] = [["com.amazonaws.sqs#AmazonSQS",
 	["com.amazonaws.acm#CertificateDetail$KeyAlgorithm", "com.amazonaws.acm#CertificateSummary$KeyAlgorithm"]]]
 
 /// The required members of the services below that AWS answers the lack of with an error of its own, by their shape
-/// ids: they take null, and their handlers answer as AWS does.
+/// ids: they take null, and their handlers answer as AWS does; or that AWS leaves out, as Kinesis the continuation of
+/// a shard read to its end.
 const optional: [string, string[]][] = [["com.amazonaws.cloudwatch#GraniteServiceVersion20100801",
 	["com.amazonaws.cloudwatch#PutMetricDataInput$Namespace", "com.amazonaws.cloudwatch#MetricDatum$MetricName",
 	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Namespace",
 	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$MetricName",
 	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$StartTime",
 	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$EndTime",
-	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Period"]]]
+	"com.amazonaws.cloudwatch#GetMetricStatisticsInput$Period"]],
+	["com.amazonaws.kinesis#Kinesis_20131202",
+	["com.amazonaws.kinesis#SubscribeToShardEvent$ContinuationSequenceNumber"]]]
 
 /// The services whose enums are all strings: AWS takes a value outside an enum, or answers it with an error of its own.
 const opened = ["com.amazonaws.s3#AmazonS3"]
@@ -403,6 +406,8 @@ class Generator {
 	aliases: [string, string][] = []
 	modeled = false
 	xmlTagged = false
+	/// Whether core/protocol/eventstream is used.
+	streamed = false
 	unchecked: string[] = []
 	/// The members whose constraints, and their items', go unchecked, and whether the member being typed is one.
 	unconstrained: string[] = []
@@ -497,6 +502,10 @@ class Generator {
 		const unserved: string[] = []
 		for (const id of ops) {
 			const op = this.shape(id)
+			if (!rest && this.streams(op.input)) {
+				unserved.push(`// ${name(id)}: an event stream in its input`)
+				continue
+			}
 			if (rest) {
 				routes.push(this.route(id))
 				const why = this.unexpressed(id)
@@ -526,7 +535,10 @@ class Generator {
 			if (rest && code != 200) {
 				by = `${if (by == "") ", []" else by}, ${code}`
 			}
-			cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.serve(h.${lowerCamel(name(id))}${by})`))
+			const stream = if (rest || op.output == null) null else this.streamOf(op.output!.target)
+			const served = if (stream == null) `serve(h.${lowerCamel(name(id))}${by})`
+				else `stream[${input}, ${output}, ${name(stream[1])}](h.${lowerCamel(name(id))}, o => o.${stream[0]}${by})`
+			cases.append(wrap(`\t\tcase ${json.quoted(name(id))}: return c.${served}`))
 		}
 		sortNames(errors)
 		for (const id of unique(errors)) {
@@ -562,7 +574,7 @@ class Generator {
 				head.push(new Decl("import", [`import * as ${c} from "${root(out)}core/protocol/${c}"`]))
 			}
 		}
-		head.append(imports(out, codec, unit, this.modeled || validated, this.xmlTagged))
+		head.append(imports(out, codec, unit, this.modeled || validated, this.xmlTagged, this.streamed))
 		const unchecked = if (this.unchecked.length == 0) []
 			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
 		if (unserved.length > 0) {
@@ -746,6 +758,17 @@ class Generator {
 			return e.what
 		}
 		return ""
+	}
+
+	/// The member of the structure id that streams events, and its union; null if none does.
+	streamOf(id: string): [string, string] | null throws ModelError {
+		for (const m of this.shape(id).members) {
+			const u = this.shape(m[1].target)
+			if (u.traits.streaming != null && u.type == "union") {
+				return [m[0], m[1].target]
+			}
+		}
+		return null
 	}
 
 	/// Whether the operation's input or output r holds an event stream.
@@ -956,6 +979,19 @@ class Generator {
 			throw new ModelError(`${id}$${m[0]}: an XML attribute`)
 		}
 		const tags = if (this.rest()) this.bindings(m[1]) else []
+		const target = this.shape(m[1].target)
+		if (!this.rest() && target.type == "union" && target.traits.streaming != null) {
+			this.streamed = true
+			const events = `eventstream.Events[${name(m[1].target)}]`
+			return new Decl("field", [`\t${m[0]}: ${events} = new ${events}()`])
+		}
+		if (t.rest.some(x => x[0] == "smithy.api#eventHeader" || x[0] == "smithy.api#eventPayload")) {
+			throw new ModelError(`${id}$${m[0]}: an event's header or payload`)
+		}
+		const within = this.shape(id)
+		if (within.type == "union" && within.traits.streaming != null && target.traits.error != null) {
+			tags.push("@eventstream.Exception")
+		}
 		if (xml && t.xmlName != null) {
 			tags.push(this.tag(`Name[${json.quoted(t.xmlName!)}]`))
 		}
@@ -1573,8 +1609,8 @@ function root(out: string): string {
 }
 
 /// The imports of the file out, of the codec, the bindings of a REST one and the JSON of restjson's, of Unit if unit,
-/// of the codecs' model if modeled and of their XML if xml.
-function imports(out: string, codec: string, unit: bool, modeled: bool, xml: bool): Decl[] {
+/// of the codecs' model if modeled, of their XML if xml and of the event stream encoding if streamed.
+function imports(out: string, codec: string, unit: bool, modeled: bool, xml: bool, streamed: bool): Decl[] {
 	const up = root(out)
 	const decls: Decl[] = []
 	const of = if (codec == "restjson") [codec, "rest", "json"]
@@ -1582,6 +1618,9 @@ function imports(out: string, codec: string, unit: bool, modeled: bool, xml: boo
 		else [codec]
 	for (const c of of) {
 		decls.push(new Decl("import", [`import * as ${c} from "${up}core/protocol/${c}"`]))
+	}
+	if (streamed) {
+		decls.push(new Decl("import", [`import * as eventstream from "${up}core/protocol/eventstream"`]))
 	}
 	if (modeled) {
 		decls.push(new Decl("import", [`import * as model from "${up}core/protocol/model"`]))

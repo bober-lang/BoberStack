@@ -1,0 +1,294 @@
+import { sign } from "../../core/auth/sigv4"
+import { ticks } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import { Message, Messages } from "../../core/protocol/eventstream"
+import { Unit } from "../../core/service"
+import * as protocol from "../../core/protocol/json"
+import * as api from "./api"
+import { Handler } from "./kinesis"
+import { indexOf } from "std/algo"
+import { Client, Request, Response, Server } from "std/http"
+import { Decodable } from "std/types"
+import { millisecond, second, sleep } from "std/time"
+
+const stream = "arn:aws:kinesis:us-east-1:000000000000:stream/s"
+const shard = "shardId-000000000000"
+
+/// A gateway of Kinesis served on the userspace network, and a client of it, over HTTP/2 if h2.
+class Net {
+	g = new Gateway()
+	server = new Server()
+	client = new Client()
+
+	constructor(h2: bool) {
+		const h = new Handler()
+		this.g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+		this.server.addr = "127.0.0.1:0"
+		this.server.listen()
+		this.client.h2c = h2
+	}
+
+	call(op: string, body: string): Response {
+		const req = new Request("POST", `http://${this.server.addr}/`, body)
+		req.headers.set("content-type", "application/x-amz-json-1.1")
+		req.headers.set("x-amz-target", `Kinesis_20131202.${op}`)
+		sign(req, body, "kinesis", "us-east-1", "test", "test", "", "20150626T140000Z")
+		return this.client.send(req)
+	}
+
+	ok[T extends Decodable](op: string, body: string): T {
+		const res = this.call(op, body)
+		const text = res.body.text()
+		assert res.status == 200 && text == text
+		return protocol.decode[T](text)
+	}
+
+	/// The code of the error that op's answer is, "" if none.
+	error(op: string, body: string): string {
+		const res = this.call(op, body)
+		const text = res.body.text()
+		const at = indexOf(text, "\"__type\":\"")
+		return if (res.status == 200 || at < 0) "" else text.slice(at + 10, indexOf(text, "\"", at + 10))
+	}
+
+	put(data: string): string {
+		const body = `{"StreamName": "s", "PartitionKey": "k", "Data": "${data}"}`
+		return this.ok[api.PutRecordOutput]("PutRecord", body).SequenceNumber
+	}
+
+	/// A stream of one shard and its consumer c, whose ARN it gives.
+	consumer(): string {
+		this.ok[Unit]("CreateStream", `{"StreamName": "s", "ShardCount": 1}`)
+		const body = `{"StreamARN": "${stream}", "ConsumerName": "c"}`
+		return this.ok[api.RegisterStreamConsumerOutput]("RegisterStreamConsumer", body).Consumer.ConsumerARN
+	}
+
+	subscribe(arn: string, position: string): Response {
+		return this.call("SubscribeToShard",
+			`{"ConsumerARN": "${arn}", "ShardId": "${shard}", "StartingPosition": {${position}}}`)
+	}
+}
+
+/// What use does against a Net, closed after.
+function against(h2: bool, use: (n: Net) => void) {
+	const n = new Net(h2)
+	const serving = async n.server.serve((req: Request) => n.g.handle(req))
+	try {
+		use(n)
+	} finally {
+		n.g.close()
+		n.server.close()
+		await serving
+	}
+}
+
+/// The events of a SubscribeToShard's answer, its initial response checked.
+class Events {
+	private ms: Messages
+
+	constructor(res: Response) {
+		assert res.status == 200 && res.headers.get("content-type") == "application/vnd.amazon.eventstream"
+		this.ms = new Messages(res.body)
+		const m = this.ms.next()!
+		assert m.header(":event-type") == "initial-response" && m.payload == "{}"
+	}
+
+	message(): Message | null { return this.ms.next() }
+
+	next(): api.SubscribeToShardEvent {
+		const m = this.ms.next()!
+		assert m.header(":message-type") == "event" && m.header(":event-type") == "SubscribeToShardEvent"
+		return protocol.decode[api.SubscribeToShardEvent](m.payload)
+	}
+}
+
+test "records come as they are put, over HTTP/1.1 and HTTP/2" {
+	for (const h2 of [false, true]) {
+		test `${if (h2) "HTTP/2" else "HTTP/1.1"}` {
+			against(h2, n => {
+				const arn = n.consumer()
+				const first = n.put("YQ==")
+				const events = new Events(n.subscribe(arn, `"Type": "TRIM_HORIZON"`))
+				const e = events.next()
+				assert e.Records.length == 1 && e.Records[0].Data == "a" && e.Records[0].SequenceNumber == first
+				assert e.ContinuationSequenceNumber == first && e.MillisBehindLatest == 0 && e.ChildShards == null
+				const putting = async (() => {
+					sleep(100 * millisecond)
+					n.put("Yg==")
+					sleep(100 * millisecond)
+					return n.put("Yw==")
+				})()
+				const got: string[] = []
+				while (got.length < 2) {
+					for (const r of events.next().Records) {
+						got.push(r.Data)
+					}
+				}
+				assert got == ["b", "c"]
+				await putting
+			})
+		}
+	}
+}
+
+test "starting positions" {
+	against(false, n => {
+		const arn = n.consumer()
+		const a = n.put("YQ==")
+		const b = n.put("Yg==")
+		const at = new Events(n.subscribe(arn, `"Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": "${b}"`)).next()
+		assert at.Records.length == 1 && at.Records[0].SequenceNumber == b
+		sleep(5 * second)
+		const after = new Events(n.subscribe(arn, `"Type": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": "${a}"`)).next()
+		assert after.Records.length == 1 && after.Records[0].SequenceNumber == b
+		sleep(5 * second)
+		const latest = new Events(n.subscribe(arn, `"Type": "LATEST"`)).next()
+		assert latest.Records.length == 0 && latest.ContinuationSequenceNumber == b
+		sleep(5 * second)
+		// AT_SEQUENCE_NUMBER of the first record, none before it: a continuation that reads it again.
+		const again = new Events(n.subscribe(arn, `"Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": "${a}"`)).next()
+		assert again.Records.length == 2
+		sleep(5 * second)
+		const late = n.subscribe(arn, `"Type": "AT_TIMESTAMP", "Timestamp": ${now() / second + 60}`)
+		assert new Events(late).next().ContinuationSequenceNumber == b
+	})
+}
+
+test "refused before streaming" {
+	const position = `"StartingPosition": {"Type": "LATEST"}`
+	const cases: [string, (arn: string) => string, string][] = [["a dry run",
+		arn => `{"ConsumerARN": "${arn}", "ShardId": "${shard}", ${position}, "DryRun": true}`,
+		"DryRunOperationException"],
+		["no such shard", arn => `{"ConsumerARN": "${arn}", "ShardId": "shardId-000000000009", ${position}}`,
+		"ResourceNotFoundException"],
+		["a stream's ARN", arn => `{"ConsumerARN": "${stream}", "ShardId": "${shard}", ${position}}`,
+		"ValidationException"],
+		["no such consumer",
+		arn => `{"ConsumerARN": "${arn.slice(0, indexOf(arn, "/consumer/"))}/consumer/d:1", `
+		+ `"ShardId": "${shard}", ${position}}`, "ResourceNotFoundException"]]
+	for (const [name, body, code] of cases) {
+		test `${name}` {
+			against(false, n => {
+				// Bound first: a failing assert prints n, which is cyclic, and overflows the stack.
+				const got = n.error("SubscribeToShard", body(n.consumer()))
+				assert got == code
+			})
+		}
+	}
+}
+
+test "an event every 5 seconds without records, and the end after 5 minutes" {
+	against(false, n => {
+		const arn = n.consumer()
+		const started = now()
+		const events = new Events(n.subscribe(arn, `"Type": "LATEST"`))
+		const ticking = async ticks(n.g, 310)
+		let count = 0
+		while (true) {
+			const m = events.message()
+			if (m == null) {
+				break
+			}
+			assert m!.header(":event-type") == "SubscribeToShardEvent"
+			count++
+		}
+		const took = now() - started
+		assert count >= 60 && count <= 61
+		assert took >= 300 * second && took < 302 * second
+		await ticking
+	})
+}
+
+test "a second subscription within 5 seconds is refused, one after takes over" {
+	against(true, n => {
+		const arn = n.consumer()
+		const first = new Events(n.subscribe(arn, `"Type": "LATEST"`))
+		first.next()
+		assert n.error("SubscribeToShard",
+			`{"ConsumerARN": "${arn}", "ShardId": "${shard}", ` + `"StartingPosition": {"Type": "LATEST"}}`)
+			== "ResourceInUseException"
+		ticks(n.g, 5)
+		const second = new Events(n.subscribe(arn, `"Type": "LATEST"`))
+		second.next()
+		const ticking = async ticks(n.g, 2)
+		while (true) {
+			const m = first.message()!
+			if (m.header(":message-type") == "exception") {
+				assert m.header(":exception-type") == "ResourceInUseException"
+				assert indexOf(m.payload, "Another active subscription exists for this consumer") >= 0
+				break
+			}
+		}
+		assert first.message() == null
+		await ticking
+	})
+}
+
+test "a shard read to its end gives its children, and the stream ends" {
+	against(false, n => {
+		const arn = n.consumer()
+		n.put("YQ==")
+		n.ok[Unit]("SplitShard", `{"StreamName": "s", "ShardToSplit": "${shard}", "NewStartingHashKey": "100"}`)
+		const events = new Events(n.subscribe(arn, `"Type": "TRIM_HORIZON"`))
+		const e = events.next()
+		assert e.Records.length == 1 && e.ContinuationSequenceNumber == null
+		assert e.ChildShards!.map(c => c.ShardId) == ["shardId-000000000001", "shardId-000000000002"]
+		assert events.message() == null
+	})
+}
+
+test "a consumer deregistered ends the stream with ResourceNotFoundException" {
+	against(false, n => {
+		const arn = n.consumer()
+		const events = new Events(n.subscribe(arn, `"Type": "LATEST"`))
+		events.next()
+		n.ok[Unit]("DeregisterStreamConsumer", `{"ConsumerARN": "${arn}"}`)
+		const m = events.message()!
+		assert m.header(":message-type") == "exception" && m.header(":exception-type") == "ResourceNotFoundException"
+		assert events.message() == null
+	})
+}
+
+test "a client that leaves frees its subscription and connection" {
+	for (const h2 of [false, true]) {
+		test `${if (h2) "HTTP/2" else "HTTP/1.1"}` {
+			against(h2, n => {
+				const arn = n.consumer()
+				const conns = n.server.conns
+				const res = n.subscribe(arn, `"Type": "LATEST"`)
+				new Events(res).next()
+				res.body.close()
+				// It learns at a write that fails: one record and then another, within the 5 s that would refuse.
+				let again: Response | null = null
+				for (let i = 0; i < 20 && again == null; i++) {
+					n.put("YQ==")
+					sleep(100 * millisecond)
+					const r = n.subscribe(arn, `"Type": "LATEST"`)
+					if (r.status == 200) {
+						again = r
+					} else {
+						r.body.text()
+					}
+				}
+				assert again != null
+				new Events(again!).next()
+				again!.body.close()
+				for (let i = 0; i < 20 && n.server.conns > conns; i++) {
+					n.put("YQ==")
+					sleep(100 * millisecond)
+				}
+				assert n.server.conns <= conns
+			})
+		}
+	}
+}
+
+test "the gateway closing ends its streams" {
+	against(true, n => {
+		const arn = n.consumer()
+		const events = new Events(n.subscribe(arn, `"Type": "LATEST"`))
+		events.next()
+		n.g.close()
+		assert events.message() == null
+	})
+}

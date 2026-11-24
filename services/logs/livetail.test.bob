@@ -1,0 +1,263 @@
+import { sign } from "../../core/auth/sigv4"
+import { ticks } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import { Message, Messages } from "../../core/protocol/eventstream"
+import * as protocol from "../../core/protocol/json"
+import * as api from "./api"
+import { Handler } from "./logs"
+import { indexOf } from "std/algo"
+import { Client, Request, Response, Server } from "std/http"
+import { hour, millisecond, second, sleep } from "std/time"
+
+const group = "arn:aws:logs:us-east-1:000000000000:log-group:g"
+
+/// A gateway of CloudWatch Logs served on the userspace network, and a client of it, over HTTP/2 if h2.
+class Net {
+	g = new Gateway()
+	server = new Server()
+	client = new Client()
+
+	constructor(h2: bool) {
+		const h = new Handler()
+		this.g.services.set(api.signingName, (caller, req) => api.handle(h, caller, req))
+		this.server.addr = "127.0.0.1:0"
+		this.server.listen()
+		this.client.h2c = h2
+	}
+
+	call(op: string, body: string): Response {
+		const req = new Request("POST", `http://${this.server.addr}/`, body)
+		req.headers.set("content-type", "application/x-amz-json-1.1")
+		req.headers.set("x-amz-target", `Logs_20140328.${op}`)
+		sign(req, body, "logs", "us-east-1", "test", "test", "", "20150626T140000Z")
+		return this.client.send(req)
+	}
+
+	ok(op: string, body: string) {
+		const res = this.call(op, body)
+		const text = res.body.text()
+		assert res.status == 200 && text == text
+	}
+
+	/// The code of the error that op's answer is, "" if none.
+	error(op: string, body: string): string {
+		const res = this.call(op, body)
+		const text = res.body.text()
+		const at = indexOf(text, "\"__type\":\"")
+		return if (res.status == 200 || at < 0) "" else text.slice(at + 10, indexOf(text, "\"", at + 10))
+	}
+
+	/// Log group g, whose stream s.
+	setUp() {
+		this.ok("CreateLogGroup", `{"logGroupName": "g"}`)
+		this.ok("CreateLogStream", `{"logGroupName": "g", "logStreamName": "s"}`)
+	}
+
+	put(messages: string[]) {
+		const t = now() / millisecond
+		const events = messages.map(m => `{"timestamp": ${t}, "message": "${m}"}`)
+		this.ok("PutLogEvents", `{"logGroupName": "g", "logStreamName": "s", "logEvents": [${events.join(",")}]}`)
+	}
+
+	tail(rest: string = ""): Response {
+		return this.call("StartLiveTail", `{"logGroupIdentifiers": ["${group}"]${rest}}`)
+	}
+}
+
+/// What use does against a Net, closed after.
+function against(h2: bool, use: (n: Net) => void) {
+	const n = new Net(h2)
+	const serving = async n.server.serve((req: Request) => n.g.handle(req))
+	try {
+		use(n)
+	} finally {
+		n.g.close()
+		n.server.close()
+		await serving
+	}
+}
+
+/// The events of a StartLiveTail's answer, its initial response and session start checked.
+class Session {
+	private ms: Messages
+
+	constructor(res: Response) {
+		assert res.status == 200 && res.headers.get("content-type") == "application/vnd.amazon.eventstream"
+		this.ms = new Messages(res.body)
+		const m = this.ms.next()!
+		assert m.header(":event-type") == "initial-response" && m.payload == "{}"
+		const start = this.ms.next()!
+		assert start.header(":event-type") == "sessionStart"
+		const s = protocol.decode[api.LiveTailSessionStart](start.payload)
+		assert s.logGroupIdentifiers == [group] && s.sessionId != null && s.requestId != null
+	}
+
+	message(): Message | null { return this.ms.next() }
+
+	update(): api.LiveTailSessionUpdate {
+		const m = this.ms.next()!
+		assert m.header(":message-type") == "event" && m.header(":event-type") == "sessionUpdate"
+		return protocol.decode[api.LiveTailSessionUpdate](m.payload)
+	}
+}
+
+test "updates each second of the events put since, filtered, over HTTP/1.1 and HTTP/2" {
+	for (const h2 of [false, true]) {
+		test `${if (h2) "HTTP/2" else "HTTP/1.1"}` {
+			against(h2, n => {
+				n.setUp()
+				n.put(["error before"])
+				const s = new Session(n.tail(`, "logEventFilterPattern": "error"`))
+				const putting = async (() => {
+					sleep(300 * millisecond)
+					n.put(["error one", "info two"])
+					sleep(1500 * millisecond)
+					n.put(["error three"])
+				})()
+				const ticking = async ticks(n.g, 4)
+				const got: string[] = []
+				for (let i = 0; i < 4; i++) {
+					const u = s.update()
+					assert !u.sessionMetadata!.sampled
+					for (const e of u.sessionResults!) {
+						assert e.logGroupIdentifier == group && e.logStreamName == "s" && e.ingestionTime != null
+						got.push(e.message!)
+					}
+				}
+				assert got == ["error one", "error three"]
+				await putting
+				await ticking
+			})
+		}
+	}
+}
+
+test "an update each second, empty without events" {
+	against(false, n => {
+		n.setUp()
+		const s = new Session(n.tail())
+		const started = now()
+		const ticking = async ticks(n.g, 5)
+		for (let i = 0; i < 5; i++) {
+			assert s.update().sessionResults!.length == 0
+		}
+		const took = now() - started
+		assert took >= 5 * second && took < 6 * second
+		await ticking
+	})
+}
+
+test "more than 500 events in an update are sampled" {
+	against(false, n => {
+		n.setUp()
+		const s = new Session(n.tail())
+		const messages: string[] = []
+		for (let i = 0; i < 600; i++) {
+			messages.push(`m${i}`)
+		}
+		n.put(messages)
+		const ticking = async ticks(n.g, 1)
+		const u = s.update()
+		assert u.sessionMetadata!.sampled && u.sessionResults!.length == 500
+		assert u.sessionResults![0].message == "m0" && u.sessionResults![499].message == "m598"
+		await ticking
+	})
+}
+
+test "refused before streaming" {
+	const cases: [string, string, string][] = [["both names and prefixes",
+		`], "logStreamNames": ["s"], "logStreamNamePrefixes": ["s"`, "InvalidParameterException"],
+		["names of two log groups", `, "${group}2"], "logStreamNames": ["s"`, "InvalidParameterException"],
+		["a filter pattern that is not one", `], "logEventFilterPattern": "{ $.a = ", "x": [`,
+		"InvalidParameterException"]]
+	for (const [name, rest, code] of cases) {
+		test `${name}` {
+			against(false, n => {
+				n.setUp()
+				// Bound first: a failing assert prints n, which is cyclic, and overflows the stack.
+				const got = n.error("StartLiveTail", `{"logGroupIdentifiers": ["${group}"${rest}]}`)
+				assert got == code
+			})
+		}
+	}
+	test "no such log group" {
+		against(false, n => {
+			const got = n.error("StartLiveTail", `{"logGroupIdentifiers": ["${group}"]}`)
+			assert got == "ResourceNotFoundException"
+		})
+	}
+	test "an ARN of another account" {
+		against(false, n => {
+			n.setUp()
+			const got = n.error("StartLiveTail",
+				`{"logGroupIdentifiers": ["arn:aws:logs:us-east-1:111111111111:log-group:g"]}`)
+			assert got == "ResourceNotFoundException"
+		})
+	}
+	test "a log group of the Infrequent Access class" {
+		against(false, n => {
+			n.ok("CreateLogGroup", `{"logGroupName": "g", "logGroupClass": "INFREQUENT_ACCESS"}`)
+			const got = n.error("StartLiveTail", `{"logGroupIdentifiers": ["${group}"]}`)
+			assert got == "InvalidOperationException"
+		})
+	}
+}
+
+test "at most 15 sessions, and one whose client leaves is freed" {
+	for (const h2 of [false, true]) {
+		test `${if (h2) "HTTP/2" else "HTTP/1.1"}` {
+			against(h2, n => {
+				n.setUp()
+				const open: Response[] = []
+				for (let i = 0; i < 15; i++) {
+					const res = n.tail()
+					new Session(res)
+					open.push(res)
+				}
+				const refused = n.error("StartLiveTail", `{"logGroupIdentifiers": ["${group}"]}`)
+				assert refused == "LimitExceededException"
+				open[0].body.close()
+				// It learns at a write that fails, of the updates each second.
+				let again: Response | null = null
+				for (let i = 0; i < 5 && again == null; i++) {
+					ticks(n.g, 1)
+					sleep(100 * millisecond)
+					const r = n.tail()
+					if (r.status == 200) {
+						again = r
+					} else {
+						r.body.text()
+					}
+				}
+				assert again != null
+				new Session(again!)
+			})
+		}
+	}
+}
+
+test "a session ends after 3 hours with SessionTimeoutException" {
+	against(false, n => {
+		n.setUp()
+		// Nothing is sent for the 3 hours, as no tick runs in them.
+		n.client.timeout = 0
+		const s = new Session(n.tail())
+		const later = async (() => {
+			sleep(3 * hour)
+			ticks(n.g, 1)
+		})()
+		const m = s.message()!
+		assert m.header(":message-type") == "exception" && m.header(":exception-type") == "SessionTimeoutException"
+		assert s.message() == null
+		await later
+	})
+}
+
+test "the gateway closing ends its sessions" {
+	against(true, n => {
+		n.setUp()
+		const s = new Session(n.tail())
+		n.g.close()
+		assert s.message() == null
+	})
+}

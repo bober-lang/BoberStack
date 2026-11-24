@@ -1,5 +1,4 @@
-//! Amazon Kinesis Data Streams. Channels, queues, account settings, limits and SubscribeToShard, an event stream over
-//! HTTP/2, are not implemented. Where AWS differs:
+//! Amazon Kinesis Data Streams. Channels, queues, account settings and limits are not implemented. Where AWS differs:
 //!
 //! - Nothing runs between requests: streams, reshards and consumers are ACTIVE at once; retention hides older records,
 //!   and shards closed before it, at each request, and nothing is deleted. An iterator expires 5 minutes after it was
@@ -10,16 +9,20 @@
 //! - There is no KMS: a stream's key is stored as given, and records are not encrypted.
 //! - Sequence numbers are 56 digits as AWS's are, but of the stream's own count and the shard's number, not a time.
 //! - An expired iterator's message gives its times in RFC 3339, not as Java's Date prints them.
+//! - SubscribeToShard sends its first event at once and then one per batch of records, or after 5 s without any; AWS
+//!   gives no interval. Subscriptions are held in memory, not in the state, and one that ends frees its shard at once.
+//! - SubscribeToShard is served over HTTP/1.1 too, and its error messages are guesses.
 
 import { Fault } from "../../core/fault"
 import * as auth from "../../core/auth/policy"
-import { Caller, requestTags, resourceTags, Unit } from "../../core/service"
+import { Caller, Live, requestTags, resourceTags, Unit } from "../../core/service"
 import { Store, Table } from "../../core/state/store"
 import * as api from "./api"
 import * as hash from "./hash"
 import { Consumer, consumers, Record, records, Shard, Stream, streams } from "./records"
 import { lastIndexOf, startsWith } from "std/algo"
 import { isDigit } from "std/ascii"
+import { HashMap } from "std/collections/hashmap"
 import { CryptoError } from "std/crypto/error"
 import { md5 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
@@ -37,6 +40,11 @@ const readBytes = 10485760
 
 export class Handler {
 	...api.Unimplemented
+
+	/// The subscriptions of SubscribeToShard streaming, by consumer ARN, NUL and shard index: held here, not in the
+	/// state, as they live with their connections.
+	private subscribed = new HashMap[string, Subscription]()
+	private subscriptions: i64 = 0
 
 	createStream(caller: Caller, input: api.CreateStreamInput): Unit throws Fault {
 		const tags = input.Tags ?? []
@@ -385,47 +393,8 @@ export class Handler {
 		const at = target(caller, input.StreamName, input.StreamARN)
 		const s = allowed(caller, at)
 		const h = shardOf(s, at, input.ShardId)
-		const kind = input.ShardIteratorType
-		const prefix = `${s.name}\x00${shardId(h.index)}\x00`
-		const db = records(at.tree)
-		let after = ""
-		if (kind == "AT_SEQUENCE_NUMBER" || kind == "AFTER_SEQUENCE_NUMBER") {
-			const seq = input.StartingSequenceNumber
-			if (seq == null) {
-				throw invalid(`StartingSequenceNumber must be specified for shardIteratorType ${kind}.`)
-			}
-			const encoded = indexOfSequence(seq!)
-			if (encoded == null) {
-				throw invalid(`StartingSequenceNumber ${seq!} used in GetShardIterator on shard ${shardId(h.index)} in `
-					+ `stream ${s.name} under account ${at.account} is invalid.`)
-			}
-			if (encoded! != h.index) {
-				throw invalid(`Invalid StartingSequenceNumber. It encodes ${shardId(encoded!)}, while it was used in a call `
-					+ `to a shard with ${shardId(h.index)}`)
-			}
-			after = if (kind == "AFTER_SEQUENCE_NUMBER") seq! else before(seq!)
-		} else if (kind == "LATEST") {
-			after = latest(db, prefix)
-		} else if (kind == "AT_TIMESTAMP") {
-			if (input.Timestamp == null) {
-				throw invalid("Must specify timestampInMillis parameter for iterator of type AT_TIMESTAMP. Current request "
-					+ "has no timestamp parameter.")
-			}
-			after = latest(db, prefix)
-			let from: string | null = null
-			while (true) {
-				const chunk = db.scan(from, 100, prefix)
-				const first = chunk.find(e => e[1].arrived >= input.Timestamp!)
-				if (first != null) {
-					after = before(first[0].slice(prefix.length, first[0].length))
-					break
-				}
-				if (chunk.length < 100) {
-					break
-				}
-				from = chunk[chunk.length - 1][0]
-			}
-		}
+		const after = position(at, s, h, input.ShardIteratorType, input.StartingSequenceNumber, input.Timestamp,
+			"GetShardIterator")
 		const r = new api.GetShardIteratorOutput()
 		r.ShardIterator = iterator(at, s, h.index, after, now())
 		return r
@@ -457,46 +426,47 @@ export class Handler {
 			throw api.resourceNotFoundException(`Shard ${shardId(i.shard)} in stream ${s.name} under account ${i.account} `
 				+ "does not exist")
 		}
-		const prefix = `${s.name}\x00${shardId(i.shard)}\x00`
-		const db = records(tree!)
-		const oldest = t - (s.retention as i64) * hour
-		const n = input.Limit ?? 10000
-		const out: api.Record[] = []
-		let bytes = 0
-		let from = if (i.after == "") null else prefix + i.after
-		let last = i.after
-		let next: Record | null = null
-		while (next == null) {
-			const chunk = db.scan(from, 100, prefix)
-			for (const [k, rec] of chunk) {
-				if (rec.arrived < oldest) {
-					continue
-				}
-				const size = rec.data.length * 3 / 4 + rec.key.length
-				if (out.length == n || out.length > 0 && bytes + size > readBytes) {
-					next = rec
-					break
-				}
-				bytes += size
-				last = k.slice(prefix.length, k.length)
-				out.push({ ...new api.Record(), SequenceNumber: last, ApproximateArrivalTimestamp: rec.arrived,
-					Data: decoded(rec.data), PartitionKey: rec.key,
-					EncryptionType: if (rec.encrypted) "KMS" as api.EncryptionType else null })
-			}
-			if (chunk.length < 100) {
-				break
-			}
-			from = chunk[chunk.length - 1][0]
-		}
+		const got = read(tree!, s, h!, i.after, input.Limit ?? 10000, t)
 		const r = new api.GetRecordsOutput()
-		r.Records = out
-		r.MillisBehindLatest = if (next == null) 0 as i64 else (t - next!.arrived) / millisecond
-		if (h!.closed != null && next == null) {
-			r.ChildShards = s.shards.filter(c => c.parent == shardId(i.shard) || c.adjacent == shardId(i.shard)).map(c => ({ ...new api.ChildShard(),
-				ShardId: shardId(c.index), ParentShards: parents(c), HashKeyRange: range(c) }))
+		r.Records = got.records
+		r.MillisBehindLatest = got.behind
+		if (got.ended) {
+			r.ChildShards = children(s, h!)
 		} else {
-			r.NextShardIterator = iterator(new Target(tree!, i.account, s.name, arn, s), s, i.shard, last, t)
+			r.NextShardIterator = iterator(new Target(tree!, i.account, s.name, arn, s), s, i.shard, got.last, t)
 		}
+		return r
+	}
+
+	subscribeToShard(caller: Caller, input: api.SubscribeToShardInput): api.SubscribeToShardOutput throws Fault {
+		const at = resource(caller, input.ConsumerARN)
+		if (at.consumer == "") {
+			throw badArn(input.ConsumerARN)
+		}
+		const c = consumerOf(caller, at)[1]
+		const s = at.stream!
+		const h = shardOf(s, at, input.ShardId)
+		const p = input.StartingPosition
+		const after = position(at, s, h, p.Type, p.SequenceNumber, p.Timestamp, "SubscribeToShard")
+		if (input.DryRun ?? false) {
+			throw dryRun()
+		}
+		if (caller.live == null) {
+			throw new Fault(500, "InternalFailure", "SubscribeToShard outlives no request here")
+		}
+		const arn = consumerArn(at.arn, c)
+		const key = `${arn}\x00${h.index}`
+		const t = now()
+		const held = this.subscribed.get(key)
+		if (held != null && t - held.started < 5 * second) {
+			throw api.resourceInUseException(`Another active subscription exists for this consumer: ${arn}`)
+		}
+		this.subscriptions++
+		const sub = new Subscription(caller.live!, caller, at, c, h, after, this.subscriptions, t, this.subscribed)
+		this.subscribed.set(key, sub)
+		const r = new api.SubscribeToShardOutput()
+		r.EventStream.next = () => sub.next()
+		r.EventStream.close = () => sub.end()
 		return r
 	}
 
@@ -922,10 +892,15 @@ function indexOfSequence(s: string): i32 | null {
 	return if (n == null || n! > 2147483647) null else n! as i32
 }
 
+/// The sequence number just before s in its shard: its count less one, its shard's index kept, so that it can be
+/// given back as a ContinuationSequenceNumber.
 function before(s: string): string {
 	const out: u8[] = []
+	for (let i = s.length - 1; i >= 36; i--) {
+		out.push(s[i])
+	}
 	let borrow = true
-	for (let i = s.length - 1; i >= 0; i--) {
+	for (let i = 35; i >= 0; i--) {
 		if (borrow && s[i] == 48) {
 			out.push(57)
 		} else {
@@ -1075,3 +1050,211 @@ function dryRun(): Fault {
 }
 
 function invalid(why: string): Fault { return api.invalidArgumentException(why) }
+
+/// The sequence number after which the shard h is read from the position of type kind, by the operation op.
+function position(at: Target, s: Stream, h: Shard, kind: api.ShardIteratorType, seq: string | null,
+	timestamp: i64 | null, op: string): string throws Fault {
+	const prefix = `${s.name}\x00${shardId(h.index)}\x00`
+	const db = records(at.tree)
+	if (kind == "AT_SEQUENCE_NUMBER" || kind == "AFTER_SEQUENCE_NUMBER") {
+		if (seq == null) {
+			throw invalid(`StartingSequenceNumber must be specified for shardIteratorType ${kind}.`)
+		}
+		const encoded = indexOfSequence(seq!)
+		if (encoded == null) {
+			throw invalid(`StartingSequenceNumber ${seq!} used in ${op} on shard ${shardId(h.index)} in stream ${s.name} `
+				+ `under account ${at.account} is invalid.`)
+		}
+		if (encoded! != h.index) {
+			throw invalid(`Invalid StartingSequenceNumber. It encodes ${shardId(encoded!)}, while it was used in a call `
+				+ `to a shard with ${shardId(h.index)}`)
+		}
+		return if (kind == "AFTER_SEQUENCE_NUMBER") seq! else before(seq!)
+	}
+	if (kind == "LATEST") {
+		return latest(db, prefix)
+	}
+	if (kind != "AT_TIMESTAMP") {
+		return ""
+	}
+	if (timestamp == null) {
+		throw invalid("Must specify timestampInMillis parameter for iterator of type AT_TIMESTAMP. Current request has "
+			+ "no timestamp parameter.")
+	}
+	let from: string | null = null
+	while (true) {
+		const chunk = db.scan(from, 100, prefix)
+		const first = chunk.find(e => e[1].arrived >= timestamp!)
+		if (first != null) {
+			return before(first[0].slice(prefix.length, first[0].length))
+		}
+		if (chunk.length < 100) {
+			return latest(db, prefix)
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+}
+
+/// What a read of a shard got: its records, the sequence number of the last or where it began, how far behind the
+/// newest the first left unread is, in ms, and whether the shard is closed and read to its end.
+class Got {
+	records: api.Record[] = []
+	last = ""
+	behind: i64 = 0
+	ended = false
+}
+
+/// The records of the shard h after the sequence number after, at most n and readBytes, as of instant t.
+function read(tree: Store, s: Stream, h: Shard, after: string, n: i32, t: i64): Got throws Fault {
+	const prefix = `${s.name}\x00${shardId(h.index)}\x00`
+	const db = records(tree)
+	const oldest = t - (s.retention as i64) * hour
+	const got = new Got()
+	got.last = after
+	let bytes = 0
+	let from = if (after == "") null else prefix + after
+	let next: Record | null = null
+	while (next == null) {
+		const chunk = db.scan(from, 100, prefix)
+		for (const [k, rec] of chunk) {
+			if (rec.arrived < oldest) {
+				continue
+			}
+			const size = rec.data.length * 3 / 4 + rec.key.length
+			if (got.records.length == n || got.records.length > 0 && bytes + size > readBytes) {
+				next = rec
+				break
+			}
+			bytes += size
+			got.last = k.slice(prefix.length, k.length)
+			got.records.push({ ...new api.Record(), SequenceNumber: got.last, ApproximateArrivalTimestamp: rec.arrived,
+				Data: decoded(rec.data), PartitionKey: rec.key,
+				EncryptionType: if (rec.encrypted) "KMS" as api.EncryptionType else null })
+		}
+		if (chunk.length < 100) {
+			break
+		}
+		from = chunk[chunk.length - 1][0]
+	}
+	got.behind = if (next == null) 0 as i64 else (t - next!.arrived) / millisecond
+	got.ended = h.closed != null && next == null
+	return got
+}
+
+function children(s: Stream, h: Shard): api.ChildShard[] {
+	const id = shardId(h.index)
+	return s.shards.filter(c => c.parent == id || c.adjacent == id).map(c => ({ ...new api.ChildShard(),
+		ShardId: shardId(c.index), ParentShards: parents(c), HashKeyRange: range(c) }))
+}
+
+/// A SubscribeToShard's events, read as its client takes them: an event once it begins, then as records come or every
+/// 5 s without, for 5 minutes, until the shard is read to its end, another subscription takes over, or the stream or
+/// consumer goes. It reads the state anew each time, by the gateway's live.
+class Subscription {
+	private live: Live
+	/// Who subscribed; its trees are not read, being closed with its request.
+	private caller: Caller
+	private account: string
+	private stream: string
+	private created: i64
+	private consumer: string
+	private born: i64
+	private arn: string
+	private shard: i32
+	private after: string
+	private first: string
+	private id: i64
+	readonly started: i64
+	private sent: i64 | null = null
+	private done = false
+	private all: HashMap[string, Subscription]
+
+	constructor(live: Live, caller: Caller, at: Target, c: Consumer, h: Shard, after: string, id: i64, t: i64,
+		all: HashMap[string, Subscription]) {
+		this.live = live
+		this.caller = caller
+		this.account = at.account
+		this.stream = at.name
+		this.created = at.stream!.created
+		this.consumer = c.name
+		this.born = c.created
+		this.arn = consumerArn(at.arn, c)
+		this.shard = h.index
+		this.after = after
+		this.first = h.first
+		this.id = id
+		this.started = t
+		this.all = all
+	}
+
+	next(): api.SubscribeToShardEventStream | null throws Fault {
+		while (!this.done) {
+			const t = now()
+			if (this.live.closed() || t - this.started >= 5 * minute) {
+				this.end()
+				return null
+			}
+			if (this.all.get(this.key())?.id != this.id) {
+				this.end()
+				const e = new api.SubscribeToShardEventStream$ResourceInUseException()
+				e.ResourceInUseException.message = `Another active subscription exists for this consumer: ${this.arn}`
+				return e
+			}
+			let e: api.SubscribeToShardEventStream | null = null
+			this.live.run(this.caller, c => {
+				e = this.event(c, t)
+			})
+			if (e != null) {
+				return e
+			}
+			this.live.wait()
+		}
+		return null
+	}
+
+	/// Ends it, freeing its consumer and shard for another.
+	end() {
+		if (!this.done) {
+			this.done = true
+			if (this.all.get(this.key())?.id == this.id) {
+				this.all.delete(this.key())
+			}
+		}
+	}
+
+	private key(): string { return `${this.arn}\x00${this.shard}` }
+
+	/// The event due as of instant t, null if none is.
+	private event(c: Caller, t: i64): api.SubscribeToShardEventStream | null throws Fault {
+		const tree = c.existing(`${this.account}/${c.region}`)
+		const s = if (tree == null) null else streams(tree!).get(this.stream)
+		const found = if (s == null || s!.created != this.created) null
+			else consumers(tree!).get(`${this.stream}\x00${this.consumer}`)
+		if (found == null || found!.created != this.born) {
+			this.end()
+			const e = new api.SubscribeToShardEventStream$ResourceNotFoundException()
+			e.ResourceNotFoundException.message = if (s == null
+				|| s!.created != this.created) `Stream ${this.stream} under account ${this.account} not found.`
+				else `Consumer ${this.consumer} under stream ${this.stream} not found for account ${this.account}.`
+			return e
+		}
+		const h = s!.shards.find(x => x.index == this.shard)!
+		const got = read(tree!, s!, h, this.after, 10000, t)
+		if (got.records.length == 0 && !got.ended && this.sent != null && t - this.sent! < 5 * second) {
+			return null
+		}
+		this.after = got.last
+		this.sent = t
+		const e = new api.SubscribeToShardEventStream$SubscribeToShardEvent()
+		const ev = e.SubscribeToShardEvent
+		ev.Records = got.records
+		ev.MillisBehindLatest = got.behind
+		if (got.ended) {
+			ev.ChildShards = children(s!, h)
+			this.end()
+		} else {
+			ev.ContinuationSequenceNumber = if (got.last == "") this.first else got.last
+		}
+		return e
+	}
+}

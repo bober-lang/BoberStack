@@ -4,12 +4,13 @@
 import { indexOf } from "std/algo"
 import * as base64 from "std/encoding/base64"
 import * as std from "std/encoding/json"
-import { Request, Response } from "std/http"
+import { Body, Request, Response } from "std/http"
 import { isFinite } from "std/math"
 import { ParseError, split } from "std/string"
 import { Decodable, has, tag } from "std/types"
 import { Fault } from "../fault"
 import { Caller, Unit } from "../service"
+import * as eventstream from "./eventstream"
 
 import { Blob, check, choice, dated, Default, instant, nullable, path, stamp, Timestamp, Validation,
 	Violations } from "./model"
@@ -79,6 +80,24 @@ export class Call {
 		}
 	}
 
+	/// As serve, of an operation whose output streams the events of its member that pick gives.
+	stream[I extends Decodable, O, E](h: (caller: Caller, input: I) => O throws Fault,
+		pick: (o: O) => eventstream.Events[E], actions: string[] = []): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			const out = h(this.caller, decode[I](this.body, this.service.validation))
+			const typed = `application/x-amz-json-${this.service.version}`
+			const s = new eventstream.Stream[E](pick(out), initial(out), typed, payload[E])
+			const res = new Response(200, new Body(s, null, () => s.close()))
+			res.headers.set("content-type", "application/vnd.amazon.eventstream")
+			res.headers.set("x-amzn-requestid", id)
+			return res
+		} catch (f: Fault) {
+			return error(this.service, f, id)
+		}
+	}
+
 	unknownOperation(): Response {
 		const f = new Fault(400, "UnknownOperationException", `Unknown operation ${this.target}`)
 		return error(this.service, f, this.caller.requestId)
@@ -106,6 +125,33 @@ export function members[T](v: T): string {
 }
 
 export function result[O](out: O): string { return if (O == Unit) "" else put(out, []) }
+
+/// The output's members but the one that streams.
+function initial[O](out: O): string {
+	const members: string[] = []
+	for (const f of O.fields) {
+		if (f.type.kind != "class" || f.type.base != eventstream.Events) {
+			const x = out[f.name]
+			if (x != null) {
+				members.push(`${std.quoted(tag(f.tags, Name, f.name))}:${put(x, f.tags)}`)
+			}
+		}
+	}
+	return `{${members.join(",")}}`
+}
+
+/// The JSON of the event e, a union's member.
+function payload[E](e: E): string {
+	for (const M of E.members) {
+		if (e instanceof M) {
+			// for, as M.fields[0] is not a static field
+			for (const f of M.fields) {
+				return put(e[f.name], f.tags)
+			}
+		}
+	}
+	return "{}"
+}
 
 export function reply(service: Service, body: string, requestId: string, status: i32 = 200): Response {
 	const res = new Response(status, body)

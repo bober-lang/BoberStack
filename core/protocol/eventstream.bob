@@ -1,0 +1,276 @@
+//! The event stream encoding (application/vnd.amazon.eventstream) of an output member that streams a union of events:
+//! binary messages of typed headers and a payload, each framed by its lengths and two CRC32s. The response outlives its
+//! request: its body asks the handler's Events for each event as the client reads, so a stream holds no fiber.
+
+import { Fault } from "../fault"
+import { crc32 } from "std/hash/crc32"
+import { Reader } from "std/io"
+import { has } from "std/types"
+
+/// Tags the member of an event union whose shape is a modelled error: sent as an exception, which ends the stream.
+export class Exception {}
+
+/// The events of an output's stream member. next waits for the next one, null at the end; a Fault it throws ends the
+/// stream with an unmodelled error. close is called once, at the end or when the client goes: std/http calls it only
+/// after a write fails, so next must return now and then for a stream to learn that its client left.
+export class Events[E] {
+	next: () => E | null throws Fault = () => null
+	close: () => void = () => {}
+}
+
+export class Bytes {
+	value: string
+
+	constructor(value: string) { this.value = value }
+}
+
+/// In ms since the epoch.
+export class Instant {
+	ms: i64
+
+	constructor(ms: i64) { this.ms = ms }
+}
+
+/// Its 16 bytes.
+export class Uuid {
+	value: string
+
+	constructor(value: string) { this.value = value }
+}
+
+export type Value = bool | i8 | i16 | i32 | i64 | string | Bytes | Instant | Uuid
+export type Header = [string, Value]
+
+export class Message {
+	headers: Header[]
+	payload: string
+
+	constructor(headers: Header[] = [], payload = "") {
+		this.headers = headers
+		this.payload = payload
+	}
+
+	header(name: string): Value | null {
+		for (const [n, v] of this.headers) {
+			if (n == name) {
+				return v
+			}
+		}
+		return null
+	}
+}
+
+export function encode(m: Message): string {
+	let headers = ""
+	for (const [name, v] of m.headers) {
+		headers += chr(name.length as u8) + name
+		if (v instanceof bool) {
+			headers += chr(if (v) 0 else 1)
+		} else if (v instanceof i8) {
+			headers += chr(2) + be(v, 1)
+		} else if (v instanceof i16) {
+			headers += chr(3) + be(v, 2)
+		} else if (v instanceof i32) {
+			headers += chr(4) + be(v, 4)
+		} else if (v instanceof i64) {
+			headers += chr(5) + be(v, 8)
+		} else if (v instanceof Bytes) {
+			headers += chr(6) + be(v.value.length, 2) + v.value
+		} else if (v instanceof string) {
+			headers += chr(7) + be(v.length, 2) + v
+		} else if (v instanceof Instant) {
+			headers += chr(8) + be(v.ms, 8)
+		} else if (v instanceof Uuid) {
+			headers += chr(9) + v.value
+		}
+	}
+	const prelude = be(16 + headers.length + m.payload.length, 4) + be(headers.length, 4)
+	const framed = prelude + be(crc32(prelude), 4) + headers + m.payload
+	return framed + be(crc32(framed), 4)
+}
+
+/// The response body of an output whose stream member is events: first initial, the output's other members, as AWS's
+/// JSON protocols send them in an initial-response event; then each event, its payload written by payload, in the
+/// codec's contentType.
+export class Stream[E] {
+	private events: Events[E]
+	private payload: (e: E) => string
+	private contentType: string
+	private pending: string
+	private ended = false
+	private closed = false
+
+	constructor(events: Events[E], initial: string | null, contentType: string, payload: (e: E) => string) {
+		this.events = events
+		this.payload = payload
+		this.contentType = contentType
+		this.pending = if (initial == null) ""
+			else encode(this.message("event", ":event-type", "initial-response", initial!))
+	}
+
+	read(n: i32): string | null {
+		while (this.pending == "") {
+			if (this.ended) {
+				this.close()
+				return null
+			}
+			this.pending = this.next()
+		}
+		const k = if (n < this.pending.length) n else this.pending.length
+		const out = this.pending.slice(0, k)
+		this.pending = this.pending.slice(k, this.pending.length)
+		return out
+	}
+
+	close() {
+		if (!this.closed) {
+			this.closed = true
+			this.ended = true
+			this.events.close()
+		}
+	}
+
+	private next(): string {
+		let e: E | null = null
+		try {
+			e = this.events.next()
+		} catch (f: Fault) {
+			this.ended = true
+			return encode(new Message([[":message-type", "error"], [":error-code", f.code],
+				[":error-message", f.message]]))
+		}
+		if (e == null) {
+			this.ended = true
+			return ""
+		}
+		for (const M of E.members) {
+			if (e instanceof M) {
+				const f = M.fields[0]
+				if (has(f.tags, Exception)) {
+					this.ended = true
+					return encode(this.message("exception", ":exception-type", f.name, this.payload(e!)))
+				}
+				return encode(this.message("event", ":event-type", f.name, this.payload(e!)))
+			}
+		}
+		return ""
+	}
+
+	private message(kind: string, typed: string, name: string, payload: string): Message {
+		return new Message([[":message-type", kind], [typed, name], [":content-type", this.contentType]], payload)
+	}
+}
+
+/// The n low bytes of v, big-endian, as std/encoding/binary writes only little-endian ones.
+function be(v: i64, n: i32): string {
+	let s = ""
+	for (let i = n - 1; i >= 0; i--) {
+		s += chr(((v >> (8 * i)) & 255) as u8)
+	}
+	return s
+}
+
+function int(s: string, at: i32, n: i32): i64 {
+	let v: i64 = 0
+	for (let i = 0; i < n; i++) {
+		v = (v << 8) | (s[at + i] as i64)
+	}
+	return v
+}
+
+/// The messages of an event stream, read from r; what is not one throws a Fault.
+class Messages {
+	private r: Reader
+	private buffer = ""
+
+	constructor(r: Reader) { this.r = r }
+
+	/// The next message, null at the end.
+	next(): Message | null throws Fault | IoError {
+		if (!this.fill(12)) {
+			return null
+		}
+		const total = int(this.buffer, 0, 4) as i32
+		if (!this.fill(total)) {
+			throw new Fault(400, "Truncated", `a message of ${total} bytes ends at ${this.buffer.length}`)
+		}
+		const m = decode(this.buffer.slice(0, total))
+		this.buffer = this.buffer.slice(total, this.buffer.length)
+		return m
+	}
+
+	/// Whether the buffer holds n bytes; false at the end before any.
+	private fill(n: i32): bool throws Fault | IoError {
+		while (this.buffer.length < n) {
+			const s = this.r.read(n - this.buffer.length)
+			if (s == null) {
+				if (this.buffer.length == 0) {
+					return false
+				}
+				throw new Fault(400, "Truncated", `the stream ends after ${this.buffer.length} bytes`)
+			}
+			this.buffer += s!
+		}
+		return true
+	}
+}
+
+/// The message s frames whole.
+function decode(s: string): Message throws Fault {
+	if (s.length < 16 || int(s, 0, 4) != s.length) {
+		throw new Fault(400, "InvalidLength", `a message of ${s.length} bytes`)
+	}
+	if (int(s, 8, 4) != (crc32(s.slice(0, 8)) as i64)) {
+		throw new Fault(400, "InvalidPreludeChecksum", "the prelude's CRC32 does not match")
+	}
+	if (int(s, s.length - 4, 4) != (crc32(s.slice(0, s.length - 4)) as i64)) {
+		throw new Fault(400, "InvalidMessageChecksum", "the message's CRC32 does not match")
+	}
+	const end = 12 + (int(s, 4, 4) as i32)
+	if (end > s.length - 4) {
+		throw new Fault(400, "InvalidLength", "headers past the payload")
+	}
+	const m = new Message([], s.slice(end, s.length - 4))
+	let at = 12
+	while (at < end) {
+		const n = s[at] as i32
+		const name = s.slice(at + 1, at + 1 + n)
+		at += 1 + n
+		const t = s[at]
+		at++
+		let v: Value = false
+		switch (t) {
+			case 0: v = true
+			case 1: v = false
+			case 2:
+				v = int(s, at, 1) as u8 as i8
+				at += 1
+			case 3:
+				v = int(s, at, 2) as u16 as i16
+				at += 2
+			case 4:
+				v = int(s, at, 4) as u32 as i32
+				at += 4
+			case 5:
+				v = int(s, at, 8)
+				at += 8
+			case 6, 7:
+				const k = int(s, at, 2) as i32
+				const x = s.slice(at + 2, at + 2 + k)
+				v = if (t == 6) new Bytes(x) else x
+				at += 2 + k
+			case 8:
+				v = new Instant(int(s, at, 8))
+				at += 8
+			case 9:
+				v = new Uuid(s.slice(at, at + 16))
+				at += 16
+			default: throw new Fault(400, "InvalidHeader", `header ${name} of type ${t}`)
+		}
+		if (at > end) {
+			throw new Fault(400, "InvalidLength", `header ${name} past the headers`)
+		}
+		m.headers.push([name, v])
+	}
+	return m
+}

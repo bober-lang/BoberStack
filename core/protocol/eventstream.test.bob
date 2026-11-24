@@ -1,0 +1,234 @@
+import { Fault } from "../fault"
+
+import { Bytes, decode, encode, Events, Exception, Instant, Message, Messages, Stream, Uuid,
+	Value } from "./eventstream"
+
+import * as hex from "std/encoding/hex"
+
+// The encoding's test suite, as AWS's SDKs share it.
+const vectors: [string, string, Header[], string][] = [["empty", "000000100000000005c248eb7d98c8ff", [], ""],
+	["int8", "000000170000000729860158046279746502ffc2f869dc", [["byte", -1 as i8]], ""],
+	["int16", "0000001900000009710e923e0573686f727403ffffb27cb6cc", [["short", -1 as i16]], ""],
+	["int32", "0000001d0000000d83e3f0e707696e746567657204ffffffff8b8e12eb", [["integer", -1 as i32]], ""],
+	["int64", "0000001e0000000e5d4adb8d046c6f6e6705ffffffffffffffff4bc232da", [["long", -1 as i64]], ""],
+	["payload", "0000001d00000000fd528c5a7b27666f6f273a27626172277dc3653936", [], "{'foo':'bar'}"],
+	["string header",
+	"0000003d0000002007fd83960c636f6e74656e742d747970650700106170706c69636174696f6e2f6a736f6e7b27666f6f273a27626172"
+	+ "277d8d9c08b1", [["content-type", "application/json"]], "{'foo':'bar'}"],
+	["all header types",
+	"000000620000005203b5cb9c013000013101013202020133030003013404000000040135050000000000000005013606000562797465730137"
+	+ "0700047574663801380800000000000000080139093031323334353637383961626364656663353671",
+	[["0", true], ["1", false], ["2", 2 as i8], ["3", 3 as i16], ["4", 4 as i32], ["5", 5 as i64],
+	["6", new Bytes("bytes")], ["7", "utf8"], ["8", new Instant(8)], ["9", new Uuid("0123456789abcdef")]], ""],
+	["error",
+	"0000005200000042bf23637e0d3a6d6573736167652d747970650700056572726f720b3a6572726f722d636f6465070004636f64650e3a65"
+	+ "72726f722d6d6573736167650700076d6573736167656b6cea3d",
+	[[":message-type", "error"], [":error-code", "code"], [":error-message", "message"]], ""]]
+
+type Header = [string, Value]
+
+function same(a: Value, b: Value): bool {
+	if (a instanceof Bytes) {
+		return b instanceof Bytes && a.value == b.value
+	}
+	if (a instanceof Instant) {
+		return b instanceof Instant && a.ms == b.ms
+	}
+	if (a instanceof Uuid) {
+		return b instanceof Uuid && a.value == b.value
+	}
+	if (a instanceof bool) {
+		return b instanceof bool && a == b
+	}
+	if (a instanceof i8) {
+		return b instanceof i8 && a == b
+	}
+	if (a instanceof i16) {
+		return b instanceof i16 && a == b
+	}
+	if (a instanceof i32) {
+		return b instanceof i32 && a == b
+	}
+	if (a instanceof i64) {
+		return b instanceof i64 && a == b
+	}
+	return a instanceof string && b instanceof string && a == b
+}
+
+function faultOf(s: string): string {
+	try {
+		decode(s)
+	} catch (f: Fault) {
+		return f.code
+	}
+	return ""
+}
+
+test "the encoding's vectors" {
+	for (const [name, x, headers, payload] of vectors) {
+		test `${name}` {
+			const wire = hex.decode(x)
+			test "encode" {
+				assert hex.encode(encode(new Message(headers, payload))) == x
+			}
+			test "decode" {
+				const m = decode(wire)
+				assert m.payload == payload
+				assert m.headers.length == headers.length
+				for (let i = 0; i < headers.length; i++) {
+					assert m.headers[i][0] == headers[i][0] && same(m.headers[i][1], headers[i][1])
+				}
+			}
+		}
+	}
+}
+
+test "a message that is not one" {
+	const wire = hex.decode("0000001d00000000fd528c5a7b27666f6f273a27626172277dc3653936")
+	test "a corrupt prelude" {
+		assert faultOf(wire.slice(0, 7) + "\x01" + wire.slice(8, wire.length)) == "InvalidPreludeChecksum"
+	}
+	test "a corrupt payload" {
+		assert faultOf(wire.slice(0, 14) + "X" + wire.slice(15, wire.length)) == "InvalidMessageChecksum"
+	}
+	test "a short one" {
+		assert faultOf(wire.slice(0, 20)) == "InvalidLength"
+	}
+	test "one cut off in a stream" {
+		const ms = new Messages(new Pieces([wire, wire.slice(0, 20)], 100))
+		assert ms.next()?.payload == "{'foo':'bar'}"
+		let code = ""
+		try {
+			ms.next()
+		} catch (f: Fault) {
+			code = f.code
+		}
+		assert code == "Truncated"
+	}
+}
+
+class Tick {
+	n = 0
+}
+
+class Gone {
+	why = ""
+}
+
+class Ticks$Tick {
+	Tick: Tick = new Tick()
+}
+
+class Ticks$Gone {
+	Gone: Gone @Exception = new Gone()
+}
+
+type Ticks = Ticks$Tick | Ticks$Gone
+
+/// The parts of s, read n bytes at most at a time.
+class Pieces {
+	private parts: string[]
+	private n: i32
+
+	constructor(parts: string[], n: i32) {
+		this.parts = parts
+		this.n = n
+	}
+
+	read(n: i32): string | null {
+		if (this.parts.length == 0) {
+			return null
+		}
+		const k = if (n < this.n) n else this.n
+		const p = this.parts[0]
+		if (p.length <= k) {
+			this.parts = this.parts.slice(1, this.parts.length)
+			return p
+		}
+		this.parts[0] = p.slice(k, p.length)
+		return p.slice(0, k)
+	}
+}
+
+function ticks(of: Ticks[], end: Fault | null): [Stream[Ticks], () => i32] {
+	const events = new Events[Ticks]()
+	let i = 0
+	let closed = 0
+	events.next = () => {
+		if (i < of.length) {
+			i++
+			return of[i - 1]
+		}
+		if (end != null) {
+			throw end!
+		}
+		return null
+	}
+	events.close = () => {
+		closed++
+	}
+	const payload = (e: Ticks) => if (e instanceof Ticks$Tick) `{"n":${e.Tick.n}}` else "{}"
+	return [new Stream[Ticks](events, "{}", "application/json", payload), () => closed]
+}
+
+function tick(n: i32): Ticks {
+	const t = new Ticks$Tick()
+	t.Tick.n = n
+	return t
+}
+
+/// Reads s at most n bytes at a time.
+class Small {
+	private s: Stream[Ticks]
+	private n: i32
+
+	constructor(s: Stream[Ticks], n: i32) {
+		this.s = s
+		this.n = n
+	}
+
+	read(n: i32): string | null { return this.s.read(if (n < this.n) n else this.n) }
+}
+
+function all(s: Stream[Ticks], n: i32): Message[] {
+	const ms = new Messages(new Small(s, n))
+	const out: Message[] = []
+	while (true) {
+		const m = ms.next()
+		if (m == null) {
+			return out
+		}
+		out.push(m!)
+	}
+}
+
+test "a stream of events" {
+	const [s, closed] = ticks([tick(1), tick(2)], null)
+	const ms = all(s, 7)
+	assert ms.length == 3
+	assert ms[0].header(":event-type") == "initial-response" && ms[0].payload == "{}"
+	assert ms[1].header(":message-type") == "event" && ms[1].header(":event-type") == "Tick"
+	assert ms[1].header(":content-type") == "application/json" && ms[1].payload == "{\"n\":1}"
+	assert ms[2].payload == "{\"n\":2}"
+	assert closed() == 1
+	s.close()
+	assert closed() == 1
+}
+
+test "a modelled exception ends the stream" {
+	const [s, closed] = ticks([tick(1), new Ticks$Gone(), tick(3)], null)
+	const ms = all(s, 1000)
+	assert ms.length == 3
+	assert ms[2].header(":message-type") == "exception" && ms[2].header(":exception-type") == "Gone"
+	assert ms[2].header(":event-type") == null
+	assert closed() == 1
+}
+
+test "a fault ends the stream as an unmodelled error" {
+	const [s, closed] = ticks([tick(1)], new Fault(500, "InternalFailure", "it broke"))
+	const ms = all(s, 3)
+	assert ms.length == 3
+	assert ms[2].header(":message-type") == "error" && ms[2].header(":error-code") == "InternalFailure"
+	assert ms[2].header(":error-message") == "it broke" && ms[2].payload == ""
+	assert closed() == 1
+}

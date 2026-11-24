@@ -46,6 +46,8 @@ export class Caller {
 	held: i64 | null = null
 	/// Whether the gateway runs the request again once held: a tick's callers it does not.
 	rerun = true
+	/// What a response that outlives the request, as an event stream, reads the state by later; null where none may.
+	live: Live | null = null
 	/// The trees the request has opened, by account, the global one by "": clones that its gateway commits together if
 	/// it succeeds, and closes if not.
 	opened: [string, Store][] = []
@@ -233,6 +235,16 @@ export class Caller {
 		}
 		return new Fault(status, code, why)
 	}
+}
+
+/// The gateway, as a response that outlives its request sees it. That must not use the request's trees, closed once it
+/// is answered, but those of a caller that run gives.
+export interface Live {
+	/// Runs f, under the lock, on a caller as c over the state committed then; what f writes is dropped.
+	run(c: Caller, f: (c: Caller) => void throws Fault) throws Fault
+	/// Returns after the next commit, tick or close.
+	wait()
+	closed(): bool
 }
 
 /// Who a caller that is neither a root nor a service is to IAM, and the policies that apply to it; IAM's, which the

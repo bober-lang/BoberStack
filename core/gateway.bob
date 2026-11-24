@@ -71,6 +71,7 @@ export class Gateway {
 	private freed = new Signal()
 	/// Woken by each commit, tick, reset and restore, for the requests held.
 	private changed = new Signal()
+	private closing = false
 
 	handle(req: Request): Response throws IoError | ParseError {
 		const seen = this.internal.feed.seen(req)
@@ -182,7 +183,7 @@ export class Gateway {
 
 	/// Runs f as a request outside HTTP is run, as SES's SMTP submission: under the lock, given the committed trees and
 	/// the list it puts the trees its caller opens in, which commit together unless it throws.
-	run(f: (committed: HashMap[string, Store], opened: [string, Store][]) => void throws Fault) throws Fault {
+	transact(f: (committed: HashMap[string, Store], opened: [string, Store][]) => void throws Fault) throws Fault {
 		this.acquire()
 		const opened: [string, Store][] = []
 		let done = false
@@ -195,7 +196,32 @@ export class Gateway {
 		}
 	}
 
+	run(c: Caller, f: (c: Caller) => void throws Fault) throws Fault {
+		this.acquire()
+		const r = new Caller(c.account, c.region, c.arn, c.requestId, c.userId, this.trees)
+		r.source = c.source
+		r.endpoint = c.endpoint
+		r.credential = c.credential
+		r.userAgent = c.userAgent
+		r.identify = c.identify
+		r.lenient = c.lenient
+		r.arrived = c.arrived
+		r.rerun = false
+		r.live = this
+		try {
+			f(r)
+		} finally {
+			this.commit(r.opened, false)
+			this.release()
+		}
+	}
+
+	wait() { this.changed.wait() }
+	closed(): bool { return this.closing }
+
 	close() {
+		this.closing = true
+		this.changed.wake()
 		for (const t of this.trees.values()) {
 			t.close()
 		}
@@ -317,6 +343,7 @@ export class Gateway {
 		caller.lenient = this.lenient
 		caller.arrived = arrived
 		seen?.served(caller)
+		caller.live = this
 		let res: Response | null = null
 		let held = false
 		try {

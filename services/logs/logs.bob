@@ -10,14 +10,19 @@
 //!   refused.
 //! - There is no KMS: a log group's key is stored as given, and events are not encrypted.
 //! - Stored bytes are always 0.
+//! - A Live Tail session's updates are read as its client reads: one that reads slowly gets fewer updates, each of
+//!   the events since the last, rather than AWS's buffer of 10 that drops the oldest. Its sessions are held in memory,
+//!   not in the state. A log group may be named, not only by its ARN; its events give it as the session was given it.
+//!   The messages of its errors are guesses.
 
 import * as auth from "../../core/auth/policy"
 import { Fault } from "../../core/fault"
-import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
+import { uuid } from "../../core/random"
+import { Caller, Live, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as api from "./api"
 import * as insights from "./insights"
-import { match, parse } from "./pattern"
+import { match, parse, Pattern } from "./pattern"
 import { list, member } from "../events/pattern"
 import * as firehoseApi from "../firehose/api"
 import * as kinesisApi from "../kinesis/api"
@@ -31,19 +36,23 @@ import { events, Event, Group, groups, MetricFilter, metricFilters, policies, Po
 
 import { endsWith, indexOf, sortBy, startsWith } from "std/algo"
 import { isDigit } from "std/ascii"
+import { HashMap } from "std/collections/hashmap"
 import { gzip } from "std/compress/gzip"
 import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { ParseError, parseInt, split } from "std/string"
 import { Decodable } from "std/types"
-import { day, hour, millisecond } from "std/time"
+import { day, hour, millisecond, second } from "std/time"
 
 const retentions = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288,
 	3653]
 
-/// The subscription filters a log group may have, and the resource policies a region.
+/// The subscription filters a log group may have, the resource policies a region and its Live Tail sessions.
 const subscriptionLimit = 2
 const policyLimit = 10
+const tailLimit = 15
+/// The events a Live Tail update holds, sampled down to it.
+const tailEvents = 500
 /// The bytes a PutLogEvents batch may hold, each event counting its message and 26.
 const batchBytes = 1048576
 const noGroup = "The specified log group does not exist."
@@ -59,6 +68,8 @@ export class Handler {
 	lambda: lambdaApi.Lambda | null = null
 	/// What metric filters publish to, which the stack sets.
 	cloudwatch: cloudwatchApi.CloudWatch | null = null
+	/// The Live Tail sessions open, by account, a NUL and region.
+	private tails = new HashMap[string, i32]()
 
 	/// Whether the stream took data, put as CloudWatch Logs under role on behalf of the log group source.
 	private send(caller: Caller, stream: string, role: string, source: string, data: string): bool {
@@ -704,6 +715,54 @@ export class Handler {
 		return insights.describeQueries(caller, input)
 	}
 
+	startLiveTail(caller: Caller, input: api.StartLiveTailRequest): api.StartLiveTailResponse throws Fault {
+		// AWS's authorization model names no action for it, though IAM has this one.
+		caller.actions = ["logs:StartLiveTail"]
+		const names = input.logStreamNames
+		const prefixes = input.logStreamNamePrefixes
+		if (names != null && prefixes != null) {
+			throw invalid("Cannot specify both logStreamNames and logStreamNamePrefixes")
+		}
+		if ((names != null || prefixes != null) && input.logGroupIdentifiers.length > 1) {
+			throw invalid("logStreamNames and logStreamNamePrefixes can only be specified with a single log group")
+		}
+		const chosen: [string, string][] = []
+		for (const id of input.logGroupIdentifiers) {
+			const g = nameOf(id)
+			if (startsWith(id, "arn:") && id != arnOf(caller, g)) {
+				throw api.resourceNotFoundException(noGroup)
+			}
+			caller.allow(arnOf(caller, g))
+			if (found(caller, g).class != "STANDARD") {
+				throw api.invalidOperationException(`Live Tail is not supported for log group ${g}, not of the Standard `
+					+ "log class")
+			}
+			chosen.push([id, g])
+		}
+		const p = parse(input.logEventFilterPattern ?? "")
+		if (caller.live == null) {
+			throw new Fault(500, "InternalFailure", "StartLiveTail outlives no request here")
+		}
+		const key = `${caller.account}\x00${caller.region}`
+		const open = this.tails.get(key) ?? 0
+		if (open >= tailLimit) {
+			throw api.limitExceededException(`Maximum number of concurrent Live Tail sessions (${tailLimit}) reached`)
+		}
+		const start = { ...new api.LiveTailSessionStart(), requestId: caller.requestId, sessionId: uuid(),
+			logGroupIdentifiers: input.logGroupIdentifiers, logStreamNames: names, logStreamNamePrefixes: prefixes,
+			logEventFilterPattern: input.logEventFilterPattern }
+		const seen = (sequence(caller.regional()).get("") ?? new Sequence()).n
+		this.tails.set(key, open + 1)
+		const tails = this.tails
+		const tail = new Tail(caller.live!, caller, chosen, names, prefixes, p, start, seen, () => {
+			tails.set(key, (tails.get(key) ?? 1) - 1)
+		})
+		const r = new api.StartLiveTailResponse()
+		r.responseStream.next = () => tail.next()
+		r.responseStream.close = () => tail.end()
+		return r
+	}
+
 	getLogRecord(caller: Caller, input: api.GetLogRecordRequest): api.GetLogRecordResponse throws Fault {
 		return insights.getLogRecord(caller, input)
 	}
@@ -769,6 +828,134 @@ class Cursor {
 }
 
 /// Up to n entries of db under prefix after the key after, while keep holds of their ids, the keys past prefix.
+/// A Live Tail session: its start, then an update each second of the events ingested since the last, for 3 hours.
+class Tail {
+	private live: Live
+	/// Who started it; its trees are not read, being closed with its request.
+	private caller: Caller
+	/// Its log groups, as given and by name.
+	private groups: [string, string][]
+	private names: string[] | null
+	private prefixes: string[] | null
+	private pattern: Pattern
+	private start: api.LiveTailSessionStart | null
+	/// The region's last event sequence, and the time in ms, as of the last update.
+	private seen: i64
+	private read: i64
+	private started: i64
+	private last: i64
+	private done = false
+	private freed: () => void
+
+	constructor(live: Live, caller: Caller, groups: [string, string][], names: string[] | null,
+		prefixes: string[] | null, pattern: Pattern, start: api.LiveTailSessionStart, seen: i64, freed: () => void) {
+		this.live = live
+		this.caller = caller
+		this.groups = groups
+		this.names = names
+		this.prefixes = prefixes
+		this.pattern = pattern
+		this.start = start
+		this.seen = seen
+		this.read = ms()
+		this.started = now()
+		this.last = this.started
+		this.freed = freed
+	}
+
+	next(): api.StartLiveTailResponseStream | null throws Fault {
+		if (this.start != null) {
+			const e = new api.StartLiveTailResponseStream$sessionStart()
+			e.sessionStart = this.start!
+			this.start = null
+			return e
+		}
+		while (!this.done) {
+			const t = now()
+			if (this.live.closed()) {
+				this.end()
+				return null
+			}
+			if (t - this.started >= 3 * hour) {
+				this.end()
+				const e = new api.StartLiveTailResponseStream$SessionTimeoutException()
+				e.SessionTimeoutException.message = "Live Tail session has timed out after 3 hours"
+				return e
+			}
+			if (t - this.last >= second) {
+				this.last = t
+				let u = new api.LiveTailSessionUpdate()
+				try {
+					this.live.run(this.caller, c => {
+						u = this.update(c)
+					})
+				} catch (f: Fault) {
+					this.end()
+					const e = new api.StartLiveTailResponseStream$SessionStreamingException()
+					e.SessionStreamingException.message = f.message
+					return e
+				}
+				const e = new api.StartLiveTailResponseStream$sessionUpdate()
+				e.sessionUpdate = u
+				return e
+			}
+			this.live.wait()
+		}
+		return null
+	}
+
+	end() {
+		if (!this.done) {
+			this.done = true
+			this.freed()
+		}
+	}
+
+	private update(c: Caller): api.LiveTailSessionUpdate throws Fault {
+		const s = c.regional()
+		const t = ms()
+		const top = (sequence(s).get("") ?? new Sequence()).n
+		const got: [i64, api.LiveTailSessionLogEvent][] = []
+		const edb = events(s)
+		for (const [id, g] of this.groups) {
+			const group = groups(s).get(g)
+			if (group == null) {
+				continue
+			}
+			const from = since(group!, t)
+			for (const [_, st] of streams(s).scan(null, 1000000, g + "\x00")) {
+				if (st.ingested < this.read || !this.wanted(st.name)) {
+					continue
+				}
+				for (const [k, e] of scan(edb, keyOf(g, st.name) + "\x00", null, 1000000, false, _ => true)) {
+					const n = number(k.slice(20, k.length)) ?? 0
+					if (n > this.seen && stamp(k) >= from && match(this.pattern, e.message) != null) {
+						got.push([n,
+							{ ...new api.LiveTailSessionLogEvent(), logStreamName: st.name, logGroupIdentifier: id,
+							message: e.message, timestamp: stamp(k), ingestionTime: e.ingested }])
+					}
+				}
+			}
+		}
+		this.seen = top
+		this.read = t
+		sortBy(got, (a, b) => a[0] < b[0])
+		const u = new api.LiveTailSessionUpdate()
+		u.sessionMetadata = { ...new api.LiveTailSessionMetadata(), sampled: got.length > tailEvents }
+		u.sessionResults = []
+		for (let i = 0; i < tailEvents && i < got.length; i++) {
+			const at = if (got.length > tailEvents) ((i as i64) * (got.length as i64) / tailEvents) as i32 else i
+			u.sessionResults!.push(got[at][1])
+		}
+		return u
+	}
+
+	private wanted(stream: string): bool {
+		return (this.names == null || this.names!.includes(stream))
+			&& (this.prefixes == null || this.prefixes!.some(p => startsWith(stream, p)))
+	}
+}
+
 function scan(db: Table[Event], prefix: string, after: string | null, n: i32, descending: bool,
 	keep: (id: string) => bool): [string, Event][] {
 	const out: [string, Event][] = []
