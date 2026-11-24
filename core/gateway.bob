@@ -18,12 +18,14 @@ import { indexOf } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
 import { CryptoError } from "std/crypto/error"
 import { Body, Request, Response } from "std/http"
-import { ParseError } from "std/string"
+import { lower, ParseError, split } from "std/string"
 
 /// A service's handler; the request's body is already read whole.
 export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
 /// A service's answer, in its protocol, to a fault the gateway finds.
 export type Faulted = (f: Fault, requestId: string, req: Request | null) => Response
+/// A service's answer at a host of its own, to the id the host or path names, with the path past that.
+export type Hosted = (caller: Caller, req: Request, id: string, path: string) => Response throws IoError | ParseError
 /// A service's work between requests: what is due by instant t in the state that caller, an account's root in one of
 /// its regions, sees.
 export type Timed = (caller: Caller, t: i64) => void throws Fault
@@ -33,13 +35,17 @@ export type Timed = (caller: Caller, t: i64) => void throws Fault
 export class Gateway {
 	/// By signing name.
 	services = new HashMap[string, Service]()
-	/// How a service answers the faults the gateway finds, by signing name; awsQuery's XML for one not here.
+	/// How a service answers the faults the gateway finds, by signing name, or by label at a host of its own; awsQuery's
+	/// XML for one not here.
 	faults = new HashMap[string, Faulted]()
 	/// What tick runs, in order.
 	timed: Timed[] = []
 	/// The signing name of the service that unauthenticated requests go to, as S3 serves public objects; null answers
 	/// them MissingAuthenticationToken.
 	anonymous: string | null = null
+	/// Services at hosts of their own, with their signing names, by the label after the id, as Lambda's function URLs:
+	/// <id>.<label>.<region>.<any domain>, or /_aws/<label>/<id>/<path> on any host. Signed or not.
+	hosted = new HashMap[string, [string, Hosted]]()
 	/// Each account's committed tree, and the global one by "", which holds the credentials issued. Access keys of none
 	/// are taken, unchecked, for the root of accountOf's account.
 	trees = new HashMap[string, Store]()
@@ -52,13 +58,17 @@ export class Gateway {
 	identify: Identify | null = null
 	/// Refuse no request for lack of permission or trust.
 	lenient = false
+	/// Where the tick's callers say requests come to, as a request's Host says it for its own.
+	endpoint = "http://localhost:4566"
 	private busy = false
 	private freed = new Signal()
 	/// Woken by each commit, tick, reset and restore, for the requests held.
 	private changed = new Signal()
 
 	handle(req: Request): Response throws IoError | ParseError {
-		if (addressed(req.url.path)) {
+		const [label, at, path] = this.host(req)
+		const hosting = this.hosted.get(label)
+		if (hosting == null && addressed(req.url.path)) {
 			try {
 				return this.locked(() => this.internal.handle(req))!
 			} finally {
@@ -70,11 +80,19 @@ export class Gateway {
 		try {
 			id = uuid()
 			auth = sigv2.presigned(req) ?? sigv4.authorization(req)
+			if (hosting != null && auth != null && auth!.service != hosting![0]) {
+				throw new Fault(403, "InvalidSignatureException",
+					`Credential should be scoped to correct service: '${hosting![0]}'.`)
+			}
 		} catch (f: Fault) {
-			return query.error(f, id)
+			const faulted = this.faults.get(label)
+			return if (faulted == null) query.error(f, id) else faulted!(f, id, req)
 		}
-		const name = auth?.service ?? this.anonymous
-		const service = if (name == null) null else this.services.get(name!)
+		const name = if (hosting != null) hosting![0] else auth?.service ?? this.anonymous
+		const service: Service | null = if (hosting != null) (c, r) => hosting![1](c, r, at, path)
+			else if (name == null) null
+			else this.services.get(name!)
+		const faulted = this.faults.get(if (hosting != null) label else name ?? "")
 		if (auth == null && service == null) {
 			const why = "Request is missing Authentication Token"
 			return query.error(new Fault(403, "MissingAuthenticationToken", why), id)
@@ -91,13 +109,27 @@ export class Gateway {
 		while (true) {
 			const res = this.locked(() => {
 				req.body = new Body(body)
-				return this.serve(name!, service!, req, body, auth, id, arrived)
+				return this.serve(name!, service!, faulted, req, body, auth, id, arrived)
 			})
 			if (res != null) {
 				return res!
 			}
 			this.changed.wait()
 		}
+	}
+
+	/// The label of the host of its own that a service answers req at, the id it names and the path past it; "" for none.
+	private host(req: Request): [string, string, string] {
+		const labels = split(lower(req.headers.get("host") ?? ""), ".")
+		if (labels.length >= 3 && this.hosted.has(labels[1])) {
+			return [labels[1], labels[0], req.url.path]
+		}
+		const parts = split(req.url.path, "/")
+		if (parts.length >= 4 && parts[1] == "_aws" && this.hosted.has(parts[2])) {
+			const rest = req.url.path.slice(`/_aws/${parts[2]}/${parts[3]}`.length, req.url.path.length)
+			return [parts[2], parts[3], if (rest == "") "/" else rest]
+		}
+		return ["", "", ""]
 	}
 
 	/// Runs what each service has due by instant t in every account's regions, in one transaction of the trees it opens,
@@ -118,6 +150,7 @@ export class Gateway {
 						account, this.trees)
 					c.identify = this.identify
 					c.lenient = this.lenient
+					c.endpoint = this.endpoint
 					c.opened = opened
 					c.rerun = false
 					timed(c, t)
@@ -197,8 +230,8 @@ export class Gateway {
 	}
 
 	/// null if the service held the request.
-	private serve(name: string, service: Service, req: Request, body: string, auth: sigv4.Authorization | null,
-		id: string, arrived: i64): Response | null throws IoError | ParseError {
+	private serve(name: string, service: Service, faulted: Faulted | null, req: Request, body: string,
+		auth: sigv4.Authorization | null, id: string, arrived: i64): Response | null throws IoError | ParseError {
 		const global = this.trees.get("")
 		const known = if (global == null || auth == null) null else credentials(global).get(auth.accessKey)
 		let why: Fault | null = null
@@ -218,7 +251,6 @@ export class Gateway {
 			why = if (e instanceof Fault) e else new Fault(500, "InternalFailure", e.what)
 		}
 		if (why != null) {
-			const faulted = this.faults.get(name)
 			return if (faulted == null) query.error(why!, id) else faulted!(why!, id, req)
 		}
 		let caller = new Caller("", auth?.region ?? "us-east-1", "*", id, "anonymous", this.trees)
@@ -239,7 +271,8 @@ export class Gateway {
 			res = service(caller, req)
 			held = caller.held != null && now() < caller.held!
 		} finally {
-			this.commit(caller.opened, res != null && res!.status < 300 && !held)
+			// S3 answers a form's upload with a redirect when the form asks for one
+			this.commit(caller.opened, res != null && (res!.status < 300 || res!.status == 303) && !held)
 		}
 		return if (held) null else res!
 	}

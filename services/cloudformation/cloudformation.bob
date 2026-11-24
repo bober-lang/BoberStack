@@ -1707,6 +1707,10 @@ export class Handler {
 			q.SourceAccount = p.str("SourceAccount")
 			q.EventSourceToken = p.str("EventSourceToken")
 			q.PrincipalOrgID = p.str("PrincipalOrgID")
+			const auth = p.str("FunctionUrlAuthType")
+			q.FunctionUrlAuthType = if (auth == "NONE") "NONE" else if (auth == "AWS_IAM") "AWS_IAM" else null
+			q.InvokedViaFunctionUrl = if (p.get("InvokedViaFunctionUrl") == null) null
+				else p.get("InvokedViaFunctionUrl")!.text == "true"
 			c.actions = ["lambda:AddPermission"]
 			this.lambda.addPermission(c, q)
 			r.physical = q.StatementId
@@ -1719,6 +1723,9 @@ export class Handler {
 			q.FunctionName = p.str("TargetFunctionArn") ?? ""
 			q.Qualifier = p.str("Qualifier")
 			q.AuthType = if (p.str("AuthType") == "AWS_IAM") "AWS_IAM" else "NONE"
+			q.InvokeMode = if (p.str("InvokeMode") == "RESPONSE_STREAM") "RESPONSE_STREAM" else null
+			const cors = p.get("Cors")
+			q.Cors = if (cors == null) null else json.decode[lambdaApi.Cors](write(cors!))
 			c.actions = ["lambda:CreateFunctionUrlConfig"]
 			const u = this.lambda.createFunctionUrlConfig(c, q)
 			r.physical = u.FunctionArn

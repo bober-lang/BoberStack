@@ -1,0 +1,267 @@
+//! A function URL's HTTP: the payload format 2.0 event a request is to its function, the response its result maps to,
+//! and the CORS of its configuration.
+
+import { Fault } from "../../core/fault"
+import { Caller } from "../../core/service"
+import * as sigv4 from "../../core/auth/sigv4"
+import { Cors } from "./api"
+import { endsWith, indexOf, lastIndexOf, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { lower, ParseError, parseInt, split, trim } from "std/string"
+import { millisecond, rfc3339, second } from "std/time"
+
+const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+/// Who signed a request, as the event's requestContext.authorizer.iam names them; null for a URL of auth type NONE.
+export class Signer {
+	accessKey = ""
+	account = ""
+	arn = ""
+	userId = ""
+}
+
+export function signer(caller: Caller, req: Request): Signer {
+	const s = new Signer()
+	try {
+		s.accessKey = sigv4.authorization(req)?.accessKey ?? ""
+	} catch (f: Fault) {} // the gateway has authenticated it
+	s.account = caller.account
+	s.arn = caller.arn
+	s.userId = caller.userId
+	return s
+}
+
+/// The event req is to the function of the URL id in account and region, at path past any prefix of the URL's.
+export function event(req: Request, id: string, path: string, account: string, region: string, requestId: string,
+	arrived: i64, trace: string, iam: Signer | null): string {
+	const host = lower(req.headers.get("host") ?? "")
+	const named = startsWith(host, `${id}.lambda-url.`)
+	const colon = lastIndexOf(host, ":")
+	const domain = if (!named) `${id}.lambda-url.${region}.localhost`
+		else if (colon > lastIndexOf(host, "]")) host.slice(0, colon)
+		else host
+	const scheme = req.url.scheme
+	const port = if (colon > lastIndexOf(host, "]")) host.slice(colon + 1, host.length)
+		else if (scheme == "https") "443"
+		else "80"
+	const forwarded = req.headers.get("x-forwarded-for")
+	const source = if (forwarded == null) "127.0.0.1" else trim(split(forwarded!, ",")[0])
+	const headers: [string, string][] = []
+	const cookies: string[] = []
+	for (const [k, v] of req.headers.entries) {
+		if (k == "cookie") {
+			for (const c of split(v, ";")) {
+				if (trim(c) != "") {
+					cookies.push(trim(c))
+				}
+			}
+			continue
+		}
+		joined(headers, k, v)
+	}
+	for (const [k, v] of [["x-amzn-trace-id", trace], ["x-forwarded-for", source], ["x-forwarded-port", port],
+		["x-forwarded-proto", scheme]]) {
+		if (!req.headers.has(k)) {
+			headers.push([k, v])
+		}
+	}
+	const params: [string, string][] = []
+	for (const [k, v] of req.url.query.entries) {
+		joined(params, k, v)
+	}
+	const t = arrived - arrived % second
+	const stamp = rfc3339(t)
+	let month = 1
+	try {
+		month = parseInt(stamp.slice(5, 7))
+	} catch (e: ParseError) {} // rfc3339's, two digits
+	const time = `${stamp.slice(8, 10)}/${months[month - 1]}/${stamp.slice(0, 4)}:${stamp.slice(11, 19)} +0000`
+	const method = req.method
+	let e = `{"version":"2.0","routeKey":"$default","rawPath":${json.quoted(path)},`
+		+ `"rawQueryString":${json.quoted(req.url.query.raw ?? "")},`
+	if (cookies.length > 0) {
+		e += `"cookies":[${cookies.map(c => json.quoted(c)).join(",")}],`
+	}
+	e += `"headers":${object(headers)},`
+	if (params.length > 0) {
+		e += `"queryStringParameters":${object(params)},`
+	}
+	e += `"requestContext":{"accountId":${json.quoted(account)},"apiId":${json.quoted(id)},`
+	if (iam != null) {
+		e += `"authorizer":{"iam":{"accessKey":${json.quoted(iam.accessKey)},"accountId":${json.quoted(iam.account)},`
+			+ `"callerId":${json.quoted(iam.userId)},"cognitoIdentity":null,"principalOrgId":null,`
+			+ `"userArn":${json.quoted(iam.arn)},"userId":${json.quoted(iam.userId)}}},`
+	}
+	e += `"domainName":${json.quoted(domain)},"domainPrefix":${json.quoted(id)},`
+		+ `"http":{"method":${json.quoted(method)},"path":${json.quoted(path)},"protocol":${json.quoted(req.version)},`
+		+ `"sourceIp":${json.quoted(source)},"userAgent":${json.quoted(req.headers.get("user-agent") ?? "")}},`
+		+ `"requestId":${json.quoted(requestId)},"routeKey":"$default","stage":"$default","time":${json.quoted(time)},`
+		+ `"timeEpoch":${arrived / millisecond}},`
+	const body = req.body.whole ?? ""
+	const text = textual(req.headers.get("content-type") ?? "")
+	if (body != "") {
+		e += `"body":${json.quoted(if (text) body else base64.encode(body))},`
+	}
+	return e + `"isBase64Encoded":${body != "" && !text}}`
+}
+
+/// The response a function's result is: by its statusCode, headers, cookies and body if it has a statusCode, else
+/// itself as JSON; null if it is not JSON or does not hold a response.
+export function response(payload: string): Response | null {
+	try {
+		json.decode[json.Raw](payload)
+	} catch (e: ParseError) {
+		return null
+	}
+	let fields: json.Unknown[] = []
+	try {
+		fields = json.decode[json.Keys](payload).all
+	} catch (e: ParseError) {
+		return bare(payload)
+	}
+	const status = member(fields, "statusCode")
+	if (status == null) {
+		return bare(payload)
+	}
+	try {
+		const code = json.decode[i32](status!)
+		if (code < 100 || code > 599) {
+			return null
+		}
+		const given = member(fields, "body")
+		let body = if (given == null || given! == "null") "" else stringOf(given!)
+		const encoded = member(fields, "isBase64Encoded")
+		if (encoded != null && encoded! != "null" && json.decode[bool](encoded!)) {
+			body = base64.decode(body)
+		}
+		const res = new Response(code, body)
+		const headers = member(fields, "headers")
+		if (headers != null && headers! != "null") {
+			for (const [k, v] of json.decode[json.Keys](headers!).all) {
+				res.headers.set(lower(k), stringOf(v.text))
+			}
+		}
+		const cookies = member(fields, "cookies")
+		if (cookies != null && cookies! != "null") {
+			for (const c of json.decode[string[]](cookies!)) {
+				res.headers.append("set-cookie", c)
+			}
+		}
+		return res
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The answer to a CORS preflight, which the function is not invoked for: the configuration's headers, if it allows
+/// origin.
+export function preflight(c: Cors, origin: string): Response {
+	const res = new Response(200, "")
+	if (!allows(c, origin)) {
+		return res
+	}
+	res.headers.set("access-control-allow-origin", allowedOrigin(c, origin))
+	if (c.AllowMethods != null) {
+		res.headers.set("access-control-allow-methods", c.AllowMethods!.join(","))
+	}
+	if (c.AllowHeaders != null) {
+		res.headers.set("access-control-allow-headers", c.AllowHeaders!.join(","))
+	}
+	if (c.AllowCredentials == true) {
+		res.headers.set("access-control-allow-credentials", "true")
+	}
+	if (c.MaxAge != null) {
+		res.headers.set("access-control-max-age", `${c.MaxAge!}`)
+	}
+	res.headers.set("vary", "Origin")
+	return res
+}
+
+/// Adds the configuration's CORS headers to res, the answer to a request from origin, after any the function set.
+export function cors(res: Response, c: Cors, origin: string) {
+	if (!allows(c, origin)) {
+		return
+	}
+	res.headers.append("access-control-allow-origin", allowedOrigin(c, origin))
+	if (c.ExposeHeaders != null) {
+		res.headers.append("access-control-expose-headers", c.ExposeHeaders!.join(","))
+	}
+	if (c.AllowCredentials == true) {
+		res.headers.append("access-control-allow-credentials", "true")
+	}
+	res.headers.append("vary", "Origin")
+}
+
+/// A refusal in the body Lambda's front end gives one: {"Message": …}, its kind in x-amzn-ErrorType.
+export function refusal(status: i32, kind: string, message: string, requestId: string): Response {
+	const res = new Response(status, `{"Message":${json.quoted(message)}}`)
+	res.headers.set("content-type", "application/json")
+	res.headers.set("x-amzn-errortype", kind)
+	res.headers.set("x-amzn-requestid", requestId)
+	return res
+}
+
+/// Where the function URL of id answers on this server, by the scheme and port of endpoint.
+export function urlOn(endpoint: string, id: string, region: string): string {
+	const at = indexOf(endpoint, "://")
+	const scheme = if (at < 0) "http" else endpoint.slice(0, at)
+	const host = endpoint.slice(at + 3, endpoint.length)
+	const colon = lastIndexOf(host, ":")
+	const port = if (colon > lastIndexOf(host, "]")) host.slice(colon, host.length) else ""
+	return `${scheme}://${id}.lambda-url.${region}.localhost${port}/`
+}
+
+function bare(payload: string): Response {
+	const res = new Response(200, payload)
+	res.headers.set("content-type", "application/json")
+	return res
+}
+
+function allows(c: Cors, origin: string): bool {
+	const origins = c.AllowOrigins ?? []
+	return origins.includes("*") || origins.some(o => lower(o) == lower(origin))
+}
+
+/// A wildcard is the origin itself where credentials are allowed, which browsers refuse a * with.
+function allowedOrigin(c: Cors, origin: string): string {
+	const exact = (c.AllowOrigins ?? []).some(o => lower(o) == lower(origin))
+	return if (exact || c.AllowCredentials == true) origin else "*"
+}
+
+/// Whether a body of content type t reaches the function as text; else it is base64, as a form's is.
+function textual(t: string): bool {
+	const m = lower(trim(split(t, ";")[0]))
+	return startsWith(m, "text/") || m == "application/json" || m == "application/javascript" || m == "application/xml"
+		|| endsWith(m, "+json") || endsWith(m, "+xml")
+}
+
+/// Adds v under k, after a comma to a value there.
+function joined(pairs: [string, string][], k: string, v: string) {
+	for (let i = 0; i < pairs.length; i++) {
+		if (pairs[i][0] == k) {
+			pairs[i] = [k, `${pairs[i][1]},${v}`]
+			return
+		}
+	}
+	pairs.push([k, v])
+}
+
+function object(pairs: [string, string][]): string {
+	return `{${pairs.map(p => `${json.quoted(p[0])}:${json.quoted(p[1])}`).join(",")}}`
+}
+
+function member(fields: json.Unknown[], name: string): string | null {
+	for (const [k, v] of fields) {
+		if (k == name) {
+			return v.text
+		}
+	}
+	return null
+}
+
+/// A JSON string's value, or any other JSON value's text.
+function stringOf(raw: string): string throws ParseError {
+	return if (startsWith(raw, "\"")) json.decode[string](raw) else raw
+}

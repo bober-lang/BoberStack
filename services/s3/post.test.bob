@@ -1,0 +1,299 @@
+import { hmacSha1 } from "../../core/auth/sigv2"
+import { Authorization, key, sign } from "../../core/auth/sigv4"
+import { request, text, texts } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import { live } from "../../core/state/store"
+import { Catalog } from "../iam/catalog"
+import { stack } from "../../stack"
+import { indexOf } from "std/algo"
+import { hmacSha256, md5, sha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import { Request, Response } from "std/http"
+import { second, sleep } from "std/time"
+
+const boundary = "b0und4ry"
+
+/// A form's body: its fields, its file if not null, and fields after it.
+function form(fields: [string, string][], file: string | null = "data", filename = "f.txt",
+	after: [string, string][] = []): string {
+	const field = (f: [string,
+		string]) => `--${boundary}\r\nContent-Disposition: form-data; name="${f[0]}"\r\n\r\n${f[1]}\r\n`
+	let s = fields.map(field).join("")
+	if (file != null) {
+		s += `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\n`
+			+ `Content-Type: application/octet-stream\r\n\r\n${file!}\r\n`
+	}
+	return s + after.map(field).join("") + `--${boundary}--\r\n`
+}
+
+/// A POST of body to path, unsigned, as a browser sends a form.
+function posting(g: Gateway, path: string, body: string, host = "localhost:4566",
+	contentType = `multipart/form-data; boundary=${boundary}`): Response {
+	const req = new Request("POST", `http://${host}${path}`, body)
+	req.headers.set("host", host)
+	req.headers.set("content-type", contentType)
+	return g.handle(req)
+}
+
+/// Signed by the root of 000000000000.
+function s3(g: Gateway, method: string, path: string, body = "", headers: [string, string][] = []): Response {
+	const req = new Request(method, `http://localhost:4566${path}`, body)
+	for (const [n, v] of headers) {
+		req.headers.set(n, v)
+	}
+	sign(req, body, "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function call(g: Gateway, service: string, query: string, id = "test", secret = "test", token = ""): Response {
+	return g.handle(request(service, id, secret, query, token))
+}
+
+function fails(res: Response, status: i32, code: string, message = ""): bool {
+	return res.status == status && text(res, "Code") == code && (message == "" || text(res, "Message") == message)
+}
+
+function quoted(s: string): string { return `"${hex.encode(md5(s))}"` }
+
+function policy(conditions: string, expiration = "2030-01-01T00:00:00Z"): string {
+	return base64.encode(`{"expiration":"${expiration}","conditions":[${conditions}]}`)
+}
+
+function v2(p: string, id = "test", secret = "test"): [string, string][] {
+	return [["AWSAccessKeyId", id], ["policy", p], ["signature", base64.encode(hmacSha1(secret, p))]]
+}
+
+function v4(p: string, id = "test", secret = "test", token = ""): [string, string][] {
+	const a = { ...new Authorization(), accessKey: id, date: "20150626", region: "us-east-1", service: "s3" }
+	const out: [string, string][] = [["x-amz-algorithm", "AWS4-HMAC-SHA256"],
+		["x-amz-credential", `${id}/20150626/us-east-1/s3/aws4_request`], ["x-amz-date", "20150626T000000Z"]]
+	if (token != "") {
+		out.push(["x-amz-security-token", token])
+	}
+	out.append([["policy", p], ["x-amz-signature", hex.encode(hmacSha256(key(a, secret), p))]])
+	return out
+}
+
+/// The conditions a SigV4 form of key k needs beyond its own.
+const signing = `["starts-with","$x-amz-algorithm",""],["starts-with","$x-amz-credential",""],`
+	+ `["starts-with","$x-amz-date",""]`
+
+/// A bucket anyone may put objects in.
+function open(g: Gateway, name: string) {
+	assert s3(g, "PUT", `/${name}`).status == 200
+	assert s3(g, "DELETE", `/${name}?publicAccessBlock`).status == 204
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",`
+		+ `"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::${name}/*"}]}`
+	assert s3(g, "PUT", `/${name}?policy`, p).status == 204
+}
+
+test "POST Object: an anonymous form's upload, by the path or the host, its fields in any case and before the file" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/shut").status == 200
+	assert fails(posting(g, "/shut", form([["key", "k"]])), 403, "AccessDenied", "Access Denied")
+	open(g, "bkt")
+	let res = posting(g, "/bkt", "key=k", "localhost:4566", "application/x-www-form-urlencoded")
+	assert fails(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
+		&& text(res, "Condition") == "Bucket POST must be of the enclosure-type multipart/form-data"
+	const binary = "a\r\n--b0und4ryz\r\n\x00\xff"
+	res = posting(g, "/bkt",
+		form([["KEY", "in/${filename}"], ["content-TYPE", "text/plain"], ["x-amz-meta-Colour", "blue"],
+		["x-amz-meta-colour", "red"]], binary, "C:\\dir\\a.txt"))
+	assert res.status == 204 && res.headers.get("etag") == quoted(binary)
+		&& res.headers.get("location") == "http://localhost:4566/bkt/in/a.txt" && res.body.whole == ""
+	const got = s3(g, "GET", "/bkt/in/a.txt")
+	assert got.status == 200 && got.body.whole == binary && got.headers.get("content-type") == "text/plain"
+		&& got.headers.get("x-amz-meta-colour") == "blue,red"
+	// an unquoted name, and no file name
+	const plain = `--${boundary}\r\nContent-Disposition: form-data; name=key\r\n\r\n` + "${filename}x\r\n"
+		+ `--${boundary}\r\nContent-Disposition: form-data; name="file"\r\n\r\nv\r\n--${boundary}--\r\n`
+	assert posting(g, "/bkt/", plain).status == 204 && s3(g, "GET", "/bkt/x").body.whole == "v"
+	res = posting(g, "/", form([["key", "a b+c"]], "h"), "bkt.localhost:4566")
+	assert res.status == 204 && res.headers.get("location") == "http://bkt.localhost:4566/a%20b%2Bc"
+		&& s3(g, "GET", "/bkt/a%20b%2Bc").body.whole == "h"
+	res = posting(g, "/bkt", form([], "data", "f.txt", [["key", "k"]]))
+	assert fails(res, 400, "InvalidArgument",
+		"Bucket POST must contain a field named 'key'.  If it is specified, please check the order of the fields.")
+		&& text(res, "ArgumentName") == "key"
+	assert fails(posting(g, "/bkt", form([["key", "k"]], null)), 400, "InvalidArgument",
+		"POST requires exactly one file upload per request.")
+	assert fails(posting(g, "/bkt", `--${boundary}\r\nContent-Disposition: form-data; name="key"\r\n\r\nk`), 400,
+		"MalformedPOSTRequest")
+	let big = ""
+	while (big.length <= 20 << 10) {
+		big += "0123456789abcdef"
+	}
+	assert fails(posting(g, "/bkt", form([["key", "k"], ["x-ignore-big", big]])), 400,
+		"MaxPostPreDataLengthExceededError")
+	assert fails(posting(g, "/nope", form([["key", "k"]])), 404, "NoSuchBucket")
+	g.close()
+	assert live() == before
+}
+
+test "POST Object: answered by success_action_status, or redirected by success_action_redirect" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	open(g, "bkt")
+	let res = posting(g, "/bkt", form([["key", "a&b"], ["success_action_status", "201"]], "x"))
+	assert res.status == 201 && res.headers.get("content-type") == "application/xml"
+		&& res.body.whole
+		== `<?xml version="1.0" encoding="UTF-8"?>\n<PostResponse>`
+		+ `<Location>http://localhost:4566/bkt/a%26b</Location><Bucket>bkt</Bucket><Key>a&amp;b</Key>`
+		+ `<ETag>${quoted("x")}</ETag></PostResponse>`
+	res = posting(g, "/bkt", form([["key", "k"], ["success_action_status", "200"]], "x"))
+	assert res.status == 200 && res.body.whole == ""
+	assert posting(g, "/bkt", form([["key", "k"], ["success_action_status", "202"]], "x")).status == 204
+	res = posting(g, "/bkt",
+		form([["key", "r/1 2"], ["success_action_status", "201"],
+		["success_action_redirect", "https://example.com/done?x=1"]], "r"))
+	assert res.status == 303
+		&& res.headers.get("location")
+		== `https://example.com/done?x=1&bucket=bkt&key=r/1%202&etag=%22${hex.encode(md5("r"))}%22`
+	// the object a redirect answers is kept
+	assert s3(g, "GET", "/bkt/r/1%202").body.whole == "r"
+	res = posting(g, "/bkt", form([["key", "k"], ["redirect", "http://example.com"]], "x"))
+	assert res.status == 303 && indexOf(res.headers.get("location") ?? "", "http://example.com?bucket=bkt&key=k") == 0
+	assert posting(g, "/bkt", form([["key", "k"], ["success_action_redirect", "nowhere"]], "x")).status == 204
+	g.close()
+	assert live() == before
+}
+
+test "POST Object: a policy signed by SigV2 or SigV4 makes its key's principal the uploader" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	const p = policy(`{"bucket":"bkt"},["starts-with","$key",""],${signing}`)
+	let res = posting(g, "/bkt", form([["key", "two"], ...v2(p)], "2"))
+	assert res.status == 204 && s3(g, "GET", "/bkt/two").body.whole == "2"
+	assert posting(g, "/bkt", form([["key", "four"], ...v4(p)], "4")).status == 204
+	assert s3(g, "GET", "/bkt/four").body.whole == "4"
+	assert fails(posting(g, "/bkt", form([["key", "k"], ["AWSAccessKeyId", "test"], ["policy", p]])), 400,
+		"InvalidArgument",
+		"Bucket POST must contain a field named 'Signature'.  If it is specified, please check the "
+		+ "order of the fields.")
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...v4(p).filter(f => f[0] != "x-amz-date")])), 400,
+		"InvalidArgument",
+		"Bucket POST must contain a field named 'X-Amz-Date'.  If it is specified, please check the "
+		+ "order of the fields.")
+	assert fails(posting(g, "/bkt", form([["key", "k"], ["policy", p]])), 403, "AccessDenied", "Access Denied")
+	const algorithm = v4(p).map(f => if (f[0] == "x-amz-algorithm") ["x-amz-algorithm", "AWS4-HMAC-SHA1"] else f)
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...algorithm])), 400, "InvalidArgument")
+	const scope = v4(p).map(f => if (f[0] == "x-amz-credential") ["x-amz-credential", "test/20150626"] else f)
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...scope])), 400, "InvalidArgument")
+	// an unknown key is its account's root, unchecked, as at the gateway
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...v2(p, "111111111111", "any")])), 403, "AccessDenied")
+	assert posting(g, "/bkt", form([["key", "k"], ...v2(p, "000000000000", "any")])).status == 204
+	// an IAM user's key, as its user, and as long as it is active
+	assert call(g, "iam", "Action=CreateUser&UserName=bob&Version=2010-05-08").status == 200
+	const issued = call(g, "iam", "Action=CreateAccessKey&UserName=bob&Version=2010-05-08")
+	const [id, secret] = [text(issued, "AccessKeyId")!, text(issued, "SecretAccessKey")!]
+	res = posting(g, "/bkt", form([["key", "k"], ...v2(p, id, "wrong")]))
+	assert fails(res, 403, "SignatureDoesNotMatch") && text(res, "StringToSign") == p
+		&& text(res, "AWSAccessKeyId") == id
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...v4(p, id, "wrong")])), 403, "SignatureDoesNotMatch")
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...v2(p, id, secret)])), 403, "AccessDenied")
+	g.lenient = true
+	assert posting(g, "/bkt", form([["key", "k"], ...v2(p, id, secret)])).status == 204
+	g.lenient = false
+	assert call(g, "iam",
+		`Action=UpdateAccessKey&UserName=bob&AccessKeyId=${id}&Status=Inactive&Version=2010-05-08`).status == 200
+	assert fails(posting(g, "/bkt", form([["key", "k"], ...v2(p, id, secret)])), 403, "InvalidAccessKeyId",
+		"The AWS Access Key Id you provided does not exist in our records.")
+	// a temporary key goes with its token, until it expires
+	const session = call(g, "sts", "Action=GetSessionToken&DurationSeconds=900&Version=2011-06-15")
+	const [sid, ssecret,
+		token] = [text(session, "AccessKeyId")!, text(session, "SecretAccessKey")!, text(session, "SessionToken")!]
+	const tokened = policy(`{"bucket":"bkt"},["starts-with","$key",""],${signing},{"x-amz-security-token":"${token}"}`)
+	assert posting(g, "/bkt", form([["key", "s"], ...v4(tokened, sid, ssecret, token)])).status == 204
+	assert fails(posting(g, "/bkt", form([["key", "s"], ...v4(p, sid, ssecret)])), 403, "InvalidAccessKeyId")
+	assert fails(posting(g, "/bkt", form([["key", "s"], ...v4(tokened, sid, ssecret, "other")])), 400, "InvalidToken")
+	sleep(901 * second)
+	assert fails(posting(g, "/bkt", form([["key", "s"], ...v4(tokened, sid, ssecret, token)])), 400, "ExpiredToken",
+		"The provided token has expired.")
+	g.close()
+	assert live() == before
+}
+
+test "POST Object: a policy's expiration, and conditions that cover every field" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	const signed = (fields: [string, string][], p: string,
+		file = "data") => posting(g, "/bkt", form([...fields, ...v2(p)], file))
+	const k: [string, string][] = [["key", "in/k"]]
+	assert fails(signed(k, policy(`["eq","$key","in/k"]`, "2015-01-01T00:00:00Z")), 403, "AccessDenied",
+		"Invalid according to Policy: Policy expired.")
+	assert fails(signed(k, policy(`["eq","$key","in/k"]`, "2030-01-01 00:00:00")), 400, "InvalidPolicyDocument",
+		"Invalid Policy: Invalid 'expiration' value: '2030-01-01 00:00:00'")
+	assert fails(signed(k, base64.encode(`{"EXPIRATION":"2030-01-01T00:00:00Z","conditions":[]}`)), 400,
+		"InvalidPolicyDocument", "Invalid Policy: Policy missing expiration.")
+	assert fails(signed(k, base64.encode(`{"expiration":"2030-01-01T00:00:00Z","CONDITIONS":[]}`)), 400,
+		"InvalidPolicyDocument", "Invalid Policy: Policy missing conditions.")
+	assert fails(signed(k, base64.encode("{nope")), 400, "InvalidPolicyDocument", "Invalid Policy: Invalid JSON.")
+	assert fails(signed(k, policy(`{"key":"in/k","acl":"private"}`)), 400, "InvalidPolicyDocument",
+		"Invalid Policy: Invalid Simple-Condition: Simple-Conditions must have exactly one property specified.")
+	assert fails(signed(k, policy(`["eq","$key","in/j"]`)), 403, "AccessDenied",
+		"Invalid according to Policy: Policy Condition failed: [\"eq\", \"$key\", \"in/j\"]")
+	assert fails(signed(k, policy(`{"bucket":"other"},["eq","$key","in/k"]`)), 403, "AccessDenied",
+		"Invalid according to Policy: Policy Condition failed: [\"eq\", \"$bucket\", \"other\"]")
+	assert signed(k, policy(`{"bUcKeT":"bkt"},["StArTs-WiTh","$KeY","in/"]`)).status == 204
+	// each of a Content-Type's values must start so
+	const typed = policy(`["starts-with","$key",""],["starts-with","$Content-Type","text/"]`)
+	assert signed([...k, ["content-type", "text/plain, text/html"]], typed).status == 204
+	assert fails(signed([...k, ["content-type", "text/plain, image/png"]], typed), 403, "AccessDenied")
+	assert fails(signed([...k, ["x-amz-meta-a", "1"], ["x-ignore-b", "2"]], policy(`["eq","$key","in/k"]`)), 403,
+		"AccessDenied", "Invalid according to Policy: Extra input fields: x-amz-meta-a")
+	// starts-with "" holds of a field the form lacks
+	assert signed(k, policy(`["eq","$key","in/k"],["starts-with","$x-amz-meta-a",""]`)).status == 204
+	assert fails(signed(k, policy(`["eq","$key","in/k"],["starts-with","$x-amz-meta-a","b"]`)), 403, "AccessDenied")
+	const sized = (low: i32, high: i32) => policy(`["eq","$key","in/k"],["content-length-range",${low},${high}]`)
+	let res = signed(k, sized(5, 10), "four")
+	assert fails(res, 400, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed size")
+		&& text(res, "ProposedSize") == "4" && text(res, "MinSizeAllowed") == "5"
+	res = signed(k, sized(0, 3), "four")
+	assert fails(res, 400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+		&& text(res, "MaxSizeAllowed") == "3"
+	assert signed(k, sized(4, 4), "four").status == 204
+	assert fails(signed(k, sized(-1, 3)), 400, "InvalidPolicyDocument")
+	assert fails(signed(k, policy(`["eq","$key","in/k"],["content-length-range",0]`)), 400, "InvalidPolicyDocument")
+	assert fails(signed(k, policy(`["matches","$key","in/k"]`)), 400, "InvalidPolicyDocument")
+	assert fails(signed(k, policy(`["eq","key","in/k"]`)), 400, "InvalidPolicyDocument")
+	g.close()
+	assert live() == before
+}
+
+test "POST Object: its fields set what a PutObject's headers do" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	open(g, "bkt")
+	const tagging = "<Tagging><TagSet><Tag><Key>a b</Key><Value>1&amp;2</Value></Tag><Tag><Key>c</Key><Value></Value>"
+		+ "</Tag></TagSet></Tagging>"
+	let res = posting(g, "/bkt",
+		form([["key", "t"], ["tagging", tagging], ["Cache-Control", "no-cache"],
+		["x-amz-website-redirect-location", "/else"], ["x-amz-server-side-encryption", "AES256"]], "v"))
+	assert res.status == 204 && res.headers.get("x-amz-server-side-encryption") == "AES256"
+	assert texts(s3(g, "GET", "/bkt/t?tagging"), "Key") == ["a b", "c"]
+		&& texts(s3(g, "GET", "/bkt/t?tagging"), "Value") == ["1&2", ""]
+	const got = s3(g, "GET", "/bkt/t")
+	assert got.headers.get("cache-control") == "no-cache"
+		&& got.headers.get("x-amz-website-redirect-location") == "/else"
+	assert fails(posting(g, "/bkt", form([["key", "t"], ["tagging", "<Tagging><TagSet>"]])), 400, "MalformedXML")
+	assert fails(posting(g, "/bkt", form([["key", "t"], ["tagging", "<Tags/>"]])), 400, "MalformedXML")
+	const sum = base64.encode(sha256("v"))
+	res = posting(g, "/bkt", form([["key", "c"], ["x-amz-checksum-sha256", sum]], "v"))
+	assert res.status == 204 && res.headers.get("x-amz-checksum-sha256") == sum
+	assert posting(g, "/bkt", form([["key", "c"], ["x-amz-checksum-sha256", base64.encode(sha256("w"))]], "v")).status
+		== 400
+	assert fails(posting(g, "/bkt", form([["key", "c"], ["Content-MD5", base64.encode(md5("w"))]], "v")), 400,
+		"BadDigest")
+	assert fails(posting(g, "/bkt", form([["key", "c"], ["acl", "public-read"]], "v")), 400,
+		"AccessControlListNotSupported")
+	assert s3(g, "PUT", "/bkt?versioning",
+		"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>").status == 200
+	res = posting(g, "/bkt", form([["key", "v"]], "v"))
+	assert res.status == 204 && (res.headers.get("x-amz-version-id") ?? "") != ""
+	g.close()
+	assert live() == before
+}

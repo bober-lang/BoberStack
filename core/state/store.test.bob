@@ -45,6 +45,21 @@ test "scan pages through a prefix in byte order" {
 	s.close()
 }
 
+test "a scan past a chunk of the store's reads on from where the last stopped" {
+	const s = new Store()
+	for (const i of 0 ... 599) {
+		s.put(k(i), `${i}`)
+		s.put(`other${i}`, "")
+	}
+	const all = s.scan("k", null, 2147483647)
+	assert all.length == 600 && all[0][0] == k(0) && all[255][0] == k(255) && all[256][0] == k(256)
+	assert all[599] == [k(599), "599"] && s.scan("k", k(99), 300).map(e => e[0]) == all.slice(100, 400).map(e => e[0])
+	const back = s.scan("k", null, 2147483647, true)
+	assert back.length == 600 && back[0][0] == k(599) && back[256][0] == k(343) && back[599][0] == k(0)
+	assert s.scan("k", k(500), 2147483647, true).length == 500 && s.scan("k", null, 256).length == 256
+	s.close()
+}
+
 test "a scan is a copy" {
 	const s = new Store()
 	s.put("a", "1")

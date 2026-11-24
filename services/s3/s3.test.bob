@@ -116,6 +116,9 @@ test "objects: headers and metadata, ranges, conditions, digests and checksums, 
 	assert fails(s3(g, "GET", "/bkt/a%20key", "", [["if-match", "\"nope\""]]), 412, "PreconditionFailed")
 	assert fails(s3(g, "GET", "/bkt/nothing"), 404, "NoSuchKey", "The specified key does not exist.")
 	assert fails(s3(g, "PUT", "/bkt/a%20key", "x", [["if-none-match", "*"]]), 412, "PreconditionFailed")
+	const sse: [string, string][] = [["x-amz-server-side-encryption", "AES256"]]
+	assert fails(s3(g, "GET", "/bkt/a%20key", "", sse), 400, "InvalidArgument")
+	assert s3(g, "HEAD", "/bkt/a%20key", "", sse).status == 400
 	assert fails(s3(g, "PUT", "/bkt/k", "x", [["content-md5", base64.encode(md5("y"))]]), 400, "BadDigest")
 	assert fails(s3(g, "PUT", "/bkt/k", "x", [["content-md5", "abc"]]), 400, "InvalidDigest")
 	const crc = s3(g, "PUT", "/bkt/k", "hello world", [["x-amz-checksum-crc32", "DUoRhQ=="]])
@@ -140,6 +143,19 @@ test "objects: headers and metadata, ranges, conditions, digests and checksums, 
 	assert live() == before
 }
 
+test "an object larger than a body's default limit is put whole" {
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	let body = "0123456789abcdef"
+	while (body.length < 16 << 20) {
+		body += body
+	}
+	assert s3(g, "PUT", "/bkt/big", body).status == 200
+	const got = s3(g, "GET", "/bkt/big")
+	assert got.status == 200 && all(got) == body
+	g.close()
+}
+
 test "listing: prefixes and delimiters, pages, start-after, url encoding, owners; and DeleteObjects" {
 	const before = live()
 	const g = stack(new Catalog(""))
@@ -149,6 +165,12 @@ test "listing: prefixes and delimiters, pages, start-after, url encoding, owners
 	}
 	const top = s3(g, "GET", "/bkt?list-type=2&delimiter=/")
 	assert texts(top, "Key") == ["c", "d e"] && texts(top, "Prefix") == ["", "a/", "b/"] && text(top, "KeyCount") == "4"
+	const marked = s3(g, "GET", "/bkt?delimiter=/&max-keys=1&marker=a/")
+	assert texts(marked, "Prefix") == ["", "b/"] && text(marked, "NextMarker") == "b/"
+	const first = s3(g, "GET", "/bkt?list-type=2&delimiter=/&max-keys=1")
+	const second = s3(g, "GET",
+		`/bkt?list-type=2&delimiter=/&max-keys=1&continuation-token=${escape(text(first, "NextContinuationToken")!, "component")}`)
+	assert texts(first, "Prefix") == ["", "a/"] && texts(second, "Prefix") == ["", "b/"]
 	const one = s3(g, "GET", "/bkt?list-type=2&max-keys=2&fetch-owner=true")
 	assert texts(one, "Key") == ["a/1", "a/2"] && text(one, "IsTruncated") == "true" && text(one, "ID") != null
 	const next = s3(g, "GET",
@@ -287,6 +309,10 @@ test "access: bucket policies allow others and anyone; others are denied plainly
 	assert fails(s3(g, "GET", "/bkt/k", "", [], rootOf(other)), 403, "AccessDenied", "Access Denied")
 	assert fails(s3(g, "GET", "/bkt?policy"), 404, "NoSuchBucketPolicy", "The bucket policy does not exist")
 	assert fails(s3(g, "PUT", "/bkt?policy", "nope"), 400, "MalformedPolicy")
+	assert fails(s3(g, "PUT", "/bkt?policy",
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow",`
+		+ `"NotPrincipal":{"AWS":"arn:aws:iam::${other}:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}]}`),
+		400, "MalformedPolicy", "Allow with NotPrincipal is not allowed.")
 	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",`
 		+ `"Resource":"arn:aws:s3:::bkt/*"}]}`
 	assert fails(s3(g, "PUT", "/bkt?policy", p), 403, "AccessDenied")
@@ -304,6 +330,85 @@ test "access: bucket policies allow others and anyone; others are denied plainly
 	assert fails(s3(g, "GET", "/bkt/k", "", [], null), 403, "AccessDenied")
 	g.close()
 	assert live() == before
+}
+
+test "object lock: GET and HEAD show retention and legal hold to those allowed to read them" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/locked", "", [["x-amz-bucket-object-lock-enabled", "true"]]).status == 200
+	const lock: [string, string][] = [["x-amz-object-lock-mode", "GOVERNANCE"],
+		["x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00Z"], ["x-amz-object-lock-legal-hold", "ON"]]
+	assert s3(g, "PUT", "/locked/k", "v", lock).status == 200
+	for (const method of ["GET", "HEAD"]) {
+		const r = s3(g, method, "/locked/k")
+		assert r.status == 200 && r.headers.get("x-amz-object-lock-mode") == "GOVERNANCE"
+			&& indexOf(r.headers.get("x-amz-object-lock-retain-until-date") ?? "", "2099-01-01T00:00:00") == 0
+			&& r.headers.get("x-amz-object-lock-legal-hold") == "ON"
+	}
+	assert s3(g, "PUT", "/locked/plain", "v").status == 200
+	assert s3(g, "HEAD", "/locked/plain").headers.get("x-amz-object-lock-mode") == null
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",`
+		+ `"Resource":"arn:aws:s3:::locked/*"}]}`
+	assert s3(g, "DELETE", "/locked?publicAccessBlock").status == 204
+	assert s3(g, "PUT", "/locked?policy", p).status == 204
+	const theirs = s3(g, "HEAD", "/locked/k", "", [], rootOf(other))
+	assert theirs.status == 200 && theirs.headers.get("x-amz-object-lock-mode") == null
+		&& theirs.headers.get("x-amz-object-lock-legal-hold") == null
+	g.close()
+}
+
+test "object lock: a default retention of a valid mode and Days or else Years, on a configuration Enabled" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/locked", "", [["x-amz-bucket-object-lock-enabled", "true"]]).status == 200
+	const conf = (enabled: string, retention: string) => `<ObjectLockConfiguration><ObjectLockEnabled>${enabled}`
+		+ `</ObjectLockEnabled><Rule><DefaultRetention>${retention}</DefaultRetention></Rule></ObjectLockConfiguration>`
+	const put = (body: string) => s3(g, "PUT", "/locked?object-lock", body, [["content-md5", base64.encode(md5(body))]])
+	for (const bad of [conf("Enabled", "<Mode>GOVERNANCE</Mode><Days>1</Days><Years>1</Years>"),
+		conf("Enabled", "<Mode>governance</Mode><Days>1</Days>"),
+		conf("Disabled", "<Mode>GOVERNANCE</Mode><Days>1</Days>")]) {
+		assert fails(put(bad), 400, "MalformedXML")
+	}
+	assert fails(put(conf("Enabled", "<Mode>GOVERNANCE</Mode>")), 400, "InvalidRequest",
+		"DefaultRetention must specify a fixed retention (Days or Years) or a DefaultEventHold.")
+	assert fails(put(conf("Enabled", "<Mode>GOVERNANCE</Mode><Days>0</Days>")), 400, "InvalidArgument",
+		"Default retention period must be a positive integer value.")
+	assert put(conf("Enabled", "<Mode>COMPLIANCE</Mode><Years>1</Years>")).status == 200
+	g.close()
+}
+
+test "lifecycle: a rule id is at most 255 characters" {
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	let id = ""
+	while (id.length < 256) {
+		id += "a"
+	}
+	const rule = (id: string) => `<LifecycleConfiguration><Rule><ID>${id}</ID><Filter><Prefix>a/</Prefix></Filter>`
+		+ `<Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`
+	const put = (body: string) => s3(g, "PUT", "/bkt?lifecycle", body, [["content-md5", base64.encode(md5(body))]])
+	assert fails(put(rule(id)), 400, "InvalidArgument", "ID length should not exceed allowed limit of 255")
+	assert put(rule(id.slice(1, id.length))).status == 200
+	g.close()
+}
+
+test "ownership: asked for at creation; a bucket's ACLs disabled refuse all but those of its owners alone" {
+	const g = stack(new Catalog(""))
+	assert fails(s3(g, "PUT", "/open", "", [["x-amz-acl", "public-read"]]), 400, "InvalidBucketAclWithObjectOwnership")
+	assert fails(s3(g, "PUT", "/open", "",
+		[["x-amz-grant-read", "uri=http://acs.amazonaws.com/groups/global/AllUsers"]]), 400,
+		"InvalidBucketAclWithObjectOwnership")
+	assert s3(g, "PUT", "/bkt", "", [["x-amz-acl", "private"]]).status == 200
+	for (const owners of ["private", "bucket-owner-read", "bucket-owner-full-control"]) {
+		assert s3(g, "PUT", "/bkt/k", "v", [["x-amz-acl", owners]]).status == 200
+	}
+	assert fails(s3(g, "PUT", "/bkt/k", "v", [["x-amz-acl", "public-read"]]), 400, "AccessControlListNotSupported")
+	assert fails(s3(g, "PUT", "/bkt/c", "", [["x-amz-copy-source", "/bkt/k"], ["x-amz-acl", "public-read"]]), 400,
+		"AccessControlListNotSupported")
+	assert fails(s3(g, "POST", "/bkt/m?uploads", "", [["x-amz-acl", "public-read"]]), 400,
+		"AccessControlListNotSupported")
+	assert s3(g, "PUT", "/writer", "", [["x-amz-object-ownership", "ObjectWriter"]]).status == 200
+	assert text(s3(g, "GET", "/writer?ownershipControls"), "ObjectOwnership") == "ObjectWriter"
+	assert text(s3(g, "GET", "/bkt?ownershipControls"), "ObjectOwnership") == "BucketOwnerEnforced"
+	g.close()
 }
 
 test "a bucket created with tags has them" {
@@ -329,6 +434,64 @@ test "access: the owner's root manages a bucket policy that denies it all" {
 	assert s3(g, "PUT", "/bkt?policy", p).status == 204
 	assert s3(g, "DELETE", "/bkt?policy").status == 204
 	assert s3(g, "PUT", "/bkt/k", "v").status == 200
+	g.close()
+	assert live() == before
+}
+
+test "access: a bucket policy tests a write's encryption headers" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject",`
+		+ `"Resource":"arn:aws:s3:::bkt/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}},`
+		+ `{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*",`
+		+ `"Condition":{"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption":"AES256"}}}]}`
+	assert s3(g, "PUT", "/bkt?policy", p).status == 204
+	const sse: [string, string][] = [["x-amz-server-side-encryption", "AES256"]]
+	assert fails(s3(g, "PUT", "/bkt/k", "v"), 403, "AccessDenied")
+	assert fails(s3(g, "PUT", "/bkt/k", "v", [["x-amz-server-side-encryption", "aws:kms"]]), 403, "AccessDenied")
+	assert s3(g, "PUT", "/bkt/k", "v", sse).status == 200
+	assert fails(s3(g, "PUT", "/bkt/c", "", [["x-amz-copy-source", "/bkt/k"]]), 403, "AccessDenied")
+	assert s3(g, "PUT", "/bkt/c", "", [["x-amz-copy-source", "/bkt/k"], ...sse]).status == 200
+	assert fails(s3(g, "POST", "/bkt/m?uploads"), 403, "AccessDenied")
+	assert s3(g, "POST", "/bkt/m?uploads", "", sse).status == 200
+	const customer = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject",`
+		+ `"Resource":"arn:aws:s3:::bkt/*","Condition":`
+		+ `{"StringEquals":{"s3:x-amz-server-side-encryption-customer-algorithm":"AES256"}}}]}`
+	assert s3(g, "PUT", "/bkt?policy", customer).status == 204
+	const key = "01234567890123456789012345678901"
+	const denied = s3(g, "PUT", "/bkt/c", "v",
+		[["x-amz-server-side-encryption-customer-algorithm", "AES256"],
+		["x-amz-server-side-encryption-customer-key", base64.encode(key)],
+		["x-amz-server-side-encryption-customer-key-md5", base64.encode(md5(key))]])
+	assert denied.status == 403 && indexOf(all(denied), "explicit deny") > 0
+	g.close()
+	assert live() == before
+}
+
+test "access: a bucket policy tests an object's tags and those a write sets" {
+	const before = live()
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	assert s3(g, "PUT", "/bkt/open", "v", [["x-amz-tagging", "security=public"]]).status == 200
+	assert s3(g, "PUT", "/bkt/shut", "v", [["x-amz-tagging", "security=private"]]).status == 200
+	const them = `"Principal":{"AWS":"arn:aws:iam::${other}:root"}`
+	const p = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",${them},`
+		+ `"Action":["s3:GetObject","s3:GetObjectTagging"],"Resource":"arn:aws:s3:::bkt/*",`
+		+ `"Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}},{"Effect":"Allow",${them},`
+		+ `"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bkt/*",`
+		+ `"Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}`
+	assert s3(g, "PUT", "/bkt?policy", p).status == 204
+	const k = rootOf(other)
+	assert all(s3(g, "GET", "/bkt/open", "", [], k)) == "v"
+	assert s3(g, "GET", "/bkt/open?tagging", "", [], k).status == 200
+	assert fails(s3(g, "GET", "/bkt/shut", "", [], k), 403, "AccessDenied")
+	assert fails(s3(g, "GET", "/bkt/shut?tagging", "", [], k), 403, "AccessDenied")
+	assert s3(g, "PUT", "/bkt/new", "v", [["x-amz-tagging", "security=public"]], k).status == 200
+	assert fails(s3(g, "PUT", "/bkt/new", "v", [], k), 403, "AccessDenied")
+	const tags = "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>"
+	assert s3(g, "PUT", "/bkt/shut?tagging", tags, [], k).status == 200
+	assert all(s3(g, "GET", "/bkt/shut", "", [], k)) == "v"
 	g.close()
 	assert live() == before
 }
@@ -384,4 +547,35 @@ test "tagging: of objects, given with the object or after; of buckets" {
 	assert s3(g, "DELETE", "/bkt?tagging").status == 204 && fails(s3(g, "GET", "/bkt?tagging"), 404, "NoSuchTagSet")
 	g.close()
 	assert live() == before
+}
+
+test "tagging: an object takes 10 tags and a bucket 50, of keys up to 128 characters and values up to 256" {
+	const g = stack(new Catalog(""))
+	bucket(g, "bkt")
+	assert s3(g, "PUT", "/bkt/k", "v").status == 200
+	let eleven = ""
+	let header = ""
+	for (let i = 0; i < 11; i++) {
+		eleven += `<Tag><Key>k${i}</Key><Value>v</Value></Tag>`
+		header += `${if (i == 0) "" else "&"}k${i}=v`
+	}
+	const many = `<Tagging><TagSet>${eleven}</TagSet></Tagging>`
+	assert fails(s3(g, "PUT", "/bkt/k?tagging", many), 400, "BadRequest", "Object tags cannot be greater than 10")
+	assert fails(s3(g, "PUT", "/bkt/h", "v", [["x-amz-tagging", header]]), 400, "BadRequest")
+	assert s3(g, "PUT", "/bkt?tagging", many).status == 204
+	let long = ""
+	while (long.length < 129) {
+		long += "a"
+	}
+	const key = `<Tagging><TagSet><Tag><Key>${long}</Key><Value>v</Value></Tag></TagSet></Tagging>`
+	assert fails(s3(g, "PUT", "/bkt/k?tagging", key), 400, "InvalidTag",
+		"The TagKey you have provided is too long, max 128")
+	while (long.length < 257) {
+		long += "a"
+	}
+	const value = `<Tagging><TagSet><Tag><Key>k</Key><Value>${long}</Value></Tag></TagSet></Tagging>`
+	assert fails(s3(g, "PUT", "/bkt?tagging", value), 400, "InvalidTag",
+		"The TagValue you have provided is too long, max 256")
+	assert s3(g, "PUT", "/bkt/k?tagging", key.slice(0, 33) + key.slice(34, key.length)).status == 200
+	g.close()
 }

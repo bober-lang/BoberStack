@@ -1,4 +1,5 @@
 import { authenticate, Credential, credentials } from "../../core/auth/credentials"
+import * as sigv2 from "../../core/auth/sigv2"
 import * as sigv4 from "../../core/auth/sigv4"
 import * as client from "../../core/client.test"
 import { Fault } from "../../core/fault"
@@ -231,6 +232,15 @@ test "a role's credentials: with their token, until they expire" {
 	const body = "Action=GetCallerIdentity&Version=2011-06-15"
 	assert authenticate(c, req, body, auth, now() + 899 * second) == null
 	assert authenticate(c, req, body, auth, now() + 900 * second)?.code == "ExpiredToken"
+	const presigned = (t: string) => {
+		const url = `http://localhost:4566/b/k?AWSAccessKeyId=${key}&Expires=${now() / second + 60}`
+			+ (if (t == "") "" else `&x-amz-security-token=${escape(t, "component")}`)
+		const draft = new Request("GET", `${url}&Signature=x`)
+		const signature = sigv2.signature(draft, sigv2.presigned(draft)!, secret)
+		const signed = new Request("GET", `${url}&Signature=${escape(signature, "component")}`)
+		return authenticate(c, signed, "", sigv2.presigned(signed)!, now())
+	}
+	assert presigned(token) == null && presigned("")?.code == "InvalidClientTokenId"
 	g.close()
 	assert live() == before
 }

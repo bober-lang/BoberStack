@@ -6,6 +6,7 @@
 
 import { Fault } from "../../core/fault"
 import { Policy } from "../../core/auth/policy"
+import { uuid } from "../../core/random"
 import { Caller, Unit } from "../../core/service"
 import { Table } from "../../core/state/store"
 import * as events from "../events/events"
@@ -13,9 +14,10 @@ import * as lambdaApi from "../lambda/api"
 import * as snsApi from "../sns/api"
 import * as sqsApi from "../sqs/api"
 import * as api from "./api"
-import { arn, found, Found, member, noSuchBucket, noSuchKey, owner } from "./common"
+import { arn, existing, found, Found, member, noSuchBucket, noSuchKey, owner, units } from "./common"
 import { path, places, Tables, Version } from "./records"
 import { endsWith, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
 import * as json from "std/encoding/json"
 import { Request, Response } from "std/http"
 import { lower, replace, split, trim } from "std/string"
@@ -76,11 +78,21 @@ export function isPublic(p: Policy): bool {
 		&& s.principals.some(n => n[0] == "*" || n[1] == "*"))
 }
 
+/// Refuses an object's ACL where its bucket's ACLs are disabled, but those that grant no one past the owners, which S3
+/// takes there.
 export function acl(f: Found, acl: string | null) throws Fault {
 	canned(acl)
-	if (acl != null && settings(f).ownership == "BucketOwnerEnforced") {
+	const owners = ["private", "bucket-owner-read", "bucket-owner-full-control"]
+	if (acl != null && !owners.includes(acl!) && settings(f).ownership == "BucketOwnerEnforced") {
 		throw aclsDisabled()
 	}
+}
+
+/// Keeps the Object Ownership a CreateBucket asked for.
+export function own(f: Found, ownership: string) throws Fault {
+	const s = settings(f)
+	s.ownership = ownership
+	save(f, s)
 }
 
 export function mfaDelete(f: Found): api.MFADeleteStatus | null throws Fault { return settings(f).mfaDelete }
@@ -198,7 +210,8 @@ export class Config {
 
 	getObjectAcl(caller: Caller, input: api.GetObjectAclRequest): api.GetObjectAclOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:GetObjectAcl" else "s3:GetObjectVersionAcl"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		if (f.db.objects.get(path(input.Bucket, input.Key)) == null) {
 			throw noSuchKey(input.Key)
 		}
@@ -208,7 +221,8 @@ export class Config {
 
 	putObjectAcl(caller: Caller, input: api.PutObjectAclRequest): api.PutObjectAclOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:PutObjectAcl" else "s3:PutObjectVersionAcl"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		canned(if (input.ACL == null) null else `${input.ACL!}`)
 		if (settings(f).ownership == "BucketOwnerEnforced") {
 			throw aclsDisabled()
@@ -315,6 +329,9 @@ export class Config {
 			const days = r.Expiration?.Days
 			if (days != null && days! <= 0) {
 				throw argument("'Days' for Expiration action must be a positive integer", "Days", `${days!}`)
+			}
+			if (r.ID != null && units(r.ID!) > 255) {
+				throw argument("ID length should not exceed allowed limit of 255", "ID", r.ID!)
 			}
 			if (r.ID != null && ids.includes(r.ID!)) {
 				throw argument("Rule ID must be unique. Found same ID for more than one rule", "ID", r.ID!)
@@ -654,8 +671,24 @@ export class Config {
 			throw new Fault(409, "InvalidBucketState",
 				"Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration")
 		}
+		const c = input.ObjectLockConfiguration
+		const d = c?.Rule?.DefaultRetention
+		// a retention of Days or else Years, never both, as S3's schema has it
+		if (c?.ObjectLockEnabled != null && c!.ObjectLockEnabled != "Enabled"
+			|| d != null
+			&& (d!.Days != null && d!.Years != null
+			|| d!.Mode != null && !among[api.ObjectLockRetentionMode](d!.Mode!))) {
+			throw malformed()
+		}
+		if (d != null && d!.Days == null && d!.Years == null) {
+			throw new Fault(400, "InvalidRequest",
+				"DefaultRetention must specify a fixed retention (Days or Years) or a DefaultEventHold.")
+		}
+		if (d != null && (d!.Days ?? 1) < 1 || d != null && (d!.Years ?? 1) < 1) {
+			throw new Fault(400, "InvalidArgument", "Default retention period must be a positive integer value.")
+		}
 		const s = settings(f)
-		s.lock = input.ObjectLockConfiguration
+		s.lock = c
 		save(f, s)
 		return new api.PutObjectLockConfigurationOutput()
 	}
@@ -726,6 +759,16 @@ export class Config {
 				throw new Fault(400, "InvalidArgument", "Unable to validate the following destination configurations",
 					true, members)
 			}
+		}
+		// S3 names a configuration given no Id.
+		for (const q of c.QueueConfigurations ?? []) {
+			q.Id = q.Id ?? base64.encode(uuid())
+		}
+		for (const t of c.TopicConfigurations ?? []) {
+			t.Id = t.Id ?? base64.encode(uuid())
+		}
+		for (const l of c.LambdaFunctionConfigurations ?? []) {
+			l.Id = l.Id ?? base64.encode(uuid())
 		}
 		const s = settings(f)
 		s.notification = c

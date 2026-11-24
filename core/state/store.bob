@@ -73,7 +73,22 @@ export class Store {
 	/// A page, copied: up to limit entries whose keys start with prefix and, unless after is null, come after it, in
 	/// byte order, or before it in the reverse order if descending. The next page is past the last key.
 	scan(prefix: string, after: string | null = null, limit = 1000, descending = false): [string, string][] {
-		const n = if (limit < this.count()) limit else this.count()
+		// By chunks, as a limit is often all: a buffer of the limit, or of the store's count, costs what the store holds.
+		const page: [string, string][] = []
+		let from = after
+		while (page.length < limit) {
+			const n = if (limit - page.length < chunk) limit - page.length else chunk
+			const got = this.chunk(prefix, from, n, descending)
+			page.append(got)
+			if (got.length < n) {
+				break
+			}
+			from = got[n - 1][0]
+		}
+		return page
+	}
+
+	private chunk(prefix: string, after: string | null, n: i32, descending: bool): [string, string][] {
 		const out = new u64[](4 * n)
 		const bound = if (descending) above(prefix) else null
 		// Descending, the scan starts below the least key past the prefix's.
@@ -100,6 +115,8 @@ export class Store {
 }
 
 /// The least key above every key that starts with prefix, null if there is none.
+const chunk = 256
+
 function above(prefix: string): string | null {
 	let n = prefix.length
 	while (n > 0 && prefix[n - 1] == 0xff) {

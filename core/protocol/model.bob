@@ -227,7 +227,7 @@ export function values[T](): string {
 }
 
 /// The value of the enum T that s names; if none, its first, with a violation noted into v.
-export function choice[T](s: string, at: string, v: Violations): T {
+export function choice[T](s: string, at: string, v: Violations): T throws Fault {
 	if (T.kind == "literal") {
 		if (s != T.value) {
 			v.note(s, at, `Member must satisfy enum value set: ${values[T]()}`)
@@ -245,7 +245,8 @@ export function choice[T](s: string, at: string, v: Violations): T {
 			return M.value
 		}
 	}
-	return T.value
+	// Instanced, though never called, for a union of no literals, which -O1 resolves too.
+	throw v.fault(s, at, `Member must be a ${T.name}`)
 }
 
 function text[T](x: T): string {

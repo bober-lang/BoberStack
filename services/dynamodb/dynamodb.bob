@@ -30,7 +30,7 @@ import { attribute, Change, Definition, Destination, entries, Index, indexKeyOf,
 	projected, sizeOf, stored, Stream, streamKey, Tables, Token, typeOf } from "./records"
 
 import { keyArn } from "../kms/kms"
-import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { indexOf, lastIndexOf, sortBy, startsWith } from "std/algo"
 import * as b64 from "std/encoding/base64"
 import { crc32 } from "std/hash/crc32"
 import { Request, Response } from "std/http"
@@ -93,8 +93,22 @@ export class Handler {
 		}
 		for (const [n, _] of defined) {
 			if (!used.includes(n)) {
-				throw invalidParameters("Number of attributes in KeySchema does not exactly match number of attributes "
-					+ "defined in AttributeDefinitions")
+				if (input.LocalSecondaryIndexes == null && input.GlobalSecondaryIndexes == null) {
+					throw invalidParameters("Number of attributes in KeySchema does not exactly match number of "
+						+ "attributes defined in AttributeDefinitions")
+				}
+				const names = defined.map(e => e[0])
+				const keys: string[] = []
+				for (const k of used) {
+					if (!keys.includes(k)) {
+						keys.push(k)
+					}
+				}
+				// AWS's order of either list is not known; sorted here.
+				sortBy(names, (a, b) => a < b)
+				sortBy(keys, (a, b) => a < b)
+				throw invalidParameters(`Some AttributeDefinitions are not used. AttributeDefinitions: `
+					+ `[${names.join(", ")}], keys used: [${keys.join(", ")}]`)
 			}
 		}
 		if (db.get(d.name) != null) {

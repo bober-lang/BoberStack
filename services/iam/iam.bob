@@ -337,6 +337,30 @@ export class Handler {
 		return new Unit()
 	}
 
+	updateRole(caller: Caller, input: api.UpdateRoleRequest): api.UpdateRoleResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		modifiable(r)
+		r.description = input.Description ?? r.description
+		r.maxSession = input.MaxSessionDuration ?? r.maxSession
+		r.maxSignin = if (input.ResetMaxSigninSessionDuration ?? false) null
+			else input.MaxSigninSessionDuration ?? r.maxSignin
+		db.roles.put(key(r.name), r)
+		return new api.UpdateRoleResponse()
+	}
+
+	updateRoleDescription(caller: Caller,
+		input: api.UpdateRoleDescriptionRequest): api.UpdateRoleDescriptionResponse throws Fault {
+		onRole(caller, input.RoleName)
+		const db = new Tables(caller.store())
+		const r = role(db, input.RoleName)
+		modifiable(r)
+		r.description = input.Description
+		db.roles.put(key(r.name), r)
+		return { ...new api.UpdateRoleDescriptionResponse(), Role: roleOf(caller.account, r, true) }
+	}
+
 	deleteRole(caller: Caller, input: api.DeleteRoleRequest): Unit throws Fault {
 		onRole(caller, input.RoleName)
 		const db = new Tables(caller.store())

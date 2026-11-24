@@ -5,13 +5,13 @@ import { parse, Policy } from "../../core/auth/policy"
 import { Caller, Context } from "../../core/service"
 import { key, Tables as Iam } from "../iam/records"
 import * as api from "./api"
-import { Bucket, places, Tables } from "./records"
+import { Bucket, path, places, Tables } from "./records"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
 import { sha256 } from "std/crypto/hash"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
-import { lower, ParseError, replace, split, trim } from "std/string"
+import { codePoint, lower, ParseError, replace, split, trim } from "std/string"
 
 export class Found {
 	db: Tables
@@ -27,18 +27,57 @@ export class Found {
 /// an account other than expected is denied.
 export function found(caller: Caller, name: string, expected: string | null, resource: string | null = null,
 	context: Context = []): Found throws Fault {
-	const g = caller.existing("")
-	const p = if (g == null) null else places(g!).get(name)
-	if (p == null) {
+	const db = tablesOf(caller, name)
+	if (db == null) {
 		throw noSuchBucket(name)
 	}
-	const db = new Tables(caller.tree(`${p.account}/${p.region}`))
-	const b = db.buckets.get(name)!
+	const b = db!.buckets.get(name)!
 	authorize(caller, b, resource ?? arn(name), context)
 	if (expected != null && expected! != b.owner) {
 		throw new Fault(403, "AccessDenied", "Access Denied")
 	}
-	return new Found(db, b)
+	return new Found(db!, b)
+}
+
+function tablesOf(caller: Caller, name: string): Tables | null throws Fault {
+	const g = caller.existing("")
+	const p = if (g == null) null else places(g!).get(name)
+	return if (p == null) null else new Tables(caller.tree(`${p.account}/${p.region}`))
+}
+
+/// A policy's s3:ExistingObjectTag keys: the tags of key, or of its version id, in the bucket named name; none where
+/// there is no such object, which the request fails on once authorized.
+export function existing(caller: Caller, name: string, key: string, id: string | null): Context throws Fault {
+	const db = tablesOf(caller, name)
+	if (db == null) {
+		return []
+	}
+	const at = path(name, key)
+	let v = if (id == null) db!.objects.get(at) else null
+	if (id != null) {
+		for (const [_, w] of db!.versions.scan(null, 100000, `${at}\x00`)) {
+			if (w.id == id!) {
+				v = w
+			}
+		}
+	}
+	const out: Context = []
+	for (const [k, t] of v?.tags ?? []) {
+		out.push([`s3:ExistingObjectTag/${k}`, t])
+	}
+	return out
+}
+
+/// A policy's s3:RequestObjectTag keys, of the tags a request sets.
+export function requested(tags: [string, string][]): Context {
+	const out: Context = []
+	for (const [k, v] of tags) {
+		out.push([`s3:RequestObjectTag/${k}`, v])
+	}
+	if (tags.length > 0) {
+		out.push(["s3:RequestObjectTagKeys", tags.map(t => t[0])])
+	}
+	return out
 }
 
 /// Throws S3's access denied unless the caller may perform its actions on resource, with the reason only to a caller
@@ -102,6 +141,9 @@ export function bucketPolicy(caller: Caller, f: Found, document: string): Policy
 	}
 	const bucket = arn(f.bucket.name)
 	for (const s of p!.statements) {
+		if (s.allow && s.notPrincipal) {
+			throw malformed("Allow with NotPrincipal is not allowed.")
+		}
 		for (const a of s.actions) {
 			if (a != "*" && !startsWith(lower(a), "s3:")) {
 				// as the document spells it, which parsing lowers
@@ -141,4 +183,16 @@ function exists(caller: Caller, account: string, a: string): bool throws Fault {
 
 function malformed(message: string, detail: string | null = null): Fault {
 	return new Fault(400, "MalformedPolicy", message, true, if (detail == null) "" else member("Detail", detail!))
+}
+
+/// The UTF-16 code units of s, by which S3 measures tags and rule ids.
+export function units(s: string): i32 {
+	let n = 0
+	let i = 0
+	while (i < s.length) {
+		const [cp, end] = codePoint(s, i)
+		n += if (cp > 0xffff) 2 else 1
+		i = end
+	}
+	return n
 }

@@ -265,3 +265,25 @@ test "a presigned URL of a key never issued expires as one of an issued key does
 	assert v2(now() / second + 60).status == 200
 	g.close()
 }
+
+test "the tick's callers say requests come to the gateway's endpoint, as a request's caller says its Host" {
+	const g = new Gateway()
+	const seen: string[] = []
+	g.services.set("test", (caller: Caller, req: Request) => {
+		seen.push(caller.endpoint)
+		try {
+			caller.regional().put("k", "v")
+		} catch (f: Fault) {
+			return new Response(f.status, f.message)
+		}
+		return new Response(200, "")
+	})
+	g.timed.push((caller: Caller, t: i64) => {
+		seen.push(caller.endpoint)
+	})
+	g.endpoint = "http://localhost:4702"
+	assert g.handle(request("test", "test", "test", "")).status == 200
+	g.tick(now())
+	assert seen == ["http://localhost:4566", "http://localhost:4702"]
+	g.close()
+}

@@ -5,6 +5,7 @@ import { Gateway } from "./core/gateway"
 import * as protocol from "./core/protocol/json"
 import { Catalog } from "./services/iam/catalog"
 import { Fake, runner, unix } from "./services/lambda/runner.test"
+import { form, posting } from "./services/s3/post.test"
 import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
 import { indexOf, startsWith } from "std/algo"
@@ -578,6 +579,21 @@ test "S3 notifies a queue of the objects made and removed under its filter, as t
 	g.close()
 }
 
+test "S3 names a notification configuration given no Id, and its events carry that name" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	queue(g, "open", sendable("open", "s3.amazonaws.com", "arn:aws:s3:::bkt"))
+	assert s3(g, "PUT", "/bkt?notification",
+		`<NotificationConfiguration><QueueConfiguration><Queue>${queueArn("open")}`
+		+ "</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>").status == 200
+	const id = text(s3(g, "GET", "/bkt?notification"), "Id") ?? ""
+	assert id.length > 0
+	assert s3(g, "PUT", "/bkt/k", "k").status == 200
+	const got = bodies(g, "open")
+	assert got.length == 2 && indexOf(got[1], `"configurationId":${json.quoted(id)}`) > 0
+	g.close()
+}
+
 test "S3 answers a CORS preflight by its bucket's rules, and names them on an answer to an origin" {
 	const g = stack(new Catalog(""))
 	assert s3(g, "PUT", "/bkt").status == 200
@@ -603,6 +619,39 @@ test "S3 answers a CORS preflight by its bucket's rules, and names them on an an
 	sign(req, "", "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
 	const res = g.handle(req)
 	assert res.status == 200 && res.headers.get("access-control-allow-methods") == "GET"
+	g.close()
+}
+
+test "S3 names a form's upload ObjectCreated:Post, and answers its preflight and itself by the CORS rules" {
+	const g = stack(new Catalog(""))
+	assert s3(g, "PUT", "/bkt").status == 200
+	assert s3(g, "DELETE", "/bkt?publicAccessBlock").status == 204
+	assert s3(g, "PUT", "/bkt?policy",
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",`
+		+ `"Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*"}]}`).status == 204
+	queue(g, "open", sendable("open", "s3.amazonaws.com", "arn:aws:s3:::bkt"))
+	assert s3(g, "PUT", "/bkt?notification",
+		`<NotificationConfiguration><QueueConfiguration><Queue>${queueArn("open")}`
+		+ "</Queue><Event>s3:ObjectCreated:Post</Event></QueueConfiguration></NotificationConfiguration>").status == 200
+	bodies(g, "open")
+	assert s3(g, "PUT", "/bkt/put", "p").status == 200
+	assert posting(g, "/bkt", form([["key", "posted"]], "ab")).status == 204
+	const got = bodies(g, "open")
+	assert got.length == 1 && indexOf(got[0], `"eventName":"ObjectCreated:Post"`) > 0
+		&& indexOf(got[0], `"key":"posted","size":2`) > 0 && indexOf(got[0], `"principalId":"AWS:anonymous"`) > 0
+	const rules = "<CORSConfiguration><CORSRule><AllowedMethod>POST</AllowedMethod>"
+		+ "<AllowedOrigin>https://a.example</AllowedOrigin></CORSRule></CORSConfiguration>"
+	assert s3(g, "PUT", "/bkt?cors", rules).status == 200
+	const preflight = new Request("OPTIONS", "http://localhost:4566/bkt", "")
+	preflight.headers.set("origin", "https://a.example")
+	preflight.headers.set("access-control-request-method", "POST")
+	const ok = g.handle(preflight)
+	assert ok.status == 200 && ok.headers.get("access-control-allow-methods") == "POST"
+	const req = new Request("POST", "http://localhost:4566/bkt", form([["key", "k"]]))
+	req.headers.set("content-type", "multipart/form-data; boundary=b0und4ry")
+	req.headers.set("origin", "https://a.example")
+	const res = g.handle(req)
+	assert res.status == 204 && res.headers.get("access-control-allow-origin") == "https://a.example"
 	g.close()
 }
 
@@ -843,7 +892,7 @@ test "Lambda: a function of a role Lambda may assume, its versions, aliases, pol
 		"ResourceConflictException")
 	assert lambdaCall(g, "DELETE", `/2015-03-31/event-source-mappings/${id}`, "").status == 202
 	res = lambdaCall(g, "POST", "/2021-10-31/functions/f/url", `{"AuthType":"NONE"}`)
-	assert res.status == 201 && indexOf(member(res, "FunctionUrl"), ".lambda-url.us-east-1.on.aws/") == 40
+	assert res.status == 201 && indexOf(member(res, "FunctionUrl"), ".lambda-url.us-east-1.localhost:4566/") == 39
 	assert lambdaCall(g, "DELETE", "/2015-03-31/functions/f", "").status == 204
 	assert refused(lambdaGet(g, "/2015-03-31/functions/f:live/configuration"), 404, "ResourceNotFoundException")
 	g.close()
@@ -1678,7 +1727,11 @@ test "CloudFormation makes a function of inline code zipped as index.py, its ver
 		+ `"P": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": {"Ref": "A"},`
 		+ `"Action": "lambda:InvokeFunction", "Principal": "sns.amazonaws.com"}},`
 		+ `"U": {"Type": "AWS::Lambda::Url", "Properties": {"TargetFunctionArn": {"Fn::GetAtt": ["F", "Arn"]},`
-		+ `"AuthType": "NONE"}}},`
+		+ `"AuthType": "NONE", "Cors": {"AllowOrigins": ["*"], "MaxAge": 5}}},`
+		+ `"Q": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": {"Ref": "F"},`
+		+ `"Action": "lambda:InvokeFunctionUrl", "Principal": "*", "FunctionUrlAuthType": "NONE"}},`
+		+ `"I": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": {"Ref": "F"},`
+		+ `"Action": "lambda:InvokeFunction", "Principal": "*", "InvokedViaFunctionUrl": true}}},`
 		+ `"Outputs": {"Url": {"Value": {"Fn::GetAtt": ["U", "FunctionUrl"]}}, "Alias": {"Value": {"Ref": "A"}}}}`
 	assert query(g, "cloudformation",
 		[["Action", "CreateStack"], ["StackName", "fn"], ["TemplateBody", template],
@@ -1697,6 +1750,9 @@ test "CloudFormation makes a function of inline code zipped as index.py, its ver
 	assert startsWith(zip, "PK\x03\x04") && indexOf(zip, "index.pydef handler(e, c):\n  return 1\n") >= 0
 	assert indexOf(lambdaGet(g, `/2015-03-31/functions/${name}/policy?Qualifier=live`).body.whole ?? "",
 		"sns.amazonaws.com") >= 0
+	assert has(lambdaGet(g, `/2021-10-31/functions/${name}/url`), `"Cors":{"AllowOrigins":["*"],"MaxAge":5}`)
+	res = lambdaGet(g, `/2015-03-31/functions/${name}/policy`)
+	assert has(res, `lambda:FunctionUrlAuthType`) && has(res, `lambda:InvokedViaFunctionUrl`)
 	assert query(g, "cloudformation", [["Action", "DeleteStack"], ["StackName", "fn"]]).status == 200
 	assert lambdaGet(g, `/2015-03-31/functions/${name}`).status == 404
 }
@@ -2230,4 +2286,247 @@ class Awslogs {
 
 class AwslogsData {
 	data = ""
+}
+
+/// A request to a function URL at url, by the Host given or url's, signed for service by k if given.
+function urlCall(g: Gateway, method: string, url: string, body = "", headers: [string, string][] = [],
+	k: Key | null = null, service = "lambda"): Response {
+	const req = new Request(method, url, body)
+	for (const [h, v] of headers) {
+		req.headers.append(h, v)
+	}
+	if (!req.headers.has("host")) {
+		req.headers.set("host", `${req.url.host}${if (req.url.port == null) "" else `:${req.url.port}`}`)
+	}
+	if (k != null) {
+		sign(req, body, service, "us-east-1", k!.id, k!.secret, k!.token, "20150626T140000Z")
+	}
+	return g.handle(req)
+}
+
+/// The id of a new URL of name, of auth type and further configuration as given.
+function urlOf(g: Gateway, name: string, auth: string, more = "", qualifier = ""): string {
+	const res = lambdaCall(g, "POST",
+		`/2021-10-31/functions/${name}/url${if (qualifier == "") "" else `?Qualifier=${qualifier}`}`,
+		`{"AuthType":"${auth}"${more}}`)
+	assert res.status == 201
+	const url = member(res, "FunctionUrl")
+	assert startsWith(url, "http://") && url.slice(39, url.length) == ".lambda-url.us-east-1.localhost:4566/"
+	return url.slice(7, 39)
+}
+
+/// Lets anyone call name's URL of auth type NONE, as the console's two statements do.
+function opened(g: Gateway, name: string, qualifier = "") {
+	const q = if (qualifier == "") "" else `?Qualifier=${qualifier}`
+	assert lambdaCall(g, "POST", `/2015-03-31/functions/${name}/policy${q}`,
+		`{"StatementId":"url","Action":"lambda:InvokeFunctionUrl","Principal":"*","FunctionUrlAuthType":"NONE"}`).status
+		== 201
+	assert lambdaCall(g, "POST", `/2015-03-31/functions/${name}/policy${q}`,
+		`{"StatementId":"invoke","Action":"lambda:InvokeFunction","Principal":"*","InvokedViaFunctionUrl":true}`).status
+		== 201
+}
+
+const urlDenied = "Forbidden. For troubleshooting Function URL authorization issues, see: "
+	+ "https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html"
+
+function has(res: Response, s: string): bool { return indexOf(res.body.whole ?? "", s) >= 0 }
+
+test "a function URL of auth type NONE answers as its policy allows both statements, by Host, any suffix or path" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	const id = urlOf(g, "echo", "NONE")
+	const at = `http://${id}.lambda-url.us-east-1.localhost:4566`
+	assert refused(urlCall(g, "GET", `${at}/`), 403, "AccessDeniedException", urlDenied)
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"url","Action":"lambda:InvokeFunctionUrl","Principal":"*","FunctionUrlAuthType":"NONE"}`).status
+		== 201
+	assert refused(urlCall(g, "GET", `${at}/`), 403, "AccessDeniedException", urlDenied)
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"invoke","Action":"lambda:InvokeFunction","Principal":"*","InvokedViaFunctionUrl":true}`).status
+		== 201
+	assert has(lambdaGet(g, "/2015-03-31/functions/echo/policy"),
+		`\\"Condition\\":{\\"Bool\\":{\\"lambda:InvokedViaFunctionUrl\\":\\"true\\"}}`)
+	assert has(lambdaGet(g, "/2015-03-31/functions/echo/policy"),
+		`{\\"StringEquals\\":{\\"lambda:FunctionUrlAuthType\\":\\"NONE\\"}}`)
+	let res = urlCall(g, "GET", `${at}/hello/world?b=2&a=1&a=3`, "",
+		[["Cookie", "x=1; y=2"], ["X-Multi", "a"], ["X-Multi", "b"], ["User-Agent", "curl/8"]])
+	assert res.status == 200 && res.headers.get("content-type") == "application/json"
+	const requestId = res.headers.get("x-amzn-requestid") ?? ""
+	assert requestId != "" && startsWith(res.headers.get("x-amzn-trace-id") ?? "", "Root=1-")
+	assert startsWith(res.body.whole ?? "",
+		`{"version":"2.0","routeKey":"$default","rawPath":"/hello/world",`
+		+ `"rawQueryString":"b=2&a=1&a=3","cookies":["x=1","y=2"],"headers":{`)
+	assert has(res, `"x-multi":"a,b"`) && has(res, `"user-agent":"curl/8"`) && !has(res, `"cookie"`)
+	assert has(res, `"x-forwarded-for":"127.0.0.1","x-forwarded-port":"4566","x-forwarded-proto":"http"}`)
+	assert has(res,
+		`"queryStringParameters":{"b":"2","a":"1,3"},"requestContext":{"accountId":"${account}",`
+		+ `"apiId":"${id}","domainName":"${id}.lambda-url.us-east-1.localhost","domainPrefix":"${id}",`
+		+ `"http":{"method":"GET","path":"/hello/world","protocol":"HTTP/1.1","sourceIp":"127.0.0.1",`
+		+ `"userAgent":"curl/8"},"requestId":"${requestId}","routeKey":"$default","stage":"$default","time":"`)
+	assert has(res, `"isBase64Encoded":false}`) && !has(res, `"body"`) && !has(res, `"authorizer"`)
+	res = urlCall(g, "POST", `http://localhost:4566/_aws/lambda-url/${id}/p`, "\x00\x01",
+		[["Content-Type", "application/octet-stream"], ["X-Forwarded-For", "10.0.0.9, 10.0.0.1"]])
+	assert res.status == 200 && has(res, `"rawPath":"/p","rawQueryString":"",`) && !has(res, `"cookies"`)
+	assert has(res, `"domainName":"${id}.lambda-url.us-east-1.localhost"`) && has(res, `"sourceIp":"10.0.0.9"`)
+	assert has(res, `"body":"AAE=","isBase64Encoded":true}`) && !has(res, "queryStringParameters")
+	res = urlCall(g, "POST", `http://localhost:4566/_aws/lambda-url/${id}`, `{"n":1}`,
+		[["Content-Type", "application/json; charset=utf-8"]])
+	assert has(res, `"rawPath":"/",`) && has(res, `"body":"{\\"n\\":1}","isBase64Encoded":false}`)
+	res = urlCall(g, "GET", `http://localhost:4566/x`, "", [["Host", `${id}.lambda-url.us-east-1.on.aws`]])
+	assert res.status == 200 && has(res, `"domainName":"${id}.lambda-url.us-east-1.on.aws"`)
+	assert has(res, `"x-forwarded-port":"80"`)
+	assert f.boxes.length == 1 && f.boxes[0].payloads.length == 4
+	assert refused(urlCall(g, "GET", `http://nope.lambda-url.us-east-1.localhost:4566/`), 403, "AccessDeniedException",
+		"Forbidden")
+	assert refused(urlCall(g, "GET", `http://${id}.lambda-url.eu-west-1.localhost:4566/`), 403, "AccessDeniedException",
+		"Forbidden")
+	assert refused(urlCall(g, "GET", "http://localhost:4566/_aws/lambda-url/nope/"), 403, "AccessDeniedException")
+	assert lambdaCall(g, "DELETE", "/2021-10-31/functions/echo/url", "").status == 204
+	assert refused(urlCall(g, "GET", `${at}/`), 403, "AccessDeniedException", "Forbidden")
+	assert f.boxes[0].payloads.length == 4
+	g.close()
+}
+
+test "a function URL's response is the result's statusCode, headers, cookies and body; other JSON as itself; else 502" {
+	const f = new Fake()
+	const g = running(f, ["answer", "fail", "hang"])
+	const id = urlOf(g, "answer", "NONE")
+	opened(g, "answer")
+	const answer = (result: string) => urlCall(g, "POST", `http://${id}.lambda-url.us-east-1.localhost:4566/`, result,
+		[["Content-Type", "application/json"]])
+	let res = answer(`{"statusCode":201,"headers":{"X-A":"1","content-type":"text/plain"},"cookies":["c=1","d=2"],`
+		+ `"body":"made"}`)
+	assert res.status == 201 && res.body.whole == "made" && res.headers.get("x-a") == "1"
+	assert res.headers.get("content-type") == "text/plain" && res.headers.all("set-cookie") == ["c=1", "d=2"]
+	assert res.headers.get("x-amzn-requestid") != null
+	res = answer(`{"statusCode":200,"body":"aGk=","isBase64Encoded":true}`)
+	assert res.status == 200 && res.body.whole == "hi"
+	res = answer(`{"statusCode":204}`)
+	assert res.status == 204 && res.body.whole == ""
+	res = answer("[1,2]")
+	assert res.status == 200 && res.body.whole == "[1,2]" && res.headers.get("content-type") == "application/json"
+	res = answer(`"Hello"`)
+	assert res.status == 200 && res.body.whole == `"Hello"`
+	res = answer(`{"a":1}`)
+	assert res.status == 200 && res.body.whole == `{"a":1}`
+	for (const bad of [`{"statusCode":99}`, `{"statusCode":"x"}`, `{"statusCode":200,"headers":[1]}`]) {
+		res = answer(bad)
+		assert res.status == 502 && res.body.whole == "Internal Server Error"
+	}
+	res = urlCall(g, "POST", `http://${id}.lambda-url.us-east-1.localhost:4566/`, "not json",
+		[["Content-Type", "text/plain"]])
+	assert res.status == 502 && res.body.whole == "Internal Server Error"
+	const failing = urlOf(g, "fail", "NONE")
+	opened(g, "fail")
+	res = urlCall(g, "GET", `http://${failing}.lambda-url.us-east-1.localhost:4566/`)
+	assert res.status == 502 && res.body.whole == "Internal Server Error"
+	assert lambdaCall(g, "PUT", "/2015-03-31/functions/hang/configuration", `{"Timeout":1}`).status == 200
+	const hanging = urlOf(g, "hang", "NONE")
+	opened(g, "hang")
+	res = urlCall(g, "GET", `http://${hanging}.lambda-url.us-east-1.localhost:4566/`)
+	assert res.status == 502 && res.body.whole == "Internal Server Error"
+	assert lambdaCall(g, "PUT", "/2017-10-31/functions/answer/concurrency", `{"ReservedConcurrentExecutions":0}`).status
+		== 200
+	res = answer("{}")
+	assert res.status == 429 && res.headers.get("x-amzn-errortype") == "TooManyRequestsException"
+	g.close()
+}
+
+test "a function URL of auth type AWS_IAM answers a caller signed for lambda as policies allow, never one unsigned" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	const id = urlOf(g, "echo", "AWS_IAM")
+	const at = `http://${id}.lambda-url.us-east-1.localhost:4566/`
+	assert refused(urlCall(g, "GET", at), 403, "AccessDeniedException", "Forbidden")
+	let res = urlCall(g, "GET", at, "", [], root())
+	assert res.status == 200 && has(res, `"authorizer":{"iam":{"accessKey":"test","accountId":"${account}",`)
+	assert has(res, `"userArn":"arn:aws:iam::${account}:root"`)
+	assert refused(urlCall(g, "GET", at, "", [], root(), "s3"), 403, "InvalidSignatureException",
+		"Credential should be scoped to correct service: 'lambda'.")
+	assert urlCall(g, "GET", `http://localhost:4566/_aws/lambda-url/${id}/q?x=1`, "", [], root()).status == 200
+	const bob = user(g, "bob", policy([statement("Allow", `"lambda:InvokeFunctionUrl"`, "*")]))
+	assert refused(urlCall(g, "GET", at, "", [], { ...bob, secret: "wrong" }), 403, "SignatureDoesNotMatch")
+	assert refused(urlCall(g, "GET", at, "", [], bob), 403, "AccessDeniedException", urlDenied)
+	const fn = `arn:aws:lambda:us-east-1:${account}:function:echo`
+	const alice = user(g, "alice",
+		policy([statement("Allow", `"lambda:InvokeFunctionUrl"`, fn, "",
+		`{"StringEquals":{"lambda:FunctionUrlAuthType":"AWS_IAM"}}`),
+		statement("Allow", `"lambda:InvokeFunction"`, fn, "", `{"Bool":{"lambda:InvokedViaFunctionUrl":"true"}}`)]))
+	res = urlCall(g, "GET", at, "", [], alice)
+	assert res.status == 200 && has(res, `"userArn":"arn:aws:iam::${account}:user/alice"`)
+	assert refused(lambdaCall(g, "POST", "/2015-03-31/functions/echo/invocations", "{}", alice), 403,
+		"AccessDeniedException")
+	assert refused(urlCall(g, "GET", at, "", [], otherRoot()), 403, "AccessDeniedException", urlDenied)
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"u","Action":"lambda:InvokeFunctionUrl","Principal":"${other}","FunctionUrlAuthType":"AWS_IAM"}`).status
+		== 201
+	assert refused(urlCall(g, "GET", at, "", [], otherRoot()), 403, "AccessDeniedException", urlDenied)
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/policy",
+		`{"StatementId":"i","Action":"lambda:InvokeFunction","Principal":"${other}","InvokedViaFunctionUrl":true}`).status
+		== 201
+	res = urlCall(g, "GET", at, "", [], otherRoot())
+	assert res.status == 200 && has(res, `"accountId":"${other}","callerId"`)
+	assert has(res, `"requestContext":{"accountId":"${account}"`)
+	g.close()
+}
+
+test "lenient, a function URL answers without a policy, but not unsigned if of auth type AWS_IAM" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	g.lenient = true
+	const open = urlOf(g, "echo", "NONE")
+	assert urlCall(g, "GET", `http://${open}.lambda-url.us-east-1.localhost:4566/`).status == 200
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/versions", "{}").status == 201
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/aliases", `{"Name":"live","FunctionVersion":"1"}`).status
+		== 201
+	const signed = urlOf(g, "echo", "AWS_IAM", "", "live")
+	const at = `http://${signed}.lambda-url.us-east-1.localhost:4566/`
+	assert refused(urlCall(g, "GET", at), 403, "AccessDeniedException", "Forbidden")
+	assert urlCall(g, "GET", at, "", [], user(g, "bob")).status == 200
+	g.close()
+}
+
+test "a function URL of an alias invokes the alias, and goes with it" {
+	const f = new Fake()
+	const g = running(f, ["echo"])
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/versions", "{}").status == 201
+	assert lambdaCall(g, "POST", "/2015-03-31/functions/echo/aliases", `{"Name":"live","FunctionVersion":"1"}`).status
+		== 201
+	const id = urlOf(g, "echo", "NONE", "", "live")
+	const at = `http://${id}.lambda-url.us-east-1.localhost:4566/`
+	opened(g, "echo")
+	assert refused(urlCall(g, "GET", at), 403, "AccessDeniedException", urlDenied)
+	opened(g, "echo", "live")
+	assert urlCall(g, "GET", at).status == 200
+	assert indexOf(f.boxes[0].heard[0], ` arn:aws:lambda:us-east-1:${account}:function:echo:live `) > 0
+	assert f.boxes[0].spec.env.some(e => e[0] == "AWS_LAMBDA_FUNCTION_VERSION" && e[1] == "1")
+	assert lambdaCall(g, "DELETE", "/2015-03-31/functions/echo/aliases/live", "").status == 204
+	assert refused(urlCall(g, "GET", at), 403, "AccessDeniedException", "Forbidden")
+	g.close()
+}
+
+test "a function URL answers a CORS preflight by its configuration without invoking, and adds its headers after" {
+	const f = new Fake()
+	const g = running(f, ["answer"])
+	const id = urlOf(g, "answer", "NONE",
+		`,"Cors":{"AllowOrigins":["https://a.example"],"AllowMethods":["GET","POST"],"AllowHeaders":["x-a"],`
+		+ `"ExposeHeaders":["x-b"],"MaxAge":60,"AllowCredentials":true}`)
+	const at = `http://${id}.lambda-url.us-east-1.localhost:4566/`
+	let res = urlCall(g, "OPTIONS", at, "",
+		[["Origin", "https://a.example"], ["Access-Control-Request-Method", "POST"]])
+	assert res.status == 200 && res.headers.get("access-control-allow-origin") == "https://a.example"
+	assert res.headers.get("access-control-allow-methods") == "GET,POST"
+	assert res.headers.get("access-control-allow-headers") == "x-a" && res.headers.get("access-control-max-age") == "60"
+	assert res.headers.get("access-control-allow-credentials") == "true"
+	res = urlCall(g, "OPTIONS", at, "", [["Origin", "https://b.example"], ["Access-Control-Request-Method", "GET"]])
+	assert res.status == 200 && !res.headers.has("access-control-allow-origin")
+	assert f.boxes.length == 0
+	opened(g, "answer")
+	res = urlCall(g, "POST", at, `{"statusCode":200,"headers":{"Access-Control-Allow-Origin":"*"},"body":"x"}`,
+		[["Origin", "https://a.example"], ["Content-Type", "application/json"]])
+	assert res.status == 200 && res.headers.all("access-control-allow-origin") == ["*", "https://a.example"]
+	assert res.headers.get("access-control-expose-headers") == "x-b"
+	res = urlCall(g, "POST", at, `{"statusCode":200}`, [["Content-Type", "application/json"]])
+	assert !res.headers.has("access-control-allow-origin")
+	g.close()
 }

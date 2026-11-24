@@ -56,3 +56,9 @@ test "a presigned URL without its Signature is AccessDenied, one with none of Si
 	}
 	assert presigned(new Request("GET", "http://localhost/b/k")) == null
 }
+
+test "a presigned URL's x-amz-* query parameters are signed as its headers are, a session's token among them" {
+	const req = new Request("GET",
+		"http://localhost/b/k?AWSAccessKeyId=A&Expires=9&Signature=s&x-amz-security-token=t%2B1")
+	assert stringToSign(req, presigned(req)!) == "GET\n\n\n9\nx-amz-security-token:t+1\n/b/k"
+}

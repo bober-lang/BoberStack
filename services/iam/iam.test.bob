@@ -538,6 +538,14 @@ test "roles: create, get, list, update the trust policy, delete" {
 	assert text(call(g, "GetRole", [["RoleName", "app"]]), "AssumeRolePolicyDocument") == escape(other, "component")
 	assert fails(call(g, "UpdateAssumeRolePolicy", [["RoleName", "app"], ["PolicyDocument", "[]"]]), 400,
 		"MalformedPolicyDocument")
+	assert fails(call(g, "UpdateRole", [["RoleName", "nope"]]), 404, "NoSuchEntity")
+	assert fails(call(g, "UpdateRole", [["RoleName", "app"], ["MaxSessionDuration", "43201"]]), 400, "ValidationError")
+	assert call(g, "UpdateRole", [["RoleName", "app"], ["MaxSessionDuration", "43200"]]).status == 200
+	res = call(g, "GetRole", [["RoleName", "app"]])
+	assert text(res, "Description") == "the app" && text(res, "MaxSessionDuration") == "43200"
+	res = call(g, "UpdateRoleDescription", [["RoleName", "app"], ["Description", "renamed"]])
+	assert text(res, "Description") == "renamed" && text(res, "MaxSessionDuration") == "43200"
+	assert text(call(g, "GetRole", [["RoleName", "app"]]), "Description") == "renamed"
 	assert call(g, "DeleteRole", [["RoleName", "app"]]).status == 200
 	assert fails(call(g, "DeleteRole", [["RoleName", "app"]]), 404, "NoSuchEntity")
 	assert texts(call(g, "ListRoles"), "RoleName") == ["other"]

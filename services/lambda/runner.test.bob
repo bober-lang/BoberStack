@@ -6,6 +6,7 @@ import { Signal } from "builtin/fiber"
 import { indexOf } from "std/algo"
 import { sha256 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
+import * as json from "std/encoding/json"
 import { exists, lstat, makeTempDir, readFile, readLink } from "std/fs"
 import { Request, send } from "std/http"
 import { ParseError, replace } from "std/string"
@@ -103,7 +104,8 @@ function variable(spec: Spec, name: string): string | null {
 	return null
 }
 
-/// echo answers the payload, fail its error, hang nothing, exit exits with 3, init fails its init.
+/// echo answers the payload, answer the body of its function URL event, fail its error, hang nothing, exit exits
+/// with 3, init fails its init.
 function runtime(b: Box) {
 	const api = `http://${variable(b.spec, "AWS_LAMBDA_RUNTIME_API") ?? ""}/2018-06-01/runtime`
 	const handler = b.spec.command[1]
@@ -130,6 +132,8 @@ function runtime(b: Box) {
 			if (handler == "echo") {
 				post(`${api}/invocation/${id}/response`, payload, null)
 				b.late = post(`${api}/invocation/${id}/response`, payload, null)
+			} else if (handler == "answer") {
+				post(`${api}/invocation/${id}/response`, answered(payload), null)
 			} else if (handler == "fail") {
 				post(`${api}/invocation/${id}/error`, `{"errorMessage":"boom","errorType":"ValueError"}`, "Unhandled")
 			} else if (handler == "exit") {
@@ -145,6 +149,16 @@ function runtime(b: Box) {
 	} catch (x: IoError | ParseError) {
 		b.output += `runtime failed: ${x}\n`
 	}
+}
+
+/// The body of a function URL's event.
+function answered(event: string): string throws ParseError {
+	for (const [k, v] of json.decode[json.Keys](event).all) {
+		if (k == "body") {
+			return json.decode[string](v.text)
+		}
+	}
+	return ""
 }
 
 function post(url: string, body: string, kind: string | null): i32 throws IoError | ParseError {

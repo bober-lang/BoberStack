@@ -1,0 +1,481 @@
+//! S3's POST Object: an object uploaded by an HTML form, posted to its bucket as multipart/form-data.
+//!
+//! The form's fields up to its file are read, ${filename} in each the file's name. A form with a policy is signed by
+//! the SigV4 or the SigV2 fields beside it and is taken for that key's principal, an unknown key's as at the gateway;
+//! the policy's conditions must hold, and cover every field but those S3 exempts. A form without one is anonymous.
+//! The object is then written by a PutObject of the form's fields as its headers, and answered as the form asks.
+//!
+//! Where AWS differs: an unknown access key is taken for its account's root, unchecked, where S3 answers
+//! InvalidAccessKeyId; starts-with is taken on any field, where S3 refuses it on a few; the wordings of an algorithm,
+//! a credential, a condition or a content-length-range S3 cannot read are this stack's own.
+
+import { Fault } from "../../core/fault"
+import { accountOf, credentials, use } from "../../core/auth/credentials"
+import { hmacSha1, hosted } from "../../core/auth/sigv2"
+import * as sigv4 from "../../core/auth/sigv4"
+import { Caller } from "../../core/service"
+import { member } from "./common"
+import { indexOf, lastIndexOf, startsWith } from "std/algo"
+import { CryptoError } from "std/crypto/error"
+import { equal, hmacSha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import * as hex from "std/encoding/hex"
+import * as json from "std/encoding/json"
+import * as xml from "std/encoding/xml"
+import { Body, Request, Response } from "std/http"
+import { parts } from "std/http/multipart"
+import { Reader } from "std/io"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { parseRfc3339 } from "std/time"
+import { escape, Url } from "std/url"
+
+/// The most the fields before the file may hold, their names and values together.
+const preData: i32 = 20 << 10
+/// The fields a policy need not name.
+const exempt = ["x-amz-signature", "file", "policy", "awsaccesskeyid", "signature"]
+
+/// The fields that become the PutObject's headers as they are, and the prefixes of those that do.
+const headers = ["cache-control", "content-type", "content-disposition", "content-encoding", "expires", "content-md5",
+	"x-amz-storage-class", "x-amz-website-redirect-location"]
+
+const prefixes = ["x-amz-meta-", "x-amz-server-side-encryption", "x-amz-checksum-", "x-amz-object-lock-"]
+
+class Field {
+	/// Lowercased, as S3 reads a field's name; given is as the form spells it first.
+	name = ""
+	given = ""
+	/// The values of all the fields of the name, joined by commas.
+	value = ""
+}
+
+class Form {
+	fields: Field[] = []
+	file: string | null = null
+	filename = ""
+
+	get(name: string): string | null {
+		for (const f of this.fields) {
+			if (f.name == name) {
+				return f.value
+			}
+		}
+		return null
+	}
+
+	add(name: string, value: string) {
+		for (const f of this.fields) {
+			if (f.name == lower(name)) {
+				f.value += `,${value}`
+				return
+			}
+		}
+		this.fields.push({ ...new Field(), name: lower(name), given: name, value: value })
+	}
+}
+
+/// Whether req is a POST Object: a POST of its bucket, with no subresource.
+export function posted(req: Request): bool {
+	const p = req.url.path
+	return req.method == "POST" && req.url.query.entries.length == 0 && p.length > 1
+		&& split(p.slice(1, p.length), "/").filter(s => s != "").length == 1
+}
+
+/// The answer to the POST Object req, whose object put writes as a PutObject request answered.
+export function post(caller: Caller, req: Request,
+	put: (r: Request) => Response throws IoError): Response throws Fault | IoError {
+	if (!startsWith(lower(req.headers.get("content-type") ?? ""), "multipart/form-data")) {
+		throw new Fault(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold",
+			true, member("Condition", "Bucket POST must be of the enclosure-type multipart/form-data"))
+	}
+	const bucket = replace(req.url.path.slice(1, req.url.path.length), "/", "")
+	const form = read(req.body, req.headers.get("content-type")!)
+	if (form.file == null) {
+		throw new Fault(400, "InvalidArgument", "POST requires exactly one file upload per request.", true,
+			member("ArgumentName", "file") + member("ArgumentValue", "0"))
+	}
+	const key = form.get("key") ?? ""
+	if (key == "") {
+		throw required("key")
+	}
+	const policy = form.get("policy") ?? ""
+	if (policy != "") {
+		authenticate(caller, form, policy)
+		check(form, decoded(policy), bucket, form.file!.length as i64)
+	}
+	const r = putting(bucket, key, form.file!)
+	for (const f of form.fields) {
+		if (headers.includes(f.name) || prefixes.some(p => startsWith(f.name, p))) {
+			r.headers.set(f.name, f.value)
+		}
+	}
+	const acl = form.get("acl")
+	if (acl != null) {
+		r.headers.set("x-amz-acl", acl!)
+	}
+	const tagging = form.get("tagging")
+	if (tagging != null) {
+		r.headers.set("x-amz-tagging", tags(tagging!))
+	}
+	const res = put(r)
+	if (res.status >= 300) {
+		return res
+	}
+	const etag = res.headers.get("etag") ?? ""
+	const location = if (hosted(req) != "") `${caller.endpoint}/${path(key)}`
+		else `${caller.endpoint}/${bucket}/${path(key)}`
+	res.headers.set("location", location)
+	const to = redirect(form.get("success_action_redirect") ?? form.get("redirect"))
+	if (to != null) {
+		res.status = 303
+		res.headers.set("location",
+			`${to!}${if (indexOf(to!, "?") < 0) "?" else "&"}`
+			+ `bucket=${escape(bucket, "component")}&key=${path(key)}&etag=${escape(etag, "component")}`)
+		return res
+	}
+	const status = form.get("success_action_status")
+	if (status == "201") {
+		res.status = 201
+		res.headers.set("content-type", "application/xml")
+		res.body = new Body(`<?xml version="1.0" encoding="UTF-8"?>\n<PostResponse>${member("Location", location)}`
+			+ `${member("Bucket", bucket)}${member("Key", key)}${member("ETag", etag)}</PostResponse>`)
+	} else {
+		res.status = if (status == "200") 200 else 204
+	}
+	return res
+}
+
+/// The fields of the form body of Content-Type ct up to its file, and the file, with ${filename} in each field.
+function read(body: Reader, ct: string): Form throws Fault {
+	const form = new Form()
+	let pre = 0
+	try {
+		const ps = parts(body, ct)
+		while (true) {
+			const p = ps.next()
+			if (p == null) {
+				break
+			}
+			if (lower(p.name) == "file") {
+				form.file = all(p.body, null)
+				const name = p.filename ?? ""
+				const slash = lastIndexOf(name, "/")
+				const backslash = lastIndexOf(name, "\\")
+				form.filename = name.slice((if (slash > backslash) slash else backslash) + 1, name.length)
+				break
+			}
+			pre += p.name.length
+			const value = all(p.body, preData - pre)
+			pre += value.length
+			if (pre > preData) {
+				throw new Fault(400, "MaxPostPreDataLengthExceededError",
+					"Your POST request fields preceding the upload file were too large.")
+			}
+			form.add(p.name, value)
+		}
+	} catch (e: IoError | ParseError) {
+		throw new Fault(400, "MalformedPOSTRequest",
+			"The body of your POST request is not well-formed multipart/form-data.")
+	}
+	for (const f of form.fields) {
+		f.value = replace(f.value, "${filename}", form.filename)
+	}
+	return form
+}
+
+/// What r gives, or as soon as it gives more than limit bytes, what it gave so far.
+function all(r: Reader, limit: i32 | null): string throws IoError {
+	let s = ""
+	while (limit == null || s.length <= limit!) {
+		const c = r.read(1 << 16)
+		if (c == null) {
+			break
+		}
+		s += c
+	}
+	return s
+}
+
+function required(field: string): Fault {
+	return new Fault(400, "InvalidArgument",
+		`Bucket POST must contain a field named '${field}'.  If it is specified, please check the order of the fields.`,
+		true, member("ArgumentName", field) + member("ArgumentValue", ""))
+}
+
+/// Makes caller the principal whose key signs policy by the form's SigV4 or SigV2 fields, once they all are there and
+/// the signature is that key's; an unknown key is its account's root, unchecked.
+function authenticate(caller: Caller, form: Form, policy: string) throws Fault {
+	const v4 = signed(form, ["X-Amz-Signature", "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date"])
+	if (!v4 && !signed(form, ["Signature", "AWSAccessKeyId"])) {
+		throw new Fault(403, "AccessDenied", "Access Denied")
+	}
+	const auth = new sigv4.Authorization()
+	if (v4) {
+		const algorithm = form.get("x-amz-algorithm")!
+		if (algorithm != "AWS4-HMAC-SHA256") {
+			throw new Fault(400, "InvalidArgument", "X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\"", true,
+				member("ArgumentName", "x-amz-algorithm") + member("ArgumentValue", algorithm))
+		}
+		const credential = form.get("x-amz-credential")!
+		const scope = split(credential, "/")
+		if (scope.length != 5 || scope[0] == "" || scope[4] != "aws4_request") {
+			throw new Fault(400, "InvalidArgument",
+				"Invalid credential: the scope is not key/date/region/service/aws4_request", true,
+				member("ArgumentName", "x-amz-credential") + member("ArgumentValue", credential))
+		}
+		auth.accessKey = scope[0]
+		auth.date = scope[1]
+		auth.region = scope[2]
+		auth.service = scope[3]
+		auth.signature = form.get("x-amz-signature")!
+	} else {
+		auth.version = 2
+		auth.accessKey = form.get("awsaccesskeyid")!
+		auth.signature = form.get("signature")!
+	}
+	const global = caller.global()
+	const known = credentials(global).get(auth.accessKey)
+	if (known != null) {
+		const token = form.get("x-amz-security-token") ?? ""
+		if (known.status != "Active" || known.token != "" && token == "") {
+			throw new Fault(403, "InvalidAccessKeyId",
+				"The AWS Access Key Id you provided does not exist in our records.", true,
+				member("AWSAccessKeyId", auth.accessKey))
+		}
+		if (token != known.token) {
+			throw new Fault(400, "InvalidToken", "The provided token is malformed or otherwise invalid.", true,
+				member("Token-0", token))
+		}
+		if (known.expiry != 0 && now() >= known.expiry) {
+			throw new Fault(400, "ExpiredToken", "The provided token has expired.", true, member("Token-0", token))
+		}
+		try {
+			const ok = if (v4) equal(hex.encode(hmacSha256(sigv4.key(auth, known.secret), policy)), auth.signature)
+				else equal(base64.encode(hmacSha1(known.secret, policy)), auth.signature)
+			if (!ok) {
+				throw sigv4.mismatch(auth, policy, [])
+			}
+		} catch (e: CryptoError) {
+			throw new Fault(500, "InternalError", e.what)
+		}
+		use(global, auth.accessKey, known, "s3", if (v4) auth.region else caller.region, now())
+	}
+	caller.account = known?.account ?? accountOf(auth.accessKey)
+	caller.arn = known?.arn ?? `arn:aws:iam::${caller.account}:root`
+	caller.userId = known?.userId ?? caller.account
+	caller.credential = known
+	if (v4) {
+		caller.region = auth.region
+	}
+}
+
+/// Whether the form signs by the fields named, as S3 spells them: true once it has them all, false if it has none.
+function signed(form: Form, names: string[]): bool throws Fault {
+	if (!names.some(n => form.get(lower(n)) != null)) {
+		return false
+	}
+	for (const n of names) {
+		if (form.get(lower(n)) == null) {
+			throw required(n)
+		}
+	}
+	return true
+}
+
+/// A policy's conditions, each an operation, its field, lowercased, as given and its values, once it is in force.
+class Condition {
+	operation = ""
+	field = ""
+	given = ""
+	values: string[] = []
+	/// As S3 shows one that fails.
+	shown = ""
+}
+
+/// The conditions of the base64 policy, which must not have expired.
+function decoded(policy: string): Condition[] throws Fault {
+	let doc: json.Keys | null = null
+	try {
+		doc = json.decode[json.Keys](base64.decode(replace(replace(policy, "\r", ""), "\n", "")))
+	} catch (e: ParseError) {
+		throw invalid("Invalid JSON.")
+	}
+	const expiration = doc!.all.filter(e => e[0] == "expiration")
+	const conditions = doc!.all.filter(e => e[0] == "conditions")
+	if (expiration.length == 0) {
+		throw invalid("Policy missing expiration.")
+	}
+	if (conditions.length == 0) {
+		throw invalid("Policy missing conditions.")
+	}
+	const raw = expiration[0][1].text
+	let at: i64 | null = null
+	try {
+		const s = json.decode[string](raw)
+		if (s.length > 10 && s[10] == 0x54) {
+			at = parseRfc3339(s)
+		}
+	} catch (e: ParseError) {}
+	if (at == null) {
+		throw invalid(`Invalid 'expiration' value: '${scalar(raw)}'`)
+	}
+	if (now() >= at!) {
+		throw new Fault(403, "AccessDenied", "Invalid according to Policy: Policy expired.")
+	}
+	const out: Condition[] = []
+	try {
+		for (const c of json.decode[json.Raw[]](conditions[0][1].text)) {
+			out.push(condition(c.text))
+		}
+	} catch (e: ParseError) {
+		throw invalid("Invalid 'conditions' value: must be a List.")
+	}
+	return out
+}
+
+/// The condition the JSON text is: an object of one field and its value, or an array of an operation and its operands.
+function condition(text: string): Condition throws Fault | ParseError {
+	const c = new Condition()
+	if (startsWith(trim(text), "{")) {
+		const pairs = json.decode[json.Keys](text).all
+		if (pairs.length != 1) {
+			throw invalid("Invalid Simple-Condition: Simple-Conditions must have exactly one property specified.")
+		}
+		c.operation = "eq"
+		c.given = pairs[0][0]
+		c.field = lower(c.given)
+		c.values = [scalar(pairs[0][1].text)]
+		c.shown = `["eq", ${json.quoted(`$${c.given}`)}, ${pairs[0][1].text}]`
+		return c
+	}
+	const items = json.decode[json.Raw[]](text)
+	c.shown = `[${items.map(i => i.text).join(", ")}]`
+	if (items.length == 0) {
+		throw invalid(`Invalid Condition: ${c.shown}`)
+	}
+	c.operation = lower(scalar(items[0].text))
+	c.values = items.slice(1, items.length).map(i => scalar(i.text))
+	if (c.operation == "content-length-range") {
+		if (c.values.length != 2 || bound(c.values[0]) == null || bound(c.values[1]) == null) {
+			throw invalid(`Invalid content-length-range: ${c.shown}`)
+		}
+		return c
+	}
+	if (c.operation != "eq" && c.operation != "starts-with" || c.values.length != 2 || !startsWith(c.values[0], "$")) {
+		throw invalid(`Invalid Condition: ${c.shown}`)
+	}
+	c.given = c.values[0].slice(1, c.values[0].length)
+	c.field = lower(c.given)
+	c.values = [c.values[1]]
+	return c
+}
+
+/// A JSON string's value, or the text of any other value, as a number.
+function scalar(text: string): string {
+	try {
+		return json.decode[string](text)
+	} catch (e: ParseError) {
+		return trim(text)
+	}
+}
+
+/// A content-length-range's bound: a whole number of bytes, from 0.
+function bound(s: string): i64 | null {
+	try {
+		const n = parseInt[i64](s)
+		return if (n < 0) null else n
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function invalid(why: string): Fault { return new Fault(400, "InvalidPolicyDocument", `Invalid Policy: ${why}`) }
+
+/// Throws unless the form for bucket, of a file of size bytes, meets every condition and has no field none names.
+function check(form: Form, conditions: Condition[], bucket: string, size: i64) throws Fault {
+	for (const c of conditions) {
+		if (c.operation == "content-length-range") {
+			const [low, high] = [bound(c.values[0])!, bound(c.values[1])!]
+			if (size < low) {
+				throw new Fault(400, "EntityTooSmall", "Your proposed upload is smaller than the minimum allowed size",
+					true, member("ProposedSize", `${size}`) + member("MinSizeAllowed", `${low}`))
+			}
+			if (size > high) {
+				throw new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
+					member("ProposedSize", `${size}`) + member("MaxSizeAllowed", `${high}`))
+			}
+			continue
+		}
+		const value = if (c.field == "bucket") bucket else form.get(c.field) ?? ""
+		const wanted = c.values[0]
+		// each of a Content-Type's values separated by commas must start so
+		const ok = if (c.operation == "eq") value == wanted
+			else if (c.field == "content-type") split(value, ",").every(v => startsWith(trim(v), wanted))
+			else startsWith(value, wanted)
+		if (!ok) {
+			throw new Fault(403, "AccessDenied", `Invalid according to Policy: Policy Condition failed: ${c.shown}`)
+		}
+	}
+	const extra = form.fields.filter(f => !exempt.includes(f.name) && !startsWith(f.name, "x-ignore-")
+		&& !conditions.some(c => c.field == f.name))
+	if (extra.length > 0) {
+		throw new Fault(403, "AccessDenied",
+			`Invalid according to Policy: Extra input fields: ${extra.map(f => f.given).join(", ")}`)
+	}
+}
+
+function putting(bucket: string, key: string, data: string): Request throws Fault {
+	try {
+		return new Request("PUT", `http://localhost/${bucket}/${path(key)}`, data)
+	} catch (e: ParseError) {
+		throw new Fault(500, "InternalError", "We encountered an internal error. Please try again.")
+	}
+}
+
+/// key as a URL's path names it, its slashes kept.
+function path(key: string): string { return split(key, "/").map(s => escape(s, "component")).join("/") }
+
+/// The tags of a form's tagging field, the XML of a PutObjectTagging, as x-amz-tagging gives them.
+function tags(tagging: string): string throws Fault {
+	const malformed = new Fault(400, "MalformedXML",
+		"The XML you provided was not well-formed or did not validate against our published schema")
+	let doc: xml.Node | null = null
+	try {
+		doc = xml.parse(tagging)
+	} catch (e: ParseError) {
+		throw malformed
+	}
+	const root = elements(doc!, "Tagging")
+	const set = if (root.length == 1) elements(root[0], "TagSet") else []
+	if (set.length != 1) {
+		throw malformed
+	}
+	const out: string[] = []
+	for (const t of elements(set[0], "Tag")) {
+		const k = elements(t, "Key")
+		const v = elements(t, "Value")
+		if (k.length != 1 || v.length > 1) {
+			throw malformed
+		}
+		out.push(`${escape(text(k[0]), "form")}=${escape(if (v.length == 0) "" else text(v[0]), "form")}`)
+	}
+	return out.join("&")
+}
+
+function elements(n: xml.Node, name: string): xml.Node[] {
+	return n.children.filter(c => c.kind == "element" && c.name == name)
+}
+
+function text(n: xml.Node): string { return n.children.filter(c => c.kind == "text").map(c => c.data).join("") }
+
+/// The URL of a success_action_redirect field, if S3 can read it as one: absolute, of http or https.
+function redirect(field: string | null): string | null {
+	if (field == null) {
+		return null
+	}
+	try {
+		const u = Url.parse(field!)
+		return if ((u.scheme == "http" || u.scheme == "https") && u.host != "") field else null
+	} catch (e: ParseError) {
+		return null
+	}
+}

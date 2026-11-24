@@ -90,7 +90,10 @@ export function text[T](v: T, tags: Type[], style: Style): string {
 		return ""
 	}
 	const s = format(v, tags, style.dates()) // a float's NaN and infinities as awsQuery has them too
-	if (style.pointed && (T == f64 || T == f32) && isFinite(v as f64) && indexOf(s, ".") < 0 && indexOf(s, "e") < 0) {
+	if (T.kind != "float") {
+		return s
+	}
+	if (style.pointed && isFinite(v as f64) && indexOf(s, ".") < 0 && indexOf(s, "e") < 0) {
 		return `${s}.0` // a whole number as AWS writes it
 	}
 	return s
@@ -234,7 +237,7 @@ export function read[T extends Decodable](el: Node, n: string, at: string, tags:
 function variant[T extends Decodable](el: Node, at: string, v: Violations): T throws Fault {
 	const set = el.children.filter(c => c.kind == "element")
 	for (const M of T.members) {
-		if (M.kind != "class") {
+		if (M.kind != "class" || M.fields.length == 0) {
 			continue
 		}
 		const n = tag(M.fields[0].tags, Name, M.fields[0].name)

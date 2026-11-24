@@ -7,6 +7,7 @@ import { uuid } from "./core/random"
 import { Runner } from "./services/lambda/runner"
 import { Catalog } from "./services/iam/catalog"
 import { stack } from "./stack"
+import { indexOf } from "std/algo"
 import { decode, help, Short } from "std/encoding/optarg"
 import { readFile } from "std/fs"
 import { Server } from "std/http"
@@ -84,6 +85,9 @@ function main(): i32 {
 	const runner = runnerOf(o)
 	const g = stack(catalog!, runner)
 	g.lenient = o.lenient
+	const local = o.host == "" || o.host == "0.0.0.0" || o.host == "::"
+	const named = if (local) "localhost" else if (indexOf(o.host, ":") >= 0) "[" + o.host + "]" else o.host
+	g.endpoint = `http://${named}:${o.port}`
 	try {
 		server.listen()
 		runner.sweep()

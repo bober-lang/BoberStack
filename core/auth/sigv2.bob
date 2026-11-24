@@ -61,14 +61,22 @@ export function signature(req: Request, auth: Authorization, secret: string): st
 	return base64.encode(hmacSha1(secret, stringToSign(req, auth)))
 }
 
-/// What SigV2 signs of req: its method, Content-MD5, Content-Type and Expires, its x-amz-* headers in order, with
-/// their values joined, and its resource: the bucket a host names, its path, and the subresources of its query.
+/// What SigV2 signs of req: its method, Content-MD5, Content-Type and Expires, its x-amz-* headers and query
+/// parameters in order, a header's values joined, and its resource: the bucket a host names, its path, and the
+/// subresources of its query.
 export function stringToSign(req: Request, auth: Authorization): string {
 	const amz: [string, string][] = []
 	for (const [k, v] of req.headers.entries) {
 		const name = lower(k)
 		if (startsWith(name, "x-amz-") && !amz.some(e => e[0] == name)) {
 			amz.push([name, req.headers.all(name).map(trim).join(",")])
+		}
+	}
+	// A presigned URL carries the x-amz-* headers it signs, a session's token among them, in its query.
+	for (const [k, v] of req.url.query.entries) {
+		const name = lower(k)
+		if (startsWith(name, "x-amz-") && !amz.some(e => e[0] == name)) {
+			amz.push([name, trim(v)])
 		}
 	}
 	sortBy(amz, (a, b) => a[0] < b[0])

@@ -22,9 +22,12 @@ import { crc64nvme } from "../../core/hash/crc64nvme"
 import { Blob } from "../../core/state/store"
 import { decryptAs, encryptAs, sealer } from "../kms/kms"
 import * as api from "./api"
-import { arn, authorize, bucketPolicy, Found, found, member, noSuchBucket, noSuchKey, owner } from "./common"
+import { post, posted } from "./post"
 
-import { acl, Config, exposed, forget, lockable, locking, mfaDelete, preflight, publicPolicy, settings,
+import { arn, authorize, bucketPolicy, existing, Found, found, member, noSuchBucket, noSuchKey, owner, requested,
+	units } from "./common"
+
+import { acl, Config, exposed, forget, lockable, locking, mfaDelete, own, preflight, publicPolicy, settings,
 	versioned } from "./config"
 
 import { blob, body, Bucket, drop, keep, Part, part, path, Place, places, read, save, share, Tables, Upload, version,
@@ -63,6 +66,10 @@ export class Handler {
 	typed: string | null = null
 	/// The version id the answer being made names where S3's model has no member for it.
 	versionId: string | null = null
+	/// Whether the PutObject being answered writes a form's upload, whose event S3 names as a POST's.
+	posting = false
+	/// The x-amz-server-side-encryption header of the request being answered, which S3's reads have no member for.
+	declared: string | null = null
 
 	createBucket(caller: Caller, input: api.CreateBucketRequest): api.CreateBucketOutput throws Fault {
 		const name = input.Bucket
@@ -95,11 +102,18 @@ export class Handler {
 			caller.actions.append(["s3:PutBucketObjectLockConfiguration", "s3:PutBucketVersioning"])
 		}
 		const initial = input.CreateBucketConfiguration?.Tags ?? []
-		const tagged = if (initial.length == 0) null else tags(initial)
+		const tagged = if (initial.length == 0) null else tags(initial, 50)
 		if (tagged != null) {
 			caller.actions.push("s3:TagResource")
 		}
 		caller.allow(arn(name), null, requestTags(tagged ?? []), `"${arn(name)}"`)
+		const granted = [input.GrantRead, input.GrantWrite, input.GrantReadACP,
+			input.GrantWriteACP].some(g => g != null)
+		if ((input.ObjectOwnership ?? "BucketOwnerEnforced") == "BucketOwnerEnforced"
+			&& (input.ACL != null && input.ACL != "private" || granted)) {
+			throw new Fault(400, "InvalidBucketAclWithObjectOwnership",
+				"Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting")
+		}
 		const home = given ?? "us-east-1"
 		if (there != null) {
 			if (there.account != caller.account) {
@@ -119,7 +133,11 @@ export class Handler {
 			all.put(name, { ...new Place(), account: caller.account, region: home, created: t - t % second })
 			const b = { ...new Bucket(), name: name, owner: caller.account, region: home, created: t - t % second,
 				versioning: if (locked) "Enabled" else "", locked: locked, tags: tagged }
-			(new Tables(caller.tree(`${caller.account}/${home}`)).buckets).put(name, b)
+			const db = new Tables(caller.tree(`${caller.account}/${home}`))
+			db.buckets.put(name, b)
+			if (input.ObjectOwnership != null) {
+				own(new Found(db, b), input.ObjectOwnership!)
+			}
 		}
 		const r = new api.CreateBucketOutput()
 		r.Location = if (home == "us-east-1") `/${name}` else `http://${name}.s3.amazonaws.com/`
@@ -197,7 +215,8 @@ export class Handler {
 		if (input.Tagging != null) {
 			caller.actions.push("s3:PutObjectTagging")
 		}
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			[...encryption(input), ...requested(given(input.Tagging))])
 		acl(f, if (input.ACL == null) null else `${input.ACL!}`)
 		const data = input.Body
 		digest(input.ContentMD5, data)
@@ -243,7 +262,7 @@ export class Handler {
 		retain(f, v, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 		encrypt(caller, f, v, input)
 		const k = write(caller, f, v, data)
-		this.notify(caller, f, "ObjectCreated:Put", v)
+		this.notify(caller, f, if (this.posting) "ObjectCreated:Post" else "ObjectCreated:Put", v)
 		const r = new api.PutObjectOutput()
 		r.ETag = v.etag
 		encrypted(r, v)
@@ -257,14 +276,17 @@ export class Handler {
 
 	getObject(caller: Caller, input: api.GetObjectRequest): api.GetObjectOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:GetObject" else "s3:GetObjectVersion"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		const v = object(f, input.Key, input.VersionId)
+		undeclared(this.declared, v)
 		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
 		decrypt(caller, input.Bucket, v, input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
 			true)
 		const k = version(input.Bucket, v.key, v.order)
 		const r = new api.GetObjectOutput()
 		described(r, f.bucket, v)
+		locks(caller, f, r, v)
 		const range = this.selected(r, v, input.Range, input.PartNumber)
 		const [at, n] = range ?? [0 as i64, v.size]
 		if (range == null && input.ChecksumMode != null) {
@@ -291,13 +313,16 @@ export class Handler {
 
 	headObject(caller: Caller, input: api.HeadObjectRequest): api.HeadObjectOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:GetObject" else "s3:GetObjectVersion"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		const v = object(f, input.Key, input.VersionId)
+		undeclared(this.declared, v)
 		conditions(v, input.IfMatch, input.IfNoneMatch, input.IfModifiedSince, input.IfUnmodifiedSince)
 		decrypt(caller, input.Bucket, v, input.SSECustomerAlgorithm, input.SSECustomerKey, input.SSECustomerKeyMD5,
 			false)
 		const r = new api.HeadObjectOutput()
 		described(r, f.bucket, v)
+		locks(caller, f, r, v)
 		const range = this.selected(r, v, input.Range, input.PartNumber)
 		const [at, n] = range ?? [0 as i64, v.size]
 		if (range == null && input.ChecksumMode != null) {
@@ -435,7 +460,10 @@ export class Handler {
 		if (input.TaggingDirective == "REPLACE" && input.Tagging != null) {
 			caller.actions.push("s3:PutObjectTagging")
 		}
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const replaced = if (input.TaggingDirective == "REPLACE") given(input.Tagging) else []
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			[...encryption(input), ...requested(replaced)])
+		acl(f, if (input.ACL == null) null else `${input.ACL!}`)
 		const directives: [string, string | null][] = [["x-amz-metadata-directive", input.MetadataDirective],
 			["x-amz-tagging-directive", input.TaggingDirective]]
 		for (const [h, d] of directives) {
@@ -511,7 +539,9 @@ export class Handler {
 		if (input.Tagging != null) {
 			caller.actions.push("s3:PutObjectTagging")
 		}
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			[...encryption(input), ...requested(given(input.Tagging))])
+		acl(f, if (input.ACL == null) null else `${input.ACL!}`)
 		const u = new Upload()
 		u.id = random(64)
 		u.key = input.Key
@@ -905,7 +935,9 @@ export class Handler {
 
 	putObjectTagging(caller: Caller, input: api.PutObjectTaggingRequest): api.PutObjectTaggingOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:PutObjectTagging" else "s3:PutObjectVersionTagging"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			[...existing(caller, input.Bucket, input.Key, input.VersionId),
+			...requested(input.Tagging.TagSet.map(t => [t.Key, t.Value] as [string, string]))])
 		const v = object(f, input.Key, input.VersionId)
 		v.tags = tags(input.Tagging.TagSet)
 		retag(f, v)
@@ -914,7 +946,8 @@ export class Handler {
 
 	getObjectTagging(caller: Caller, input: api.GetObjectTaggingRequest): api.GetObjectTaggingOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:GetObjectTagging" else "s3:GetObjectVersionTagging"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		const v = object(f, input.Key, input.VersionId)
 		this.typed = ""
 		return { ...new api.GetObjectTaggingOutput(), VersionId: versionOf(f.bucket, v), TagSet: tagSet(v.tags) }
@@ -923,7 +956,8 @@ export class Handler {
 	deleteObjectTagging(caller: Caller,
 		input: api.DeleteObjectTaggingRequest): api.DeleteObjectTaggingOutput throws Fault {
 		caller.actions = [if (input.VersionId == null) "s3:DeleteObjectTagging" else "s3:DeleteObjectVersionTagging"]
-		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key))
+		const f = found(caller, input.Bucket, input.ExpectedBucketOwner, arn(input.Bucket, input.Key),
+			existing(caller, input.Bucket, input.Key, input.VersionId))
 		const v = object(f, input.Key, input.VersionId)
 		v.tags = []
 		retag(f, v)
@@ -1069,7 +1103,7 @@ export class Handler {
 	putBucketTagging(caller: Caller, input: api.PutBucketTaggingRequest): Unit throws Fault {
 		caller.actions = ["s3:PutBucketTagging"]
 		const f = found(caller, input.Bucket, input.ExpectedBucketOwner)
-		f.bucket.tags = tags(input.Tagging.TagSet)
+		f.bucket.tags = tags(input.Tagging.TagSet, 50)
 		f.db.buckets.put(input.Bucket, f.bucket)
 		return new Unit()
 	}
@@ -1207,17 +1241,30 @@ function retag(f: Found, v: Version) throws Fault {
 	restore(f.db, f.bucket.name, v.key)
 }
 
-function tags(set: api.Tag[]): [string, string][] throws Fault {
+/// The tags of set, of an object unless most says a bucket's 50.
+function tags(set: api.Tag[], most = 10): [string, string][] throws Fault {
+	return bounded(set.map(t => [t.Key, t.Value] as [string, string]), most)
+}
+
+function bounded(given: [string, string][], most: i32): [string, string][] throws Fault {
 	const out: [string, string][] = []
-	for (const t of set) {
-		if (out.some(o => o[0] == t.Key)) {
+	for (const [k, v] of given) {
+		if (out.some(o => o[0] == k)) {
 			throw new Fault(400, "InvalidTag", "Cannot provide multiple Tags with the same key", true,
-				member("TagKey", t.Key))
+				member("TagKey", k))
 		}
-		out.push([t.Key, t.Value])
+		if (units(k) > 128) {
+			throw new Fault(400, "InvalidTag", "The TagKey you have provided is too long, max 128", true,
+				member("TagKey", k))
+		}
+		if (units(v) > 256) {
+			throw new Fault(400, "InvalidTag", "The TagValue you have provided is too long, max 256", true,
+				member("TagKey", k) + member("TagValue", v))
+		}
+		out.push([k, v])
 	}
-	if (out.length > 50) {
-		throw new Fault(400, "BadRequest", "Object tags cannot be greater than 50")
+	if (out.length > most) {
+		throw new Fault(400, "BadRequest", `Object tags cannot be greater than ${most}`)
 	}
 	return out
 }
@@ -1246,7 +1293,17 @@ export function serve(h: Handler, caller: Caller, req: Request): Response throws
 	try {
 		region = if (listed == "") null else regionOf(caller, listed)
 		screen(req)
-		res = api.handle(h, caller, req)
+		h.declared = req.headers.get("x-amz-server-side-encryption")
+		if (posted(req)) {
+			h.posting = true
+			try {
+				res = post(caller, req, r => api.handle(h, caller, r))
+			} finally {
+				h.posting = false
+			}
+		} else {
+			res = api.handle(h, caller, req)
+		}
 	} catch (f: Fault) {
 		res = restxml.error(api.service, f, caller.requestId)
 	}
@@ -1311,7 +1368,7 @@ function regionOf(caller: Caller, name: string): string | null throws Fault {
 /// Throws what S3 answers req with before its operation's; drops the conditional headers whose dates S3 cannot read,
 /// as it ignores them.
 function screen(req: Request) throws Fault | IoError {
-	const body = req.body.text()
+	const body = req.body.whole ?? req.body.text()
 	const claimed = req.headers.get("x-amz-content-sha256")
 	let hexed = claimed != null && claimed!.length == 64
 	try {
@@ -1396,6 +1453,26 @@ export function address(req: Request) {
 	if (bucket != "") {
 		req.url.path = `/${bucket}${req.url.path}`
 	}
+}
+
+interface Encrypting {
+	ServerSideEncryption: string | null
+	SSEKMSKeyId: string | null
+	SSECustomerAlgorithm: string | null
+}
+
+/// The condition keys of a write's encryption headers, which bucket policies test to refuse unencrypted writes.
+function encryption(w: Encrypting): Context {
+	const c: Context = []
+	const named: [string, string | null][] = [["s3:x-amz-server-side-encryption", w.ServerSideEncryption],
+		["s3:x-amz-server-side-encryption-aws-kms-key-id", w.SSEKMSKeyId],
+		["s3:x-amz-server-side-encryption-customer-algorithm", w.SSECustomerAlgorithm]]
+	for (const [k, v] of named) {
+		if (v != null) {
+			c.push([k, v!])
+		}
+	}
+	return c
 }
 
 function listing(prefix: string | null, delimiter: string | null, max: i32 | null): Context {
@@ -1667,7 +1744,17 @@ function source(s: string): [string, string, string | null] throws Fault {
 	return [rest.slice(0, slash), rest.slice(slash + 1, rest.length), id]
 }
 
-function tagging(header: string | null): [string, string][] {
+/// Refuses a read that names an encryption, as S3 does of an object it encrypted itself.
+function undeclared(declared: string | null, v: Version) throws Fault {
+	if (declared != null && v.sse != "") {
+		throw new Fault(400, "InvalidArgument",
+			"x-amz-server-side-encryption header is not supported for this operation.")
+	}
+}
+
+function tagging(header: string | null): [string, string][] throws Fault { return bounded(given(header), 10) }
+
+function given(header: string | null): [string, string][] {
 	return if (header == null) [] else Query.parse(header!).entries
 }
 
@@ -1902,6 +1989,35 @@ function described(r: Described, b: Bucket, v: Version) {
 	r.TagCount = if (v.tags.length == 0) null else v.tags.length
 }
 
+interface Locks {
+	ObjectLockMode: string | null
+	ObjectLockRetainUntilDate: i64 | null
+	ObjectLockLegalHoldStatus: string | null
+}
+
+/// Sets v's retention and legal hold on r, each only for a caller allowed to read it, as AWS shows them.
+function locks(caller: Caller, f: Found, r: Locks, v: Version) {
+	const actions = caller.actions
+	if (v.mode != null && may(caller, f, v.key, "s3:GetObjectRetention")) {
+		r.ObjectLockMode = v.mode
+		r.ObjectLockRetainUntilDate = v.until
+	}
+	if (v.hold != null && may(caller, f, v.key, "s3:GetObjectLegalHold")) {
+		r.ObjectLockLegalHoldStatus = v.hold
+	}
+	caller.actions = actions
+}
+
+function may(caller: Caller, f: Found, key: string, action: string): bool {
+	caller.actions = [action]
+	try {
+		authorize(caller, f.bucket, arn(f.bucket.name, key))
+		return true
+	} catch (e: Fault) {
+		return false
+	}
+}
+
 function keys(max: i32 | null): i32 throws Fault {
 	if (max != null && max! < 0) {
 		throw new Fault(400, "InvalidArgument", "Argument maxKeys must be an integer between 0 and 2147483647", true,
@@ -1939,6 +2055,11 @@ function list(db: Tables, bucket: string, prefix: string, delimiter: string, aft
 			const rest = v.key.slice(prefix.length, v.key.length)
 			const d = if (delimiter == "") -1 else indexOf(rest, delimiter)
 			const cp = if (d < 0) "" else prefix + rest.slice(0, d + delimiter.length)
+			if (cp != "" && cp == after) {
+				// a page that ended on a common prefix resumes past its keys
+				from = path(bucket, cp) + fromBytes([0xff as u8])
+				break
+			}
 			if (cp != "" && cp == l.last) {
 				continue
 			}

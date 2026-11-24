@@ -2,7 +2,8 @@
 //! of zip functions run by ./runner in containers of Lambda's public images.
 //!
 //! A synchronous Invoke holds its request until the function answers, the gateway running it again after each change;
-//! the run that finds the invocation done answers it. An asynchronous one is queued in the store and run at the tick,
+//! the run that finds the invocation done answers it. A request to a function URL is invoked so too, its event and
+//! response as ./urls maps them. An asynchronous one is queued in the store and run at the tick,
 //! retried after one and then two minutes up to MaximumRetryAttempts, and dropped once older than
 //! MaximumEventAgeInSeconds; its record then goes to the destination of its outcome, and a failure to the dead-letter
 //! queue, as the function's role. An environment gets its role's credentials at the tick, as STS issues them to Lambda.
@@ -19,9 +20,12 @@
 //! - REPORT has no Max Memory Used. A function's logs are put at the tick, as its role, a second or so late.
 //! - The init phase may take 10 seconds plus the function's timeout. A throttled asynchronous invocation is tried again
 //!   after a second, doubling to five minutes. Only reserved concurrency throttles.
-//! - Functions, mappings and provisioned concurrency are ready at once, and a mapping polls nothing. A function URL
-//!   serves nothing, and responses do not stream. The Extensions and Telemetry APIs are not served, and SnapStart is
-//!   stored only. Layers are of the function's account and region; code signing is never set.
+//! - Functions, mappings and provisioned concurrency are ready at once, and a mapping polls nothing. Responses do not
+//!   stream, a function URL's of RESPONSE_STREAM neither. The Extensions and Telemetry APIs are not served, and
+//!   SnapStart is stored only. Layers are of the function's account and region; code signing is never set.
+//! - A function URL is <id>.lambda-url.<region>.localhost on this server's scheme and port, not on.aws; a request is
+//!   its URL's by those leading labels of its Host, whatever follows, or by a path under /_aws/lambda-url/<id>/ on any
+//!   host. Its event's sourceIp is the first of X-Forwarded-For, else 127.0.0.1, as the server is not told its peer.
 
 import { Fault } from "../../core/fault"
 import { random, uuid } from "../../core/random"
@@ -42,6 +46,7 @@ import { Credentials } from "../sts/api"
 import { actAs, passRole, session } from "../sts/sts"
 import * as api from "./api"
 import * as running from "./runner"
+import * as urls from "./urls"
 import { indexOf, lastIndexOf, startsWith } from "std/algo"
 import { CryptoError } from "std/crypto/error"
 import { sha256 } from "std/crypto/hash"
@@ -49,7 +54,8 @@ import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
 import { EncodeError } from "std/encoding/json"
-import { formatInt, ParseError, replace, split } from "std/string"
+import { Request, Response } from "std/http"
+import { formatInt, lower, ParseError, replace, split } from "std/string"
 import { millisecond, minute, rfc3339, second } from "std/time"
 import { Decodable } from "std/types"
 
@@ -150,6 +156,15 @@ class Url {
 	mode: api.InvokeMode = "BUFFERED"
 	created = ""
 	modified = ""
+}
+
+/// Where a function URL is, by its id in the global tree, as a request to it names only the id.
+class UrlOwner {
+	account = ""
+	region = ""
+	name = ""
+	/// "" for the unqualified function's.
+	qualifier = ""
 }
 
 class Alias {
@@ -418,8 +433,9 @@ export class Handler {
 		for (const [k, _] of db.policies.scan(null, 100000, `${t.name}:`)) {
 			db.policies.delete(k)
 		}
-		for (const [k, _] of db.urls.scan(null, 100000, `${t.name}:`)) {
+		for (const [k, u] of db.urls.scan(null, 100000, `${t.name}:`)) {
 			db.urls.delete(k)
+			owners(caller).delete(u.id)
 		}
 		for (const [k, _] of db.provisioned.scan(null, 100000, `${t.name}:`)) {
 			db.provisioned.delete(k)
@@ -507,7 +523,11 @@ export class Handler {
 			resourceTags(db.functions.get(t.name)?.tags ?? []))
 		db.aliases.delete(`${t.name}:${input.Name}`)
 		db.policies.delete(`${t.name}:${input.Name}`)
-		db.urls.delete(`${t.name}:${input.Name}`)
+		const u = db.urls.get(`${t.name}:${input.Name}`)
+		if (u != null) {
+			db.urls.delete(`${t.name}:${input.Name}`)
+			owners(caller).delete(u!.id)
+		}
 		return new Unit()
 	}
 
@@ -967,6 +987,9 @@ export class Handler {
 		u.created = stamp()
 		u.modified = u.created
 		db.urls.put(k, u)
+		owners(caller).put(u.id,
+			{ ...new UrlOwner(), account: caller.account, region: caller.region, name: t.name,
+			qualifier: t.qualifier ?? "" })
 		const c = urlOf(caller, t, u)
 		return { ...new api.CreateFunctionUrlConfigResponse(), FunctionUrl: c.FunctionUrl, FunctionArn: c.FunctionArn,
 			AuthType: c.AuthType, Cors: c.Cors, CreationTime: c.CreationTime, InvokeMode: c.InvokeMode }
@@ -998,7 +1021,7 @@ export class Handler {
 
 	deleteFunctionUrlConfig(caller: Caller, input: api.DeleteFunctionUrlConfigRequest): Unit throws Fault {
 		const t = target(caller, input.FunctionName, input.Qualifier)
-		url(caller, t)
+		owners(caller).delete(url(caller, t).id)
 		new Tables(caller).urls.delete(`${t.name}:${t.qualifier ?? ""}`)
 		return new Unit()
 	}
@@ -1148,36 +1171,104 @@ export class Handler {
 			r.StatusCode = 202
 			return r
 		}
-		const k = `${caller.requestId}#${caller.call()}`
-		const found = this.runner?.find(k) ?? null
-		if (found != null) {
-			if (found!.state != "done") {
-				caller.hold(now() + minute)
-				throw pending()
+		return answered(this.awaited(caller, db, t, v, payload, context, null), input.LogType)
+	}
+
+	/// Answers a request to the function URL of id at path as Lambda's front end does: a CORS preflight by the URL's
+	/// configuration, anything else by invoking its function or alias as Invoke does, if its auth type and policies let
+	/// the caller, and mapping the result.
+	functionUrl(caller: Caller, req: Request, id: string, path: string): Response {
+		const requestId = caller.requestId
+		let o: UrlOwner | null = null
+		try {
+			o = owners(caller).get(id)
+		} catch (f: Fault) {
+			return urls.refusal(f.status, f.code, f.message, requestId)
+		}
+		const host = lower(req.headers.get("host") ?? "")
+		if (o == null
+			|| (startsWith(host, `${id}.lambda-url.`) && !startsWith(host, `${id}.lambda-url.${o!.region}.`))) {
+			return urls.refusal(403, "AccessDeniedException", "Forbidden", requestId)
+		}
+		const owner = caller.internal(`arn:aws:iam::${o!.account}:root`, "", [])
+		owner.account = o!.account
+		owner.region = o!.region
+		const t = { ...new Target(), name: o!.name, qualifier: if (o!.qualifier == "") null else o!.qualifier }
+		try {
+			const db = new Tables(owner)
+			const u = db.urls.get(`${t.name}:${o!.qualifier}`)
+			if (u == null) {
+				return urls.refusal(403, "AccessDeniedException", "Forbidden", requestId)
 			}
-			return answered(found!, input.LogType)
+			const origin = req.headers.get("origin")
+			const cors = u!.cors
+			if (cors != null && origin != null && req.method == "OPTIONS"
+				&& req.headers.has("access-control-request-method")) {
+				const res = urls.preflight(cors!, origin!)
+				res.headers.set("x-amzn-requestid", requestId)
+				return res
+			}
+			const signed = caller.account != ""
+			if (u!.auth == "AWS_IAM" && !signed) {
+				return urls.refusal(403, "AccessDeniedException", "Forbidden", requestId)
+			}
+			if (u!.auth == "AWS_IAM" && caller.region != o!.region) {
+				return urls.refusal(403, "InvalidSignatureException",
+					`Credential should be scoped to a valid region, not '${caller.region}'.`, requestId)
+			}
+			const iam = if (u!.auth == "AWS_IAM") urls.signer(caller, req) else null
+			if (u!.auth == "NONE") {
+				// The URL is public: a signature, if any, names no one its policy is evaluated for.
+				caller.account = ""
+				caller.arn = "*"
+				caller.userId = "anonymous"
+			}
+			const resource = arn(owner, t.name, t.qualifier)
+			const p = policy(db, t.name, t.qualifier)
+			const tags = resourceTags(db.functions.get(t.name)?.tags ?? [])
+			try {
+				caller.actions = ["lambda:InvokeFunctionUrl"]
+				caller.allow(resource, p, [...tags, ["lambda:FunctionUrlAuthType", u!.auth]])
+				caller.actions = ["lambda:InvokeFunction"]
+				caller.allow(resource, p, [...tags, ["lambda:InvokedViaFunctionUrl", "true"]])
+			} catch (f: Fault) {
+				return urls.refusal(403, "AccessDeniedException",
+					"Forbidden. For troubleshooting Function URL "
+					+ "authorization issues, see: https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html",
+					requestId)
+			}
+			const v = version(owner, db, t)
+			const trace = traced()
+			const payload = urls.event(req, id, path, o!.account, o!.region, requestId, caller.arrived, trace, iam)
+			if ((payload.length as i64) > 6291456) {
+				return urls.refusal(413, "RequestTooLargeException",
+					"Request must be smaller than 6291456 bytes for the InvokeFunction operation", requestId)
+			}
+			let inv: running.Invocation | null = null
+			try {
+				inv = this.awaited(owner, db, t, v, payload, null, trace)
+			} catch (f: Fault) {
+				if (caller.holding() || f.status == 429) {
+					throw f
+				}
+				return urls.refusal(502, "ServiceException", "Internal Server Error", requestId)
+			}
+			let res = if (inv!.result!.error != null) null else urls.response(inv!.result!.payload)
+			if (res == null) {
+				res = new Response(502, "Internal Server Error")
+				res!.headers.set("content-type", "application/json")
+			}
+			res!.headers.set("x-amzn-requestid", requestId)
+			if (inv!.job.trace != "") {
+				res!.headers.set("x-amzn-trace-id", inv!.job.trace)
+			}
+			if (cors != null && origin != null) {
+				urls.cors(res!, cors!, origin!)
+			}
+			return res!
+		} catch (f: Fault) {
+			return urls.refusal(f.status, f.code, f.message, requestId)
 		}
-		if (caller.holding()) {
-			throw pending()
-		}
-		const chosen = routed(caller, db, t, v)
-		r.ExecutedVersion = chosen.version
-		const refused = this.refused(caller, db, chosen)
-		if (refused != null) {
-			r.StatusCode = 200
-			r.FunctionError = "Unhandled"
-			r.Payload = refused!
-			return r
-		}
-		if (!caller.rerun) {
-			throw api.serviceException("A synchronous invocation cannot wait for its function here: it was made between "
-				+ "requests, which are not run again.")
-		}
-		const j = this.job(caller, db, t, chosen, payload, context)
-		j.id = if (k == `${caller.requestId}#1`) caller.requestId else uuid()
-		this.runner!.submit(k, j)
-		caller.hold(now() + minute)
-		throw pending()
 	}
 
 	invokeAsync(caller: Caller, input: api.InvokeAsyncRequest): api.InvokeAsyncResponse throws Fault {
@@ -1217,6 +1308,44 @@ export class Handler {
 			}
 		}
 		runner!.reap(t)
+	}
+
+	/// The synchronous invocation of t done, or one refused that did not run: it holds the request until the runner has
+	/// the result, which a run of it after finds by the request and the number of the call.
+	private awaited(caller: Caller, db: Tables, t: Target, v: Version, payload: string, context: string | null,
+		trace: string | null): running.Invocation throws Fault {
+		const k = `${caller.requestId}#${caller.call()}`
+		const found = this.runner?.find(k) ?? null
+		if (found != null) {
+			if (found!.state != "done") {
+				caller.hold(now() + minute)
+				throw pending()
+			}
+			return found!
+		}
+		if (caller.holding()) {
+			throw pending()
+		}
+		const chosen = routed(caller, db, t, v)
+		const refused = this.refused(caller, db, chosen)
+		if (refused != null) {
+			const j = new running.Job()
+			j.config.version = chosen.version
+			const inv = new running.Invocation(k, j)
+			inv.state = "done"
+			inv.result = { ...new running.Result(), payload: refused!, error: "Unhandled" }
+			return inv
+		}
+		if (!caller.rerun) {
+			throw api.serviceException("A synchronous invocation cannot wait for its function here: it was made between "
+				+ "requests, which are not run again.")
+		}
+		const j = this.job(caller, db, t, chosen, payload, context)
+		j.id = if (k == `${caller.requestId}#1`) caller.requestId else uuid()
+		j.trace = trace ?? j.trace
+		this.runner!.submit(k, j)
+		caller.hold(now() + minute)
+		throw pending()
 	}
 
 	/// Why v answers an invocation without running, as its payload, or null if it runs.
@@ -1288,8 +1417,7 @@ export class Handler {
 		j.config = c
 		j.payload = payload
 		j.context = context
-		j.trace = `Root=1-${formatInt(now() / second, 16)}-${hex.encode(random(12))};Parent=${hex.encode(random(8))};`
-			+ "Sampled=0"
+		j.trace = traced()
 		return j
 	}
 
@@ -1657,9 +1785,13 @@ function url(caller: Caller, t: Target): Url throws Fault {
 	return u!
 }
 
+function owners(caller: Caller): Table[UrlOwner] throws Fault {
+	return new Table[UrlOwner](caller.global(), "lambda.urlOwners")
+}
+
 function urlOf(caller: Caller, t: Target, u: Url): api.FunctionUrlConfig {
 	const c = new api.FunctionUrlConfig()
-	c.FunctionUrl = `https://${u.id}.lambda-url.${caller.region}.on.aws/`
+	c.FunctionUrl = urls.urlOn(caller.endpoint, u.id, caller.region)
 	c.FunctionArn = arn(caller, t.name, t.qualifier)
 	c.CreationTime = u.created
 	c.LastModifiedTime = u.modified
@@ -2044,6 +2176,9 @@ function statement(caller: Caller, input: api.AddPermissionRequest, on: string):
 	if (input.SourceArn != null) {
 		conditions.push(`"ArnLike":{"AWS:SourceArn":${json.quoted(input.SourceArn!)}}`)
 	}
+	if (input.InvokedViaFunctionUrl == true) {
+		conditions.push(`"Bool":{"lambda:InvokedViaFunctionUrl":"true"}`)
+	}
 	return `{"Sid":${json.quoted(input.StatementId)},"Effect":"Allow","Principal":${principal},`
 		+ `"Action":${json.quoted(input.Action)},"Resource":${json.quoted(on)}`
 		+ (if (conditions.length == 0) "" else `,"Condition":{${conditions.join(",")}}`) + "}"
@@ -2126,6 +2261,10 @@ function enqueue(caller: Caller, db: Tables, t: Target, payload: string, context
 	db.queue.put(`${q.enqueued}:${q.id}`, q)
 }
 
+function traced(): string throws Fault {
+	return `Root=1-${formatInt(now() / second, 16)}-${hex.encode(random(12))};Parent=${hex.encode(random(8))};Sampled=0`
+}
+
 /// What a request held answers, which the gateway does not send unless the hold runs out.
 function pending(): Fault { return api.serviceException("The function has not answered yet.") }
 
@@ -2135,7 +2274,7 @@ function answered(inv: running.Invocation, log: api.LogType | null): api.Invocat
 	r.ExecutedVersion = inv.job.config.version
 	r.Payload = inv.result!.payload
 	r.FunctionError = inv.result!.error
-	if (log == "Tail") {
+	if (log == "Tail" && inv.result!.log != "") {
 		r.LogResult = base64.encode(inv.result!.log)
 	}
 	return r
