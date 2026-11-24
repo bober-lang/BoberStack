@@ -6,9 +6,10 @@ import { Fault } from "./core/fault"
 import { uuid } from "./core/random"
 import { Runner } from "./services/lambda/runner"
 import { Catalog } from "./services/iam/catalog"
+import { Smtp } from "./services/ses/smtp"
 import { stack } from "./stack"
 import { indexOf } from "std/algo"
-import { decode, help, Short } from "std/encoding/optarg"
+import { decode, help, Name, Short } from "std/encoding/optarg"
 import { readFile } from "std/fs"
 import { Server } from "std/http"
 import { stderr } from "std/io"
@@ -35,6 +36,8 @@ class Options {
 	containers = ""
 	/// The seconds a function's environment is kept once idle.
 	idle: u32 = 300
+	/// The port to take mail on as SES's SMTP interface does, with STARTTLS given --cert; none if 0.
+	smtpPort: u16 @Name["smtp-port"] = 0
 	/// Print this help.
 	help: bool @Short["h"] = false
 }
@@ -83,13 +86,20 @@ function main(): i32 {
 		}
 	}
 	const runner = runnerOf(o)
-	const g = stack(catalog!, runner)
+	const smtp = if (o.smtpPort == 0) null else new Smtp()
+	const g = stack(catalog!, runner, smtp)
 	g.lenient = o.lenient
 	const local = o.host == "" || o.host == "0.0.0.0" || o.host == "::"
 	const named = if (local) "localhost" else if (indexOf(o.host, ":") >= 0) "[" + o.host + "]" else o.host
 	g.endpoint = `http://${named}:${o.port}`
 	try {
 		server.listen()
+		if (smtp != null) {
+			smtp!.addr = `${o.host}:${o.smtpPort}`
+			smtp!.tls = server.tls
+			smtp!.listen()
+			const mailing = async smtp!.serve()
+		}
 		runner.sweep()
 		// The line LocalStack prints once it serves, which the tools that start it wait for.
 		print("Ready.")

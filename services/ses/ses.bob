@@ -1,4 +1,5 @@
-//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state.
+//! Amazon Simple Email Service, its classic API (awsQuery) and v2 (restJson1) over one state, and its SMTP interface
+//! (smtp.bob) if served.
 //!
 //! An identity is verified at once, as nobody can follow a verification mail's link. Nothing is sent anywhere: each
 //! message is stored, as LocalStack's /_aws/ses lists it (core/internal), and delivered, or bounced or complained of
@@ -26,7 +27,7 @@ import * as base64 from "std/encoding/base64"
 import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
 import { min } from "std/math"
-import { ParseError, parseInt, replace, split, trim, utf8 } from "std/string"
+import { lower, ParseError, parseInt, replace, split, trim, utf8 } from "std/string"
 import { day, millisecond, rfc3339, second } from "std/time"
 import { Body, Request } from "std/http"
 
@@ -412,10 +413,19 @@ export class Handler {
 		if (source == null) {
 			throw new Fault(400, "InvalidParameterValue", "Missing required header 'From'.")
 		}
-		const s = sent(caller, source!, null, input.SourceArn)
+		const to = input.Destinations ?? []
+		if (to.length > 50) {
+			throw new Fault(400, "InvalidParameterValue", "Recipient count exceeds 50.")
+		}
+		let recipients: Recipients | null = null
+		if (to.length > 0) {
+			recipients = { ...new Recipients(), ToAddresses: to }
+		}
+		const s = sent(caller, source!, recipients, input.SourceArn)
 		s.RawData = data
 		const r = new api.SendRawEmailResponse()
-		r.MessageId = store(caller, s, input.ConfigurationSetName, this.sns)
+		const set = input.ConfigurationSetName ?? header(data, "X-SES-CONFIGURATION-SET")
+		r.MessageId = store(caller, s, set, this.sns)
 		return r
 	}
 
@@ -2098,14 +2108,16 @@ function addressOf(mailbox: string): string {
 	return if (open >= 0 && close > open) mailbox.slice(open + 1, close) else trim(mailbox)
 }
 
+/// The first header of the name, in any case, of the message's head alone, which a message of 40 MB has before its body.
 function header(data: string, name: string): string | null {
-	const lower = name + ":"
-	for (const line of split(replace(data, "\r\n", "\n"), "\n")) {
-		if (line == "") {
-			return null
-		}
-		if (line.length > lower.length && line.slice(0, lower.length) == lower) {
-			return trim(line.slice(lower.length, line.length))
+	const field = lower(name) + ":"
+	const crlf = indexOf(data, "\r\n\r\n")
+	const lf = indexOf(data, "\n\n")
+	const end = if (crlf < 0) lf else if (lf < 0) crlf else min(crlf, lf)
+	const head = if (end < 0) data else data.slice(0, end)
+	for (const line of split(replace(head, "\r\n", "\n"), "\n")) {
+		if (line.length > field.length && lower(line.slice(0, field.length)) == field) {
+			return trim(line.slice(field.length, line.length))
 		}
 	}
 	return null

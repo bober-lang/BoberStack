@@ -451,3 +451,22 @@ test "receipt rule sets, their rules in order, the active one, and receipt filte
 	call(g, "DeleteReceiptFilter", [["FilterName", "f"]])
 	assert !has(call(g, "ListReceiptFilters"), "<Name>f</Name>")
 }
+
+test "SendRawEmail sends to its Destinations, at most 50, from the From header in any case if no Source" {
+	const g = stack(new Catalog(""))
+	call(g, "VerifyEmailIdentity", [["EmailAddress", "a@example.com"]])
+	const raw: [string, string][] = [["RawMessage.Data", "ZnJvbTogYUBleGFtcGxlLmNvbQ0KDQpC"]]
+	assert call(g, "SendRawEmail", raw).status == 200
+	const listed = internal(g, "GET", "/_aws/ses")
+	assert has(listed, `"Source":"a@example.com"`) && !has(listed, `"Destination"`)
+	const to: [string, string][] = [raw[0], ["Destinations.member.1", "b@example.net"]]
+	assert call(g, "SendRawEmail", to).status == 200
+	assert has(internal(g, "GET", "/_aws/ses"), `"Destination":{"ToAddresses":["b@example.net"]}`)
+	const many: [string, string][] = [raw[0]]
+	for (let i = 1; i <= 51; i++) {
+		many.push([`Destinations.member.${i}`, `r${i}@example.net`])
+	}
+	const refused = call(g, "SendRawEmail", many)
+	assert refused.status == 400 && text(refused, "Code") == "InvalidParameterValue"
+	assert text(refused, "Message") == "Recipient count exceeds 50."
+}

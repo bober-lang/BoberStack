@@ -41,6 +41,7 @@ import * as secretsmanagerApi from "./services/secretsmanager/api"
 import * as secretsmanager from "./services/secretsmanager/secretsmanager"
 import * as sesApi from "./services/ses/api"
 import * as ses from "./services/ses/ses"
+import { Smtp } from "./services/ses/smtp"
 import * as sesv2Api from "./services/ses/v2/api"
 import * as schedulerApi from "./services/scheduler/api"
 import * as scheduler from "./services/scheduler/scheduler"
@@ -57,8 +58,8 @@ import * as sts from "./services/sts/sts"
 import { startsWith } from "std/algo"
 
 /// A gateway to every service by signing name, catalog the policies AWS manages; services that deliver to others call
-/// them directly. runner runs Lambda's functions, if given.
-export function stack(catalog: Catalog, runner: Runner | null = null): Gateway {
+/// them directly. runner runs Lambda's functions, and smtp takes mail for SES, if given.
+export function stack(catalog: Catalog, runner: Runner | null = null, smtp: Smtp | null = null): Gateway {
 	const g = new Gateway()
 	g.identify = identify(catalog)
 	const i = new iam.Handler(catalog)
@@ -151,6 +152,10 @@ export function stack(catalog: Catalog, runner: Runner | null = null): Gateway {
 	const v2 = new ses.V2()
 	v.sns = n
 	v2.sns = n
+	if (smtp != null) {
+		smtp!.gateway = g
+		smtp!.ses = v
+	}
 	g.services.set(sesApi.signingName, (caller, req) => {
 		const json = startsWith(req.url.path, "/v2/")
 		return if (json) sesv2Api.handle(v2, caller, ses.routed(req)) else sesApi.handle(v, caller, req)

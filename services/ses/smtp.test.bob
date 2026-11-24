@@ -1,0 +1,326 @@
+import { sign } from "../../core/auth/sigv4"
+import { text } from "../../core/client.test"
+import { Gateway } from "../../core/gateway"
+import { stack } from "../../stack"
+import { Catalog } from "../iam/catalog"
+import { Smtp, smtpPassword } from "./smtp"
+import { indexOf } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import { Request, Response } from "std/http"
+import { Buffered } from "std/http/h1"
+import { Stream } from "std/io"
+import * as net from "std/net"
+import { second, sleep } from "std/time"
+import * as tls from "std/tls"
+import { escape } from "std/url"
+
+const cert = `-----BEGIN CERTIFICATE-----
+MIIBnDCCAUGgAwIBAgIUTcRhneuM3W5i0rJJ/KMe5ZumPNUwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNDEyMjQ1OVoYDzIxMjYxMDMx
+MTIyNDU5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASRliicnvmDXodVNIWHl+cU8OwmcF355SOmM3gB4r93ANIJuqRfaPM6
+tkKxewallpzCoLEcsZkyaYnB8q2cGU0Yo28wbTAdBgNVHQ4EFgQUmjnrC8d92/kD
+SovAAm+Qv3q+EgEwHwYDVR0jBBgwFoAUmjnrC8d92/kDSovAAm+Qv3q+EgEwDwYD
+VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI
+zj0EAwIDSQAwRgIhAK6b8U51MR0PjTCZP2sjO4ZXO4b2U2lmItkciUTkn6CaAiEA
+4JRPX1X8h7RMhlMxf7rFKdYLaqXl8Y3Lr/Ay2qE/5d8=
+-----END CERTIFICATE-----
+`
+
+const key = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgFMVggPVi93Zbe7Gb
+87YqhrDgJhmD1oPB3GObYS4aVwWhRANCAASRliicnvmDXodVNIWHl+cU8OwmcF35
+5SOmM3gB4r93ANIJuqRfaPM6tkKxewallpzCoLEcsZkyaYnB8q2cGU0Y
+-----END PRIVATE KEY-----
+`
+
+/// A mail client, line by line.
+class Client {
+	conn: net.Conn
+	stream: Stream
+	in: Buffered
+
+	constructor(addr: string) {
+		this.conn = net.dial(addr)
+		this.stream = this.conn
+		this.in = new Buffered(this.conn)
+	}
+
+	/// The next reply, its lines joined by LF; "" once the server has closed.
+	reply(): string {
+		const lines: string[] = []
+		while (true) {
+			const l = this.in.line(1 << 16, true)
+			if (l == null) {
+				return lines.join("\n")
+			}
+			lines.push(l!)
+			if (l!.length < 4 || l!.slice(3, 4) != "-") {
+				return lines.join("\n")
+			}
+		}
+	}
+
+	send(line: string): string {
+		this.stream.write(`${line}\r\n`)
+		return this.reply()
+	}
+
+	starttls() {
+		const c = new tls.Config()
+		c.insecure = true
+		this.stream = tls.client(this.conn, "localhost", c)
+		this.in = new Buffered(this.stream)
+	}
+
+	login(user: string, password: string): string {
+		return this.send(`AUTH PLAIN ${base64.encode(`\0${user}\0${password}`)}`)
+	}
+}
+
+class Key {
+	id = ""
+	secret = ""
+}
+
+/// A server of SMTP on the userspace network, with STARTTLS if secure, and its gateway.
+function serving(secure = false, lenient = false): [Gateway, Smtp] {
+	const mail = new Smtp()
+	mail.addr = "127.0.0.1:0"
+	if (secure) {
+		const c = new tls.Config()
+		c.cert = cert
+		c.key = key
+		mail.tls = c
+	}
+	const g = stack(new Catalog(""), null, mail)
+	g.lenient = lenient
+	mail.listen()
+	const accepting = async mail.serve()
+	return [g, mail]
+}
+
+function query(g: Gateway, service: string, version: string, params: [string, string][],
+	region = "us-east-1"): Response {
+	const body = `Version=${version}`
+		+ params.map(p => `&${escape(p[0], "component")}=${escape(p[1], "component")}`).join("")
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, service, region, "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+/// An IAM user of the root's account, allowed what its policy, if any, allows, and its access key.
+function user(g: Gateway, name: string, actions = ""): Key {
+	const iam = (params: [string, string][]) => query(g, "iam", "2010-05-08", params)
+	assert iam([["Action", "CreateUser"], ["UserName", name]]).status == 200
+	if (actions != "") {
+		const document = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":${actions},"Resource":"*"}]}`
+		const put = iam([["Action", "PutUserPolicy"], ["UserName", name], ["PolicyName", "p"],
+			["PolicyDocument", document]])
+		assert put.status == 200
+	}
+	const res = iam([["Action", "CreateAccessKey"], ["UserName", name]])
+	return { ...new Key(), id: text(res, "AccessKeyId")!, secret: text(res, "SecretAccessKey")! }
+}
+
+function verified(g: Gateway, address: string, region = "us-east-1") {
+	const res = query(g, "ses", "2010-12-01", [["Action", "VerifyEmailIdentity"], ["EmailAddress", address]], region)
+	assert res.status == 200
+}
+
+function listed(g: Gateway): string {
+	return g.handle(new Request("GET", "http://localhost:4566/_aws/ses")).body.text()
+}
+
+function has(s: string, sub: string): bool { return indexOf(s, sub) >= 0 }
+
+test "a message submitted by SMTP is sent as SendRawEmail sends it, its lines unstuffed, several on a connection" {
+	const [g, mail] = serving()
+	const k = user(g, "mailer", `"ses:SendRawEmail"`)
+	verified(g, "sender@example.com")
+	const c = new Client(mail.addr)
+	assert c.reply() == "220 email-smtp.amazonaws.com ESMTP SimpleEmailService-d-BoberStack"
+	assert c.send("MAIL FROM:<sender@example.com>") == "503 Bad sequence of commands"
+	assert c.send("EHLO client.example") == "250-email-smtp.amazonaws.com\n250-8BITMIME\n250-AUTH PLAIN LOGIN\n250 Ok"
+	assert c.send("MAIL FROM:<sender@example.com>") == "530 Authentication required"
+	assert c.send("AUTH LOGIN") == "334 VXNlcm5hbWU6"
+	assert c.send(base64.encode(k.id)) == "334 UGFzc3dvcmQ6"
+	assert c.send(base64.encode(smtpPassword(k.secret, "us-east-1"))) == "235 Authentication successful"
+	assert c.send("DATA") == "503 Bad sequence of commands"
+	assert c.send("MAIL FROM:<sender@example.com> BODY=8BITMIME") == "250 Ok"
+	assert c.send("MAIL FROM:<sender@example.com>") == "503 Sender already specified"
+	assert c.send("RCPT TO:<one@example.net>") == "250 Ok"
+	assert c.send("RCPT TO:<nobody>") == "553 <nobody> address unknown"
+	assert c.send("rcpt to:<bcc@example.net>") == "250 Ok"
+	assert c.send("DATA") == "354 End data with <CR><LF>.<CR><LF>"
+	const sent = c.send("From: Sender <sender@example.com>\r\nTo: one@example.net\r\nSubject: Dots\r\n\r\n"
+		+ "..hidden\r\n...\r\nplain\r\n.")
+	assert sent.slice(0, 11) == "250 Ok 0100" && sent.length == 67
+	const id = sent.slice(7, sent.length)
+	// Pipelined, though SES does not advertise it, as clients send it anyway.
+	c.stream.write("MAIL FROM:<>\r\nRCPT TO:<two@example.net>\r\nDATA\r\n")
+	assert c.reply() == "250 Ok" && c.reply() == "250 Ok" && c.reply() == "354 End data with <CR><LF>.<CR><LF>"
+	const second = c.send("From: sender@example.com\r\nX-SES-CONFIGURATION-SET: none\r\n\r\nagain\r\n.")
+	assert second.slice(0, 7) == "250 Ok " && second.slice(7, second.length) != id
+	assert c.send("RSET") == "250 Ok" && c.send("NOOP") == "250 Ok" && c.send("VRFY x") == "500 Unrecognized command"
+	assert c.send("QUIT") == "221 Bye" && c.reply() == ""
+	const all = listed(g)
+	assert has(all, `"Id":"${id}"`) && has(all, `"Region":"us-east-1"`) && has(all, `"Source":"sender@example.com"`)
+	assert has(all, `"Destination":{"ToAddresses":["one@example.net","bcc@example.net"]}`)
+	assert has(all, `Subject: Dots\\r\\n\\r\\n.hidden\\r\\n..\\r\\nplain\\r\\n"`)
+	mail.close()
+}
+
+test "a password signs in to the region it was derived for, and nothing else does" {
+	const [g, mail] = serving()
+	const k = user(g, "mailer", `"ses:SendRawEmail"`)
+	verified(g, "sender@example.com")
+	const c = new Client(mail.addr)
+	c.reply()
+	c.send("EHLO client.example")
+	assert c.login(k.id, smtpPassword(k.secret, "us-east-1") + "x") == "535 Authentication Credentials Invalid"
+	assert c.login(k.id, smtpPassword("wrong", "us-east-1")) == "535 Authentication Credentials Invalid"
+	assert c.login(k.id, k.secret) == "535 Authentication Credentials Invalid"
+	assert c.send("AUTH CRAM-MD5") == "504 Unrecognized authentication type"
+	assert c.send("AUTH PLAIN") == "334 " && c.send("*") == "501 Authentication canceled or not base64"
+	assert c.login(k.id, smtpPassword(k.secret, "eu-west-1")) == "235 Authentication successful"
+	assert c.send("AUTH LOGIN") == "503 Already authenticated"
+	c.send("MAIL FROM:<sender@example.com>")
+	c.send("RCPT TO:<to@example.net>")
+	c.send("DATA")
+	// The identity is verified in us-east-1, not in the region the password was made for.
+	assert c.send("From: sender@example.com\r\n\r\nhi\r\n.")
+		== "554 Message rejected: Email address is not verified. "
+		+ "The following identities failed the check in region EU-WEST-1: sender@example.com"
+	verified(g, "sender@example.com", "eu-west-1")
+	c.send("MAIL FROM:<sender@example.com>")
+	c.send("RCPT TO:<to@example.net>")
+	c.send("DATA")
+	assert c.send("From: sender@example.com\r\n\r\nhi\r\n.").slice(0, 7) == "250 Ok "
+	assert has(listed(g), `"Region":"eu-west-1"`)
+	mail.close()
+}
+
+test "an unverified sender, a user denied, or too many recipients are refused as SES refuses them, lenient or not" {
+	for (const lenient of [false, true]) {
+		const [g, mail] = serving(false, lenient)
+		const k = user(g, "nobody")
+		verified(g, "sender@example.com")
+		const c = new Client(mail.addr)
+		c.reply()
+		c.send("HELO client.example")
+		assert c.login(k.id, smtpPassword(k.secret, "us-east-1")) == "235 Authentication successful"
+		c.send("MAIL FROM:<other@example.org>")
+		c.send("RCPT TO:<to@example.net>")
+		c.send("DATA")
+		const unverified = c.send("From: other@example.org\r\n\r\nhi\r\n.")
+		assert unverified
+			== (if (lenient) "554 Message rejected: Email address is not verified. The following "
+			+ "identities failed the check in region US-EAST-1: other@example.org"
+			else "554 Access denied: User: arn:aws:iam::000000000000:user/nobody is not authorized to perform: "
+			+ "ses:SendRawEmail on resource: arn:aws:ses:us-east-1:000000000000:identity/other@example.org because "
+			+ "no identity-based policy allows the ses:SendRawEmail action")
+		c.send("MAIL FROM:<sender@example.com>")
+		for (let i = 0; i < 50; i++) {
+			assert c.send(`RCPT TO:<to${i}@example.net>`) == "250 Ok"
+		}
+		assert c.send("RCPT TO:<more@example.net>") == "452 Too many recipients"
+		c.send("DATA")
+		const denied = c.send("From: sender@example.com\r\n\r\nhi\r\n.")
+		assert if (lenient) denied.slice(0, 7) == "250 Ok " else denied.slice(0, 18) == "554 Access denied:"
+		mail.close()
+	}
+}
+
+test "STARTTLS is offered given a certificate, AUTH refused before it, and what was sent after it in the clear dropped" {
+	const [g, mail] = serving(true)
+	const k = user(g, "mailer", `"ses:SendRawEmail"`)
+	verified(g, "sender@example.com")
+	const c = new Client(mail.addr)
+	c.reply()
+	assert c.send("EHLO client.example") == "250-email-smtp.amazonaws.com\n250-8BITMIME\n250-STARTTLS\n250 Ok"
+	assert c.login(k.id, smtpPassword(k.secret, "us-east-1")) == "530 Must issue a STARTTLS command first"
+	assert c.send("STARTTLS now") == "501 Syntax error"
+	c.stream.write("STARTTLS\r\nNOOP\r\n")
+	assert c.reply() == "220 Ready to start TLS"
+	c.starttls()
+	assert c.send("MAIL FROM:<sender@example.com>") == "503 Bad sequence of commands"
+	assert c.send("EHLO client.example") == "250-email-smtp.amazonaws.com\n250-8BITMIME\n250-AUTH PLAIN LOGIN\n250 Ok"
+	assert c.send("STARTTLS") == "502 Command not implemented"
+	assert c.login(k.id, smtpPassword(k.secret, "us-east-1")) == "235 Authentication successful"
+	c.send("MAIL FROM:<sender@example.com>")
+	c.send("RCPT TO:<to@example.net>")
+	c.send("DATA")
+	assert c.send("From: sender@example.com\r\n\r\nsecret\r\n.").slice(0, 7) == "250 Ok "
+	assert c.send("QUIT") == "221 Bye"
+	assert has(listed(g), "secret")
+	mail.close()
+}
+
+test "a message over the limit is refused once it has all come, and the connection goes on" {
+	const [g, mail] = serving()
+	mail.maxSize = 100
+	verified(g, "sender@example.com")
+	const c = new Client(mail.addr)
+	c.reply()
+	c.send("EHLO client.example")
+	// A key never issued signs in as its account's root, whatever its password, as the gateway takes it.
+	assert c.login("test", "anything") == "235 Authentication successful"
+	assert c.send("MAIL FROM:<sender@example.com> SIZE=101") == "552 Message is too long."
+	c.send("MAIL FROM:<sender@example.com> SIZE=50")
+	c.send("RCPT TO:<to@example.net>")
+	c.send("DATA")
+	let body = "From: sender@example.com\r\n\r\n"
+	for (let i = 0; i < 10; i++) {
+		body += "0123456789\r\n"
+	}
+	assert c.send(`${body}.`) == "552 Message is too long."
+	assert c.send("DATA") == "503 Bad sequence of commands"
+	c.send("MAIL FROM:<sender@example.com>")
+	c.send("RCPT TO:<to@example.net>")
+	c.send("DATA")
+	assert c.send("From: sender@example.com\r\n\r\nshort\r\n.").slice(0, 7) == "250 Ok "
+	mail.close()
+}
+
+test "a silent client is timed out, a long line ends the connection, a bare LF a line, and connections are bounded" {
+	const [g, mail] = serving()
+	mail.maxConns = 2
+	const silent = new Client(mail.addr)
+	silent.reply()
+	const long = new Client(mail.addr)
+	long.reply()
+	const refused = new Client(mail.addr)
+	assert refused.reply() == "421 Too many concurrent SMTP connections" && refused.reply() == ""
+	let line = "NOOP "
+	while (line.length <= 12288) {
+		line += "x"
+	}
+	assert long.send(line) == "500 Line too long" && long.reply() == ""
+	sleep(11 * second)
+	assert silent.reply() == "451 Timeout waiting for data from client" && silent.reply() == ""
+	mail.maxConns = 10
+	// One whose end has not come once the limit has.
+	const unended = new Client(mail.addr)
+	unended.reply()
+	unended.stream.write(line)
+	assert unended.reply() == "500 Line too long" && unended.reply() == ""
+	verified(g, "a@example.com")
+	const bare = new Client(mail.addr)
+	bare.reply()
+	bare.send("EHLO client.example")
+	bare.login("test", "x")
+	bare.send("MAIL FROM:<a@example.com>")
+	bare.send("RCPT TO:<b@example.net>")
+	bare.send("DATA")
+	assert bare.send("From: a@example.com\n\nbare\n.\n").slice(0, 7) == "250 Ok "
+	assert has(listed(g), `"RawData":"From: a@example.com\\r\\n\\r\\nbare\\r\\n"`)
+	let chatty = new Client(mail.addr)
+	chatty.reply()
+	for (let i = 0; i < 20; i++) {
+		assert chatty.send("NOOP") == "250 Ok"
+	}
+	assert chatty.send("NOOP") == "421 Too many commands before authentication" && chatty.reply() == ""
+	mail.close()
+}

@@ -164,6 +164,21 @@ export class Gateway {
 		}
 	}
 
+	/// Runs f as a request outside HTTP is run, as SES's SMTP submission: under the lock, given the committed trees and
+	/// the list it puts the trees its caller opens in, which commit together unless it throws.
+	run(f: (committed: HashMap[string, Store], opened: [string, Store][]) => void throws Fault) throws Fault {
+		this.acquire()
+		const opened: [string, Store][] = []
+		let done = false
+		try {
+			f(this.trees, opened)
+			done = true
+		} finally {
+			this.commit(opened, done)
+			this.release()
+		}
+	}
+
 	close() {
 		for (const t of this.trees.values()) {
 			t.close()

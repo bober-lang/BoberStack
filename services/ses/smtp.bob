@@ -1,0 +1,538 @@
+//! SES's SMTP interface (RFC 5321, with STARTTLS of RFC 3207 and AUTH PLAIN and LOGIN of RFC 4954): a message a mail
+//! client submits is sent as SendRawEmail sends it, by the IAM user whose access key id is the user name and whose SMTP
+//! password, derived from its secret key for a region, is the password; the envelope's recipients are its
+//! Destinations and MAIL FROM its Source. Replies are worded as SES's "SMTP response codes" page words them.
+//!
+//! Where AWS differs: STARTTLS is offered only given a certificate, and AUTH is refused before it as AWS refuses it;
+//! without one, AUTH is taken in the clear. Implicit TLS is not served. A key never issued signs in, whatever the
+//! password, as the root of the account accountOf names, in us-east-1, as the gateway takes such keys; an issued key
+//! signs in to the first region of those SES serves that its password was derived for, as no host name tells the region.
+//! A message's From, Sender and Return-Path headers are not checked against the verified identities, only MAIL FROM,
+//! or From if MAIL FROM is empty. A bare LF ends a line of DATA as CRLF does, as nothing here is relayed on to be
+//! smuggled into. Where the page gives no wording (syntax errors, bad sequences, line and command limits), RFC 5321's
+//! codes are used.
+
+import { accountOf, Credential, credentials, use } from "../../core/auth/credentials"
+import * as sigv4 from "../../core/auth/sigv4"
+import { Fault } from "../../core/fault"
+import { Gateway } from "../../core/gateway"
+import { uuid } from "../../core/random"
+import { Caller } from "../../core/service"
+import { Store } from "../../core/state/store"
+import * as api from "./api"
+import { Handler } from "./ses"
+import { indexOf, startsWith } from "std/algo"
+import { HashMap } from "std/collections/hashmap"
+import { CryptoError } from "std/crypto/error"
+import { equal, hmacSha256 } from "std/crypto/hash"
+import * as base64 from "std/encoding/base64"
+import { Buffered } from "std/http/h1"
+import { Stream } from "std/io"
+import * as net from "std/net"
+import { lower, ParseError, parseInt, replace, split, trim } from "std/string"
+import { deadline, millisecond, second, sleep } from "std/time"
+import * as tls from "std/tls"
+
+/// The regions of SES's SMTP endpoints, whose passwords are tried in turn.
+const regions = ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "af-south-1", "ap-south-1", "ap-south-2",
+	"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-southeast-1", "ap-southeast-2", "ap-southeast-3",
+	"ap-southeast-5", "ca-central-1", "ca-west-1", "eu-central-1", "eu-central-2", "eu-west-1", "eu-west-2",
+	"eu-west-3", "eu-south-1", "eu-north-1", "il-central-1", "me-south-1", "me-central-1", "mx-central-1", "sa-east-1",
+	"us-gov-west-1", "us-gov-east-1"]
+
+const host = "email-smtp.amazonaws.com"
+/// RFC 4954's bound of an AUTH line, the longest a command may be.
+const commandLine = 12288
+const dataLine: i64 = 1 << 20
+
+/// A listener of SMTP submissions to a gateway's SES, which stack gives it.
+export class Smtp {
+	/// As net.listen takes it; port 0 is any free one, which addr then holds once listening.
+	addr = ":2525"
+	/// STARTTLS is offered with it.
+	tls: tls.Config | null = null
+	gateway: Gateway | null = null
+	ses: Handler | null = null
+	/// For each line, so a silent or slow client does not hold its fiber.
+	timeout: i64 = 10 * second
+	/// Connections at once; one past them is refused.
+	maxConns = 100
+	conns = 0
+	/// SES's limit of a message submitted by SMTP, its recipients, and the commands it takes before AUTH.
+	maxSize: i64 = 40 * 1024 * 1024
+	maxRecipients = 50
+	maxUnauthenticated = 20
+	private listener: net.Listener | null = null
+	private closed = false
+
+	/// Binds addr; fails first if tls's certificate or key is unsound.
+	listen() throws IoError | ParseError {
+		if (this.tls != null) {
+			tls.load(this.tls!, "smtp")
+		}
+		this.listener = net.listen(this.addr)
+		this.addr = this.listener!.addr.toString()
+	}
+
+	/// Serves each connection on a fiber of its own, until close.
+	serve() {
+		while (!this.closed) {
+			let c: net.Conn | null = null
+			try {
+				c = this.listener!.accept()
+			} catch (e: IoError) {
+				if (!this.closed) {
+					sleep(10 * millisecond) // out of descriptors, say: let some close
+				}
+				continue
+			}
+			c!.timeout = this.timeout
+			if (this.conns >= this.maxConns) {
+				try {
+					c!.write("421 Too many concurrent SMTP connections\r\n")
+					c!.close()
+				} catch (e: IoError) {}
+				continue
+			}
+			this.conns++
+			const s = new Session(this, c!)
+			const serving = async s.run()
+		}
+	}
+
+	close() {
+		this.closed = true
+		try {
+			this.listener?.close()
+		} catch (e: IoError) {}
+	}
+}
+
+/// Who AUTH signed in as: a key, its password, and the region it was derived for.
+class Login {
+	key = ""
+	password = ""
+	region = "us-east-1"
+}
+
+class Session {
+	smtp: Smtp
+	conn: net.Conn
+	stream: Stream
+	in: Buffered
+	secure = false
+	greeted = false
+	login: Login | null = null
+	/// The envelope's sender, "" for <>, null before MAIL.
+	from: string | null = null
+	to: string[] = []
+	commands = 0
+
+	constructor(smtp: Smtp, conn: net.Conn) {
+		this.smtp = smtp
+		this.conn = conn
+		this.stream = conn
+		this.in = new Buffered(conn)
+	}
+
+	run() {
+		try {
+			this.reply(`220 ${host} ESMTP SimpleEmailService-d-BoberStack`)
+			while (true) {
+				const l = this.line(commandLine)
+				if (l == null || !this.command(l!)) {
+					break
+				}
+			}
+		} catch (e: IoError) {
+			const why = if (e.kind == "TimedOut") "451 Timeout waiting for data from client"
+				else if (e.kind == "TooLarge") "500 Line too long"
+				else ""
+			if (why != "") {
+				try {
+					this.reply(why)
+				} catch (e: IoError) {}
+			}
+		} finally {
+			try {
+				this.stream.close()
+			} catch (e: IoError) {}
+			this.smtp.conns--
+		}
+	}
+
+	/// Whether to read the next command.
+	private command(l: string): bool throws IoError {
+		const sp = indexOf(l, " ")
+		const verb = lower(if (sp < 0) l else l.slice(0, sp))
+		const arg = if (sp < 0) "" else trim(l.slice(sp + 1, l.length))
+		if (this.login == null) {
+			this.commands++
+			if (this.commands > this.smtp.maxUnauthenticated) {
+				this.reply("421 Too many commands before authentication")
+				return false
+			}
+		}
+		if (verb == "ehlo" || verb == "helo") {
+			this.greeted = true
+			this.reset()
+			if (verb == "helo") {
+				this.reply(`250 ${host}`)
+				return true
+			}
+			const lines = [host, "8BITMIME"]
+			if (this.smtp.tls != null && !this.secure) {
+				lines.push("STARTTLS")
+			}
+			if (this.smtp.tls == null || this.secure) {
+				lines.push("AUTH PLAIN LOGIN")
+			}
+			this.reply(lines.map(x => `250-${x}`).join("\r\n") + "\r\n250 Ok")
+		} else if (verb == "starttls") {
+			if (this.smtp.tls == null || this.secure) {
+				this.reply("502 Command not implemented")
+			} else if (arg != "") {
+				this.reply("501 Syntax error")
+			} else {
+				this.reply("220 Ready to start TLS")
+				this.upgrade()
+			}
+		} else if (verb == "auth") {
+			this.authenticate(arg)
+		} else if (verb == "mail") {
+			this.mail(arg)
+		} else if (verb == "rcpt") {
+			this.rcpt(arg)
+		} else if (verb == "data") {
+			return this.data(arg)
+		} else if (verb == "rset" || verb == "noop") {
+			if (verb == "rset") {
+				this.reset()
+			}
+			this.reply("250 Ok")
+		} else if (verb == "quit") {
+			this.reply("221 Bye")
+			return false
+		} else {
+			this.reply("500 Unrecognized command")
+		}
+		return true
+	}
+
+	/// Starts TLS over the socket. What the client sent past STARTTLS is dropped unread, as RFC 3207 has it, so that
+	/// no command sent in the clear runs as one sent under TLS.
+	private upgrade() throws IoError {
+		const t = tls.server(this.conn, this.smtp.tls!)
+		t.timeout = this.smtp.timeout
+		this.stream = t
+		this.in = new Buffered(t)
+		this.secure = true
+		this.greeted = false
+		this.reset()
+	}
+
+	private authenticate(arg: string) throws IoError {
+		if (this.login != null) {
+			this.reply("503 Already authenticated")
+			return
+		}
+		if (!this.greeted) {
+			this.reply("503 Bad sequence of commands")
+			return
+		}
+		if (this.smtp.tls != null && !this.secure) {
+			this.reply("530 Must issue a STARTTLS command first")
+			return
+		}
+		const words = split(arg, " ").filter(w => w != "")
+		const mechanism = lower(words.at(0) ?? "")
+		let user: string | null = null
+		let password: string | null = null
+		if (mechanism == "plain") {
+			const given = if (words.length > 1) words[1] else this.challenge("")
+			const plain = decoded(given)
+			const parts = if (plain == null) [] else split(plain!, "\0")
+			if (parts.length == 3 && (parts[0] == "" || parts[0] == parts[1])) {
+				user = parts[1]
+				password = parts[2]
+			}
+		} else if (mechanism == "login") {
+			user = decoded(if (words.length > 1) words[1] else this.challenge("VXNlcm5hbWU6"))
+			if (user != null) {
+				password = decoded(this.challenge("UGFzc3dvcmQ6"))
+			}
+		} else {
+			this.reply("504 Unrecognized authentication type")
+			return
+		}
+		if (user == null || password == null) {
+			this.reply("501 Authentication canceled or not base64")
+			return
+		}
+		const l = new Login()
+		l.key = user!
+		l.password = password!
+		let found: string | null = null
+		try {
+			this.smtp.gateway!.run((committed, _) => {
+				const signed = signedIn(committed, l.key, l.password)
+				found = if (signed == null) null else signed![1]
+			})
+		} catch (f: Fault) {}
+		if (found == null) {
+			this.reply("535 Authentication Credentials Invalid")
+			return
+		}
+		l.region = found!
+		this.login = l
+		this.reply("235 Authentication successful")
+	}
+
+	/// The client's answer to a 334 of prompt; "*", which cancels, as "".
+	private challenge(prompt: string): string throws IoError {
+		this.reply(`334 ${prompt}`)
+		const answer = this.line(commandLine) ?? "*"
+		return if (answer == "*") "" else answer
+	}
+
+	private mail(arg: string) throws IoError {
+		if (!this.ready()) {
+			return
+		}
+		if (this.from != null) {
+			this.reply("503 Sender already specified")
+			return
+		}
+		const path = this.path(arg, "from:")
+		if (path == null) {
+			this.reply("501 Syntax error")
+			return
+		}
+		const [address, params] = path!
+		if (address != "" && !addressed(address)) {
+			this.reply(`553 <${address}> Invalid email address`)
+			return
+		}
+		for (const p of params) {
+			if (startsWith(lower(p), "size=") && size(p.slice(5, p.length)) > this.smtp.maxSize) {
+				this.reply("552 Message is too long.")
+				return
+			}
+		}
+		this.from = address
+		this.reply("250 Ok")
+	}
+
+	private rcpt(arg: string) throws IoError {
+		if (!this.ready()) {
+			return
+		}
+		if (this.from == null) {
+			this.reply("503 Bad sequence of commands")
+			return
+		}
+		const path = this.path(arg, "to:")
+		if (path == null) {
+			this.reply("501 Syntax error")
+			return
+		}
+		const address = path![0]
+		if (!addressed(address)) {
+			this.reply(`553 <${address}> address unknown`)
+			return
+		}
+		if (this.to.length >= this.smtp.maxRecipients) {
+			this.reply("452 Too many recipients")
+			return
+		}
+		this.to.push(address)
+		this.reply("250 Ok")
+	}
+
+	/// Whether to read the next command: false once the client ends inside the message.
+	private data(arg: string): bool throws IoError {
+		if (!this.ready()) {
+			return true
+		}
+		if (arg != "") {
+			this.reply("501 Syntax error")
+			return true
+		}
+		if (this.from == null || this.to.length == 0) {
+			this.reply("503 Bad sequence of commands")
+			return true
+		}
+		this.reply("354 End data with <CR><LF>.<CR><LF>")
+		const lines: string[] = []
+		let size: i64 = 0
+		while (true) {
+			// A bare LF ends a line too, as it did in Postfix before SMTP smuggling: nothing here is relayed on.
+			const l = this.line(dataLine)
+			if (l == null) {
+				return false
+			}
+			if (l! == ".") {
+				break
+			}
+			const unstuffed = if (startsWith(l!, ".")) l!.slice(1, l!.length) else l!
+			size += unstuffed.length + 2
+			if (size <= this.smtp.maxSize) {
+				lines.push(unstuffed)
+			}
+		}
+		if (size > this.smtp.maxSize) {
+			this.reset()
+			this.reply("552 Message is too long.")
+			return true
+		}
+		lines.push("")
+		this.reply(this.submit(lines.join("\r\n")))
+		this.reset()
+		return true
+	}
+
+	/// The reply to a message, sent as SendRawEmail sends it, by the login's identity in its region.
+	private submit(message: string): string {
+		const l = this.login!
+		let reply = "535 Authentication Credentials Invalid"
+		try {
+			this.smtp.gateway!.run((committed, opened) => {
+				const signed = signedIn(committed, l.key, l.password)
+				if (signed == null) {
+					return
+				}
+				const [known, region] = signed!
+				const g = this.smtp.gateway!
+				const account = if (known == null) accountOf(l.key) else known!.account
+				const arn = if (known == null) `arn:aws:iam::${account}:root` else known!.arn
+				const c = new Caller(account, region, arn, uuid(), known?.userId ?? account, committed)
+				if (known != null) {
+					use(committed.get("")!, l.key, known!, "ses", region, now())
+				}
+				c.opened = opened
+				c.credential = known
+				c.identify = g.identify
+				c.lenient = g.lenient
+				c.endpoint = if (this.secure) replace(g.endpoint, "http:", "https:") else g.endpoint
+				const input = new api.SendRawEmailRequest()
+				input.Source = if (this.from! == "") null else this.from!
+				input.Destinations = this.to
+				input.RawMessage.Data = message
+				reply = `250 Ok ${this.smtp.ses!.sendRawEmail(c, input).MessageId}`
+			})
+		} catch (f: Fault) {
+			reply = refusal(f)
+		}
+		return reply
+	}
+
+	/// Whether the session may begin or go on with a transaction, else says why not.
+	private ready(): bool throws IoError {
+		if (!this.greeted) {
+			this.reply("503 Bad sequence of commands")
+			return false
+		}
+		if (this.login == null) {
+			this.reply("530 Authentication required")
+			return false
+		}
+		return true
+	}
+
+	/// The address of MAIL's FROM:<…> or RCPT's TO:<…>, and the parameters after it; null if it is not one.
+	private path(arg: string, prefix: string): [string, string[]] | null {
+		if (!startsWith(lower(arg), prefix)) {
+			return null
+		}
+		const rest = trim(arg.slice(prefix.length, arg.length))
+		const close = indexOf(rest, ">")
+		if (!startsWith(rest, "<") || close < 0) {
+			return null
+		}
+		const params = split(rest.slice(close + 1, rest.length), " ").filter(p => p != "")
+		return [rest.slice(1, close), params]
+	}
+
+	private reset() {
+		this.from = null
+		this.to = []
+	}
+
+	private line(limit: i64): string | null throws IoError {
+		this.in.deadline = deadline(this.smtp.timeout)
+		const l = this.in.line(limit)
+		// One whose end came in the read that passed the limit is let through by line.
+		if (l != null && l!.length > limit) {
+			throw new IoError("TooLarge", "smtp", "a line")
+		}
+		return l
+	}
+
+	private reply(s: string) throws IoError { this.stream.write(`${s}\r\n`) }
+}
+
+/// The credential a key and password sign in with, null for a key never issued, and the region of the password; null
+/// if they do not sign in. A temporary key does not, as SMTP has no session token.
+function signedIn(committed: HashMap[string, Store], key: string,
+	password: string): [Credential | null, string] | null throws Fault {
+	const global = committed.get("")
+	const known = if (global == null) null else credentials(global!).get(key)
+	if (known == null) {
+		return [null, "us-east-1"]
+	}
+	if (known!.status != "Active" || known!.token != "") {
+		return null
+	}
+	for (const r of regions) {
+		if (equal(smtpPassword(known!.secret, r), password)) {
+			return [known, r]
+		}
+	}
+	return null
+}
+
+/// The SMTP password of a secret key in a region, as AWS's "Obtaining Amazon SES SMTP credentials" derives it.
+function smtpPassword(secret: string, region: string): string throws Fault {
+	const a = new sigv4.Authorization()
+	a.date = "11111111"
+	a.region = region
+	a.service = "ses"
+	try {
+		return base64.encode("\x04" + hmacSha256(sigv4.key(a, secret), "SendRawEmail"))
+	} catch (e: CryptoError) {
+		throw new Fault(500, "InternalFailure", e.what)
+	}
+}
+
+/// SES's reply to the fault SendRawEmail refused a message with.
+function refusal(f: Fault): string {
+	if (f.status >= 500) {
+		return "451 Temporary service failure"
+	}
+	const why = replace(replace(f.message, "\r", " "), "\n", " ")
+	return if (f.code == "MessageRejected") `554 Message rejected: ${why}`
+		else if (f.code == "AccessDenied") `554 Access denied: ${why}`
+		else `554 Transaction failed: ${why}`
+}
+
+function decoded(s: string): string | null {
+	try {
+		return base64.decode(s)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+function addressed(address: string): bool {
+	const at = indexOf(address, "@")
+	return at > 0 && at < address.length - 1 && indexOf(address, " ") < 0
+}
+
+/// A SIZE parameter's bytes, 0 if it is not a number.
+function size(s: string): i64 {
+	try {
+		return parseInt[i64](s)
+	} catch (e: ParseError) {
+		return 0
+	}
+}
