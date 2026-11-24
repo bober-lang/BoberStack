@@ -1,5 +1,5 @@
 //! The HTTP handler in front of every service: it authenticates a request (SigV4, or a SigV2 presigned URL), decodes an
-//! aws-chunked body, and hands it to the service its credential scope names, in a transaction over the state. A
+//! aws-chunked or gzip body, and hands it to the service its credential scope names, in a transaction over the state. A
 //! request whose handler holds it, as a long poll with nothing to answer yet, waits without the lock and is run again
 //! whole after each request that commits and each tick. tick does, between requests, what services have due.
 
@@ -10,15 +10,17 @@ import * as sigv4 from "./auth/sigv4"
 import { Fault } from "./fault"
 import { uuid } from "./random"
 import { addressed, Internal } from "./internal"
+import * as cbor from "./protocol/cbor"
 import * as query from "./protocol/query"
 import { Caller, Identify } from "./service"
 import { Store } from "./state/store"
 import { Signal } from "builtin/fiber"
 import { indexOf } from "std/algo"
 import { HashMap } from "std/collections/hashmap"
+import { Gunzipper } from "std/compress/gzip"
 import { CryptoError } from "std/crypto/error"
 import { Body, Request, Response } from "std/http"
-import { lower, ParseError, split } from "std/string"
+import { lower, ParseError, split, trim } from "std/string"
 
 /// A service's handler; the request's body is already read whole.
 export type Service = (caller: Caller, req: Request) => Response throws IoError | ParseError
@@ -36,7 +38,7 @@ export class Gateway {
 	/// By signing name.
 	services = new HashMap[string, Service]()
 	/// How a service answers the faults the gateway finds, by signing name, or by label at a host of its own; awsQuery's
-	/// XML for one not here.
+	/// XML for one not here, or RPC v2 CBOR's to a request of it.
 	faults = new HashMap[string, Faulted]()
 	/// What tick runs, in order.
 	timed: Timed[] = []
@@ -54,6 +56,10 @@ export class Gateway {
 	internal = new Internal(this, n => this.services.has(n))
 	/// The most bytes a body may hold, by signing name, else std's 10 MiB. A body is read whole into memory.
 	limits = limits()
+	/// The signing names whose requests' Content-Encoding is their content's own, kept as S3 keeps an object's and a
+	/// function URL hands its function the body: a gzip body of any other is decoded, after its signature is checked over
+	/// it as sent, to at most its limit.
+	kept = ["s3", "lambda"]
 	/// How IAM sees a caller; without it only an account's root is allowed.
 	identify: Identify | null = null
 	/// Refuse no request for lack of permission or trust.
@@ -86,7 +92,7 @@ export class Gateway {
 			}
 		} catch (f: Fault) {
 			const faulted = this.faults.get(label)
-			return if (faulted == null) query.error(f, id) else faulted!(f, id, req)
+			return if (faulted == null) fallback(f, id, req) else faulted!(f, id, req)
 		}
 		const name = if (hosting != null) hosting![0] else auth?.service ?? this.anonymous
 		const service: Service | null = if (hosting != null) (c, r) => hosting![1](c, r, at, path)
@@ -95,14 +101,14 @@ export class Gateway {
 		const faulted = this.faults.get(if (hosting != null) label else name ?? "")
 		if (auth == null && service == null) {
 			const why = "Request is missing Authentication Token"
-			return query.error(new Fault(403, "MissingAuthenticationToken", why), id)
+			return fallback(new Fault(403, "MissingAuthenticationToken", why), id, req)
 		}
 		if (service == null) {
-			return query.error(new Fault(501, "NotImplemented", `The service ${name} is not implemented`), id)
+			return fallback(new Fault(501, "NotImplemented", `The service ${name} is not implemented`), id, req)
 		}
 		const limit = this.limits.get(name!) ?? (10 << 20)
 		if ((req.body.length ?? 0) > limit) {
-			return this.oversized(name!, req.body.length!, limit, id)
+			return this.oversized(name!, req.body.length!, limit, id, req)
 		}
 		const body = req.body.text(limit)
 		const arrived = now()
@@ -189,17 +195,22 @@ export class Gateway {
 	}
 
 	/// The answer to a body over limit, as AWS answers it: S3's EntityTooLarge, CloudWatch's RequestEntityTooLarge, Logs'
-	/// bare InternalFailure, else a 413 of no body, as STS's and Route 53's front ends. Where AWS differs: CloudWatch
-	/// refuses a body over 40960 bytes, and names that limit.
-	private oversized(name: string, size: i64, limit: i64, id: string): Response {
+	/// bare InternalFailure, else a 413 of no body, as STS's and Route 53's front ends; of a size not known, null, for a
+	/// body decoded past its limit. Where AWS differs: CloudWatch refuses a body over 40960 bytes, and names that limit.
+	private oversized(name: string, size: i64 | null, limit: i64, id: string, req: Request): Response {
 		if (name == "s3") {
 			const why = new Fault(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size", true,
-				`<ProposedSize>${size}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
+				`<ProposedSize>${size ?? limit}</ProposedSize><MaxSizeAllowed>${limit}</MaxSizeAllowed>`)
 			const faulted = this.faults.get(name)
 			return if (faulted == null) query.error(why, id) else faulted!(why, id, null)
 		}
 		if (name == "monitoring") {
-			const why = new Fault(413, "RequestEntityTooLarge", `Request size ${size} exceeded ${limit} bytes`, true)
+			const sized = if (size == null) "" else ` ${size}`
+			const why = new Fault(413, "RequestEntityTooLarge", `Request size${sized} exceeded ${limit} bytes`, true)
+			const faulted = this.faults.get(name)
+			if (cbor.claims(req)) {
+				return if (faulted == null) fallback(why, id, req) else faulted!(why, id, req)
+			}
 			return query.error(why, id, "http://monitoring.amazonaws.com/doc/2010-08-01/")
 		}
 		return new Response(if (name == "logs") 400 else 413, if (name == "logs") "<InternalFailure/>" else "")
@@ -266,7 +277,21 @@ export class Gateway {
 			why = if (e instanceof Fault) e else new Fault(500, "InternalFailure", e.what)
 		}
 		if (why != null) {
-			return if (faulted == null) query.error(why!, id) else faulted!(why!, id, req)
+			return if (faulted == null) fallback(why!, id, req) else faulted!(why!, id, req)
+		}
+		if (gzipped(req) && !this.kept.includes(name)) {
+			const limit = this.limits.get(name) ?? (10 << 20)
+			try {
+				req.body = new Body(new Body(new Gunzipper(req.body)).text(limit))
+			} catch (e: IoError) {
+				if (e.kind == "TooLarge") {
+					return this.oversized(name, null, limit, id, req)
+				}
+				// AWS's documentation does not say how it answers a corrupt gzip body
+				const corrupt = new Fault(400, "SerializationException",
+					"The body is not gzip, as its Content-Encoding says")
+				return if (faulted == null) fallback(corrupt, id, req) else faulted!(corrupt, id, req)
+			}
 		}
 		let caller = new Caller("", auth?.region ?? "us-east-1", "*", id, "anonymous", this.trees)
 		if (auth != null) {
@@ -291,6 +316,18 @@ export class Gateway {
 		}
 		return if (held) null else res!
 	}
+}
+
+/// The answer of the fault f to req of a service that answers none itself.
+function fallback(f: Fault, id: string, req: Request): Response {
+	return if (cbor.claims(req)) cbor.error(null, f, id) else query.error(f, id)
+}
+
+/// Whether gzip is the last coding req's Content-Encoding lists, aws-chunked aside, and so the first to undo.
+function gzipped(req: Request): bool {
+	const listed = split(lower(req.headers.get("content-encoding") ?? ""), ",")
+	const codings = listed.map(c => trim(c)).filter(c => c != "" && c != "aws-chunked")
+	return codings.length > 0 && codings[codings.length - 1] == "gzip"
 }
 
 function limits(): HashMap[string, i64] {

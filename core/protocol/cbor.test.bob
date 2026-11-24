@@ -1,0 +1,261 @@
+import { encode } from "std/encoding/cbor"
+import { decode as unhex, encode as tohex } from "std/encoding/hex"
+import { Request } from "std/http"
+import { replace } from "std/string"
+import { Fault } from "../fault"
+import { Caller, notImplemented, Unit } from "../service"
+import { Call, decode, error, members, result } from "./cbor"
+import { Document, ErrorShape, Service } from "./json"
+import { Blob, Timestamp, Valid } from "./model"
+
+// The bodies are after the Smithy RPC v2 CBOR spec and its protocol tests, written out as hex.
+function x(h: string): string { return unhex(replace(h, " ", "")) }
+
+class GreetingStruct {
+	hi: string | null
+}
+
+class Scalars {
+	Name: string
+	Count: i32 | null
+	Big: i64 | null
+	Ratio: f64 | null
+	On: bool | null
+	Data: string | null @Blob
+	Epoch: i64 | null @Timestamp
+	Mode: "fast" | "safe" | null
+}
+
+class Collections {
+	Strings: string[] | null
+	Structs: GreetingStruct[] | null
+	Lists: string[][] | null
+	Map: [string, GreetingStruct][] | null
+	Sparse: (string | null)[] | null
+	SparseMap: [string, string | null][] | null
+	Stamps: i64[] | null @Timestamp
+}
+
+test "scalars" {
+	const v = decode[Scalars](x("a9 644e616d65 616e 65436f756e74 22 63426967 1b112210f47de98115 65526174696f f94100"
+		+ "624f6e f5 6444617461 4576616c7565 6545706f6368 c1fb41d6954ad247df3b 644d6f6465 6473616665"
+		+ "67556e6b6e6f776e 8201a161784100"))
+	assert v.Name == "n" && v.Count == -3 && v.Big == 1234567890123456789 && v.Ratio == 2.5 && v.On == true
+	assert v.Data == "value" && v.Mode == "safe" && v.Epoch == 1515531081_123_000_000
+	const absent = decode[Scalars](x("a4 644e616d65 7f61616162ff 6545706f6368 c11a5a552b49 65436f756e74 f6"
+		+ "65526174696f f7"))
+	assert absent.Name == "ab" && absent.Epoch == 1515531081_000_000_000 && absent.Count == null && absent.Ratio == null
+	assert decode[Scalars](x("bf 644e616d65 60 ff")).Name == ""
+}
+
+test "collections" {
+	const v = decode[Collections](x("a7 67537472696e6773 8261616162 6753747275637473 82a16268696178a0"
+		+ "654c69737473 838161618082616261 63 634d6170 a1636f6e65a162686961 79 66537061727365 826161f6"
+		+ "695370617273654d6170 a26161f661626163 665374616d7073 82c101c1fb4004000000000000"))
+	assert v.Strings == ["a", "b"] && v.Structs!.map(g => g.hi) == ["x", null] && v.Lists == [["a"], [], ["b", "c"]]
+	assert v.Map!.map(e => `${e[0]}=${e[1].hi}`) == ["one=y"]
+	assert v.Sparse == ["a", null] && v.SparseMap == [["a", null], ["b", "c"]]
+	assert v.Stamps == [1_000_000_000, 2_500_000_000]
+	const empty = decode[Collections]("")
+	assert empty.Strings == null && empty.Map == null
+	assert decode[Collections](x("bf 67537472696e6773 9f616161 62ff ff")).Strings == ["a", "b"]
+}
+
+class Nested {
+	Items: Scalars[] = []
+}
+
+function invalid(why: string): Fault {
+	return new Fault(400, "ValidationException", `1 validation error detected: ${why}`)
+}
+
+test "a missing required member" {
+	const why = "Value null at 'name' failed to satisfy constraint: Member must not be null"
+	assert decode[Scalars](x("a1 65436f756e74 01")) throws invalid(why)
+	assert decode[Scalars](x("a1 644e616d65 f7")) throws invalid(why)
+	const nested = "Value null at 'items.2.member.name' failed to satisfy constraint: Member must not be null"
+	assert decode[Nested](x("a1 654974656d73 82 a1644e616d656161 a165436f756e7401")) throws invalid(nested)
+}
+
+class Bounded {
+	Size: i32 @Valid["1", "5", ""] = 0
+}
+
+function answer(code: string, message: string): string {
+	return map(["__type", `smithy.example#${code}`, "message", message])
+}
+
+function malformed(what: string, at: string, not: string): Fault {
+	return new Fault(400, "SerializationException", `Expected ${what} at ${at}, not ${not}`)
+}
+
+test "a value not of its type" {
+	const name = "644e616d65 6161"
+	assert decode[Scalars](x(`a2 ${name} 6444617461 6176`)) throws malformed("a byte string", "'Data'", "a text string")
+	const stamp = "a timestamp, tag 1 over its epoch seconds"
+	assert decode[Scalars](x(`a2 ${name} 6545706f6368 1a5a552b49`)) throws malformed(stamp, "'Epoch'",
+		"an unsigned integer")
+	assert decode[Scalars](x(`a2 ${name} 6545706f6368 c06161`)) throws malformed(stamp, "'Epoch'", "a tagged item")
+	assert decode[Scalars](x(`a2 ${name} 65436f756e74 fb3ff8000000000000`)) throws malformed("an integer", "'Count'",
+		"a float")
+	const range = new Fault(400, "SerializationException", "an integer out of range at 'Count'")
+	assert decode[Scalars](x(`a2 ${name} 65436f756e74 1b0000010000000000`)) throws range
+	assert decode[Scalars](x(`a2 ${name} 624f6e 01`)) throws malformed("a boolean", "'On'", "an unsigned integer")
+	assert decode[Scalars](x(`a2 ${name} 644d6f6465 6473616665`)).Mode == "safe"
+	assert decode[Scalars](x("80")) throws malformed("a map", "the body", "an array")
+	assert decode[Collections](x("a1 67537472696e6773 6161")) throws malformed("a list", "'Strings'", "a text string")
+	assert decode[Scalars](x("a1 644e616d65 6161 00")) throws new Fault(400, "SerializationException",
+		"Malformed CBOR at byte 8 of the body")
+	assert decode[Scalars](x("a2 644e616d65")) throws new Fault(400, "SerializationException",
+		"Malformed CBOR at byte 6 of the body")
+	const bound = "Value '9' at 'size' failed to satisfy constraint: Member must have value less than or equal to 5"
+	assert decode[Bounded](x("a1 6453697a65 09")) throws invalid(bound)
+}
+
+class Documented {
+	Doc: string | null @Document
+}
+
+test "a document is refused" {
+	assert decode[Documented](x("a1 63446f63 a0")) throws new Fault(400, "SerializationException",
+		"A document, at 'Doc', is not supported")
+	assert decode[Documented](x("a1 63446f63 f6")).Doc == null
+}
+
+class Choice$Text {
+	text: string
+}
+
+class Choice$Number {
+	number: i32
+}
+
+type Choice = Choice$Text | Choice$Number
+
+class WithChoice {
+	choice: Choice | null
+}
+
+test "a union" {
+	const text = decode[WithChoice](x("a1 6663686f696365 a2 665f5f74797065 6143 6474657874 6161")).choice
+	assert text instanceof Choice$Text && (text as Choice$Text).text == "a"
+	const number = decode[WithChoice](x("a1 6663686f696365 a2 6474657874 f6 666e756d626572 05")).choice
+	assert number instanceof Choice$Number && (number as Choice$Number).number == 5
+	const two = "Value null at 'choice' failed to satisfy constraint: Member must have exactly one member set"
+	assert decode[WithChoice](x("a1 6663686f696365 a2 6474657874 6161 666e756d626572 05")) throws invalid(two)
+}
+
+class Output {
+	binary: string @Blob = "value"
+	epoch: i64 @Timestamp = 1515531081_123_000_000
+	whole: i64 @Timestamp = 1398796238_000_000_000
+	n = 7
+	on = true
+	ratio = 1234.5
+	mode: "fast" | "safe" = "fast"
+	missing: string | null = null
+	list: (string | null)[] = ["a", null]
+	map: [string, i32][] = [["k", 1]]
+	nested = new GreetingStruct()
+	doc: string | null @Document = "{}"
+}
+
+test "an output" {
+	assert tohex(result(new Output()))
+		== replace("aa 6662696e617279 4576616c7565 6565706f6368 c1fb41d6954ad247df3b 6577686f6c65 c11a535fefce 616e07"
+		+ " 626f6ef5 65726174696f fb40934a0000000000 646d6f6465 6466617374 646c697374 826161f6 636d6170 a1616b01"
+		+ " 666e6573746564 a0", " ", "")
+	assert result(new Unit()) == ""
+	assert tohex(members(new GreetingStruct())) == "" && members({ hi: "a" }) == x("626869 6161")
+}
+
+function caller(): Caller { return new Caller("000000000000", "us-east-1", "arn:aws:iam::000000000000:root", "id") }
+
+const plain = new Service("smithy.example#Greeter", "1.0", false,
+	[new ErrorShape("smithy.example#Denied", "Message", "")])
+
+const compatible = new Service("smithy.example#Greeter", "1.0", true,
+	[new ErrorShape("smithy.example#Denied", "message", "AWS.Denied"), new ErrorShape("smithy.example#Bare", "", "")])
+
+function request(path: string, body: string = ""): Request {
+	const req = new Request("POST", `http://localhost${path}`, body)
+	req.headers.set("smithy-protocol", "rpc-v2-cbor")
+	return req
+}
+
+function call(service: Service, body: string, path: string = "/service/Greeter/operation/Greet"): Call {
+	return new Call(caller(), service, request(path), body)
+}
+
+/// The indefinite CBOR map of the texts in turn, as errors are written.
+function map(texts: string[]): string { return x("bf") + texts.map(t => encode(t)).join("") + x("ff") }
+
+test "serve" {
+	const unimplemented = call(plain, x("a0")).serve((c: Caller, input: GreetingStruct): GreetingStruct => {
+		throw notImplemented("Greet")
+	})
+	assert unimplemented.status == 501 && unimplemented.headers.get("content-type") == "application/cbor"
+	assert unimplemented.headers.get("smithy-protocol") == "rpc-v2-cbor"
+	assert unimplemented.body.whole == answer("NotImplemented", "The operation Greet is not implemented")
+	const h = (c: Caller, input: GreetingStruct): GreetingStruct => {
+		if (input.hi == "no") {
+			throw new Fault(403, "Denied", "no")
+		}
+		return input
+	}
+	const ok = call(plain, x("a1 626869 6161")).serve(h)
+	assert ok.status == 200 && ok.headers.get("x-amzn-requestid") == "id" && ok.body.whole == x("a1 626869 6161")
+	const denied = call(plain, x("a1 626869 626e6f")).serve(h)
+	assert denied.status == 403 && denied.body.whole == map(["__type", "smithy.example#Denied", "Message", "no"])
+	const bad = call(plain, x("80")).serve(h)
+	const why = "Expected a map at the body, not an array"
+	assert bad.status == 400 && bad.body.whole == answer("SerializationException", why)
+}
+
+test "an empty input and output" {
+	let got: Unit | null = null
+	const res = call(plain, "").serve((c: Caller, input: Unit) => {
+		got = input
+		return input
+	})
+	assert got != null && res.status == 200 && res.body.whole == ""
+	assert res.headers.get("content-type") == null && res.headers.get("smithy-protocol") == "rpc-v2-cbor"
+}
+
+test "the operation a path names" {
+	assert call(plain, "").operation == "Greet"
+	assert call(plain, "", "/prefix/service/smithy.example.Greeter/operation/Greet").operation == "Greet"
+	assert call(plain, "", "/service/Other/operation/Greet").operation == ""
+	assert call(plain, "", "/service/Greeter/operation/smithy.example.Greet").operation == ""
+	assert call(plain, "", "/service/Greeter/operations/Greet").operation == ""
+	const get = new Call(caller(), plain, new Request("GET", "http://localhost/service/Greeter/operation/Greet"), "")
+	assert get.operation == ""
+	const unknown = call(plain, "", "/service/Greeter/operation/Other").unknownOperation()
+	const why = "Unknown operation /service/Greeter/operation/Other"
+	assert unknown.status == 400 && unknown.body.whole == answer("UnknownOperationException", why)
+}
+
+test "a request naming a target" {
+	const req = request("/service/Greeter/operation/Greet", x("a0"))
+	req.headers.set("x-amz-target", "Greeter.Greet")
+	const res = new Call(caller(), plain, req, x("a0")).serve((c: Caller, input: Unit) => input)
+	const why = "An rpc-v2-cbor request may not name a target"
+	assert res.status == 400 && res.body.whole == answer("SerializationException", why)
+}
+
+test "awsQuery compatibility" {
+	const denied = error(compatible, new Fault(400, "Denied", "no"), "id")
+	assert denied.headers.get("x-amzn-query-error") == "AWS.Denied;Sender"
+	assert denied.body.whole == answer("Denied", "no")
+	const bare = error(compatible, new Fault(500, "Bare", "lost"), "id")
+	assert bare.status == 500 && bare.headers.get("x-amzn-query-error") == "Bare;Receiver"
+	assert bare.body.whole == map(["__type", "smithy.example#Bare"])
+	assert error(plain, new Fault(400, "Denied", "no"), "id").headers.get("x-amzn-query-error") == null
+	const xml = new Fault(400, "Denied", "no", true, "<Reason>r</Reason>")
+	assert error(compatible, xml, "id").body.whole == denied.body.whole
+	const extra = new Fault(400, "Denied", "no", true, members({ hi: "a" }))
+	assert error(compatible, extra, "id").body.whole
+		== map(["__type", "smithy.example#Denied", "message", "no", "hi", "a"])
+	assert error(null, new Fault(403, "AccessDenied", "no"), "id").body.whole
+		== map(["__type", "AccessDenied", "message", "no"])
+}

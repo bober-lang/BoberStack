@@ -1,0 +1,372 @@
+//! The Smithy RPC v2 CBOR protocol: a request names its service and operation in its path, as
+//! [prefix]/service/{service}/operation/{operation}, and its input, output and errors are CBOR maps, read and written by
+//! reflection over the classes of awsJson: a blob is a byte string, a timestamp tag 1 over its epoch seconds, and
+//! null, as CBOR's undefined, an absent member. A service is described as an awsJson one, its version aside.
+//! Where AWS differs: a document, which the protocol does not support, is refused in a request and left out of an
+//! answer; an error's members besides its message are left out where its service writes them in another protocol.
+
+import { indexOf } from "std/algo"
+import * as std from "std/encoding/cbor"
+import { Request, Response } from "std/http"
+import { round } from "std/math"
+import { ParseError, replace, split } from "std/string"
+import { millisecond, second } from "std/time"
+import { Decodable, has } from "std/types"
+import { Fault } from "../fault"
+import { Caller, Unit } from "../service"
+import * as gap from "./cborgap"
+import { Document, Service } from "./json"
+import { Blob, check, choice, Default, nullable, path, Timestamp, Validation, Violations } from "./model"
+
+/// Whether req is of this protocol, as its Smithy-Protocol header says; its call checks the rest.
+export function claims(req: Request): bool { return req.headers.get("smithy-protocol") == "rpc-v2-cbor" }
+
+export class Call {
+	caller: Caller
+	service: Service
+	body: string
+	/// The operation its path names, "" if it names none of the service; and what refuses it whatever it names.
+	operation: string
+	refused: Fault | null = null
+	private path: string
+
+	constructor(caller: Caller, service: Service, req: Request, body: string) {
+		this.caller = caller
+		this.service = service
+		this.body = body
+		this.path = req.url.path
+		const parts = split(req.url.path, "/")
+		const n = parts.length
+		const named = n >= 5 && parts[n - 4] == "service" && parts[n - 2] == "operation"
+			&& (parts[n - 3] == name(service.id) || parts[n - 3] == replace(service.id, "#", "."))
+		this.operation = if (named && req.method == "POST" && indexOf(parts[n - 1], ".") < 0) parts[n - 1] else ""
+		if (req.headers.has("x-amz-target") || req.headers.has("x-amzn-target")) {
+			this.refused = new Fault(400, "SerializationException", "An rpc-v2-cbor request may not name a target")
+		}
+	}
+
+	/// The answer by h, the handler of its operation, which IAM authorizes as actions: h's output or the Fault it throws.
+	serve[I extends Decodable, O](h: (caller: Caller, input: I) => O throws Fault, actions: string[] = []): Response {
+		const id = this.caller.requestId
+		this.caller.actions = actions
+		try {
+			if (this.refused != null) {
+				throw this.refused!
+			}
+			return reply(result(h(this.caller, decode[I](this.body, this.service.validation))), id)
+		} catch (f: Fault) {
+			return error(this.service, f, id)
+		}
+	}
+
+	unknownOperation(): Response {
+		const f = this.refused ?? new Fault(400, "UnknownOperationException", `Unknown operation ${this.path}`)
+		return error(this.service, f, this.caller.requestId)
+	}
+}
+
+export function call(caller: Caller, req: Request, service: Service): Call throws IoError {
+	return new Call(caller, service, req, req.body.text())
+}
+
+/// The T the CBOR map s holds, none if s is empty; s not of T's CBOR is a SerializationException, s breaking T's model
+/// validation's fault.
+export function decode[T extends Decodable](s: string,
+	validation: Validation = new Validation("ValidationException")): T throws Fault {
+	const v = new Violations(validation)
+	const x = if (s == "") gap.head(5, 0) else s
+	try {
+		gap.whole(x)
+	} catch (e: ParseError) {
+		throw new Fault(400, "SerializationException", `Malformed CBOR at byte ${e.at} of the body`)
+	}
+	const r = value[T](x, "", "", [], v)
+	v.check()
+	return r
+}
+
+/// v's members, as the entries of a map, for an error's besides its message.
+export function members[T](v: T): string {
+	let out = ""
+	for (const f of T.fields) {
+		const x = v[f.name]
+		if (x != null && !has(f.tags, Document)) {
+			out += std.encode(f.name) + put(x, f.tags)
+		}
+	}
+	return out
+}
+
+export function result[O](out: O): string { return if (O == Unit) "" else put(out, []) }
+
+/// The answer of body; of no content type if there is none, as for an operation without output.
+export function reply(body: string, requestId: string, status: i32 = 200): Response {
+	const res = new Response(status, body)
+	res.headers.set("smithy-protocol", "rpc-v2-cbor")
+	if (body != "") {
+		res.headers.set("content-type", "application/cbor")
+	}
+	res.headers.set("x-amzn-requestid", requestId)
+	return res
+}
+
+/// The answer of the fault f from service, or from a service unknown if null. Its __type is the shape id of the error
+/// that f's code names, or whose code under awsQuery it is; a code the service does not list is taken for a name in its
+/// namespace. If service is compatible with awsQuery, x-amzn-query-error holds the error's code there and who is at
+/// fault.
+export function error(service: Service | null, f: Fault, requestId: string): Response {
+	const errors = service?.errors ?? []
+	const declared = errors.find(e => name(e.id) == f.code) ?? errors.find(e => e.query == f.code)
+	const id = if (declared != null) declared.id
+		else if (indexOf(f.code, "#") >= 0 || service == null) f.code
+		else `${split(service!.id, "#")[0]}#${f.code}`
+	const key = if (declared == null) "message" else declared.message
+	let entries = std.encode("__type") + std.encode(id)
+	if (key != "") {
+		entries += std.encode(key) + std.encode(f.message)
+	}
+	// members written for another protocol, as an awsQuery service's XML, do not read as CBOR's
+	const open = gap.head(5, 0)[0] | 31
+	try {
+		gap.items(gap.whole(fromBytes([open]) + f.members + "\xff"))
+		entries += f.members
+	} catch (e: ParseError) {}
+	const res = reply(fromBytes([open]) + entries + "\xff", requestId, f.status)
+	if (service?.queryCompatible ?? false) {
+		const code = if (declared == null || declared.query == "") name(f.code) else declared.query
+		res.headers.set("x-amzn-query-error", `${code};${if (f.sender) "Sender" else "Receiver"}`)
+	}
+	return res
+}
+
+/// What the item x is, for a message.
+function kind(x: string): string {
+	switch (gap.major(x)) {
+		case 0: return "an unsigned integer"
+		case 1: return "a negative integer"
+		case 2: return "a byte string"
+		case 3: return "a text string"
+		case 4: return "an array"
+		case 5: return "a map"
+		case 6: return "a tagged item"
+		default: switch (x[0]) {
+			case 0xf4, 0xf5: return "a boolean"
+			case 0xf6, 0xf7: return "null"
+			default: return "a float"
+		}
+	}
+}
+
+function malformed(x: string, k: string, what: string): Fault {
+	const at = if (k == "") "the body" else `'${k}'`
+	return new Fault(400, "SerializationException", `Expected ${what} at ${at}, not ${kind(x)}`)
+}
+
+/// Whether x is null, or undefined, which the protocol takes for null.
+function none(x: string): bool { return x == "\xf6" || x == "\xf7" }
+
+/// The T that the CBOR item x holds, at k on the wire and the member path at, of a member tagged tags.
+function value[T extends Decodable](x: string, k: string, at: string, tags: Type[], v: Violations): T throws Fault {
+	switch (T.kind) {
+		case "null":
+			if (none(x)) {
+				return null
+			}
+			throw malformed(x, k, "null")
+		case "union":
+			if (!none(x) && T.members.filter(M => M.kind == "class").length > 1) {
+				return variant[T](x, k, at, v)
+			}
+			if (!none(x) && T.members.every(M => M.kind == "literal" || M.kind == "null")) {
+				return choice[T](scalar[string](x, k, 3, "a string"), at, v)
+			}
+			let last = malformed(x, k, "a value")
+			for (const M of T.members) {
+				try {
+					return value[M](x, k, at, tags, v)
+				} catch (f: Fault) {
+					last = if (M.kind == "null") last else f
+				}
+			}
+			throw last
+		case "literal": return choice[T](scalar[string](x, k, 3, "a string"), at, v)
+		case "array":
+			const xs: T = []
+			if (T.elem.kind == "tuple") {
+				for (const [key, item] of entries(x, k)) {
+					const name = scalar[string](key, k, 3, "a string")
+					const e = new T.elem()
+					for (const f of T.elem.fields) {
+						e[f.name] = if (f.name == "0") value[f.type](key, k, at, [], v)
+							else value[f.type](item, `${k}.${name}`, `${at}.${name}`, tags, v)
+					}
+					xs.push(e)
+				}
+				check(xs, at, tags, v)
+				return xs
+			}
+			let items: string[] = []
+			try {
+				items = if (gap.major(x) == 4) gap.items(x) else []
+			} catch (e: ParseError) {}
+			if (gap.major(x) != 4) {
+				throw malformed(x, k, "a list")
+			}
+			for (let i = 0; i < items.length; i++) {
+				xs.push(value[T.elem](items[i], `${k}.${i + 1}`, `${at}.${i + 1}.member`, tags, v))
+			}
+			check(xs, at, tags, v)
+			return xs
+		case "class":
+			const r = new T()
+			const members = entries(x, k)
+			const from: i32[] = []
+			for (const f of T.fields) {
+				from.push(v.found.length)
+				const m = if (k == "") f.name else `${k}.${f.name}`
+				const e = members.find(e => e[0] == std.encode(f.name) && !none(e[1]))
+				if (e != null && has(f.tags, Document)) {
+					throw new Fault(400, "SerializationException", `A document, at '${m}', is not supported`)
+				}
+				if (e != null) {
+					r[f.name] = value[f.type](e[1], m, path(at, f.name), f.tags, v)
+				} else if (!nullable(f.type) && !has(f.tags, Default)) {
+					v.note(null, path(at, f.name), "Member must not be null")
+				}
+			}
+			v.order(T.fields.map(f => path("", f.name)), from)
+			return r
+		case "string":
+			const blob = has(tags, Blob)
+			const s = scalar[string](x, k, if (blob) 2 else 3, if (blob) "a byte string" else "a text string")
+			check(s, at, tags, v, blob)
+			return s
+		case "bool":
+			if (x != "\xf4" && x != "\xf5") {
+				throw malformed(x, k, "a boolean")
+			}
+			return scalar[bool](x, k, 7, "a boolean")
+		case "int":
+			if (T == i64 && has(tags, Timestamp)) {
+				let tagged: [i64, string] = [0, ""]
+				try {
+					tagged = gap.untag(x)
+				} catch (e: ParseError) {}
+				if (tagged[0] != 1 || ![0, 1, 7].includes(gap.major(tagged[1]))) {
+					throw malformed(x, k, "a timestamp, tag 1 over its epoch seconds")
+				}
+				const seconds = scalar[f64](tagged[1], k, gap.major(tagged[1]), "a number of seconds")
+				return (round(seconds * 1000.0) as i64) * millisecond
+			}
+			const n = scalar[T](x, k, if (gap.major(x) == 1) 1 else 0, "an integer")
+			check(n, at, tags, v)
+			return n
+		case "float":
+			if (gap.major(x) == 7 && x[0] < 0xf9) {
+				throw malformed(x, k, "a number")
+			}
+			const f = scalar[T](x, k, if (gap.major(x) == 7) 7 else if (gap.major(x) == 1) 1 else 0, "a number")
+			check(f, at, tags, v)
+			return f
+		default: throw malformed(x, k, `a ${T.name}`)
+	}
+}
+
+/// The T, a union, of the one member that the CBOR map x sets, its __type aside; of none or several, a union the
+/// service words on its own is noted into v, as its first member unset.
+function variant[T extends Decodable](x: string, k: string, at: string, v: Violations): T throws Fault {
+	const set = entries(x, k).filter(e => e[0] != std.encode("__type") && !none(e[1]))
+	for (const M of T.members) {
+		if (M.kind != "class" || M.fields.length == 0) {
+			continue
+		}
+		if (set.length == 1 && std.encode(M.fields[0].name) == set[0][0]) {
+			return value[M](x, k, at, [], v)
+		}
+		if (set.length != 1 && v.worded(split(M.name, "$")[0], set.length == 0)) {
+			return value[M](gap.head(5, 0), k, at, [], new Violations(v.validation))
+		}
+	}
+	throw v.fault(null, at, "Member must have exactly one member set")
+}
+
+/// The keys and values of the CBOR map x, as their items; a key as its shortest encoding, so that one key compares
+/// equal to another however it was written.
+function entries(x: string, k: string): [string, string][] throws Fault {
+	let items: string[] = []
+	try {
+		items = if (gap.major(x) == 5) gap.items(x) else []
+	} catch (e: ParseError) {}
+	if (gap.major(x) != 5) {
+		throw malformed(x, k, "a map")
+	}
+	const out: [string, string][] = []
+	for (let i = 0; i + 1 < items.length; i += 2) {
+		out.push([std.encode(scalar[string](items[i], k, 3, "a text string as a key")), items[i + 1]])
+	}
+	return out
+}
+
+/// The T that std reads from x, an item of major type m.
+function scalar[T extends Decodable](x: string, k: string, m: i32, what: string): T throws Fault {
+	if (gap.major(x) != m) {
+		throw malformed(x, k, what)
+	}
+	try {
+		return std.decode[T](x)
+	} catch (e: ParseError) {
+		throw if (e.kind == "range") new Fault(400, "SerializationException", `${what} out of range at '${k}'`)
+			else malformed(x, k, what)
+	}
+}
+
+/// The CBOR of v, of a member tagged tags; a structure's null members, and its documents, are left out.
+function put[T](v: T, tags: Type[]): string {
+	switch (T.kind) {
+		case "null": return "\xf6"
+		case "union":
+			for (const M of T.members) {
+				if (v instanceof M) {
+					return put(v, tags)
+				}
+			}
+			return "\xf6"
+		case "literal": return std.encode(`${v}`)
+		case "array":
+			let items = ""
+			if (T.elem.kind == "tuple") {
+				for (const e of v) {
+					for (const f of T.elem.fields) {
+						items += if (f.name == "0") std.encode(`${e[f.name]}`) else put(e[f.name], tags)
+					}
+				}
+				return gap.head(5, v.length as i64) + items
+			}
+			for (const x of v) {
+				items += put(x, tags)
+			}
+			return gap.head(4, v.length as i64) + items
+		case "class", "object":
+			let n = 0
+			let members = ""
+			for (const f of T.fields) {
+				const x = v[f.name]
+				if (x != null && !has(f.tags, Document)) {
+					members += std.encode(f.name) + put(x, f.tags)
+					n++
+				}
+			}
+			return gap.head(5, n as i64) + members
+		case "string": return if (has(tags, Blob)) gap.head(2, v.length as i64) + v else std.encode(v)
+		case "int":
+			if (T == i64 && has(tags, Timestamp)) {
+				const ms = (v - v % millisecond) / millisecond
+				const seconds = if (ms % 1000 == 0) std.encode(ms / 1000) else std.encode((ms as f64) / 1000.0)
+				return gap.head(6, 1) + seconds
+			}
+			return std.encode(v)
+		default: return std.encode(v)
+	}
+}
+
+function name(id: string): string { return split(id, "#").pop()! }

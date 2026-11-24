@@ -1,8 +1,9 @@
-//! Amazon CloudWatch: metrics, metric math, metric and composite alarms and dashboards, in awsQuery and awsJson alike.
-//! Datapoints are stored as put and aggregated at each read. There is no background work: an alarm is evaluated when
-//! data is put to its metric and before the Describe*Alarm* calls answer, and its actions are delivered within the
-//! request by SNS's Publish as cloudwatch.amazonaws.com, so that the topic's policy decides. Anomaly detectors stay
-//! PENDING_TRAINING; metric streams and Contributor Insights rules are kept but do nothing. Where AWS differs:
+//! Amazon CloudWatch: metrics, metric math, metric and composite alarms and dashboards, in awsQuery, awsJson and RPC v2
+//! CBOR alike. Datapoints are stored as put and aggregated at each read. There is no background work: an alarm is
+//! evaluated when data is put to its metric and before the Describe*Alarm* calls answer, and its actions are delivered
+//! within the request by SNS's Publish as cloudwatch.amazonaws.com, so that the topic's policy decides. Anomaly
+//! detectors stay PENDING_TRAINING; metric streams and Contributor Insights rules are kept but do nothing. Where AWS
+//! differs:
 //!
 //! - Retention is of the request's time: 15 months, 15 days for periods under 5 minutes, 63 under an hour; a metric
 //!   without data put in two weeks is not listed.
@@ -13,6 +14,8 @@
 //! - Only SNS actions are delivered; an alarm message's Region is the region's code and has no StateReasonData.
 //! - A composite alarm's syntax errors list fewer of the tokens AWS would take; its reasons are worded more briefly.
 //! - A dashboard's body is checked for its widgets' types only, and its Size is the body's length.
+//! - A missing dashboard's error is typed ResourceNotFound, not DashboardNotFoundError, in awsJson and CBOR; a CBOR
+//!   error holds its type and message only.
 
 import { Fault } from "../../core/fault"
 import { Caller, notImplemented, requestTags, resourceTags, Unit } from "../../core/service"

@@ -1,4 +1,4 @@
-//! Generates the API of an awsQuery, awsJson, restXml or restJson1 service from its Smithy model, in the JSON AST: a
+//! Generates the API of an awsQuery, awsJson, restXml, restJson1 or RPC v2 CBOR service from its Smithy model, in the JSON AST: a
 //! class for each structure its operations take or give, a type for each enum, for each union a class U$M of one field
 //! M for each member M and their union U, a function making each error's Fault, an interface of the operations'
 //! handlers, a class Unimplemented answering each NotImplemented, for a service to mix in, and a function handle
@@ -78,6 +78,7 @@ class Traits {
 	queryCompatible: Mark | null @json.Name["aws.protocols#awsQueryCompatible"]
 	restXml: RestXml | null @json.Name["aws.protocols#restXml"]
 	restJson1: Mark | null @json.Name["aws.protocols#restJson1"]
+	rpcv2Cbor: Mark | null @json.Name["smithy.protocols#rpcv2Cbor"]
 	jsonName: string | null @json.Name["smithy.api#jsonName"]
 	http: Http | null @json.Name["smithy.api#http"]
 	httpLabel: Mark | null @json.Name["smithy.api#httpLabel"]
@@ -418,8 +419,10 @@ class Generator {
 	interleaved: [string, string, string][] = []
 	/// The XML names AWS gives structures, by their ids, where it differs from the model.
 	xmlNames: [string, string][] = []
-	/// Whether the service serves awsJson 1.0 besides awsQuery.
+	/// Whether the service serves awsJson 1.0 besides awsQuery; and RPC v2 CBOR besides awsQuery or awsJson, which its
+	/// handle and handleJson hand to handleCbor.
 	twofold = false
+	cbor = false
 	/// Whether the member being typed is a restXml payload, which may be a stream; and the operations the API cannot
 	/// express.
 	payload = false
@@ -430,9 +433,9 @@ class Generator {
 	/// The names declared, the imported ones too, to fail on a second of one.
 	taken = ["query", "json", "model", "Caller", "Fault", "notImplemented", "Unit", "Request", "Response",
 		"signingName", "version", "ns", "service", "validation", "Unimplemented", "handle", "restxml", "routes", "rest",
-		"restjson", "handleJson", "xml"]
+		"restjson", "handleJson", "xml", "cbor", "handleCbor", "fault"]
 
-	/// The service's protocol, awsQuery, awsJson1_0, awsJson1_1, restXml or restJson1, once api has begun; and its
+	/// The service's protocol, awsQuery, awsJson1_0, awsJson1_1, restXml, restJson1 or rpcv2Cbor, once api has begun; and its
 	/// shape id, operations and
 	/// version, once api has run.
 	protocol = ""
@@ -454,16 +457,18 @@ class Generator {
 			else if (t.awsJson11 != null) "awsJson1_1"
 			else if (t.restXml != null) "restXml"
 			else if (t.restJson1 != null) "restJson1"
+			else if (t.rpcv2Cbor != null) "rpcv2Cbor"
 			else ""
 		const query = this.protocol == "awsQuery"
 		const rest = this.rest()
 		if (this.protocol == "" || query && t.xmlNamespace == null || t.sigv4 == null
 			|| !rest && s.resources.length > 0) {
-			const why = "not an awsQuery service of an XML namespace, an awsJson or REST one, of sigv4, or has resources"
+			const why = "not an awsQuery service of an XML namespace, an awsJson, REST or CBOR one, of sigv4, or has resources"
 			throw new ModelError(`${services[0][0]}: ${why}`)
 		}
 		this.amend(services[0][0])
 		this.twofold = query && twofold.includes(services[0][0])
+		this.cbor = t.rpcv2Cbor != null && this.protocol != "rpcv2Cbor" && !rest
 		this.validation = validations.find(v => v[0] == services[0][0])
 		const exempt = unconstrained.find(u => u[0] == services[0][0])
 		this.unconstrained = if (exempt == null) [] else exempt[1]
@@ -549,9 +554,14 @@ class Generator {
 		const worded = unions.find(u => u[0] == services[0][0])
 		const validated = v != null || worded != null
 		const codec = this.codec()
-		const head: Decl[] = if (this.twofold) [new Decl("import",
-			[`import * as json from "${root(out)}core/protocol/json"`])]
-			else []
+		const head: Decl[] = []
+		const jsonToo = this.twofold || codec == "cbor" || this.cbor && query
+		const extra: [string, bool][] = [["cbor", this.cbor], ["json", jsonToo]]
+		for (const [c, imported] of extra) {
+			if (imported) {
+				head.push(new Decl("import", [`import * as ${c} from "${root(out)}core/protocol/${c}"`]))
+			}
+		}
 		head.append(imports(out, codec, unit, this.modeled || validated, this.xmlTagged))
 		const unchecked = if (this.unchecked.length == 0) []
 			else ["// Patterns that std/regex cannot run, so unchecked:", ...this.unchecked.map(u => `// ${u}`)]
@@ -612,7 +622,7 @@ class Generator {
 			const doc = "/// The operations' routes, the most specific first."
 			head.push(new Decl("const", [doc, ...wrap(`export const routes = [${routes.map(r => r[1]).join(", ")}]`)]))
 		}
-		if (!query && !rest || this.twofold) {
+		if (!query && !rest || this.twofold || this.cbor) {
 			const version = json.quoted(if (this.protocol == "awsJson1_1") "1.1" else "1.0")
 			const start = `export const service = new json.Service(${json.quoted(services[0][0])}, ${version}`
 			const end = if (validated) ", validation" else ""
@@ -628,9 +638,16 @@ class Generator {
 		decls.push(new Decl("class", [doc, "export class Unimplemented {", ...layout(unimplemented), "}"]))
 		const denied = if (denial == null) `403, "AccessDenied", "reasoned"`
 			else `${denial[1]}, ${json.quoted(denial[2])}, ${json.quoted(denial[3])}`
-		decls.push(new Decl("function", handle(handlers, cases, codec, validated, denied)))
+		decls.push(new Decl("function", handle(handlers, cases, codec, validated, denied, "handle", this.cbor)))
 		if (this.twofold) {
-			decls.push(new Decl("function", handle(handlers, cases, "json", validated, denied, "handleJson")))
+			decls.push(new Decl("function",
+				handle(handlers, cases, "json", validated, denied, "handleJson", this.cbor)))
+		}
+		if (this.cbor) {
+			decls.push(new Decl("function", handle(handlers, cases, "cbor", validated, denied, "handleCbor")))
+		}
+		if (this.cbor || this.twofold) {
+			decls.push(new Decl("function", fault(codec, this.twofold, this.cbor)))
 		}
 		return [`// Code generated by tools/smithygen from ${from}. DO NOT EDIT.`, ...layout(decls)].join("\n") + "\n"
 	}
@@ -863,6 +880,7 @@ class Generator {
 			case "awsQuery": "query"
 			case "restXml": "restxml"
 			case "restJson1": "restjson"
+			case "rpcv2Cbor": "cbor"
 			default: "json"
 		}
 	}
@@ -871,6 +889,8 @@ class Generator {
 	rest(): bool { return this.protocol == "restXml" || this.protocol == "restJson1" }
 	/// Whether the service's bodies are JSON.
 	json(): bool { return this.codec() == "json" || this.codec() == "restjson" }
+	/// The function of ./vectors comparing a response's body with a vector's.
+	same(): string { return if (this.json()) "sameJson" else if (this.codec() == "cbor") "sameCbor" else "same" }
 
 	/// The tag n of core/protocol/xml.
 	tag(n: string): string {
@@ -1224,7 +1244,8 @@ class Generator {
 		const errors: string[] = []
 		const got: Decl[] = [] // the methods of Got
 		const spread = new Decl("spread", ["\t...api.Unimplemented"])
-		const classes = ["Got", "Caller", "Fault", "Unit", "Request", "caller", "same", "sameJson", "api"]
+		const classes = ["Got", "Caller", "Fault", "Unit", "Request", "caller", "same", "sameJson", "sameCbor", "api",
+			"base64"]
 		for (const op of this.ops) {
 			let requested = false
 			const vectors: [Vector, string | null][] = [] // a response's error, "" if none; null for a request
@@ -1245,7 +1266,8 @@ class Generator {
 				const test = `${v.id} ${if (error == null) "request" else "response"}` // an id can name one of each
 				names.push(test)
 				const reason = reasons.find(r => r[0] == v.id || r[0] == test)
-				if (v.protocol != `aws.protocols#${this.protocol}`) {
+				const cbor = this.protocol == "rpcv2Cbor"
+				if (v.protocol != `${if (cbor) "smithy" else "aws"}.protocols#${this.protocol}`) {
 					throw new ModelError(`${v.id}: a vector of ${v.protocol}`)
 				} else if (v.appliesTo == "client" || reason != null) {
 					const why = if (reason == null) "for clients only" else reason.slice(1, reason.length).join(": ")
@@ -1282,9 +1304,11 @@ class Generator {
 		const up = root(out)
 		const decls = [new Decl("import", [`import { Fault } from "${up}core/fault"`])]
 		decls.push(new Decl("import", [`import { Caller, Unit } from "${up}core/service"`]))
-		const same = if (this.json()) "sameJson" else "same"
-		decls.push(new Decl("import", [`import { caller, ${same} } from "${up}tools/smithygen/vectors"`]))
+		decls.push(new Decl("import", [`import { caller, ${this.same()} } from "${up}tools/smithygen/vectors"`]))
 		decls.push(new Decl("import", [`import * as api from "./${replace(split(out, "/").pop()!, ".bob", "")}"`]))
+		if (this.codec() == "cbor") {
+			decls.push(new Decl("import", [`import * as base64 from "std/encoding/base64"`]))
+		}
 		decls.push(new Decl("import", [`import { Request } from "std/http"`]))
 		if (got.length > 0) {
 			const members = layout([spread, new Decl("field", ["\tinput = \"\""]), ...got])
@@ -1307,17 +1331,20 @@ class Generator {
 		const o = this.shape(op)
 		const input = this.className(o.input)
 		const rest = this.rest()
-		if (v.body == null && !rest) {
+		const cbor = this.codec() == "cbor"
+		if (v.body == null && !rest && !cbor) {
 			throw new ModelError(`${v.id}: a request without a body`)
 		}
 		const lines = ["\tconst h = new Got()"]
 		const uri = if (v.queryParams.length == 0) v.uri else `${v.uri}?${v.queryParams.join("&")}`
-		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(uri)}, ${json.quoted(v.body ?? "")})`
+		// a CBOR body as the vector has it, in base64
+		const body = if (cbor) `base64.decode(${json.quoted(v.body ?? "")})` else json.quoted(v.body ?? "")
+		const req = `new Request(${json.quoted(v.method)}, ${json.quoted(uri)}, ${body})`
 		lines.append(wrap(`\tconst req = ${req}`))
 		for (const h of v.headers) {
 			lines.push(`\treq.headers.set(${json.quoted(h[0])}, ${json.quoted(h[1])})`)
 		}
-		if (this.protocol != "awsQuery" && !rest && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
+		if (this.protocol != "awsQuery" && !rest && !cbor && !v.headers.some(h => lower(h[0]) == "x-amz-target")) {
 			lines.push(this.target(op))
 		}
 		lines.append([`\tapi.handle(h, caller(""), req)`, `\tconst want = new ${input}()`])
@@ -1378,7 +1405,13 @@ class Generator {
 		} else {
 			const header = v.headers.find(h => lower(h[0]) == "x-amzn-requestid")
 			const id = if (header == null) "" else header[1]
-			lines.append([`\tconst req = new Request("POST", "/", "{}")`, this.target(op)])
+			if (this.codec() == "cbor") {
+				const path = `/service/${name(this.id)}/operation/${name(op)}`
+				lines.append([`\tconst req = new Request("POST", ${json.quoted(path)}, "")`,
+					`\treq.headers.set("smithy-protocol", "rpc-v2-cbor")`])
+			} else {
+				lines.append([`\tconst req = new Request("POST", "/", "{}")`, this.target(op)])
+			}
 			lines.append(wrap(`\tconst res = api.handle(new ${v.id}(), caller(${json.quoted(id)}), req)`))
 		}
 		lines.push(`\tassert res.status == ${v.code}`)
@@ -1391,7 +1424,7 @@ class Generator {
 				throw new ModelError(`${v.id}: a body that a template literal cannot hold as it is`)
 			}
 			const want = (if (verbatim) `\`${body}\`` else json.quoted(body)) + ")"
-			const same = if (this.json()) "sameJson" else "same"
+			const same = this.same()
 			const line = `\tassert ${same}(res, ${want}`
 			// as bober format breaks it, a body of several lines measured as if of one
 			lines.append(if (wide(line)) [`\tassert ${same}(res,`, `\t\t${want}`] else [line])
@@ -1564,25 +1597,53 @@ function imports(out: string, codec: string, unit: bool, modeled: bool, xml: boo
 }
 
 /// The function serving a request by a handler of the interface handlers, by the cases of its operations, of the codec
-/// query, json, restxml or restjson; of the service's validation if validated; IAM's denials answered as denied says, its
-/// status, code and wording as 403, "AccessDenied", "reasoned".
-function handle(handlers: string, cases: string[], codec: string, validated: bool, denied: string,
-	named = "handle"): string[] {
-	const lines = [if (named == "handle") "/// The answer of h to req." else "/// The answer of h to req of awsJson."]
+/// query, json, cbor, restxml or restjson; of the service's validation if validated; IAM's denials answered as denied
+/// says, its status, code and wording as 403, "AccessDenied", "reasoned"; handing a request of RPC v2 CBOR to handleCbor
+/// if cbor.
+function handle(handlers: string, cases: string[], codec: string, validated: bool, denied: string, named = "handle",
+	cbor = false): string[] {
+	const of = if (named == "handleJson") " of awsJson" else if (named == "handleCbor") " of RPC v2 CBOR" else ""
+	const lines = [`/// The answer of h to req${of}.`]
 	const head = `export function ${named}(h: ${handlers}, caller: Caller, req: Request)`
 	lines.append(signature(`${head}: Response throws IoError {`))
+	if (cbor) {
+		lines.append(["\tif (cbor.claims(req)) {", "\t\treturn handleCbor(h, caller, req)", "\t}"])
+	}
 	lines.push(`\tcaller.denied = [${denied}]`)
 	if (codec == "query") {
 		const call = `\tconst c = query.call(caller, req, version, ns${if (validated) ", validation" else ""})`
 		lines.append([call, "\tswitch (c.action) {", ...cases])
 		lines.push("\t\tdefault: return c.invalidAction()")
 	} else {
-		const call = if (codec == "json") "json.call(caller, req, service)"
+		const call = if (codec == "json" || codec == "cbor") `${codec}.call(caller, req, service)`
 			else `${codec}.call(caller, req, service, routes)`
 		lines.append([`\tconst c = ${call}`, "\tswitch (c.operation) {", ...cases])
 		lines.push("\t\tdefault: return c.unknownOperation()")
 	}
 	lines.append(["\t}", "}"])
+	return lines
+}
+
+/// The function answering a fault of the gateway in the protocol of the request, of a service of the codec that serves
+/// awsJson too if twofold, or RPC v2 CBOR if cbor.
+function fault(codec: string, twofold: bool, cbor: bool): string[] {
+	const lines = ["/// The answer of the gateway's fault f in the protocol of req."]
+	lines.push("export function fault(f: Fault, requestId: string, req: Request | null): Response {")
+	if (cbor) {
+		lines.append(["\tif (req != null && cbor.claims(req)) {", "\t\treturn cbor.error(service, f, requestId)",
+			"\t}"])
+	}
+	const json = codec == "json" || twofold
+	if (codec == "query") {
+		if (twofold) {
+			lines.append(["\tif (req?.headers.has(\"x-amz-target\") ?? false) {",
+				"\t\treturn json.error(service, f, requestId)", "\t}"])
+		}
+		lines.push("\treturn query.error(f, requestId, ns)")
+	} else {
+		lines.push(`\treturn ${if (json) "json" else codec}.error(service, f, requestId)`)
+	}
+	lines.push("}")
 	return lines
 }
 

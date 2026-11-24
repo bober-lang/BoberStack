@@ -1,0 +1,126 @@
+//! STOPGAP for what std/encoding/cbor lacks: an item kept as its encoding (as json's Raw), a map of keys not known
+//! beforehand (as json's Keys) and a byte string or tag written. Until std has them, the heads of arrays, maps, byte
+//! strings and tags are read and written here; std reads and writes every scalar and every key.
+
+import { ParseError } from "std/string"
+
+/// The major type of the item s, 0 to 7.
+export function major(s: string): i32 { return if (s.length == 0) -1 else (s[0] >> 5) as i32 }
+
+/// The item that starts s, which nothing may follow.
+export function whole(s: string): string throws ParseError {
+	const n = end(s, 0)
+	if (n != s.length) {
+		throw new ParseError("syntax", n)
+	}
+	return s
+}
+
+/// The items of the array or map s, as their encodings, a map's keys and values in turn; of an indefinite length too.
+export function items(s: string): string[] throws ParseError {
+	const m = major(s)
+	if (m != 4 && m != 5) {
+		throw new ParseError("syntax", 0)
+	}
+	let [n, at] = argument(s, 0)
+	const out: string[] = []
+	while (if (n < 0) at < s.length && s[at] != 0xff else (out.length as i64) < (if (m == 5) 2 * n else n)) {
+		const next = end(s, at)
+		out.push(s.slice(at, next))
+		at = next
+	}
+	if (n < 0 && at >= s.length || m == 5 && out.length % 2 != 0) {
+		throw new ParseError("syntax", at)
+	}
+	return out
+}
+
+/// The tag of the tagged item s, and the item it tags.
+export function untag(s: string): [i64, string] throws ParseError {
+	if (major(s) != 6) {
+		throw new ParseError("syntax", 0)
+	}
+	const [tag, at] = argument(s, 0)
+	return [tag, s.slice(at, s.length)]
+}
+
+/// The head of an item of major type m and argument n, a byte string's, array's or map's length.
+export function head(m: i32, n: i64): string {
+	const t = (m << 5) as u8
+	if (n < 24) {
+		return fromBytes([t | (n as u8)])
+	}
+	const width = if (n < 256) 1 else if (n < 65536) 2 else if (n < 4294967296) 4 else 8
+	const out: u8[] = [t | (if (width == 1) 24 else if (width == 2) 25 else if (width == 4) 26 else 27)]
+	for (let i = width - 1; i >= 0; i--) {
+		out.push(((n >> (8 * i)) & 255) as u8)
+	}
+	return fromBytes(out)
+}
+
+/// The argument of the head at at of s, -1 for an indefinite length, and where the head ends.
+function argument(s: string, at: i32): [i64, i32] throws ParseError {
+	if (at >= s.length) {
+		throw new ParseError("syntax", at)
+	}
+	const minor = (s[at] & 31) as i32
+	if (minor < 24) {
+		return [minor as i64, at + 1]
+	}
+	if (minor == 31 && [2, 3, 4, 5].includes((s[at] >> 5) as i32)) {
+		return [-1, at + 1]
+	}
+	if (minor > 27) {
+		throw new ParseError("syntax", at)
+	}
+	const width = (1 as i32) << (minor - 24)
+	if (at + 1 + width > s.length) {
+		throw new ParseError("syntax", s.length)
+	}
+	let n: i64 = 0
+	for (let i = 1; i <= width; i++) {
+		n = (n << 8) | (s[at + i] as i64)
+	}
+	if (n < 0 && [2, 3, 4, 5, 6].includes((s[at] >> 5) as i32)) {
+		throw new ParseError("range", at) // a length or tag past i64; a number's or float's bits are std's to read
+	}
+	return [n, at + 1 + width]
+}
+
+/// Where the item at at of s ends; nested items are counted on a stack, not by recursion, as a body may nest deep.
+function end(s: string, at: i32): i32 throws ParseError {
+	const pending: i64[] = [1] // the items each open array, map, tag or chunked string awaits, -1 until a break
+	while (pending.length > 0) {
+		const top = pending.length - 1
+		if (pending[top] == 0) {
+			pending.pop()
+			continue
+		}
+		if (pending[top] < 0 && at < s.length && s[at] == 0xff) {
+			pending.pop()
+			at++
+			continue
+		}
+		if (pending[top] > 0) {
+			pending[top]--
+		}
+		const [n, next] = argument(s, at)
+		const m = (s[at] >> 5) as i32
+		at = next
+		switch (m) {
+			case 2, 3: if (n >= 0) {
+				if (n > ((s.length - at) as i64)) {
+					throw new ParseError("syntax", s.length)
+				}
+				at += n as i32
+			} else {
+				pending.push(-1)
+			}
+			case 4: pending.push(n)
+			case 5: pending.push(if (n < 0) n else 2 * n)
+			case 6: pending.push(1)
+			default: {}
+		}
+	}
+	return at
+}

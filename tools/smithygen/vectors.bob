@@ -1,10 +1,14 @@
 //! What the tests that smithygen generates from a model's protocol test vectors share.
 
 import { sort, startsWith } from "std/algo"
+import * as base64 from "std/encoding/base64"
+import * as cbor from "std/encoding/cbor"
+import * as hex from "std/encoding/hex"
 import * as json from "std/encoding/json"
 import { Node, parse } from "std/encoding/xml"
 import { Response } from "std/http"
 import { ParseError, trim } from "std/string"
+import * as gap from "../../core/protocol/cborgap"
 import { Caller } from "../../core/service"
 
 /// The caller of a request answered under requestId.
@@ -86,5 +90,44 @@ function encode(x: Scalar): string {
 		return json.encode(x)
 	} catch (e: json.EncodeError) {
 		return "" // a float of JSON is finite
+	}
+}
+
+/// Whether the CBOR of res and want, in base64, say the same, the order of a map's entries, the lengths an item gives
+/// or leaves indefinite and the width of a number aside; none if want is "".
+export function sameCbor(res: Response, want: string): bool throws ParseError {
+	const got = res.body.whole ?? ""
+	return if (want == "") got == "" else got != "" && diagnosis(got) == diagnosis(base64.decode(want))
+}
+
+/// The CBOR item x in a notation after RFC 8949's diagnostic one: a number by its value, a map's entries in order.
+function diagnosis(x: string): string throws ParseError {
+	switch (gap.major(gap.whole(x))) {
+		case 0, 1: return `${cbor.decode[f64](x)}`
+		case 2: return `h'${hex.encode(cbor.decode[string](x))}'`
+		case 3: return json.quoted(cbor.decode[string](x))
+		case 4, 5:
+			const items: string[] = []
+			for (const item of gap.items(x)) {
+				items.push(diagnosis(item))
+			}
+			if (gap.major(x) == 4) {
+				return `[${items.join(",")}]`
+			}
+			const entries: string[] = []
+			for (let i = 0; i + 1 < items.length; i += 2) {
+				entries.push(`${items[i]}:${items[i + 1]}`)
+			}
+			sort(entries)
+			return `{${entries.join(",")}}`
+		case 6:
+			const [t, item] = gap.untag(x)
+			return `${t}(${diagnosis(item)})`
+		default: switch (x[0]) {
+			case 0xf4: return "false"
+			case 0xf5: return "true"
+			case 0xf6, 0xf7: return "null"
+			default: return `${cbor.decode[f64](x)}`
+		}
 	}
 }

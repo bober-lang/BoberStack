@@ -3,6 +3,8 @@ import { Fault } from "./fault"
 import { Gateway } from "./gateway"
 import { Caller } from "./service"
 import { Blob, live } from "./state/store"
+import { indexOf } from "std/algo"
+import { gzip } from "std/compress/gzip"
 import { Request, Response } from "std/http"
 import { ParseError, parseInt } from "std/string"
 import { iso8601Basic, millisecond, second, sleep } from "std/time"
@@ -243,6 +245,39 @@ test "a body longer than its service's limit is refused before it is read, by S3
 	g.limits.set("s3", 4)
 	const s3 = g.handle(request("s3", "s3", "s3", "large"))
 	assert s3.status == 400 && text(s3, "Code") == "EntityTooLarge" && text(s3, "MaxSizeAllowed") == "4"
+	g.close()
+}
+
+test "a gzip body reaches the service decoded, to at most its limit, but S3's as sent" {
+	const g = gateway()
+	const zipped = (service: string, body: string) => {
+		const req = request(service, "test", "test", body)
+		req.headers.set("content-encoding", "gzip")
+		return req
+	}
+	assert g.handle(zipped("test", gzip("zipped"))).status == 200 && held(g, "zipped") == ["account", "global"]
+	g.limits.set("test", 100)
+	let large = ""
+	for (let i = 0; i < 1000; i++) {
+		large += "x"
+	}
+	const res = g.handle(zipped("test", gzip(large)))
+	assert res.status == 413 && res.body.text() == "" && held(g, large) == [null, null]
+	const corrupt = g.handle(zipped("test", "plain"))
+	assert corrupt.status == 400 && text(corrupt, "Code") == "SerializationException"
+	g.services.set("s3", g.services.get("test")!)
+	assert g.handle(zipped("s3", gzip("kept"))).status == 200 && held(g, gzip("kept"))[0] == "account"
+	g.close()
+}
+
+test "a gateway fault answers a request of RPC v2 CBOR in it" {
+	const g = gateway()
+	const req = request("absent", "test", "test", "")
+	req.headers.set("smithy-protocol", "rpc-v2-cbor")
+	const res = g.handle(req)
+	assert res.status == 501 && res.headers.get("smithy-protocol") == "rpc-v2-cbor"
+	assert res.headers.get("content-type") == "application/cbor"
+	assert indexOf(res.body.text(), "NotImplemented") >= 0
 	g.close()
 }
 

@@ -9,9 +9,10 @@ import { form, posting } from "./services/s3/post.test"
 import * as sqsApi from "./services/sqs/api"
 import { stack } from "./stack"
 import { indexOf, startsWith } from "std/algo"
-import { gunzip } from "std/compress/gzip"
+import { gunzip, gzip } from "std/compress/gzip"
 import { md5, sha256 } from "std/crypto/hash"
 import * as base64 from "std/encoding/base64"
+import * as cbor from "std/encoding/cbor"
 import * as json from "std/encoding/json"
 import { Keys } from "std/encoding/json"
 import { Request, Response } from "std/http"
@@ -1661,6 +1662,64 @@ test "a metric filter puts its matches' values to CloudWatch within PutLogEvents
 	}
 	assert stats("ms", [["svc", "web"]]) == "1.0/900.0/Milliseconds"
 	assert stats("errors", []) == "1.0/0.0/None"
+	g.close()
+}
+
+class Datum {
+	MetricName = ""
+	Value = 0.0
+}
+
+class Put {
+	Namespace = ""
+	MetricData: Datum[] = []
+}
+
+class Metric {
+	Namespace = ""
+	MetricName = ""
+	Dimensions: Named[] = []
+}
+
+class Listed {
+	Metrics: Metric[] = []
+}
+
+class Named {
+	Namespace: string | null = null
+	DashboardName: string | null = null
+}
+
+function cborCall(g: Gateway, op: string, body: string, k: Key = root(), zipped = false): Response {
+	const sent = if (zipped) gzip(body) else body
+	const req = new Request("POST", `http://localhost:4566/service/GraniteServiceVersion20100801/operation/${op}`, sent)
+	req.headers.set("smithy-protocol", "rpc-v2-cbor")
+	req.headers.set("content-type", "application/cbor")
+	if (zipped) {
+		req.headers.set("content-encoding", "gzip")
+	}
+	sign(req, sent, "monitoring", "us-east-1", k.id, k.secret, k.token, "20150626T140000Z")
+	return g.handle(req)
+}
+
+test "CloudWatch answers RPC v2 CBOR, of a gzip body too, and the gateway's faults in it" {
+	const g = gateway()
+	const put = cbor.encode({ ...new Put(), Namespace: "app",
+		MetricData: [{ ...new Datum(), MetricName: "ms", Value: 5.0 }] })
+	const k = user(g, "bob", policy([statement("Allow", `"cloudwatch:*"`, "*")]))
+	const res = cborCall(g, "PutMetricData", put, k, true)
+	assert res.status == 200 && res.headers.get("smithy-protocol") == "rpc-v2-cbor" && res.body.text() == ""
+	const listed = cborCall(g, "ListMetrics", cbor.encode({ ...new Named(), Namespace: "app" }))
+	assert listed.status == 200 && listed.headers.get("content-type") == "application/cbor"
+	assert cbor.decode[Listed](listed.body.text()).Metrics.map(m => m.MetricName) == ["ms"]
+	const missing = cborCall(g, "GetDashboard", cbor.encode({ ...new Named(), DashboardName: "d" }))
+	assert missing.status == 404
+		&& startsWith(missing.headers.get("x-amzn-query-error") ?? "", "ResourceNotFound;Sender")
+	const forged = cborCall(g, "ListMetrics", "", { ...k, secret: "wrong" })
+	assert forged.status == 403 && forged.headers.get("smithy-protocol") == "rpc-v2-cbor"
+		&& has(forged, "SignatureDoesNotMatch")
+	const unknown = cborCall(g, "Nothing", "")
+	assert unknown.status == 400 && has(unknown, "UnknownOperationException")
 	g.close()
 }
 
