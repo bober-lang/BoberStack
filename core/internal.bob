@@ -1,7 +1,8 @@
 //! The endpoints that are not AWS's, unsigned, under /_localstack/ (as LocalStack's tools probe them) and
-//! /_boberstack/: health, a reset, in-memory snapshots of the state, Lambda's code, and LocalStack's /_aws/ses of the
-//! mail SES stored.
+//! /_boberstack/: health, a reset, in-memory snapshots of the state, Lambda's code, a WebSocket feed of the requests
+//! answered (./feed), and LocalStack's /_aws/ses of the mail SES stored.
 
+import { Feed } from "./feed"
 import { Fault } from "./fault"
 import { Store } from "./state/store"
 import { startsWith } from "std/algo"
@@ -68,6 +69,7 @@ class Listing {
 
 /// The endpoints, and the snapshots taken, which outlive a reset.
 export class Internal {
+	feed = new Feed()
 	/// When it began, which info's uptime counts from.
 	private started = now()
 	private snapshots: Snapshot[] = []
@@ -93,6 +95,7 @@ export class Internal {
 		r.get("/_aws/ses", (req, p) => mails(req, state))
 		r.delete("/_aws/ses", (req, p) => mails(req, state))
 		r.get("/_boberstack/lambda/:account/:region/:table/:name/:version", (req, p) => code(p, state))
+		r.get("/_boberstack/requests", (req, p) => this.feed.accept(req))
 		r.get("/_boberstack/snapshots", (req, p) => {
 			const l = new Listing()
 			l.snapshots = this.snapshots.map(listed)
@@ -107,6 +110,7 @@ export class Internal {
 	handle(req: Request): Response throws IoError | ParseError { return this.routes.handle(req) }
 
 	close() {
+		this.feed.close()
 		for (const s of this.snapshots) {
 			s.close()
 		}

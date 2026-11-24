@@ -1,0 +1,313 @@
+//! The feed of the requests the gateway answers, to WebSocket subscribers. The gateway reports a request only while
+//! someone subscribes, after it answered and outside its lock: a subscriber has a queue of its own, which the gateway
+//! only appends to, and a fiber that writes it out, so that none can slow the gateway down.
+//!
+//! A feed sees the requests of the gateway that accepted its connection, which is all of them while one isolate serves.
+
+import * as gap from "./protocol/cborgap"
+import { Caller } from "./service"
+import { Signal } from "builtin/fiber"
+import { indexOf, startsWith } from "std/algo"
+import * as cbor from "std/encoding/cbor"
+import * as json from "std/encoding/json"
+import { Rest, Unknown } from "std/encoding/json"
+import { Request, Response } from "std/http"
+import { accept, Socket } from "std/http/websocket"
+import { lower, ParseError, split, trim } from "std/string"
+import { millisecond, monotonic, rfc3339, second, sleep } from "std/time"
+
+/// What the gateway learns of a request as it answers it, for the feed; made only while someone subscribes.
+export class Seen {
+	private feed: Feed
+	private req: Request
+	private arrived = now()
+	private started = monotonic()
+	/// Whether the request is one of a service's, not of the internal endpoints, which are not told.
+	private reached = false
+	private id = ""
+	private service: string | null = null
+	private region: string | null = null
+	private caller: Caller | null = null
+
+	constructor(feed: Feed, req: Request) {
+		this.feed = feed
+		this.req = req
+	}
+
+	numbered(id: string) {
+		this.reached = true
+		this.id = id
+	}
+
+	routed(service: string | null, region: string | null) {
+		this.service = service
+		this.region = region
+	}
+
+	/// The caller the service runs the request as, whose operation its dispatch sets.
+	served(caller: Caller) { this.caller = caller }
+
+	publish(res: Response) {
+		if (this.reached) {
+			this.feed.publish(this, res)
+		}
+	}
+
+	/// The message of the request answered res, as Feed.accept documents it.
+	message(res: Response): string {
+		const c = this.caller
+		const t = this.arrived
+		const took = (monotonic() - this.started) / 1000
+		const anonymous = c == null || c!.account == ""
+		const error = if (res.status >= 400) code(res) else null
+		return `{"arrived":"${rfc3339(t - t % millisecond)}","took":${(took as f64) / 1000.0},`
+			+ `"service":${quoted(this.service)},"operation":${quoted(if (c == null || c!.operation == "") null else c!.operation)},`
+			+ `"method":${json.quoted(this.req.method)},"path":${json.quoted(this.req.url.path)},"status":${res.status},`
+			+ `"error":${quoted(error)},"account":${quoted(if (anonymous) null else c!.account)},`
+			+ `"region":${quoted(c?.region ?? this.region)},"caller":${quoted(if (anonymous) null else c!.arn)},`
+			+ `"requestId":${quoted(if (this.id == "") null else this.id)}}`
+	}
+
+	wanted(f: Filter, status: i32): bool {
+		return (!f.errors || status >= 400) && (f.services.length == 0 || f.services.includes(this.service ?? ""))
+	}
+}
+
+class Filter {
+	/// Signing names; any if none.
+	services: string[] = []
+	errors = false
+}
+
+/// A message, or a gap of the messages dropped there.
+class Entry {
+	text: string
+	dropped: i64
+
+	constructor(text: string, dropped: i64) {
+		this.text = text
+		this.dropped = dropped
+	}
+}
+
+/// What a subscriber has yet to be sent, at most room bytes of messages: past it they are dropped, and the subscriber
+/// is told how many where they would have been.
+class Subscriber {
+	id: i64
+	ws: Socket
+	filter: Filter
+	/// Those before head are sent.
+	queue: Entry[] = []
+	head = 0
+	bytes = 0
+	/// Whether a ping is due.
+	due = false
+	/// Whether the subscription is over: the peer closed, its socket failed, or the feed closed.
+	done = false
+	/// The code and reason the feed closes the subscription with.
+	code: u16 = 1000
+	reason = ""
+	woken = new Signal()
+
+	constructor(id: i64, ws: Socket, filter: Filter) {
+		this.id = id
+		this.ws = ws
+		this.filter = filter
+	}
+
+	offer(text: string, room: i32) {
+		const last = this.queue.length - 1
+		if (this.bytes + text.length <= room) {
+			this.queue.push(new Entry(text, 0))
+			this.bytes += text.length
+		} else if (last >= this.head && this.queue[last].dropped > 0) {
+			this.queue[last].dropped++
+		} else {
+			this.queue.push(new Entry("", 1))
+		}
+		this.woken.wake()
+	}
+
+	end(code: u16, reason: string) {
+		this.code = code
+		this.reason = reason
+		this.done = true
+		this.woken.wake()
+	}
+}
+
+export class Feed {
+	/// The bytes of messages a subscriber may have waiting, past which they are dropped.
+	room: i32 = 1 << 20
+	/// How often a subscriber is pinged. Its connection's timeout, the server's, bounds each read and write, so that
+	/// one gone without a word, which no longer answers pings, or no longer reads, is closed once it is up.
+	ping = 10 * second
+	private subscribers: Subscriber[] = []
+	private ids: i64 = 0
+	private ticking = false
+	private closed = false
+
+	/// A record of req to fill as the gateway answers it; null while no one subscribes, which costs the gateway nothing.
+	seen(req: Request): Seen | null { return if (this.subscribers.length == 0) null else new Seen(this, req) }
+
+	/// GET /_boberstack/requests, upgraded to a WebSocket, sends a text message for each request the gateway answers once
+	/// it has, in the order answered, as a JSON object of:
+	///
+	/// - `arrived`: when it came, RFC 3339 in UTC to the millisecond; `took`: the milliseconds until it was answered;
+	/// - `service`: the signing name of the service it went to; `operation`: the operation its service's dispatch took
+	///   it for;
+	/// - `method`, `path`: its method and its URL's path, without the query, which may hold a signature;
+	/// - `status`; `error`: the code of the error answered, as its protocol writes it, for a status of 400 or more;
+	/// - `account`, `region`, `caller`: the account, the region and the ARN of the identity it was made as;
+	/// - `requestId`: the id it was answered under.
+	///
+	/// Each is null where not known: an operation where the service's dispatch was not reached or took the request for
+	/// none of the service's, or where the request was refused before; an account and caller for a request anonymous
+	/// or refused before its signature was checked; an error code a HEAD's empty body does not hold. Bodies are never
+	/// sent, nor the requests to these endpoints. `service=<name>`, repeated or with names separated by commas, keeps
+	/// only the requests to those services, and `errors=true` only those answered 400 or more.
+	///
+	/// A subscriber that falls more than room bytes behind misses the requests past them, and is sent
+	/// `{"dropped":<n>}` where they would have been. Messages a subscriber sends are answered with a close, 1003. Pings
+	/// go every ping ns, and a subscriber that neither reads nor answers for the server's timeout is closed.
+	accept(req: Request): Response {
+		const f = new Filter()
+		const q = req.url.query
+		for (const v of q.all("service")) {
+			for (const s of split(v, ",")) {
+				if (trim(s) != "") {
+					f.services.push(lower(trim(s)))
+				}
+			}
+		}
+		const errors = q.get("errors")
+		f.errors = errors != null && errors != "false" && errors != "0"
+		return accept(req, ws => this.follow(ws, f))
+	}
+
+	/// Ends every subscription with a 1001, going away, and takes no more.
+	close() {
+		this.closed = true
+		for (const s of this.subscribers) {
+			s.end(1001, "The server is closing")
+		}
+	}
+
+	/// res, of the request seen, to each subscriber that wants it; the message is made once, if any does.
+	publish(seen: Seen, res: Response) {
+		let text: string | null = null
+		for (const s of this.subscribers) {
+			if (!s.done && seen.wanted(s.filter, res.status)) {
+				text = text ?? seen.message(res)
+				s.offer(text!, this.room)
+			}
+		}
+	}
+
+	/// Serves ws, on its connection's fiber, until its subscription ends: writes its queue there, and reads on a fiber of
+	/// its own, which it waits for, so that neither outlives it.
+	private follow(ws: Socket, f: Filter) throws IoError {
+		if (this.closed) {
+			ws.close(1001, "The server is closing")
+			return
+		}
+		this.ids++
+		const s = new Subscriber(this.ids, ws, f)
+		this.subscribers.push(s)
+		if (!this.ticking) {
+			this.ticking = true
+			const pinging = async this.tick()
+		}
+		const reading = async read(s)
+		try {
+			write(s)
+		} catch (e: IoError) {} finally {
+			this.subscribers = this.subscribers.filter(x => x.id != s.id)
+			s.done = true
+			try {
+				ws.close(s.code, s.reason)
+			} catch (e: IoError) {}
+			await reading
+		} // the socket is closed: the peer is gone, or stopped reading for the timeout
+	}
+
+	/// Marks a ping due for each subscriber every ping ns, while there are any; one fiber for all.
+	private tick() {
+		while (this.subscribers.length > 0 && !this.closed) {
+			sleep(this.ping)
+			for (const s of this.subscribers) {
+				s.due = true
+				s.woken.wake()
+			}
+		}
+		this.ticking = false
+	}
+}
+
+/// Sends s's queue as it fills, and its pings, until its subscription ends.
+function write(s: Subscriber) throws IoError {
+	while (!s.done) {
+		if (s.head < s.queue.length) {
+			const e = s.queue[s.head]
+			s.head++
+			s.bytes -= e.text.length
+			if (s.head == s.queue.length) {
+				s.queue = []
+				s.head = 0
+			}
+			s.ws.send(if (e.dropped > 0) `{"dropped":${e.dropped}}` else e.text)
+		} else if (s.due) {
+			s.due = false
+			s.ws.ping()
+		} else {
+			s.woken.wait()
+		}
+	}
+}
+
+/// Reads what s's peer sends, which only pongs and a close may be, until the socket ends; then ends s.
+function read(s: Subscriber) {
+	try {
+		if (s.ws.receive() != null) {
+			s.end(1003, "The feed takes no messages")
+		}
+	} catch (e: IoError) {}
+	s.done = true
+	s.woken.wake()
+}
+
+/// The code of the error res holds: in restJson's X-Amzn-ErrorType, the __type of a JSON or CBOR body without its
+/// namespace, or the Code of an XML one.
+function code(res: Response): string | null {
+	const typed = res.headers.get("x-amzn-errortype")
+	if (typed != null) {
+		return split(typed!, ":")[0]
+	}
+	const body = res.body.whole ?? ""
+	if (startsWith(body, "<")) {
+		const from = indexOf(body, "<Code>")
+		const to = indexOf(body, "</Code>")
+		return if (from < 0 || to < from) null else body.slice(from + 6, to)
+	}
+	let named: string | null = null
+	try {
+		if (startsWith(body, "{")) {
+			named = json.decode[Typed](body).__type
+		} else if (res.headers.get("content-type") == "application/cbor") {
+			const items = gap.items(body)
+			for (let i = 0; i + 1 < items.length; i += 2) {
+				if (cbor.decode[string](items[i]) == "__type") {
+					named = cbor.decode[string](items[i + 1])
+				}
+			}
+		}
+	} catch (e: ParseError) {}
+	return if (named == null) null else split(named!, "#").pop()!
+}
+
+class Typed {
+	__type: string | null = null
+	rest: Unknown[] @Rest = []
+}
+
+function quoted(s: string | null): string { return if (s == null) "null" else json.quoted(s!) }

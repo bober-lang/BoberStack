@@ -7,6 +7,7 @@ import * as chunked from "./auth/chunked"
 import { accountOf, authenticate, credentials, expired, use } from "./auth/credentials"
 import * as sigv2 from "./auth/sigv2"
 import * as sigv4 from "./auth/sigv4"
+import { Seen } from "./feed"
 import { Fault } from "./fault"
 import { uuid } from "./random"
 import { addressed, Internal } from "./internal"
@@ -72,6 +73,13 @@ export class Gateway {
 	private changed = new Signal()
 
 	handle(req: Request): Response throws IoError | ParseError {
+		const seen = this.internal.feed.seen(req)
+		const res = this.answer(req, seen)
+		seen?.publish(res)
+		return res
+	}
+
+	private answer(req: Request, seen: Seen | null): Response throws IoError | ParseError {
 		const [label, at, path] = this.host(req)
 		const hosting = this.hosted.get(label)
 		if (hosting == null && addressed(req.url.path)) {
@@ -85,6 +93,7 @@ export class Gateway {
 		let auth: sigv4.Authorization | null = null
 		try {
 			id = uuid()
+			seen?.numbered(id)
 			auth = sigv2.presigned(req) ?? sigv4.authorization(req)
 			if (hosting != null && auth != null && auth!.service != hosting![0]) {
 				throw new Fault(403, "InvalidSignatureException",
@@ -95,6 +104,7 @@ export class Gateway {
 			return if (faulted == null) fallback(f, id, req) else faulted!(f, id, req)
 		}
 		const name = if (hosting != null) hosting![0] else auth?.service ?? this.anonymous
+		seen?.routed(name, auth?.region)
 		const service: Service | null = if (hosting != null) (c, r) => hosting![1](c, r, at, path)
 			else if (name == null) null
 			else this.services.get(name!)
@@ -115,7 +125,7 @@ export class Gateway {
 		while (true) {
 			const res = this.locked(() => {
 				req.body = new Body(body)
-				return this.serve(name!, service!, faulted, req, body, auth, id, arrived)
+				return this.serve(name!, service!, faulted, req, body, auth, id, arrived, seen)
 			})
 			if (res != null) {
 				return res!
@@ -257,7 +267,8 @@ export class Gateway {
 
 	/// null if the service held the request.
 	private serve(name: string, service: Service, faulted: Faulted | null, req: Request, body: string,
-		auth: sigv4.Authorization | null, id: string, arrived: i64): Response | null throws IoError | ParseError {
+		auth: sigv4.Authorization | null, id: string, arrived: i64,
+		seen: Seen | null): Response | null throws IoError | ParseError {
 		const global = this.trees.get("")
 		const known = if (global == null || auth == null) null else credentials(global).get(auth.accessKey)
 		let why: Fault | null = null
@@ -305,6 +316,7 @@ export class Gateway {
 		caller.identify = this.identify
 		caller.lenient = this.lenient
 		caller.arrived = arrived
+		seen?.served(caller)
 		let res: Response | null = null
 		let held = false
 		try {

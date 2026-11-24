@@ -1,0 +1,293 @@
+import { sign } from "./auth/sigv4"
+import { Gateway } from "./gateway"
+import { Catalog } from "../services/iam/catalog"
+import { stack } from "../stack"
+import { decode } from "std/encoding/json"
+import { Request, Response, Server } from "std/http"
+import { connect, Socket } from "std/http/websocket"
+import { monotonic, parseRfc3339, second, sleep } from "std/time"
+
+class Told {
+	arrived = ""
+	took = 0.0
+	service: string | null = null
+	operation: string | null = null
+	method = ""
+	path = ""
+	status = 0
+	error: string | null = null
+	account: string | null = null
+	region: string | null = null
+	caller: string | null = null
+	requestId: string | null = null
+}
+
+class Dropped {
+	dropped = 0
+}
+
+/// g served over HTTP on the userspace network.
+function serving(g: Gateway, timeout = 30 * second): Server {
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	s.timeout = timeout
+	s.listen()
+	const job = async s.serve(g.handle)
+	return s
+}
+
+function subscribe(s: Server, query = ""): Socket { return connect(`ws://${s.addr}/_boberstack/requests${query}`) }
+
+function sqs(g: Gateway, op: string, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-amz-json-1.0")
+	req.headers.set("x-amz-target", `AmazonSQS.${op}`)
+	sign(req, body, "sqs", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function iam(g: Gateway, body: string): Response {
+	const req = new Request("POST", "http://localhost:4566/", body)
+	req.headers.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+	sign(req, body, "iam", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function s3(g: Gateway, method: string, path: string): Response {
+	const req = new Request(method, `http://localhost:4566${path}`)
+	sign(req, "", "s3", "us-east-1", "test", "test", "", "20150626T140000Z")
+	return g.handle(req)
+}
+
+function told(ws: Socket): Told {
+	const m = ws.receive()
+	assert m != null && m!.kind == "text"
+	return decode[Told](m!.data)
+}
+
+/// Whether the feed has a subscriber still: it makes a record only then.
+function followed(g: Gateway): bool { return g.internal.feed.seen(new Request("GET", "http://localhost/")) != null }
+
+test "a subscriber is told each request answered, but those to the internal endpoints" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const ws = subscribe(s)
+	assert followed(g)
+	const created = sqs(g, "CreateQueue", `{"QueueName":"q"}`)
+	assert created.status == 200
+	assert g.handle(new Request("GET", "http://localhost:4566/_boberstack/health")).status == 200
+	assert sqs(g, "GetQueueUrl", `{"QueueName":"none"}`).status == 400
+	assert iam(g, "Action=GetUser&UserName=nobody&Version=2010-05-08").status == 404
+	assert s3(g, "PUT", "/bucket").status == 200
+	assert g.handle(new Request("GET", "http://localhost:4566/missing/key")).status == 404
+	const a = told(ws)
+	assert a.service == "sqs" && a.operation == "CreateQueue" && a.method == "POST" && a.path == "/"
+	assert a.status == 200 && a.error == null
+	assert a.account == "000000000000" && a.region == "us-east-1" && a.caller == "arn:aws:iam::000000000000:root"
+	assert a.requestId == created.headers.get("x-amzn-requestid")
+	assert parseRfc3339(a.arrived) > 0
+	assert a.took >= 0.0
+	const b = told(ws)
+	assert b.operation == "GetQueueUrl" && b.status == 400 && b.error == "QueueDoesNotExist"
+	const c = told(ws)
+	assert c.service == "iam" && c.operation == "GetUser" && c.status == 404 && c.error == "NoSuchEntity"
+	const d = told(ws)
+	assert d.service == "s3" && d.operation == "CreateBucket" && d.method == "PUT" && d.path == "/bucket"
+	assert d.status == 200 && d.region == "us-east-1"
+	const e = told(ws)
+	assert e.service == "s3" && e.operation == "GetObject" && e.status == 404 && e.error == "NoSuchBucket"
+	assert e.account == null && e.caller == null
+	ws.close()
+	s.close()
+	g.close()
+}
+
+test "a request refused before its service is told, with what the gateway knew" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const ws = subscribe(s)
+	const req = new Request("POST", "http://localhost:4566/", "{}")
+	sign(req, "{}", "nothing", "eu-west-1", "test", "test", "", "20150626T140000Z")
+	const refused = g.handle(req).status
+	const bad = new Request("POST", "http://localhost:4566/", "{}")
+	bad.headers.set("authorization", "AWS4-HMAC-SHA256 nonsense")
+	const unread = g.handle(bad).status
+	assert refused == 501 && unread == 400
+	const a = told(ws)
+	assert a.service == "nothing" && a.operation == null && a.status == 501 && a.error == "NotImplemented"
+	assert a.account == null && a.caller == null && a.region == "eu-west-1" && a.requestId != null
+	const b = told(ws)
+	assert b.service == null && b.operation == null && b.requestId != null && b.error == "IncompleteSignature"
+	ws.close()
+	s.close()
+	g.close()
+}
+
+test "service and errors filter what a subscriber is told" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const queues = subscribe(s, "?service=sqs")
+	const both = subscribe(s, "?service=iam&service=S3,sqs")
+	const errors = subscribe(s, "?errors=true")
+	assert sqs(g, "CreateQueue", `{"QueueName":"q"}`).status == 200
+	assert iam(g, "Action=GetUser&UserName=nobody&Version=2010-05-08").status == 404
+	assert s3(g, "PUT", "/bucket").status == 200
+	assert sqs(g, "GetQueueUrl", `{"QueueName":"none"}`).status == 400
+	assert told(queues).operation == "CreateQueue" && told(queues).operation == "GetQueueUrl"
+	for (const op of ["CreateQueue", "GetUser", "CreateBucket", "GetQueueUrl"]) {
+		assert told(both).operation == op
+	}
+	assert told(errors).operation == "GetUser" && told(errors).operation == "GetQueueUrl"
+	// Nothing more is waiting: the next each is told is a request after these.
+	assert sqs(g, "ListQueues", "{}").status == 200
+	assert told(queues).operation == "ListQueues" && told(both).operation == "ListQueues"
+	assert iam(g, "Action=GetUser&UserName=other&Version=2010-05-08").status == 404
+	assert told(errors).error == "NoSuchEntity"
+	s.close()
+	g.close()
+}
+
+test "a subscriber that falls behind is told how many it missed, where, and the gateway does not wait for it" {
+	const g = stack(new Catalog(""))
+	g.internal.feed.room = 2000
+	const s = serving(g)
+	const ws = subscribe(s)
+	// The gateway answers these without parking, so the subscriber's fiber writes none until they are done.
+	for (let i = 0; i < 100; i++) {
+		assert sqs(g, "ListQueues", "{}").status == 200
+	}
+	let messages = 0
+	let dropped = 0
+	let gaps = 0
+	while (messages + dropped < 100) {
+		const m = ws.receive()!.data
+		if (m.slice(0, 10) == `{"dropped"`) {
+			dropped += decode[Dropped](m).dropped
+			gaps++
+		} else {
+			assert decode[Told](m).operation == "ListQueues"
+			messages++
+		}
+	}
+	assert messages > 0 && dropped > 0 && gaps == 1 && messages + dropped == 100
+	// Caught up, it is told every request again.
+	assert sqs(g, "CreateQueue", `{"QueueName":"after"}`).status == 200
+	assert told(ws).operation == "CreateQueue"
+	ws.close()
+	s.close()
+	g.close()
+}
+
+test "a subscriber that reads on is kept past the timeout by its pongs; one that went silent is closed and freed" {
+	const g = stack(new Catalog(""))
+	g.internal.feed.ping = second / 2
+	const s = serving(g, 2 * second)
+	const reading = subscribe(s)
+	const silent = subscribe(s)
+	const got: string[] = []
+	const job = async drain(reading, got)
+	sleep(5 * second)
+	assert followed(g)
+	assert sqs(g, "ListQueues", "{}").status == 200
+	sleep(second)
+	assert got.length == 1
+	// The silent one, which neither read the pings nor answered them, was closed; the reading one was not.
+	const t = monotonic()
+	try {
+		while (silent.receive() != null) {}
+	} catch (e: IoError) {}
+	assert monotonic() - t < second && followed(g)
+	reading.close()
+	await job
+	sleep(second)
+	assert !followed(g)
+	s.close()
+	g.close()
+}
+
+function drain(ws: Socket, got: string[]) {
+	try {
+		while (true) {
+			const m = ws.receive()
+			if (m == null) {
+				return
+			}
+			got.push(m!.data)
+		}
+	} catch (e: IoError) {}
+}
+
+test "a subscriber that closes, or drops its connection, is freed at once" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const a = subscribe(s)
+	a.close()
+	sleep(second / 10)
+	assert !followed(g)
+	const b = subscribe(s)
+	assert followed(g)
+	b.stream.close()
+	sleep(second / 10)
+	assert !followed(g)
+	assert sqs(g, "ListQueues", "{}").status == 200
+	s.close()
+	g.close()
+}
+
+test "a message from a subscriber is answered with a close, 1003" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const ws = subscribe(s)
+	ws.send("hello")
+	assert ws.receive() == null && ws.code == 1003
+	sleep(second / 10)
+	assert !followed(g)
+	s.close()
+	g.close()
+}
+
+test "many subscribers are each told every request" {
+	const g = stack(new Catalog(""))
+	const s = serving(g)
+	const all: Socket[] = []
+	for (let i = 0; i < 50; i++) {
+		all.push(subscribe(s, if (i % 2 == 0) "" else "?service=sqs"))
+	}
+	for (let i = 0; i < 20; i++) {
+		assert sqs(g, "ListQueues", "{}").status == 200
+	}
+	for (const ws of all) {
+		for (let i = 0; i < 20; i++) {
+			assert told(ws).operation == "ListQueues"
+		}
+	}
+	for (const ws of all) {
+		ws.close()
+	}
+	sleep(second / 10)
+	assert !followed(g)
+	s.close()
+	g.close()
+}
+
+test "a GET that is no handshake is answered 400, and closing ends every feed" {
+	const g = stack(new Catalog(""))
+	assert g.handle(new Request("GET", "http://localhost:4566/_boberstack/requests")).status == 400
+	const s = serving(g)
+	const ws = subscribe(s)
+	g.internal.feed.close()
+	assert ws.receive() == null && ws.code == 1001
+	const other = subscribe(s)
+	assert other.receive() == null && other.code == 1001
+	const last = new Gateway()
+	const t = serving(last)
+	const cut = subscribe(t)
+	t.close()
+	try {
+		assert cut.receive() == null
+	} catch (e: IoError) {}
+	sleep(second / 10)
+	assert !followed(last)
+	s.close()
+	g.close()
+}
